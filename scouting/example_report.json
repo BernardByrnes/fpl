@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-08-19T13:00:00Z",
+  "agent": "example-scout",
+  "gameweek": 1,
+  "default_expires_at": "2026-08-28T17:30:00Z",
+  "players": [
+    {
+      "player_name": "David Raya",
+      "team_hint": "ARS",
+      "position_hint": "GKP",
+      "summary": "First-choice goalkeeper for the opening run.",
+      "observations": [
+        {
+          "key": "start_probability",
+          "value": 95,
+          "unit": "percent",
+          "category": "minutes",
+          "confidence": "high",
+          "observed_at": "2026-08-19T13:00:00Z",
+          "note": "Expected to start when fit."
+        },
+        {
+          "key": "likely_role",
+          "value": "GKP",
+          "unit": "none",
+          "category": "role",
+          "confidence": "medium",
+          "observed_at": "2026-08-19T13:00:00Z"
+        }
+      ]
+    },
+    {
+      "player_name": "David Rayaa",
+      "team_hint": "ARS",
+      "start_probability": 90,
+      "confidence": "medium",
+      "observations": ["Intentional unresolved example entry."]
+    }
+  ]
+}

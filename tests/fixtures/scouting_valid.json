@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-08-19T13:00:00Z",
+  "agent": "test-scout",
+  "gameweek": 1,
+  "players": [
+    {
+      "player_name": "David Raya",
+      "start_probability": 90,
+      "rotation_risk": "low",
+      "confidence": "high",
+      "observations": ["Expected to start."],
+      "evidence": [{"source": "test", "date": "2026-08-19"}]
+    }
+  ]
+}

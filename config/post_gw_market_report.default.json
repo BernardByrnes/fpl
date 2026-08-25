@@ -1,0 +1,88 @@
+{
+  "schema_version": "post_gw_market_report.config.v1",
+  "output": {
+    "base_dir": "reports",
+    "write_json": true,
+    "write_markdown": true,
+    "deterministic": true,
+    "include_wall_clock_generated_at": false
+  },
+  "gameweek_completion": {
+    "require_complete": true,
+    "require_event_data_checked_if_available": true,
+    "require_fixtures_finished": true,
+    "require_fixtures_not_provisional_if_available": true
+  },
+  "numeric_format": {
+    "price_decimals": 1,
+    "ownership_decimals": 1,
+    "x_metric_decimals": 2
+  },
+  "metrics": {
+    "null_xg_policy": "unknown_not_zero",
+    "xgi_preference": "official_then_xg_plus_xa"
+  },
+  "sections": {
+    "gw_stars": {
+      "enabled": true,
+      "rows": 15,
+      "minimum_minutes": 1
+    },
+    "underlying_leaders": {
+      "enabled": true,
+      "rows_per_metric": 10,
+      "minimum_minutes": 45,
+      "metrics": ["xg", "xa", "xgi"]
+    },
+    "attacking_process_under_return": {
+      "enabled": true,
+      "rows": 15,
+      "positions": ["DEF", "MID", "FWD"],
+      "minimum_minutes": 45,
+      "minimum_xgi": 0.6,
+      "maximum_actual_gi": 0
+    },
+    "attacking_output_ahead_of_process": {
+      "enabled": true,
+      "rows": 15,
+      "positions": ["DEF", "MID", "FWD"],
+      "minimum_minutes": 45,
+      "minimum_actual_gi": 1,
+      "minimum_attacking_residual": 0.5
+    },
+    "defensive_contributions": {
+      "enabled": true,
+      "rows_per_position_group": 15,
+      "minimum_minutes_per_fixture": 1,
+      "near_threshold_margin": 3,
+      "position_rules": {
+        "DEF": {"threshold": 10, "action_family": "CBIT"},
+        "MID": {"threshold": 12, "action_family": "CBIRT"},
+        "FWD": {"threshold": 12, "action_family": "CBIRT"}
+      },
+      "require_per_fixture_provenance": true
+    },
+    "minutes_watch": {
+      "enabled": true,
+      "rows_per_subsection": 20,
+      "lookback_completed_fixtures": 3,
+      "minimum_baseline_fixtures": 2,
+      "baseline_average_minutes_per_fixture": 65,
+      "baseline_starts": 2,
+      "low_minutes_threshold": 30,
+      "limited_minutes_maximum": 30,
+      "limited_minutes_minimum_points": 5,
+      "limited_minutes_minimum_xgi": 0.3
+    },
+    "our_squad": {
+      "enabled": true,
+      "squad_resolution": "target_gw_only",
+      "include_market_section_flags": true
+    },
+    "scout_candidates": {
+      "enabled": true,
+      "maximum_market_triggered_candidates": 8,
+      "maximum_questions_per_player": 3
+    }
+  }
+}

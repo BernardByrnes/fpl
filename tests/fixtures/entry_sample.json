@@ -1,0 +1,25 @@
+{
+  "id": 1,
+  "joined_time": "2026-07-23T12:08:08.754641Z",
+  "started_event": 1,
+  "favourite_team": 14,
+  "player_first_name": "Chris",
+  "player_last_name": "Musson",
+  "player_region_id": 241,
+  "player_region_name": "England",
+  "player_region_iso_code_short": "EN",
+  "player_region_iso_code_long": "ENG",
+  "years_active": 12,
+  "summary_overall_points": null,
+  "summary_overall_rank": null,
+  "summary_event_points": null,
+  "summary_event_rank": null,
+  "current_event": null,
+  "name": "Solio Moose",
+  "name_change_blocked": false,
+  "entered_events": [],
+  "last_deadline_bank": null,
+  "last_deadline_value": null,
+  "last_deadline_total_transfers": 0
+}
+

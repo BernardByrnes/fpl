@@ -1,0 +1,8 @@
+{
+  "_note": "Weekly manual scout input for the Luna brief generator. All fields are optional; a missing or empty file is valid. player ids are FPL element ids. custom_questions maps player id (as string) to a list of question strings.",
+  "gameweek": null,
+  "captaincy_candidates": [],
+  "transfer_candidates": [],
+  "extra_players": [],
+  "custom_questions": {}
+}

@@ -1,0 +1,38 @@
+# Python build/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Local secrets and machine-specific configuration
+.env
+.env.*
+config.json
+*.local.json
+
+# SQLite databases, journals, and WAL/SHM files
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Runtime API data, generated reports, and scouting workflow state
+data/raw/
+data/exports/
+data/scouting/briefs/
+data/scouting/inbox/*
+!data/scouting/inbox/
+!data/scouting/inbox/README.md
+reports/
+logs/
+scouting/rejected/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
