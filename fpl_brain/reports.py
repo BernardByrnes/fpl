@@ -40,6 +40,17 @@ def _percent(value: Any) -> str:
     return "—" if value is None else f"{float(value):.1f}%"
 
 
+def _percentage_points(value: Any) -> str:
+    """Render percentage-point deltas without exposing binary float noise."""
+
+    if value is None:
+        return "—"
+    rounded = round(float(value), 1)
+    if rounded == 0:
+        rounded = 0.0
+    return f"{rounded:.1f}"
+
+
 def _player_name(row: dict[str, Any]) -> str:
     return row.get("full_name") or row.get("web_name") or f"Player {row.get('id')}"
 
@@ -121,6 +132,27 @@ def _player_rows(conn: sqlite3.Connection, player_ids: list[int]) -> list[dict[s
 
 def _section(lines: list[str]) -> dict[str, Any]:
     return {"lines": lines}
+
+
+def _is_complete_squad_snapshot(
+    squad: list[dict[str, Any]],
+    entry_id: int | None,
+    event_id: int,
+) -> bool:
+    """Return whether rows form the exact configured 15-player target-GW squad."""
+
+    if entry_id is None or len(squad) != 15:
+        return False
+    try:
+        rows_match_scope = all(
+            int(row["entry_id"]) == int(entry_id)
+            and int(row["event"]) == int(event_id)
+            for row in squad
+        )
+        positions = [int(row["position"]) for row in squad]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return rows_match_scope and sorted(positions) == list(range(1, 16))
 
 
 def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | None = None) -> dict[str, Any]:
@@ -312,17 +344,22 @@ def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | Non
                 row = player_by_id.get(player_id) or {"id": player_id}
                 value = note.get("value_text") if note.get("value_text") is not None else note.get("value_num")
                 risk_lines.append(f"[SCOUTING] {_player_name(row)} {note['key']}: {_value(value)} (confidence {note.get('confidence')}, observed {note.get('observed_at')})")
-    club_counts = Counter(row.get("team_id") for row in squad)
-    concentrated = [team_id for team_id, count in club_counts.items() if team_id is not None and count > 2]
-    if concentrated:
-        for team_id in concentrated:
-            count = club_counts[team_id]
-            risk_lines.append(
-                f"[DERIVED] Concentration risk: {count} players from {_team_label(conn, team_id)} — maximum club allocation reached; "
-                f"another {_team_label(conn, team_id)} target would require selling one."
-            )
+    if not _is_complete_squad_snapshot(squad, entry_id, event_id):
+        risk_lines.append(
+            "[DERIVED] Structural: DATA GAP — verified complete current squad unavailable; club concentration not evaluated."
+        )
     else:
-        risk_lines.append("[DERIVED] Structural: no club has reached the three-player maximum.")
+        club_counts = Counter(row.get("team_id") for row in squad)
+        concentrated = [team_id for team_id, count in club_counts.items() if team_id is not None and count > 2]
+        if concentrated:
+            for team_id in concentrated:
+                count = club_counts[team_id]
+                risk_lines.append(
+                    f"[DERIVED] Concentration risk: {count} players from {_team_label(conn, team_id)} — maximum club allocation reached; "
+                    f"another {_team_label(conn, team_id)} target would require selling one."
+                )
+        else:
+            risk_lines.append("[DERIVED] Structural: no club has reached the three-player maximum.")
     sections[SECTION_ORDER[7]] = _section(risk_lines)
 
     watchlist_lines = []
@@ -349,7 +386,7 @@ def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | Non
         movement_lines.append(
             f"  {_player_name(row)}: {_money(cost['first'] if cost else None)} → {_money(cost['last'] if cost else None)} "
             f"({cost['absolute_delta'] if cost else '—'}) | own {_value(ownership['first'] if ownership else None)} → {_value(ownership['last'] if ownership else None)} "
-            f"({ownership['absolute_delta'] if ownership else '—'}pp) | snapshots {(cost or ownership)['sample_count']}"
+            f"({_percentage_points(ownership['absolute_delta']) if ownership else '—'}pp) | snapshots {(cost or ownership)['sample_count']}"
         )
     sections[SECTION_ORDER[9]] = _section(movement_lines)
 
@@ -381,6 +418,17 @@ def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | Non
         gaps.append("No manager or squad data: Team ID is not configured.")
     if manual_free_transfers is None:
         gaps.append("Free transfers are manual; verify them in the FPL UI.")
+    unplaced_pending = repo.unplaced_pending_fixture_rows(conn, event_id, 8)
+    if unplaced_pending:
+        fixture_details = "; ".join(
+            f"fixture {row['id']} (official event "
+            f"{'GW' + str(row['event']) if row.get('event') is not None else 'unassigned'}; "
+            f"kickoff {row.get('kickoff_time') or 'unknown'})"
+            for row in unplaced_pending
+        )
+        gaps.append(
+            "Pending fixture schedule unresolved; excluded from future FDR horizons: " + fixture_details + "."
+        )
     missing_scouting = [_player_name(row) for row in player_rows if not scouting_by_player.get(int(row["id"]))]
     if missing_scouting:
         gaps.append("No scouting notes for: " + ", ".join(missing_scouting) + ".")

@@ -19,8 +19,7 @@ from .models import (
     PositionRecord,
     TeamRecord,
 )
-from .utils import json_text, utc_now
-from .utils import normalise_name
+from .utils import json_text, normalise_name, parse_utc, utc_now
 
 
 def _raw(value: Any) -> str:
@@ -662,6 +661,158 @@ def fixture_rows(conn: sqlite3.Connection, from_event: int, horizon: int) -> lis
             (from_event, from_event + horizon),
         )
     )
+
+
+def _fixture_horizon_selection(
+    conn: sqlite3.Connection,
+    from_event: int,
+    horizon: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return fixtures placed in an event horizon and pending fixtures left unplaced."""
+
+    if horizon <= 0:
+        return [], []
+
+    rows = _rows(conn.execute("SELECT * FROM fixtures ORDER BY event, kickoff_time, id"))
+    pending = [row for row in rows if row.get("finished") != 1 and row.get("started") != 1]
+    scheduled_pending = [
+        row for row in pending
+        if row.get("event") is not None and int(row["event"]) >= int(from_event)
+    ]
+    older_pending = [
+        row for row in pending
+        if row.get("event") is not None and int(row["event"]) < int(from_event)
+    ]
+    unplaced = [row for row in pending if row.get("event") is None]
+    if not scheduled_pending:
+        return [], sorted(older_pending + unplaced, key=_fixture_sort_key)
+
+    first_event = min(int(row["event"]) for row in scheduled_pending)
+    last_event_exclusive = first_event + int(horizon)
+    placed = [
+        {**row, "horizon_event": int(row["event"])}
+        for row in scheduled_pending
+        if int(row["event"]) < last_event_exclusive
+    ]
+    if not older_pending:
+        return sorted(placed, key=_fixture_sort_key), sorted(unplaced, key=_fixture_sort_key)
+
+    deadline_rows = _rows(
+        conn.execute(
+            """SELECT id, deadline_time FROM events
+               WHERE id>=? AND id<=? ORDER BY id""",
+            (first_event, last_event_exclusive),
+        )
+    )
+    deadlines = {int(row["id"]): parse_utc(row.get("deadline_time")) for row in deadline_rows}
+    max_event = conn.execute("SELECT MAX(id) FROM events").fetchone()[0]
+    max_event = int(max_event) if max_event is not None else None
+    horizon_start = deadlines.get(first_event)
+    horizon_end = deadlines.get(last_event_exclusive)
+    cutoff_is_expected = max_event is not None and last_event_exclusive <= max_event
+    last_horizon_event = min(last_event_exclusive - 1, max_event) if max_event is not None else None
+
+    for row in older_pending:
+        kickoff = parse_utc(row.get("kickoff_time"))
+        if kickoff is None or horizon_start is None:
+            unplaced.append(row)
+            continue
+        if kickoff < horizon_start:
+            # Official fixture state says pending, but its recorded schedule is
+            # before this horizon. Keep it visible as a data-quality gap rather
+            # than treating its old event as an immediate fixture.
+            unplaced.append(row)
+            continue
+        if cutoff_is_expected and horizon_end is None:
+            unplaced.append(row)
+            continue
+        if horizon_end is not None and kickoff >= horizon_end:
+            # The known reschedule is beyond this horizon. It will be evaluated
+            # again when a later horizon reaches its kickoff window.
+            continue
+
+        placement_event = _horizon_event_for_kickoff(
+            kickoff,
+            deadlines,
+            first_event,
+            last_event_exclusive,
+            last_horizon_event,
+            max_event,
+        )
+        if placement_event is None:
+            unplaced.append(row)
+            continue
+        placed.append({**row, "horizon_event": placement_event})
+
+    return sorted(placed, key=_fixture_sort_key), sorted(unplaced, key=_fixture_sort_key)
+
+
+def _horizon_event_for_kickoff(
+    kickoff: Any,
+    deadlines: dict[int, Any],
+    first_event: int,
+    last_event_exclusive: int,
+    last_horizon_event: int | None,
+    max_event: int | None,
+) -> int | None:
+    """Map a known pending kickoff without inferring state or inventing an event."""
+
+    if last_horizon_event is None:
+        return None
+    for event_id in range(first_event, min(last_event_exclusive, last_horizon_event + 1)):
+        event_start = deadlines.get(event_id)
+        if event_start is None:
+            return None
+        next_start = deadlines.get(event_id + 1)
+        if next_start is None:
+            if event_id == last_horizon_event and (
+                event_id == max_event or event_id + 1 >= last_event_exclusive
+            ):
+                return event_id
+            return None
+        if event_start <= kickoff < next_start:
+            return event_id
+    return None
+
+
+def _fixture_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Order placed fixtures by derived event window, then scheduled kickoff."""
+
+    kickoff = parse_utc(row.get("kickoff_time"))
+    event = row.get("horizon_event", row.get("event"))
+    return (
+        int(event) if event is not None else 10**9,
+        kickoff is None,
+        kickoff.isoformat() if kickoff is not None else "",
+        int(row["id"]),
+    )
+
+
+def future_fixture_rows(conn: sqlite3.Connection, from_event: int, horizon: int) -> list[dict[str, Any]]:
+    """Return state-pending fixtures that can be placed in the next event horizon.
+
+    The normal horizon starts at the earliest pending FPL event at or after
+    ``from_event``. A pending fixture retained against an older event is not
+    automatically treated as immediate: its known kickoff must fall inside
+    the horizon's official event-deadline windows. Such a row retains its
+    source ``event`` and receives a derived ``horizon_event`` for ordering and
+    DGW accounting. The final official event is an open-ended window when no
+    later official event exists; no new event is invented. A missing or
+    contradictory schedule is excluded from numeric future metrics and exposed
+    by ``unplaced_pending_fixture_rows``.
+
+    Only ``started=1`` or ``finished=1`` proves that a fixture is no longer
+    future-facing. Kickoff time is used solely to place an already-pending
+    old-event fixture; it never infers completion.
+    """
+
+    return _fixture_horizon_selection(conn, from_event, horizon)[0]
+
+
+def unplaced_pending_fixture_rows(conn: sqlite3.Connection, from_event: int, horizon: int) -> list[dict[str, Any]]:
+    """Return pending fixtures that cannot be safely placed in an event horizon."""
+
+    return _fixture_horizon_selection(conn, from_event, horizon)[1]
 
 
 def team_row(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | None:

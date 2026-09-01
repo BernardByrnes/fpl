@@ -73,13 +73,15 @@ def run_fetch(
     endpoints_ok: list[str] = []
     endpoint_failures: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
+    current_event: int | None = None
     if not dry_run:
         ensure_directory(raw_dir)
         conn = connect_database(database_path)
         with conn:
             run_id = repo.create_fetch_run(conn, "fetch_fpl", str(raw_dir))
-    client = FplClient(config, raw_dir=None if dry_run else raw_dir, run_id=run_id, dry_run=dry_run)
+    client: FplClient | None = None
     try:
+        client = FplClient(config, raw_dir=None if dry_run else raw_dir, run_id=run_id, dry_run=dry_run)
         try:
             bootstrap_payload = client.get_bootstrap_static()
             first_records = parse_bootstrap(bootstrap_payload, captured_at)
@@ -181,8 +183,34 @@ def run_fetch(
             "counts": counts,
             "endpoints_failed": endpoint_failures,
         }
+    except Exception as exc:
+        if not dry_run and conn is not None and run_id is not None:
+            try:
+                status_row = conn.execute("SELECT status FROM fetch_runs WHERE id=?", (run_id,)).fetchone()
+                if status_row and status_row[0] == "running":
+                    if not endpoint_failures:
+                        endpoint_failures.append({"endpoint": "fetch_fpl", "error": str(exc)})
+                    with conn:
+                        repo.finish_fetch_run(
+                            conn,
+                            run_id,
+                            "failed",
+                            current_event,
+                            endpoints_ok,
+                            endpoint_failures,
+                            str(exc),
+                        )
+            except Exception as bookkeeping_exc:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"Fetch-run failure finalisation also failed: {bookkeeping_exc!r}")
+                LOGGER.exception(
+                    "Fetch-run failure finalisation failed for run %s; preserving the original fetch exception.",
+                    run_id,
+                )
+        raise
     finally:
-        client.close()
+        if client is not None:
+            client.close()
         if conn is not None:
             conn.close()
 

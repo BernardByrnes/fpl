@@ -15,12 +15,13 @@ def fixture_outlook(conn: sqlite3.Connection, team_id: int, from_event: int, hor
     """Return each scheduled fixture and its raw FDR for a team."""
 
     fixtures = []
-    for row in repo.fixture_rows(conn, from_event, horizon):
+    for row in repo.future_fixture_rows(conn, from_event, horizon):
         if row["team_h"] == team_id:
             fixtures.append(
                 {
                     "fixture_id": row["id"],
                     "event": row["event"],
+                    "horizon_event": row.get("horizon_event", row["event"]),
                     "opponent_team": row["team_a"],
                     "home": True,
                     "difficulty": row["team_h_difficulty"],
@@ -32,6 +33,7 @@ def fixture_outlook(conn: sqlite3.Connection, team_id: int, from_event: int, hor
                 {
                     "fixture_id": row["id"],
                     "event": row["event"],
+                    "horizon_event": row.get("horizon_event", row["event"]),
                     "opponent_team": row["team_h"],
                     "home": False,
                     "difficulty": row["team_a_difficulty"],
@@ -39,7 +41,7 @@ def fixture_outlook(conn: sqlite3.Connection, team_id: int, from_event: int, hor
                 }
             )
     difficulties = [item["difficulty"] for item in fixtures if item["difficulty"] is not None]
-    event_counts = Counter(item["event"] for item in fixtures)
+    event_counts = Counter(item["horizon_event"] for item in fixtures)
     return {
         "fixtures": fixtures,
         "mean_fdr": mean(difficulties) if difficulties else None,
@@ -61,7 +63,7 @@ def attacking_and_defensive_outlook(
     """Average the opponent's context-aware defence and attack strengths."""
 
     values: list[tuple[int | float, int | float]] = []
-    for row in repo.fixture_rows(conn, from_event, horizon):
+    for row in repo.future_fixture_rows(conn, from_event, horizon):
         if row["team_h"] == team_id:
             opponent_id = row["team_a"]
             opponent_side = "away"

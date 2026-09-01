@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 
 import pytest
 
@@ -84,3 +85,71 @@ def test_parser_failure_partway_preserves_existing_catalog(monkeypatch, tmp_path
     conn = connect_database(config["paths"]["database"])
     assert conn.execute("SELECT is_active FROM players WHERE id=10").fetchone()[0] == 1
     conn.close()
+
+
+def test_successful_fetch_commits_success_status(monkeypatch, tmp_path, fixture_json):
+    config = _config(tmp_path)
+
+    class PayloadClient(FakeClient):
+        def get_bootstrap_static(self):
+            return fixture_json("bootstrap_static_sample.json")
+
+    monkeypatch.setattr(ingest, "FplClient", PayloadClient)
+    result = ingest.run_fetch(config)
+    assert result["status"] == "success"
+    conn = connect_database(config["paths"]["database"])
+    row = conn.execute("SELECT status, finished_at FROM fetch_runs WHERE id=?", (result["run_id"],)).fetchone()
+    assert row["status"] == "success"
+    assert row["finished_at"] is not None
+    conn.close()
+
+
+def test_unexpected_fetch_failure_is_recorded_as_failed(monkeypatch, tmp_path, fixture_json):
+    config = _config(tmp_path)
+
+    class PayloadClient(FakeClient):
+        def get_bootstrap_static(self):
+            return fixture_json("bootstrap_static_sample.json")
+
+        def get_element_summary(self, player_id):
+            return {}
+
+    def fail_summary(*args, **kwargs):
+        raise ValueError("malformed element summary")
+
+    monkeypatch.setattr(ingest, "FplClient", PayloadClient)
+    monkeypatch.setattr(ingest, "parse_element_summary", fail_summary)
+    with pytest.raises(ValueError, match="malformed element summary"):
+        ingest.run_fetch(config, summaries="all")
+    conn = connect_database(config["paths"]["database"])
+    row = conn.execute("SELECT status, finished_at, error_message FROM fetch_runs ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"
+    assert row["finished_at"] is not None
+    assert row["error_message"] == "malformed element summary"
+    conn.close()
+
+
+def test_unexpected_fetch_failure_preserves_primary_error_when_finalisation_fails(monkeypatch, tmp_path, fixture_json, caplog):
+    config = _config(tmp_path)
+
+    class PayloadClient(FakeClient):
+        def get_bootstrap_static(self):
+            return fixture_json("bootstrap_static_sample.json")
+
+        def get_element_summary(self, player_id):
+            return {}
+
+    def fail_summary(*args, **kwargs):
+        raise ValueError("primary fetch failure")
+
+    def fail_finalisation(*args, **kwargs):
+        raise RuntimeError("fetch-run bookkeeping failure")
+
+    monkeypatch.setattr(ingest, "FplClient", PayloadClient)
+    monkeypatch.setattr(ingest, "parse_element_summary", fail_summary)
+    monkeypatch.setattr(ingest.repo, "finish_fetch_run", fail_finalisation)
+    with caplog.at_level(logging.ERROR, logger=ingest.LOGGER.name):
+        with pytest.raises(ValueError, match="primary fetch failure") as raised:
+            ingest.run_fetch(config, summaries="all")
+    assert "Fetch-run failure finalisation failed" in caplog.text
+    assert any("fetch-run bookkeeping failure" in note for note in getattr(raised.value, "__notes__", []))
