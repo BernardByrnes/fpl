@@ -146,6 +146,11 @@ _MAX_POS = (5, 5, 3)
 #: computed once per identity instead of once per squad.
 MATRIX_IDENTITY_KEY = "_p2_matrix_identity"
 
+#: Where that matrix lives on disk, when it came from (or was written to) the certified
+#: world cache.  Recorded so a parallel worker can load the SAME BYTES; never used as a
+#: memo key (a path is mutable, a content identity is not).
+MATRIX_PATH_KEY = "_p2_matrix_path"
+
 #: Run-scoped, matrix-keyed memos.  Never persisted, never keyed on a
 #: certification identity from a different run (the key IS the certified cache
 #: identity of the matrix that is already in memory).

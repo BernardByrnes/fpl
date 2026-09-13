@@ -25,7 +25,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import manager_lineup, route_comparator as rc, transfer_state as ts
-from .manager_worlds import MATRIX_IDENTITY_KEY as MANAGER_MATRIX_IDENTITY_KEY
+from .manager_worlds import (
+    MATRIX_IDENTITY_KEY as MANAGER_MATRIX_IDENTITY_KEY,
+    MATRIX_PATH_KEY as MANAGER_MATRIX_PATH_KEY,
+)
 from .season_rules import window_flag
 
 PHASE8B_VERSION = "route_optimizer_v8b_1.0.0"
@@ -831,6 +834,7 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
                       "core": {int(k): v for k, v in raw["core"].items()},
                       "minutes": {int(k): v for k, v in raw["minutes"].items()}}
             _stamp_matrix_identity(matrix, key)
+            _stamp_matrix_path(matrix, path)
             return matrix, {"source": "cache", "key": key}
     fixtures = monte_carlo.load_fixture_inputs(
         conn, event=int(event), xpts_run_id=int(bundle.xpts_run_id),
@@ -843,11 +847,13 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
     _stamp_matrix_identity(matrix, key)
     if cache_dir is not None:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
-        (Path(cache_dir) / f"{key}.json").write_text(json.dumps({
+        matrix_path = Path(cache_dir) / f"{key}.json"
+        matrix_path.write_text(json.dumps({
             "worlds": matrix["worlds"], "player_ids": matrix["player_ids"],
             "core": {str(k): v for k, v in matrix["core"].items()},
             "minutes": {str(k): v for k, v in matrix["minutes"].items()},
         }), encoding="utf-8")
+        _stamp_matrix_path(matrix, matrix_path)
     return matrix, {"source": "generated", "key": key}
 
 
@@ -861,6 +867,19 @@ def _stamp_matrix_identity(matrix, identity: str) -> None:
 
     try:
         matrix[MANAGER_MATRIX_IDENTITY_KEY] = str(identity)
+    except (TypeError, AttributeError):
+        pass
+
+
+def _stamp_matrix_path(matrix, path) -> None:
+    """Record where a world matrix lives on disk, so a worker can load the same bytes.
+
+    Only the FILE LOCATION is recorded; the matrix-keyed memos still key on the
+    provenance identity, never on a path.
+    """
+
+    try:
+        matrix[MANAGER_MATRIX_PATH_KEY] = str(path)
     except (TypeError, AttributeError):
         pass
 
@@ -1131,6 +1150,9 @@ def optimize(
     required_routes: Sequence[PartialRoute] | None = None,
     provenance: Mapping[str, Any] | None = None,
     cancel_probe: Callable[[], None] | None = None,
+    parallel_workers: int | None = None,
+    parallel_matrix_cache: int | None = None,
+    parallel_schedule_sink: dict | None = None,
 ) -> dict[str, Any]:
     """Bounded search, exact scoring, Pareto frontiers and coverage/rescue audits.
 
@@ -1205,6 +1227,23 @@ def optimize(
         required=required,
         inherited=inherited,
     )
+
+    # P3: PREFETCH the missing exact evaluations, optionally in parallel.  This only
+    # populates the run-scoped cache BY KEY; the loop below is unchanged, so route
+    # assembly, ranking, tie-breaks and paired comparison keep the same sequential order
+    # and a shuffled worker completion order cannot change the answer.
+    parallel_counters = None
+    if parallel_workers is not None:
+        from . import parallel_exact as px
+
+        kwargs = {}
+        if parallel_matrix_cache is not None:
+            kwargs["matrix_cache"] = int(parallel_matrix_cache)
+        parallel_counters = px.prefetch_exact_cache(
+            promoted=promoted, worlds_by_event=worlds_by_event, positions_of=positions_of,
+            cache=exact_cache, config=config, world_identity=worlds_identity,
+            worker_count=int(parallel_workers), cancel_probe=cancel_probe,
+            positions_by_id=positions_by_id, result_sink=parallel_schedule_sink, **kwargs)
 
     records: dict[str, dict[str, Any]] = {}
     exact_evaluations = 0
@@ -1323,6 +1362,7 @@ def optimize(
         "exact_evaluations": exact_evaluations,
         "exact_cache_entries": len(exact_cache),
         "exact_cache_hits": max(0, int(exact_cache_hits)),
+        "parallel_exact": None if parallel_counters is None else parallel_counters.as_dict(),
         "promoted_route_count": len(records),
         "routes": records,
         "h1_frontier": h1_frontier,
