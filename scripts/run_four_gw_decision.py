@@ -71,6 +71,41 @@ def _suppress_transfer_recommendation(decision: dict, *, reason: str, extra: dic
     return suppressed
 
 
+HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+
+def _cancel_probe(guard, *, heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS):
+    """A safe-boundary probe: canonical cancel check + periodic lease heartbeat.
+
+    Returns a zero-argument callable to be invoked ONLY at the boundaries P1
+    identified (top of a search level, between world-matrix builds, between exact
+    finalist-route evaluations, immediately before the escalation, between
+    prefix-invariance events).  At every one of those points no write transaction is
+    open — ``run_search`` and ``optimize`` issue no SQLite writes at all, and the
+    world builders have fully returned — so the heartbeat can never widen a write
+    lock window.
+
+    ``check_cancel`` re-reads the run row, so a ``CANCEL_REQUESTED`` written by
+    another process is observed; it raises ``RunCancelled``, which unwinds through
+    the runner's existing ``finally`` into ``production_run_guard``'s cancel branch
+    (``acknowledge_cancel`` + lease release).
+    """
+
+    state = {"last_heartbeat": 0.0, "checks": 0, "heartbeats": 0}
+
+    def probe() -> None:
+        guard.check_cancel()
+        state["checks"] += 1
+        now = time.monotonic()
+        if now - state["last_heartbeat"] >= float(heartbeat_interval):
+            guard.heartbeat()
+            state["last_heartbeat"] = now
+            state["heartbeats"] += 1
+
+    probe.state = state  # type: ignore[attr-defined]
+    return probe
+
+
 def _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy) -> list[int]:
     """Role-relevant player ids for the FINAL preferred route, sorted.
 
@@ -552,13 +587,22 @@ def main(argv=None) -> int:
         # universe; the ONLY changed input is the shared-world draw count.  The
         # refinement also publishes the one canonical paired record below.
         t_refine = time.time()
+        # ONE run-scoped exact-evaluation cache, shared by the Stage-2 refinement and the
+        # single stability escalation.  Reuse is keyed on the COMPLETE evaluation
+        # identity (event, canonical squad, draws, seed, world provenance), and both
+        # calls run at the same draw count, seed and certified worlds, so a shared entry
+        # is literally the same evaluation.  The cache never leaves the run.
+        cancel_probe = _cancel_probe(guard)
+        run_exact_cache: dict = {}
         refinement = fr.refine_finalists(
             universe=universe, initial_state=source_state, scenario=scenario,
             player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
             stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
             cache_dir=Path(args.cache_dir),
+            exact_cache=run_exact_cache, cancel_probe=cancel_probe,
         )
         stage2_result = refinement["refined"]
+        print(f"exact cache: {len(run_exact_cache)} entries after the Stage-2 refinement")
 
         # --- R4B.2b REPAIR: stability FIRST, so the final ranking is known ------
         # The gate may run the ONE bounded escalation (the next supported search
@@ -580,9 +624,12 @@ def main(argv=None) -> int:
                 stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
                 prebuilt_worlds=refinement.get("prebuilt_worlds"),
                 finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
+                exact_cache=run_exact_cache,
+                cancel_probe=cancel_probe,
             ),
             config=fr.StabilityGateConfig(current_beam=int(args.beam)),
             escalated_result_sink=escalated_sink,
+            cancel_probe=cancel_probe,
         )
         stability_seconds = time.time() - t_stability
         escalated_result = escalated_sink.get("result")
@@ -879,7 +926,7 @@ def main(argv=None) -> int:
 
 def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundles, conn,
                        base_config, stage1_result, stage2_draws, prebuilt_worlds,
-                       finalist_partials):
+                       finalist_partials, exact_cache=None, cancel_probe=None):
     """The ONE bounded search-breadth escalation, as a closure over one beam width.
 
     Runs the next SUPPORTED search budget (the next beam width in
@@ -900,6 +947,7 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
             player_meta=player_meta, bundles=bundles, conn=conn, config=config, cache_dir=None,
             prebuilt_worlds=prebuilt_worlds, required_routes=list(finalist_partials),
             nested_prior=ro.nested_budget_view(stage1_result),
+            exact_cache=exact_cache, cancel_probe=cancel_probe,
         )
 
     return run

@@ -19,11 +19,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping as AbcMapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import manager_lineup, route_comparator as rc, transfer_state as ts
+from .manager_worlds import MATRIX_IDENTITY_KEY as MANAGER_MATRIX_IDENTITY_KEY
 from .season_rules import window_flag
 
 PHASE8B_VERSION = "route_optimizer_v8b_1.0.0"
@@ -196,7 +198,11 @@ def build_search_pool(universe: Mapping[str, Any], owned_ids: Iterable[int],
 
 
 def _feature_core(feature) -> float:
-    if isinstance(feature, Mapping):
+    # ``collections.abc.Mapping`` instead of ``typing.Mapping``: the boolean result is
+    # identical for every feature object this module receives, but ``typing.Mapping``
+    # routes each check through typing's __instancecheck__/__subclasscheck__/issubclass
+    # chain (measured at ~79M extra Python-level calls in one production search).
+    if isinstance(feature, AbcMapping):
         return float(feature.get("expected_core") or 0.0)
     return float(feature.expected_core)
 
@@ -213,21 +219,40 @@ def _action(event, kind, batch, transition, hit, delta3):
 
 
 def generate_actions(*, state, rows, pool_ids, positions, price_snapshot, player_meta, config, event):
+    """Every legal action from one state at one event.
+
+    Two bit-preserving speed-ups over the P1 code, both purely repeated work:
+
+    * the per-position candidate list is built once per owned player instead of being
+      re-derived inside the sort key;
+    * each ``(out, in)`` delta is computed ONCE and reused for the sort key and for the
+      action record, instead of being recomputed on every key comparison.
+
+    The sort key components and their order are unchanged, so the generated action list
+    and its order are identical.
+    """
+
     owned = [int(p.player_id) for p in state.players]
     owned_set = set(owned)
     pool = [pid for pid in pool_ids if pid not in owned_set]
+    meta = ts.normalise_meta(player_meta)
+    position_of = positions.get
 
     singles = []
     generated = 0
     for out_id in owned:
-        candidates = [pid for pid in pool if positions.get(pid) == positions.get(out_id)]
-        ranked = sorted(candidates, key=lambda pid: (-_delta(rows, out_id, pid)[1], -_delta(rows, out_id, pid)[0], pid))
-        for in_id in ranked[: int(config.singles_per_out)]:
+        out_position = position_of(out_id)
+        deltas = []
+        for pid in pool:
+            if position_of(pid) == out_position:
+                d4, d3 = _delta(rows, out_id, pid)
+                deltas.append((-d3, -d4, pid, d3, d4))
+        deltas.sort()
+        for _neg3, _neg4, in_id, d3, d4 in deltas[: int(config.singles_per_out)]:
             generated += 1
             batch = ts.TransferBatch((ts.TransferAction(out_id, in_id),))
-            result = ts.apply_transfer_batch(state, batch, price_snapshot, player_meta)
+            result = ts.apply_transfer_batch(state, batch, price_snapshot, meta)
             if result.ok:
-                d4, d3 = _delta(rows, out_id, in_id)
                 singles.append((d3, d4, batch, result))
     singles.sort(key=lambda item: (-item[0], -item[1], item[2].out_ids(), item[2].in_ids()))
 
@@ -250,7 +275,7 @@ def generate_actions(*, state, rows, pool_ids, positions, price_snapshot, player
                     continue
                 doubles += 1
                 batch = ts.TransferBatch(top[i][2].actions + top[j][2].actions)
-                result = ts.apply_transfer_batch(state, batch, price_snapshot, player_meta)
+                result = ts.apply_transfer_batch(state, batch, price_snapshot, meta)
                 if result.ok:
                     actions.append(_action(event, "DOUBLE", batch, result, result.hit_points,
                                            top[i][0] + top[j][0]))
@@ -265,7 +290,7 @@ def generate_actions(*, state, rows, pool_ids, positions, price_snapshot, player
                         continue
                     triples += 1
                     batch = ts.TransferBatch(top[i][2].actions + top[j][2].actions + top[k][2].actions)
-                    result = ts.apply_transfer_batch(state, batch, price_snapshot, player_meta)
+                    result = ts.apply_transfer_batch(state, batch, price_snapshot, meta)
                     if result.ok:
                         actions.append(_action(event, "HIT", batch, result, result.hit_points,
                                                top[i][0] + top[j][0] + top[k][0]))
@@ -284,14 +309,41 @@ def generate_actions(*, state, rows, pool_ids, positions, price_snapshot, player
 
 
 def player_event_core(row: Mapping[str, Any], event: int) -> float:
+    """One row's expected CORE at one event.
+
+    The row's per-event feature list is indexed into a ``{event: core}`` map on first
+    use and stored ON THE ROW, so the linear rescan is paid once per (row) rather than
+    once per (row, event) across ~490k calls per search.  The map is only built when
+    the row's events are unique — otherwise the original first-match scan is used, so
+    the returned value is never changed.
+    """
+
+    cached = row.get("_p2_event_core") if hasattr(row, "get") else None
+    if cached is None:
+        features = row["events"]
+        values = [
+            int(feature.get("event") if isinstance(feature, AbcMapping) else feature.event)
+            for feature in features
+        ]
+        cached = {value: _feature_core(feature) for value, feature in zip(values, features)}
+        if len(cached) != len(values):
+            cached = None  # duplicate event numbers: keep the first-match semantics
+        try:
+            row["_p2_event_core"] = cached
+        except (TypeError, AttributeError):
+            pass
+    if cached is not None:
+        value = cached.get(int(event))
+        return 0.0 if value is None else float(value)
     for feature in row["events"]:
-        value = feature.get("event") if isinstance(feature, Mapping) else feature.event
+        value = feature.get("event") if isinstance(feature, AbcMapping) else feature.event
         if int(value) == int(event):
             return _feature_core(feature)
     return 0.0
 
 
 def window_proxy(rows, squad_ids, events) -> float:
+    # The generator's iteration order (and therefore the summation order) is unchanged.
     return sum(player_event_core(rows[pid], event) for pid in squad_ids for event in events if pid in rows)
 
 
@@ -587,11 +639,14 @@ def _event_proxy_parts(rows, squad_ids, events, level_index, inherited):
 
 
 def run_search(*, initial_state, events, rows, pool_ids, positions, scenario, player_meta, config,
-               nested_prior_levels=None):
+               nested_prior_levels=None, cancel_probe=None):
     events = [int(e) for e in events]
     # Per-event proxy parts are computed ONLY when the lens that consumes them is
     # configured, so the default cost of the other lenses is unchanged.
     needs_event_parts = PER_EVENT_MARGINAL_LENS in tuple(config.retention_lenses)
+    # Normalise the (immutable) player meta ONCE for the whole search instead of once
+    # per candidate batch; the resulting mapping is content-identical.
+    meta = ts.normalise_meta(player_meta)
     initial_bank_tenths = int(initial_state.bank_tenths)
     states = [PartialRoute(state=initial_state, actions=(), h1_proxy=0.0, window_proxy=0.0, hits=0)]
     stats = {"levels": [], "partial_states": 1, "safe_dedup": 0, "heuristic_retained": 0,
@@ -602,6 +657,8 @@ def run_search(*, initial_state, events, rows, pool_ids, positions, scenario, pl
     nested_prior_levels = list(nested_prior_levels or [])
     roll_partial = states[0]
     for level_index, event in enumerate(events):
+        if cancel_probe is not None:
+            cancel_probe()  # safe boundary: run_search performs no SQLite access at all
         by_key: dict[tuple, PartialRoute] = {}
         action_stats = {"generated": 0, "legal": 0, "kinds": {}, "generated_kinds": {}}
         for partial in states:
@@ -610,7 +667,7 @@ def run_search(*, initial_state, events, rows, pool_ids, positions, scenario, pl
                 continue
             action_set = generate_actions(state=partial.state, rows=rows, pool_ids=pool_ids,
                                           positions=positions, price_snapshot=snapshot,
-                                          player_meta=player_meta, config=config, event=event)
+                                          player_meta=meta, config=config, event=event)
             action_stats["generated"] += action_set["generated"]["singles_attempted"] + 1
             for kind, count in action_set["counts"].items():
                 action_stats["kinds"][kind] = action_stats["kinds"].get(kind, 0) + count
@@ -624,7 +681,7 @@ def run_search(*, initial_state, events, rows, pool_ids, positions, scenario, pl
                         ";".join(transition.errors), 0) + 1
                     continue
                 new_state = (transition.next_event_state if transition is not None
-                             else ts.apply_transfer_batch(partial.state, action["batch"], snapshot, player_meta).next_event_state)
+                             else ts.apply_transfer_batch(partial.state, action["batch"], snapshot, meta).next_event_state)
                 action_stats["legal"] += 1
                 squad_ids = [int(p.player_id) for p in new_state.players]
                 action["squad_ids"] = tuple(sorted(squad_ids))
@@ -659,7 +716,7 @@ def run_search(*, initial_state, events, rows, pool_ids, positions, scenario, pl
         roll_snapshot = scenario.snapshot_for(event)
         if roll_snapshot is not None:
             roll_transition = ts.apply_transfer_batch(roll_partial.state, ts.TransferBatch.roll(),
-                                                      roll_snapshot, player_meta)
+                                                      roll_snapshot, meta)
             roll_state = roll_transition.next_event_state
             roll_squad = [int(p.player_id) for p in roll_state.players]
             remaining = [e for e in events if e >= event]
@@ -758,7 +815,10 @@ def world_cache_key(*, event, bundle, config, union_ids) -> str:
 def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Path | None = None,
                        world_provider=None):
     if world_provider is not None:
-        return world_provider(event, union_ids), {"source": "injected"}
+        matrix = world_provider(event, union_ids)
+        _stamp_matrix_identity(matrix, f"injected:{int(event)}:{int(config.search_draws)}:{int(config.seed)}"
+                                       f":{len(union_ids)}")
+        return matrix, {"source": "injected"}
     from . import monte_carlo
 
     bundle = bundles[int(event)]
@@ -767,9 +827,11 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
         path = Path(cache_dir) / f"{key}.json"
         if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
-            return {"worlds": raw["worlds"], "player_ids": raw["player_ids"],
-                    "core": {int(k): v for k, v in raw["core"].items()},
-                    "minutes": {int(k): v for k, v in raw["minutes"].items()}}, {"source": "cache", "key": key}
+            matrix = {"worlds": raw["worlds"], "player_ids": raw["player_ids"],
+                      "core": {int(k): v for k, v in raw["core"].items()},
+                      "minutes": {int(k): v for k, v in raw["minutes"].items()}}
+            _stamp_matrix_identity(matrix, key)
+            return matrix, {"source": "cache", "key": key}
     fixtures = monte_carlo.load_fixture_inputs(
         conn, event=int(event), xpts_run_id=int(bundle.xpts_run_id),
         minutes_run_id=int(bundle.minutes_run_id), team_run_id=int(bundle.team_run_id),
@@ -778,6 +840,7 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
                                              occupancy_audit=True)
     result = monte_carlo.simulate(fixtures, mc_config, capture_player_ids=list(union_ids))
     matrix = result["world_matrix"]
+    _stamp_matrix_identity(matrix, key)
     if cache_dir is not None:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         (Path(cache_dir) / f"{key}.json").write_text(json.dumps({
@@ -786,6 +849,20 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             "minutes": {str(k): v for k, v in matrix["minutes"].items()},
         }), encoding="utf-8")
     return matrix, {"source": "generated", "key": key}
+
+
+def _stamp_matrix_identity(matrix, identity: str) -> None:
+    """Tag a world matrix with its provenance identity, when it is a mutable dict.
+
+    The identity is the certified cache key (or an explicit injected identity), i.e.
+    the full input payload that produced the worlds.  ``manager_worlds`` uses it to
+    memoise matrix-only work; an unstamped matrix is simply not memoised.
+    """
+
+    try:
+        matrix[MANAGER_MATRIX_IDENTITY_KEY] = str(identity)
+    except (TypeError, AttributeError):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -799,22 +876,50 @@ def _subsample(matrix, limit: int):
         return matrix
     step = max(1, worlds // limit)
     indices = list(range(0, worlds, step))[:limit]
-    return {"worlds": len(indices), "player_ids": list(matrix["player_ids"]),
-            "core": {pid: [matrix["core"][pid][i] for i in indices] for pid in matrix["player_ids"]},
-            "minutes": {pid: [matrix["minutes"][pid][i] for i in indices] for pid in matrix["player_ids"]}}
+    result = {"worlds": len(indices), "player_ids": list(matrix["player_ids"]),
+              "core": {pid: [matrix["core"][pid][i] for i in indices] for pid in matrix["player_ids"]},
+              "minutes": {pid: [matrix["minutes"][pid][i] for i in indices] for pid in matrix["player_ids"]}}
+    # A subsample is a different world set, so it needs its OWN provenance identity;
+    # inheriting the parent's would let a matrix-keyed memo serve the wrong worlds.
+    parent = matrix.get(MANAGER_MATRIX_IDENTITY_KEY) if hasattr(matrix, "get") else None
+    if parent:
+        result[MANAGER_MATRIX_IDENTITY_KEY] = (
+            f"{parent}|subsample|{len(indices)}|{indices[1] if len(indices) > 1 else 0}"
+        )
+    return result
 
 
 def route_event_squads(partial: PartialRoute) -> list[tuple[int, tuple[int, ...]]]:
     return [(int(a["event"]), tuple(int(pid) for pid in a["squad_ids"])) for a in partial.actions]
 
 
+def exact_evaluation_key(event, squad_ids, config, world_identity=None) -> tuple:
+    """The COMPLETE identity of one exact evaluation.
+
+    Covers the event, the canonical squad identity, the draw count, the seed and —
+    when known — the world-matrix provenance identity.  Two evaluations may share a
+    cache entry only when every component matches, so one run-scoped cache can be
+    shared by the Stage-2 search and its stability escalation (which run at the same
+    draw count, the same seed and the same certified worlds) without any risk of a
+    cross-generation hit.
+    """
+
+    return (
+        int(event),
+        hashlib.sha256(",".join(map(str, squad_ids)).encode()).hexdigest()[:16],
+        int(config.search_draws),
+        int(config.seed),
+        None if world_identity is None else str(world_identity),
+    )
+
+
 def exact_evaluate(partial: PartialRoute, *, worlds_by_event, positions_of, cache, config,
-                   events) -> dict[str, Any]:
+                   events, world_identity=None) -> dict[str, Any]:
     per_event = []
     event_scores: dict[int, list[float]] = {}
     for event, squad_ids in route_event_squads(partial):
-        key = (int(event), hashlib.sha256(",".join(map(str, squad_ids)).encode()).hexdigest()[:16],
-               int(config.search_draws), int(config.seed))
+        identity_of = None if world_identity is None else world_identity.get(int(event))
+        key = exact_evaluation_key(event, squad_ids, config, identity_of)
         entry = cache.get(key)
         if entry is None:
             positions = positions_of(squad_ids)
@@ -982,6 +1087,32 @@ def _select_promoted(final_states: Sequence[PartialRoute], config: OptimizerConf
     return promoted
 
 
+def _worlds_identity(worlds_by_event: Mapping[int, Mapping[str, Any]], bundles, config,
+                     union) -> dict[int, str] | None:
+    """Per-event provenance identity of the worlds this call is scoring.
+
+    Preferred source is the identity stamped on the matrix by
+    ``build_event_worlds`` (the certified cache key).  A matrix that arrived through
+    ``world_provider``, ``prebuilt_worlds`` or a test fixture may carry none; then the
+    identity is derived from the certified run ids + draws + seed + capture union, which
+    is exactly what ``world_cache_key`` hashes.  ``None`` means "not identifiable", in
+    which case the exact cache key simply omits that component.
+    """
+
+    identity: dict[int, str] = {}
+    for event, matrix in worlds_by_event.items():
+        value = matrix.get(MANAGER_MATRIX_IDENTITY_KEY) if hasattr(matrix, "get") else None
+        if not value:
+            try:
+                value = world_cache_key(event=int(event), bundle=bundles[int(event)],
+                                        config=config, union_ids=union)
+            except Exception:
+                value = None
+        if value:
+            identity[int(event)] = str(value)
+    return identity or None
+
+
 def optimize(
     *,
     universe: Mapping[str, Any],
@@ -999,6 +1130,7 @@ def optimize(
     nested_prior: Mapping[str, Any] | None = None,
     required_routes: Sequence[PartialRoute] | None = None,
     provenance: Mapping[str, Any] | None = None,
+    cancel_probe: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Bounded search, exact scoring, Pareto frontiers and coverage/rescue audits.
 
@@ -1043,6 +1175,8 @@ def optimize(
     world_info: dict[str, Any] = {}
     worlds_by_event: dict[int, Mapping[str, Any]] = {}
     for event in events:
+        if cancel_probe is not None:
+            cancel_probe()
         if prebuilt_worlds is not None and event in prebuilt_worlds:
             matrix, info = prebuilt_worlds[event], {"source": "prebuilt"}
         else:
@@ -1051,10 +1185,15 @@ def optimize(
         worlds_by_event[event] = matrix
         world_info[str(event)] = {**info, "worlds": int(matrix["worlds"]), "union_players": len(union)}
 
+    # Provenance identity per event, so a run-scoped exact cache can be shared with a
+    # later call over the SAME certified worlds without any risk of a false hit.
+    worlds_identity = _worlds_identity(worlds_by_event, bundles, config, union)
+
     search = run_search(initial_state=initial_state, events=events, rows=rows,
                         pool_ids=pool["pool_ids"], positions=positions_by_id, scenario=scenario,
                         player_meta=player_meta, config=config,
-                        nested_prior_levels=(nested_prior or {}).get("level_survivors"))
+                        nested_prior_levels=(nested_prior or {}).get("level_survivors"),
+                        cancel_probe=cancel_probe)
 
     exact_cache = exact_cache if exact_cache is not None else {}
 
@@ -1069,9 +1208,15 @@ def optimize(
 
     records: dict[str, dict[str, Any]] = {}
     exact_evaluations = 0
+    exact_cache_hits = 0
     for index, partial in enumerate(promoted):
+        if cancel_probe is not None:
+            cancel_probe()
+        before = len(exact_cache)
         exact = exact_evaluate(partial, worlds_by_event=worlds_by_event, positions_of=positions_of,
-                               cache=exact_cache, config=config, events=events)
+                               cache=exact_cache, config=config, events=events,
+                               world_identity=worlds_identity)
+        exact_cache_hits += before + len(partial.actions) - len(exact_cache)
         exact_evaluations += len(partial.actions)
         name = f"route_{index:03d}"
         h1_event = exact["per_event"][0]
@@ -1177,6 +1322,7 @@ def optimize(
         "union_players": union,
         "exact_evaluations": exact_evaluations,
         "exact_cache_entries": len(exact_cache),
+        "exact_cache_hits": max(0, int(exact_cache_hits)),
         "promoted_route_count": len(records),
         "routes": records,
         "h1_frontier": h1_frontier,

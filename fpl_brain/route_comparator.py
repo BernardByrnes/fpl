@@ -72,9 +72,22 @@ class PriceScenario:
 
 
 def flat_current_price_scenario(base: ts.PriceSnapshot, events: Iterable[int]) -> PriceScenario:
-    """Engineering validation only: copy the current prices forward unchanged."""
+    """Engineering validation only: copy the current prices forward unchanged.
 
-    snapshots = {int(event): ts.PriceSnapshot(event=int(event), prices=dict(base.prices)) for event in events}
+    Each event snapshot is stamped with its canonical price identity so
+    ``PriceSnapshot.identity()`` is O(1) instead of re-serialising the whole price
+    map for every candidate transfer batch.  The stamped string is exactly the value
+    ``identity()`` already produced for that content, so every recorded
+    ``price_snapshot_id`` is unchanged.
+    """
+
+    snapshots = {
+        int(event): ts.PriceSnapshot(
+            event=int(event), prices=dict(base.prices),
+            snapshot_id=ts.price_snapshot_identity(int(event), dict(base.prices)),
+        )
+        for event in events
+    }
     return PriceScenario(
         scenario_id="FLAT_CURRENT_PRICE", event_snapshots=snapshots, flags=(FLAT_PRICE_ASSUMPTION,)
     )

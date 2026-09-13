@@ -171,7 +171,11 @@ def price_snapshot_as_of(
                 f"{DIAG_PRICE_MISSING_AS_OF_CUTOFF}: no official price at or before {cutoff} for "
                 f"{missing}"
             )
-    return ts.PriceSnapshot(event=int(event), prices=dict(resolved.prices))
+    prices = dict(resolved.prices)
+    return ts.PriceSnapshot(
+        event=int(event), prices=prices,
+        snapshot_id=ts.price_snapshot_identity(int(event), prices),
+    )
 
 
 # ---------------------------------------------------------------------------

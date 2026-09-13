@@ -12,7 +12,9 @@ of £m — never binary floating point.
 
 from __future__ import annotations
 
+from collections.abc import Mapping as AbcMapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
 from .season_rules import ChipFreeTransferError
@@ -72,14 +74,18 @@ class PriceSnapshot:
         return None if value is None else int(value)
 
     def identity(self) -> str:
+        """Canonical identity of this snapshot's prices.
+
+        ``snapshot_id`` short-circuits; production scenario builders set it so the
+        identity costs nothing per candidate batch.  The fallback is memoised on the
+        EXACT content ``(event, sorted prices)``, so it stays correct for a snapshot
+        constructed without an id and never hashes the same content twice.
+        """
+
         if self.snapshot_id:
             return self.snapshot_id
-        from . import analytics
-
-        return analytics.canonical_hash({
-            "event": int(self.event),
-            "prices": {str(int(pid)): int(price) for pid, price in sorted(self.prices.items())},
-        })
+        items = tuple(sorted((int(pid), int(price)) for pid, price in self.prices.items()))
+        return _canonical_prices_identity(int(self.event), items)
 
 
 @dataclass(frozen=True)
@@ -299,7 +305,7 @@ def apply_transfer_batch(
 ) -> TransferTransitionResult:
     """Apply one atomic batch; on ANY error the original state is returned unchanged."""
 
-    meta = _normalise_meta(player_meta)
+    meta = normalise_meta(player_meta)
     errors: list[str] = []
     warnings: list[str] = list(TRANSFER_RULE_FLAGS)
     actions = tuple(batch.actions)
@@ -446,8 +452,71 @@ def apply_transfer_batch(
     )
 
 
+@lru_cache(maxsize=32)
+def _canonical_prices_identity(event: int, items: tuple) -> str:
+    """``analytics.canonical_hash`` over one price map, memoised on its exact content.
+
+    The payload is constructed exactly as ``PriceSnapshot.identity`` always built it,
+    so the returned string is unchanged; only the number of times it is computed
+    changes.
+    """
+
+    from . import analytics
+
+    return analytics.canonical_hash({
+        "event": int(event),
+        "prices": {str(pid): int(price) for pid, price in items},
+    })
+
+
+def price_snapshot_identity(event: int, prices: Mapping[int, Any]) -> str:
+    """The canonical identity ``PriceSnapshot(event, prices).identity()`` would return.
+
+    Lets a scenario builder stamp ``snapshot_id`` once so the per-batch identity is
+    free.  Delegates to the same memoised content hash, so the string is identical
+    to the un-stamped path.
+    """
+
+    return _canonical_prices_identity(
+        int(event), tuple(sorted((int(pid), int(price)) for pid, price in prices.items()))
+    )
+
+
+class NormalisedMeta(dict):
+    """The exact dict ``normalise_meta`` returns, tagged so it is never rebuilt.
+
+    A search applies one ``player_meta`` mapping to ~135,000 candidate batches.
+    Rebuilding the ~657-entry dict on every call is pure repeated work: the value
+    is a pure function of the input mapping.  Tagging the RESULT (a dict subclass,
+    so every existing ``dict``/``Mapping`` consumer is unaffected) lets a hot
+    caller hand the already-normalised mapping back in and makes the normalisation
+    a no-op, without a process-global memo whose key would have to be the input's
+    identity — which is not sound.
+
+    The contents are identical to what ``normalise_meta`` produces, so no reader
+    can observe a difference beyond ``type(result)``.
+    """
+
+
+def normalise_meta(
+    player_meta: Mapping[int, PlayerMeta] | Iterable[PlayerMeta],
+) -> NormalisedMeta:
+    """Canonical ``{int player_id: PlayerMeta}`` mapping for one search.
+
+    Call this ONCE per search and pass the result to every ``apply_transfer_batch``
+    call.  ``apply_transfer_batch`` detects the tagged result and skips the rebuild.
+    """
+
+    if isinstance(player_meta, NormalisedMeta):
+        return player_meta
+    if isinstance(player_meta, AbcMapping):
+        return NormalisedMeta(
+            (int(pid), meta if isinstance(meta, PlayerMeta)
+             else PlayerMeta(int(pid), meta["position"], meta["club_id"]))
+            for pid, meta in player_meta.items()
+        )
+    return NormalisedMeta((int(meta.player_id), meta) for meta in player_meta)
+
+
 def _normalise_meta(player_meta: Mapping[int, PlayerMeta] | Iterable[PlayerMeta]) -> dict[int, PlayerMeta]:
-    if isinstance(player_meta, Mapping):
-        return {int(pid): (meta if isinstance(meta, PlayerMeta) else PlayerMeta(int(pid), meta["position"], meta["club_id"]))
-                for pid, meta in player_meta.items()}
-    return {int(meta.player_id): meta for meta in player_meta}
+    return normalise_meta(player_meta)

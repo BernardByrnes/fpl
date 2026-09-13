@@ -550,6 +550,7 @@ def assess_search_stability(
     config: StabilityGateConfig | None = None,
     paired_key: str = PAIRED_SOURCE_KEY,
     escalated_result_sink: dict | None = None,
+    cancel_probe: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Decide ``SEARCH_BUDGET_STABLE`` / ``SEARCH_NOT_STABLE_AT_CURRENT_BUDGET``.
 
@@ -648,6 +649,9 @@ def assess_search_stability(
     report["escalation_used"] = True
     report["escalation_beam"] = int(next_beam)
     budget_sequence.append(int(next_beam))
+    if cancel_probe is not None:
+        # Safe boundary: nothing is in flight immediately before the escalation.
+        cancel_probe()
     try:
         escalated = escalation(int(next_beam))
     except Exception as error:  # fail closed: an unusable escalation is not stability
@@ -825,11 +829,20 @@ def refine_finalists(
     cache_dir=None,
     verify_prefix: bool = True,
     optimizer: Callable[..., Mapping[str, Any]] | None = None,
+    exact_cache: dict | None = None,
+    cancel_probe: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Re-evaluate ONLY the finalists at ``stage2_draws`` and rank them.
 
     Same seed, same certified bundles, same route legality, same discovery
     universe; the only changed input is the number of shared football worlds.
+
+    ``exact_cache`` lets a caller share ONE exact-evaluation cache between this
+    refinement and a later evaluation over the same certified worlds (the stability
+    escalation).  Reuse is keyed on the complete evaluation identity — event,
+    canonical squad identity, draw count, seed and world provenance — so a hit can
+    only occur for a literally identical evaluation.  ``cancel_probe``, when given,
+    is called at safe boundaries only (see ``optimize``/``run_search``).
     """
 
     selection = dict(finalist_selection or select_finalists(stage1_result))
@@ -858,6 +871,10 @@ def refine_finalists(
             )
         prebuilt_worlds = {}
         for event in base_config.events:
+            if cancel_probe is not None:
+                # Safe boundary: the previous build_event_worlds call has fully returned
+                # (its cache file is written and no SQLite transaction is open).
+                cancel_probe()
             matrix, _info = ro.build_event_worlds(conn, bundles, int(event), union, world_config,
                                                   cache_dir=cache_dir, world_provider=world_provider)
             prebuilt_worlds[int(event)] = matrix
@@ -868,6 +885,7 @@ def refine_finalists(
             universe=universe, initial_state=initial_state, bundles=bundles, conn=conn,
             base_config=base_config, stage2_draws=int(stage2_draws), partials=partials,
             prebuilt_worlds=prebuilt_worlds, world_provider=world_provider, cache_dir=cache_dir,
+            cancel_probe=cancel_probe,
         )
 
     refined_config = ro.OptimizerConfig(
@@ -885,11 +903,14 @@ def refine_finalists(
         retention_lenses=base_config.retention_lenses,
     )
     run = optimizer or ro.optimize
+    if cancel_probe is not None:
+        cancel_probe()
     refined = run(
         universe=universe, initial_state=initial_state, scenario=scenario, player_meta=player_meta,
         bundles=bundles, conn=conn, config=refined_config, cache_dir=None,
         world_provider=world_provider, prebuilt_worlds=prebuilt_worlds,
-        required_routes=partials, nested_prior=None,
+        required_routes=partials, nested_prior=None, exact_cache=exact_cache,
+        cancel_probe=cancel_probe,
     )
     refined = dict(refined)
 
@@ -955,7 +976,8 @@ def refine_finalists(
 
 def _measure_prefix_invariance(*, universe, initial_state, bundles, conn, base_config,
                                stage2_draws, partials, prebuilt_worlds,
-                               world_provider, cache_dir=None) -> dict[str, Any]:
+                               world_provider, cache_dir=None,
+                               cancel_probe: Callable[[], None] | None = None) -> dict[str, Any]:
     """Re-run the prefix experiment against the live 10k matrices.
 
     A 2,000-draw matrix is generated for the SAME union and seed, and its captured
@@ -978,6 +1000,8 @@ def _measure_prefix_invariance(*, universe, initial_state, bundles, conn, base_c
     overall = PREFIX_STATUS_PASS
     for event in base_config.events:
         event = int(event)
+        if cancel_probe is not None:
+            cancel_probe()  # safe boundary: each iteration is one cache read + a pure compare
         # ``cache_dir`` is the Stage-1 world cache: the 2,000-draw matrix for the
         # SAME union and seed is already there, so the prefix check compares
         # Stage 2's worlds against the worlds Stage 1 actually scored.
