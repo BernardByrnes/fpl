@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -598,6 +599,83 @@ def test_14_horizon_support_uses_certified_bundle_ids(tmp_path):
     bad["runs"] = dict(bundle["runs"], xpts_v1=7)  # wired to minutes run 6
     with pytest.raises(cb.BundleIncoherent):
         fg.event_support_from_certified_bundles(conn, {5: bad}, cutoff=cutoff)
+    conn.close()
+
+
+def test_14b_certified_support_declares_its_cutoff_so_the_horizon_is_not_stale(tmp_path):
+    """A certified bundle's support must declare the bundle's cutoff.
+
+    ``event_support_from_certified_bundles`` omitted ``data_cutoff``, so
+    ``evaluate_horizon(..., cutoff=...)`` read ``None`` for every certified event,
+    judged it STALE_CUTOFF_MISMATCH, and made the production decision refuse with
+    "certified decision horizon incomplete" no matter how coherent the bundle was.
+    """
+
+    from fpl_brain import four_gw_decision as fg
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _bundle_world(conn)
+    cutoff = "2026-09-12T19:00:00Z"
+    bundle = {
+        "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4, "monte_carlo_v1": 5},
+        "data_snapshot_sha256": None,
+        "code_snapshot_sha256": None,
+    }
+    support = fg.event_support_from_certified_bundles(conn, {5: bundle}, cutoff=cutoff)
+    assert support[5]["data_cutoff"] == cutoff
+
+    horizon = fg.evaluate_horizon(planning_event=5, support_by_event=support, cutoff=cutoff, last_event=38)
+    record = horizon["events"]["5"]
+    assert record["cutoff_matches"] is True, record
+    assert record["supported"] is True, record
+    assert record["reason"] is None, record
+    # GW6-8 carry no bundle here, so the WINDOW is legitimately incomplete -- the
+    # point is that the certified event itself is not stale.
+    assert horizon["status"] == fg.DECISION_HORIZON_INCOMPLETE
+    assert 5 not in horizon["stale_cutoff_events"]
+    conn.close()
+
+
+def test_14c_certifier_resolves_the_horizon_from_the_certified_support(tmp_path):
+    """The certifier's authorisation must run against real certified support.
+
+    Its inline predecessor referenced an undefined local, so the certification
+    artifact could never be written. A single-event artifact must yield a genuine
+    horizon status string (an incomplete window, not a crash), and a bundle the
+    artifact does not carry must refuse rather than authorise.
+    """
+
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import certify_gw5_gw8 as certifier  # noqa: E402
+
+    from fpl_brain import four_gw_decision as fg
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _bundle_world(conn)
+    cutoff = "2026-09-12T19:00:00Z"
+    artifact = {
+        "certified_bundles": {
+            "5": {
+                "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
+                         "xpts_v1": 4, "monte_carlo_v1": 5},
+                "data_snapshot_sha256": None,
+                "code_snapshot_sha256": None,
+            }
+        },
+        "data_snapshot_sha256": "d" * 64,
+        "code_snapshot_sha256": "codehash",
+    }
+    status = certifier.certified_horizon_status(conn, artifact, [5], cutoff)
+    # The synthetic world holds exactly one real event (GW5) with a supported
+    # bundle, so the resolver reports a genuinely complete short horizon -- the
+    # point is that it returns a real status from the certified support rather
+    # than crashing on an unbound local.
+    assert status == fg.SEASON_END_SHORT_HORIZON
+
+    with pytest.raises(fg.DecisionCertificationRequired):
+        certifier.certified_horizon_status(conn, artifact, [5, 6, 7, 8], cutoff)
     conn.close()
 
 

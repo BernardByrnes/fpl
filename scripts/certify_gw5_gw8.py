@@ -21,10 +21,18 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpl_brain import analytics, causality, certified_bundle, execution, execution_snapshot
+from fpl_brain import (
+    analytics,
+    causality,
+    certified_bundle,
+    execution,
+    execution_snapshot,
+    four_gw_decision as fg,
+)
 from fpl_brain.config import config_path, load_config
 from fpl_brain.database import connect_database, connect_readonly_database
 from fpl_brain.planning import get_planning_context
@@ -73,6 +81,54 @@ def _freeze_args(event: int, cutoff: str, simulations: int, out_dir: Path) -> Si
         xpts_rate_run=None,
         xpts_run=None,
     )
+
+
+def decide_search_permission(
+    *,
+    temporal_status: Any,
+    dependency_validation: Any,
+    horizon_status: Any,
+    data_snapshot_sha256: Any,
+    snapshot_error: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Authorisation is COMPUTED from the conditions, never asserted.
+
+    Extracted from ``main`` so the rule is executable from a test.  Its earlier
+    inline form read an undefined local (``horizon_status``) and was only ever
+    checked by a source-text assertion, so the defect survived the accepted suite
+    while making the certification artifact impossible to write.
+    """
+
+    reasons: list[str] = []
+    if str(temporal_status).upper() != "CAUSAL":
+        reasons.append("temporal_status is not CAUSAL")
+    if str(dependency_validation).upper() != "COHERENT":
+        reasons.append("dependency_validation is not COHERENT")
+    if horizon_status != fg.DECISION_HORIZON_COMPLETE:
+        reasons.append(f"horizon status is {horizon_status}")
+    if not data_snapshot_sha256:
+        reasons.append("no data snapshot identity")
+    if snapshot_error:
+        reasons.append(str(snapshot_error))
+    return (not reasons), reasons
+
+
+def certified_horizon_status(conn, artifact, events, cutoff) -> str:
+    """Four-GW horizon status from the SAME certified bundle identity the runner reads.
+
+    ``event_support_from_certification`` refuses a missing bundle and proves the
+    dependency DAG, so a status returned here is about the certified generation the
+    decision engine will actually consume.  Callers fail closed on an exception.
+    """
+
+    support = fg.event_support_from_certification(conn, artifact, events=events, cutoff=cutoff)
+    horizon = fg.evaluate_horizon(
+        planning_event=int(events[0]),
+        support_by_event=support,
+        cutoff=str(cutoff),
+        last_event=fg.season_last_event_from_db(conn),
+    )
+    return str(horizon["status"])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -370,21 +426,25 @@ def main(argv: list[str] | None = None) -> int:
         "decision_search_permitted_reasons": [],
     }
     # Authorisation is computed, never asserted.
-    permit_reasons: list[str] = []
-    if str(artifact["temporal_status"]).upper() != "CAUSAL":
-        permit_reasons.append("temporal_status is not CAUSAL")
-    if str(artifact["dependency_validation"]).upper() != "COHERENT":
-        permit_reasons.append("dependency_validation is not COHERENT")
-    if horizon_status != "DECISION_HORIZON_COMPLETE":
-        permit_reasons.append(f"horizon status is {horizon_status}")
-    if not artifact["data_snapshot_sha256"]:
-        permit_reasons.append("no data snapshot identity")
+    try:
+        horizon_status = certified_horizon_status(conn, artifact, events, effective_cutoff)
+    except Exception as failure:  # unresolvable horizon withholds, never crashes
+        horizon_status = f"UNRESOLVED: {type(failure).__name__}: {failure}"
+    snapshot_error = None
     try:
         execution_snapshot.assert_snapshot_unchanged(snapshot)
     except execution_snapshot.SnapshotError as failure:
-        permit_reasons.append(str(failure))
-    artifact["decision_search_permitted"] = not permit_reasons
+        snapshot_error = str(failure)
+    permitted, permit_reasons = decide_search_permission(
+        temporal_status=artifact["temporal_status"],
+        dependency_validation=artifact["dependency_validation"],
+        horizon_status=horizon_status,
+        data_snapshot_sha256=artifact["data_snapshot_sha256"],
+        snapshot_error=snapshot_error,
+    )
+    artifact["decision_search_permitted"] = permitted
     artifact["decision_search_permitted_reasons"] = permit_reasons
+    artifact["decision_search_horizon_status"] = horizon_status
     artifact_path = OUT_DIR / "certification_artifact.json"
     artifact_path.write_text(
         json.dumps(artifact, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"

@@ -396,6 +396,44 @@ def test_j_certifier_computes_the_authorisation_flag():
     assert '"transfer_execution_performed": False' in source
 
 
+def test_j_certifier_authorisation_is_executable_not_merely_present():
+    """The four-condition rule must RUN, not merely appear in the source.
+
+    The pre-existing check above is a source-text assertion, so it passed while the
+    inline rule read an undefined local ``horizon_status`` -- and the certification
+    artifact could never be written. Executing the extracted rule pins the behaviour
+    the source text alone could not.
+    """
+
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import certify_gw5_gw8 as certifier
+
+    base = dict(
+        temporal_status="CAUSAL",
+        dependency_validation="COHERENT",
+        horizon_status=fg.DECISION_HORIZON_COMPLETE,
+        data_snapshot_sha256="d" * 64,
+    )
+    permitted, reasons = certifier.decide_search_permission(**base)
+    assert permitted is True, reasons
+    assert reasons == []
+
+    for overrides, needle in (
+        ({"temporal_status": "HISTORICAL"}, "temporal_status"),
+        ({"dependency_validation": "INCOHERENT"}, "dependency_validation"),
+        ({"horizon_status": fg.DECISION_HORIZON_INCOMPLETE}, "horizon status"),
+        ({"data_snapshot_sha256": None}, "no data snapshot identity"),
+        ({"snapshot_error": "CERTIFICATION_SNAPSHOT_MUTATED"}, "CERTIFICATION_SNAPSHOT_MUTATED"),
+    ):
+        kwargs = dict(base)
+        kwargs.update(overrides)
+        permitted, reasons = certifier.decide_search_permission(**kwargs)
+        assert permitted is False, (overrides, reasons)
+        assert any(needle in reason for reason in reasons), (overrides, reasons)
+
+
 # ---------------------------------------------------------------------------
 # K / L. immutability
 # ---------------------------------------------------------------------------

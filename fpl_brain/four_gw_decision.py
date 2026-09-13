@@ -517,6 +517,11 @@ def event_support_from_certified_bundles(
             "matched_runs": dict(certified.runs),
             "missing_families": [],
             "stale_families": [],
+            # validate_certified_bundle() refuses the bundle unless EVERY family's
+            # projection_runs.data_cutoff equals this cutoff, so the value is proven
+            # rather than assumed.  Without it evaluate_horizon() sees data_cutoff=None
+            # and marks every certified event STALE_CUTOFF_MISMATCH.
+            "data_cutoff": str(cutoff),
             "run_cutoffs": [str(cutoff)],
             "bundle_identity": certified.bundle_identity(),
             "source": "certified_bundle",
