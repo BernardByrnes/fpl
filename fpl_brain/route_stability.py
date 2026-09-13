@@ -12,8 +12,30 @@ from typing import Any, Callable, Mapping, Sequence
 from . import route_optimizer as ro
 
 PHASE8B1_VERSION = "route_stability_v8b1_1.0.0"
+#: The supported nested search-breadth ladder.
+#:
+#: R4B.2b semantics (documented after inspecting the code, not assumed): each entry
+#: is a BEAM WIDTH — the bounded search's breadth — passed as
+#: ``OptimizerConfig.beam_width``.  It is NOT a Monte Carlo draw count and must
+#: never be read as one: ``retention_budgets`` derives ``KN``/``KD``/``K_MAX`` from
+#: ``beam_width`` only (``KN = max(4 * beam_width, 24)``, ``KD = max(4, beam_width
+#: // 2)``, ``K_MAX = 2 * KN``), and the draw count is a separate field
+#: (``OptimizerConfig.search_draws``).  See ``budget_config`` below.
 LADDER_BUDGETS = (12, 24, 48)
+LADDER_BUDGET_SEMANTICS = "BEAM_WIDTH_SEARCH_BREADTH_NOT_MONTE_CARLO_DRAWS"
 MATERIAL_CORE = ro.MATERIAL_FRONTIER_CHANGE_CORE  # 0.25, unchanged
+
+
+def next_ladder_budget(current: int, budgets: Sequence[int] = LADDER_BUDGETS) -> int | None:
+    """The next supported search budget strictly above ``current``, or ``None``.
+
+    Used by the R4B.2b stability gate to take AT MOST ONE bounded escalation.  A
+    ``current`` budget that is not itself on the ladder (for example the
+    production beam width of 8) still resolves to the next ladder rung above it.
+    """
+
+    higher = sorted({int(b) for b in budgets if int(b) > int(current)})
+    return higher[0] if higher else None
 
 
 def budget_config(budget: int, base: ro.OptimizerConfig) -> ro.OptimizerConfig:

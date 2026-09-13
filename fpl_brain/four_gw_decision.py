@@ -71,6 +71,12 @@ RECOMMENDATION_AVAILABLE = "TRANSFER_RECOMMENDATION_AVAILABLE"
 LINEUP_ONLY = "LINEUP_ONLY_CURRENT_GW"
 LINEUP_UNSUPPORTED = "LINEUP_UNSUPPORTED"
 
+#: R4B.2b: the bounded search could not separate the preferred route from its
+#: alternatives at the widest supported budget.  The route table stays available,
+#: but no decisive normal-transfer recommendation is emitted (and there is
+#: deliberately NO best-current-GW-transfer fallback).
+DECISION_SEARCH_NOT_STABLE = "DECISION_SEARCH_NOT_STABLE_AT_CURRENT_BUDGET"
+
 #: Predictive families that must all be present and complete for one event to
 #: count as supported.  Names are the accepted ``projection_runs.model_family``
 #: values; nothing here changes what those models compute.

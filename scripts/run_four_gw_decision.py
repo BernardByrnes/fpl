@@ -27,12 +27,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import analytics, candidate_universe as cu, decision_confidence as dc
+from fpl_brain import finalist_refinement as fr
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import certified_bundle
 from fpl_brain import manager_worlds, route_optimizer as ro, transfer_state as ts
 from fpl_brain import execution
 from fpl_brain import ingest_provenance as provenance
 from fpl_brain import repositories as repo
+from fpl_brain import route_stability as rs
 from fpl_brain.config import config_path, load_config
 from fpl_brain.database import connect_database
 from fpl_brain.planning import get_planning_context
@@ -45,12 +47,39 @@ def _refuse_execution(guard, code: int, reason: str) -> int:
     guard.finish(execution.RUN_FAILED, reason)
     return code
 
+
+def _suppress_transfer_recommendation(decision: dict, *, reason: str, extra: dict | None = None) -> dict:
+    """Replace the normal transfer recommendation with an explicit suppression.
+
+    ONE implementation for every suppression path (fixture horizon, search
+    instability, ...).  The route table and the ranking stay in the artifact; only
+    decisiveness is removed, and ``preferred_route_id`` is cleared so no downstream
+    consumer can mistake the numerically highest route for a recommendation.  There
+    is deliberately no best-current-GW-transfer fallback.
+    """
+
+    suppressed = dict(decision.get("transfer_recommendation") or {})
+    suppressed.update(
+        {
+            "status": fg.RECOMMENDATION_SUPPRESSED,
+            "reason": str(reason),
+            "preferred_route_id": None,
+        }
+    )
+    suppressed.update(extra or {})
+    decision["transfer_recommendation"] = suppressed
+    return suppressed
+
+
 SEED = 20260911
 #: Stage-1 (screening) draw count.  This is the count ACTUALLY used to build the
 #: shared per-event world matrices for every event, and it is what the artifact
-#: reports.  The two-stage finalist refinement belongs to R4B.2; until then no
-#: artifact may advertise a higher per-event fidelity than was run.
+#: reports.
 STAGE1_DRAWS = 2_000
+#: Stage-2 (finalist precision) draw count.  R4B.2b re-evaluates ONLY the
+#: finalists at this budget, with the same seed and the same certified inputs, and
+#: the artifact reports the count that actually ran.
+STAGE2_DRAWS = fr.STAGE2_DRAWS
 DIAG_PREDICTIVE_GENERATION_MISMATCH = "PREDICTIVE_GENERATION_MISMATCH"
 DIAG_DECISION_EVENT_MISMATCH = "DECISION_EVENT_MISMATCH"
 FAMILY_KINDS = {
@@ -64,6 +93,8 @@ FAMILY_TO_BUNDLE = {
     "xpts_v1": "xpts_run_id",
     "monte_carlo_v1": "mc_run_id",
 }
+
+
 
 
 def _money(tenths) -> str:
@@ -164,6 +195,12 @@ def main(argv=None) -> int:
     parser.add_argument("--search-n", type=int, default=12)
     parser.add_argument("--singles-per-out", type=int, default=4)
     parser.add_argument("--max-transfers-per-event", type=int, default=2)
+    parser.add_argument(
+        "--stage2-draws", type=int, default=STAGE2_DRAWS,
+        help="Monte Carlo draws per event for the Stage-2 FINALIST-ONLY refinement. "
+             "Must be strictly greater than the Stage-1 draw count; the artifact "
+             "reports the count that actually ran.",
+    )
     parser.add_argument(
         "--certification",
         help="path to the authoritative certification artifact (REQUIRED for --stage search|all)",
@@ -454,6 +491,16 @@ def main(argv=None) -> int:
             max_transfers_per_event=int(args.max_transfers_per_event),
             policy_selection_worlds=0,
         )
+        # A "refinement" that is not higher fidelity would still be reported as one,
+        # so it is refused before any work is done.
+        if int(args.stage2_draws) <= int(STAGE1_DRAWS):
+            print(
+                f"decision refused: --stage2-draws {int(args.stage2_draws)} must exceed the Stage-1 "
+                f"draw count {STAGE1_DRAWS}",
+                file=sys.stderr,
+            )
+            source_conn.close()
+            return _refuse_execution(guard, 6, "stage2 draws not higher than stage1")
         # All-player discovery accounting, asserted BEFORE any route search.
         discovery = cu.discovery_completeness(
             pool=pool,
@@ -464,7 +511,7 @@ def main(argv=None) -> int:
             enforce=True,
         )
         t0 = time.time()
-        result = ro.optimize(
+        stage1_result = ro.optimize(
             universe=universe, initial_state=source_state, scenario=scenario, player_meta=player_meta,
             bundles=bundles, conn=conn, config=optimizer_config, cache_dir=Path(args.cache_dir),
             provenance={**search_provenance,
@@ -472,7 +519,23 @@ def main(argv=None) -> int:
                         "exact_evaluation_certification_identity": exact_identity},
         )
         search_seconds = time.time() - t0
-        source_conn.close()
+
+        # --- R4B.2b Stage 2: FINALIST-ONLY precision refinement ----------------
+        # Same seed, same certified bundles, same route legality, same discovery
+        # universe; the ONLY changed input is the shared-world draw count.  The
+        # refinement also publishes the one canonical paired record below.
+        t_refine = time.time()
+        refinement = fr.refine_finalists(
+            universe=universe, initial_state=source_state, scenario=scenario,
+            player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
+            stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
+            cache_dir=Path(args.cache_dir),
+        )
+        # From here on the DECISION is taken at the higher-fidelity budget: `result`
+        # is the refined finalist-only result, and Stage 1 is reported separately.
+        # This keeps the documented `result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)`
+        # consumption path below exactly as the confidence contract requires.
+        result = refinement["refined"]
 
         transfers_by_route = {}
         for route_id, record in (result.get("routes") or {}).items():
@@ -510,6 +573,75 @@ def main(argv=None) -> int:
             source_conn, decision_events,
             last_event=fg.season_last_event_from_db(source_conn),
         )
+        source_conn.close()
+
+        # --- R4B.2b: the ONE canonical paired record, aligned to the DECISION ---
+        # §5 requires route_a to be the FINAL preferred leader.  The decision layer
+        # is authoritative for which route that is (it may in principle exclude a
+        # route the optimizer ranked first), so the record is published against the
+        # route the DECISION prefers, with the next-ranked refined route as the
+        # comparator.  `route_b` is never an arbitrary pick.
+        optimizer_leader = refinement["final_ranking"]["preferred_route_id"]
+        decision_preferred = (decision.get("transfer_recommendation") or {}).get("preferred_route_id")
+        final_leader = decision_preferred or optimizer_leader
+        comparator = fr.runner_up_for(result, final_leader)
+        canonical = (
+            None if final_leader is None or comparator is None
+            else fr.canonical_paired_record(
+                result, leader_route_id=final_leader, runner_up_route_id=comparator)
+        )
+        refinement["optimizer_ranked_leader_route_id"] = optimizer_leader
+        refinement["canonical_paired_near_tie"] = canonical
+        refinement["canonical_alignment"] = (
+            "OPTIMIZER_RANK_1" if final_leader == optimizer_leader else "ALIGNED_TO_DECISION_PREFERRED"
+        )
+        refinement["final_ranking"] = {"preferred_route_id": final_leader, "runner_up_route_id": comparator}
+        refinement["simulation_fidelity"]["final_ranking"] = dict(refinement["final_ranking"])
+        refinement["simulation_fidelity"]["canonical_paired_near_tie"] = canonical
+        result["canonical_paired_near_tie"] = canonical
+
+        # --- R4B.2b: leader change + ONE bounded search-stability escalation ----
+        leader_change = fr.analyze_leader_change(stage1_result, result)
+        t_stability = time.time()
+        stability = fr.assess_search_stability(
+            refined_result=result,
+            leader_change=leader_change,
+            canonical_paired=canonical,
+            escalation=_escalation_runner(
+                universe=universe, initial_state=source_state, scenario=scenario,
+                player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
+                stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
+                prebuilt_worlds=refinement.get("prebuilt_worlds"),
+                finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
+            ),
+            config=fr.StabilityGateConfig(current_beam=int(args.beam)),
+        )
+        stability_seconds = time.time() - t_stability
+        refinement["leader_change"] = leader_change
+        refinement["stability"] = stability
+        refinement["simulation_fidelity"]["leader_change"] = leader_change
+        refinement["simulation_fidelity"]["stability"] = stability
+        refinement["timing_s"] = {
+            "stage1_seconds": round(search_seconds, 3),
+            "stage2_refinement_seconds": round(t_refine - t0 - search_seconds, 3),
+            "stability_seconds": round(stability_seconds, 3),
+        }
+        print(
+            f"refinement: finalists={len(refinement['finalist_selection']['finalist_route_ids'])} "
+            f"stage2_draws={int(args.stage2_draws)} prefix="
+            f"{(refinement.get('prefix_invariance') or {}).get('status')} "
+            f"leader_change={leader_change['changed']}/{leader_change['accepted']} "
+            f"stability={stability['state']} escalation={stability['escalation_used']} "
+            f"({stability_seconds:.1f}s)"
+        )
+        if canonical is None:
+            print(
+                f"confidence: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED}: no canonical paired record for "
+                f"leader={final_leader} comparator={comparator}; confidence cannot be decisive and "
+                "search stability cannot be claimed",
+                file=sys.stderr,
+            )
+
         # --- R4B.2c: decision confidence (computed AFTER ranking; never ranks) --
         # Paired CRN near-tie is CONSUMED from the route comparison when the result
         # exposes it; otherwise it is reported unavailable and the state cannot claim
@@ -571,6 +703,57 @@ def main(argv=None) -> int:
         )
         dc.assert_confidence_invariants(confidence)
 
+        # --- Suppression is applied BEFORE the artifact is written --------------
+        # Every gate that removes decisiveness must be visible in the artifact that
+        # is actually on disk.  Deferred suppression would leave the file asserting
+        # a recommendation the runner no longer stands behind.
+        suppression_reasons: list[str] = []
+        if not fixture_horizon["complete"]:
+            # R4B.2c decision gate: an unresolved fixture that could alter any team's
+            # fixture set inside the four-GW window blocks the normal transfer
+            # recommendation.  It is SUPPRESSED, never replaced by a "best H1 transfer".
+            _suppress_transfer_recommendation(
+                decision, reason=fg.DECISION_HORIZON_INCOMPLETE,
+                extra={"fixture_horizon_blocking_reasons": fixture_horizon["blocking_reasons"]},
+            )
+            suppression_reasons.append(fg.DECISION_HORIZON_INCOMPLETE)
+            print(
+                "transfer recommendation SUPPRESSED: fixture horizon incomplete "
+                f"({len(fixture_horizon['blocking_reasons'])} blocking reason(s))"
+            )
+        if stability["state"] != fr.SEARCH_STABLE:
+            # R4B.2b search-stability gate: the bounded search cannot separate the
+            # preferred route from its alternatives at the widest supported budget.
+            # The route table stays available; decisiveness is removed, and there is
+            # deliberately no best-current-GW-transfer fallback.
+            _suppress_transfer_recommendation(
+                decision, reason=fg.DECISION_SEARCH_NOT_STABLE,
+                extra={
+                    "search_stability_state": stability["state"],
+                    "search_stability_basis": stability.get("stability_basis"),
+                    "search_budget_sequence": stability["search_budget_sequence"],
+                    "escalation_used": stability["escalation_used"],
+                },
+            )
+            suppression_reasons.append(fg.DECISION_SEARCH_NOT_STABLE)
+            print(
+                f"transfer recommendation SUPPRESSED: {stability['state']} "
+                f"(basis={stability.get('stability_basis')})"
+            )
+        if canonical is None:
+            # §5: a decisive recommendation requires the canonical paired record.  It
+            # could not be produced, so decisiveness is removed rather than inferred.
+            _suppress_transfer_recommendation(
+                decision, reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED,
+                extra={"paired_diagnostic_required": True,
+                       "search_stability_state": stability["state"]},
+            )
+            suppression_reasons.append(dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED)
+            print(
+                f"transfer recommendation SUPPRESSED: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED} "
+                f"(leader={final_leader} comparator={comparator})"
+            )
+
         artifact = {
             "schema": "fpl_brain.four_gw_decision.v1",
             "planning_event": planning_event,
@@ -581,25 +764,45 @@ def main(argv=None) -> int:
                 "engine": "route_optimizer.optimize (accepted bounded multi-event search)",
                 "config": optimizer_config.as_dict(),
                 "seconds": round(search_seconds, 1),
-                "world_info": result.get("world_info"),
-                "search_stats": result.get("search_stats"),
-                "exact_evaluations": result.get("exact_evaluations"),
-                "promoted_route_count": result.get("promoted_route_count"),
-                "flags": result.get("flags"),
+                "world_info": stage1_result.get("world_info"),
+                "search_stats": stage1_result.get("search_stats"),
+                "exact_evaluations": stage1_result.get("exact_evaluations"),
+                "promoted_route_count": stage1_result.get("promoted_route_count"),
+                "flags": stage1_result.get("flags"),
                 "no_stability_ladder_rerun": True,
-                # Truthful draw provenance: one Stage-1 count is used for EVERY
-                # event.  No per-event 10k claim until R4B.2 implements the real
-                # two-stage finalist refinement.
+                # Truthful draw provenance: Stage 1 screens EVERY route at this
+                # count for EVERY event.  The higher Stage-2 count is a FINALIST-ONLY
+                # refinement and is reported separately, never as route coverage.
                 "stage1_search_draws": STAGE1_DRAWS,
                 "draw_fidelity": {str(event): STAGE1_DRAWS for event in decision_events},
             },
+            "finalist_refinement": {
+                "stage2_draws": int(args.stage2_draws),
+                "finalists": refinement["finalist_selection"],
+                "final_ranking": refinement["final_ranking"],
+                "optimizer_ranked_leader_route_id": refinement["optimizer_ranked_leader_route_id"],
+                "canonical_alignment": refinement["canonical_alignment"],
+                "leader_change": leader_change,
+                "stability": stability,
+                "route_table": {
+                    "routes": result.get("routes"),
+                    "flags": result.get("flags"),
+                    "exact_evaluations": result.get("exact_evaluations"),
+                },
+                "timing_s": refinement["timing_s"],
+                "no_recommendation": True,
+            },
+            "simulation_fidelity": refinement["simulation_fidelity"],
+            "canonical_paired_near_tie": canonical,
             "fixture_horizon": fixture_horizon,
             "decision_confidence": confidence,
+            "suppression_reasons": suppression_reasons,
             "provenance": {
                 **search_provenance,
-                "search_artifact_cutoff": result.get("planning_cutoff"),
-                "search_artifact_context_hash": result.get("planning_context_hash"),
-                "search_supported_events": result.get("supported_events"),
+                "search_artifact_cutoff": stage1_result.get("planning_cutoff"),
+                "search_artifact_context_hash": stage1_result.get("planning_context_hash"),
+                "search_supported_events": stage1_result.get("supported_events"),
+                "refinement_cutoff": result.get("planning_cutoff"),
                 "lineup_route_id": lineup_route_id,
                 "lineup_basis": "CURRENT_GW_H1",
             },
@@ -613,25 +816,6 @@ def main(argv=None) -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True, default=cu.jsonable) + "\n",
             encoding="utf-8",
         )
-        # R4B.2c decision gate: an unresolved fixture that could alter any team's
-        # fixture set inside the four-GW window blocks the normal transfer
-        # recommendation.  It is SUPPRESSED, never replaced by a "best H1 transfer".
-        if not fixture_horizon["complete"]:
-            suppressed = dict(decision.get("transfer_recommendation") or {})
-            suppressed.update(
-                {
-                    "status": fg.RECOMMENDATION_SUPPRESSED,
-                    "reason": fg.DECISION_HORIZON_INCOMPLETE,
-                    "preferred_route_id": None,
-                    "fixture_horizon_blocking_reasons": fixture_horizon["blocking_reasons"],
-                }
-            )
-            decision["transfer_recommendation"] = suppressed
-            artifact["transfer_recommendation"] = suppressed
-            print(
-                "transfer recommendation SUPPRESSED: fixture horizon incomplete "
-                f"({len(fixture_horizon['blocking_reasons'])} blocking reason(s))"
-            )
         block = decision["transfer_recommendation"]
         print(f"STAGE B decision: {block['status']} preferred={block.get('preferred_route_id')} "
               f"eligible={block.get('eligible_route_count')} excluded={len(block.get('excluded_routes') or [])}")
@@ -645,6 +829,34 @@ def main(argv=None) -> int:
         if entered_guard is not None:
             entered_guard.__exit__(*sys.exc_info())
         conn.close()
+
+
+def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundles, conn,
+                       base_config, stage1_result, stage2_draws, prebuilt_worlds,
+                       finalist_partials):
+    """The ONE bounded search-breadth escalation, as a closure over one beam width.
+
+    Runs the next SUPPORTED search budget (the next beam width in
+    ``route_stability.LADDER_BUDGETS``, never a draw-count change) at the Stage-2
+    draw budget, in the SAME shared worlds, inheriting the Stage-1 nested
+    survivors and forcing the refined finalists in so the two leaders are always
+    comparable.  It never changes the objective, the pool, or the universe.
+    """
+
+    import dataclasses
+
+    def run(beam: int):
+        config = dataclasses.replace(
+            rs.budget_config(int(beam), base_config), search_draws=int(stage2_draws)
+        )
+        return ro.optimize(
+            universe=universe, initial_state=initial_state, scenario=scenario,
+            player_meta=player_meta, bundles=bundles, conn=conn, config=config, cache_dir=None,
+            prebuilt_worlds=prebuilt_worlds, required_routes=list(finalist_partials),
+            nested_prior=ro.nested_budget_view(stage1_result),
+        )
+
+    return run
 
 
 if __name__ == "__main__":
