@@ -83,3 +83,27 @@ def test_picks_404_is_benign_no_data_yet():
     client = FplClient(_config())
     client.session = FakeSession([FakeResponse(404)])
     assert client.get_entry_picks(1, 1) is None
+
+
+def test_transfer_history_returns_exact_rows_and_persists_raw_response(tmp_path):
+    config = _config()
+    body = json.dumps([{
+        "entry": 241392,
+        "element_in": 20,
+        "element_out": 10,
+        "event": 4,
+        "time": "2026-09-07T10:00:00Z",
+        "element_in_cost": 55,
+        "element_out_cost": 50,
+    }])
+    client = FplClient(config, raw_dir=tmp_path / "raw", run_id=9)
+    client.session = FakeSession([FakeResponse(200, body)])
+    rows = client.get_entry_transfers(241392)
+    assert rows == json.loads(body)
+    assert (tmp_path / "raw" / "9" / "entry_241392_transfers.json").read_text(encoding="utf-8") == body
+
+
+def test_transfer_history_404_is_unavailable():
+    client = FplClient(_config())
+    client.session = FakeSession([FakeResponse(404)])
+    assert client.get_entry_transfers(241392) is None

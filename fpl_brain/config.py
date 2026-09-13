@@ -40,6 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "report": {
         "fixture_horizons": [3, 5, 8],
         "scouting_stale_after_days": 14,
+        "official_price_stale_after_hours": 48,
         "include_all_players": False,
         "player_data_selection": "squad_and_watchlist",
     },
@@ -93,6 +94,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         if horizon == 0:
             raise ConfigError("report.fixture_horizons values must be positive")
     _number(report["scouting_stale_after_days"], "report.scouting_stale_after_days", integer=True)
+    _number(report["official_price_stale_after_hours"], "report.official_price_stale_after_hours", integer=True)
     if not isinstance(report["include_all_players"], bool):
         raise ConfigError("report.include_all_players must be boolean")
     if report["player_data_selection"] not in {"squad_and_watchlist", "all"}:

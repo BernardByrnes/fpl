@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import repositories as repo
-from .metrics import attacking_and_defensive_outlook, fixture_outlook, minutes_reliability, points_per_million, trend
+from .metrics import (
+    attacking_and_defensive_outlook,
+    fixture_outlook,
+    minutes_reliability,
+    points_per_million,
+    realisable_squad_value,
+    trend,
+)
 from .utils import json_text, parse_utc, utc_now
 
 SECTION_ORDER = [
@@ -155,12 +162,45 @@ def _is_complete_squad_snapshot(
     return rows_match_scope and sorted(positions) == list(range(1, 16))
 
 
+def _manual_selling_price_lines(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+) -> list[str]:
+    if not rows:
+        return []
+    total = sum(int(row["selling_price"]) for row in rows)
+    lines = [
+        f"Selling-value snapshot: {_money(total)} | {len(rows)} players | source {rows[0].get('source') or 'manual'}"
+    ]
+    for row in rows:
+        player = repo.get_player(conn, int(row["player_id"])) or {"id": row["player_id"]}
+        snapshot = repo.latest_snapshot(conn, int(row["player_id"])) or {}
+        lines.append(
+            f"  [MANUAL] {_player_name(player)}: official market {_money(snapshot.get('now_cost'))} | "
+            f"manager selling {_money(row.get('selling_price'))} | source {row.get('source') or 'manual'} "
+            f"captured {row.get('captured_at') or 'unknown'}"
+        )
+    return lines
+
+
 def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | None = None) -> dict[str, Any]:
     event_id, event = _event_context(conn, gw)
     generated = utc_now()
     deadline = event.get("deadline_time") if event else None
     entry_id = config.get("fpl_entry_id")
     manager = repo.latest_manager_state(conn, entry_id)
+    manual_state = (
+        repo.get_manual_manager_state(conn, int(entry_id), event_id)
+        if entry_id is not None
+        else None
+    )
+    manual_selling_rows = (
+        repo.get_manager_selling_prices(conn, int(entry_id), event_id)
+        if entry_id is not None
+        else []
+    )
+    planning_state = repo.manager_planning_state(conn, int(entry_id), event_id) if entry_id is not None else None
+    value_state = realisable_squad_value(conn, int(entry_id), event_id) if entry_id is not None else None
     watchlist = repo.active_watchlist_rows(conn)
     squad = repo.squad_rows(conn, int(entry_id), event_id) if entry_id is not None else []
     selected_ids = [int(row["player_id"]) for row in squad]
@@ -192,14 +232,62 @@ def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | Non
             f"Entry ID: {manager['entry_id']} | FPL team: {_value(manager.get('team_name'))} | "
             f"Manager: {_value(manager.get('player_name'))}"
         )
-        manager_lines.append(f"Bank: {_money(manager.get('bank'))} | Team value: {_money(manager.get('team_value'))}")
+        report_bank = (
+            planning_state.get("bank")
+            if planning_state is not None and planning_state.get("bank") is not None
+            else manager.get("bank")
+        )
+        manager_lines.append(f"Bank: {_money(report_bank)} | Team value: {_money(manager.get('team_value'))}")
         manager_lines.append(f"Overall rank: {_value(manager.get('summary_overall_rank'))} (pre-season if unavailable)")
     elif entry_id is None:
         manager_lines.append("No manager data — Team ID not configured")
     else:
         manager_lines.append(f"No manager data synced for Team ID {entry_id}")
-    manual_free_transfers = config.get("manual_overrides", {}).get("free_transfers")
-    manager_lines.append(f"Free transfers: {_value(manual_free_transfers)}  [MANUAL — not exposed by public API]")
+    manual_free_transfers = planning_state.get("free_transfers") if planning_state else None
+    if manual_free_transfers is None and manual_state is None:
+        manual_free_transfers = config.get("manual_overrides", {}).get("free_transfers")
+    manager_lines.append(
+        f"Free transfers: {_value(manual_free_transfers)}  [MANUAL — not exposed by public API]"
+        if manual_free_transfers is not None
+        else "Free transfers: unavailable  [DATA GAP — not exposed by public API]"
+    )
+    if manual_state is not None:
+        manual_total = sum(int(row["selling_price"]) for row in manual_selling_rows)
+        manager_lines.append(
+            f"Manual manager state: GW{event_id} | free transfers {_value(manual_state.get('free_transfers'))} | "
+            f"bank {_money(manual_state.get('bank'))} | selling-value snapshot {_money(manual_total)} | "
+            f"source {manual_state.get('source') or 'manual'} | captured {manual_state.get('captured_at') or 'unknown'}"
+        )
+        manager_lines.extend(_manual_selling_price_lines(conn, manual_selling_rows)[1:])
+    if value_state is None:
+        manager_lines.append("Manager value state: DATA GAP — Team ID not configured")
+    elif value_state["status"] == "OK":
+        manager_lines.append(
+            f"Manager value state: {value_state['status']} | squad source {value_state['squad_source']}"
+        )
+        manager_lines.append(
+            f"Official squad market value: {_money(value_state['official_market_value'])} | "
+            f"Realisable selling value: {_money(value_state['realisable_selling_value'])}"
+        )
+        for player in value_state["players"]:
+            manual_suffix = ""
+            if (
+                player.get("manual_market_price_at_capture") is not None
+                and player.get("official_market_price") is not None
+                and int(player["manual_market_price_at_capture"]) != int(player["official_market_price"])
+            ):
+                manual_suffix = " | manual snapshot STALE FOR CURRENT MARKET PRICE"
+            manager_lines.append(
+                f"  {_player_name(player)}: purchase {_money(player.get('purchase_price'))} | "
+                f"market {_money(player.get('official_market_price'))} | "
+                f"calculated sell {_money(player.get('calculated_selling_price'))} | "
+                f"manual snapshot {_money(player.get('manual_selling_price'))} | "
+                f"effective sell {_money(player.get('effective_selling_price'))} | "
+                f"status {player.get('status')}{manual_suffix}"
+            )
+    else:
+        detail = "; ".join(value_state.get("mismatches") or value_state.get("data_gaps") or [])
+        manager_lines.append(f"Manager value state: {value_state['status']} — {detail or 'value unavailable'}")
     chips_used = conn.execute("SELECT name,event FROM manager_chips WHERE entry_id=? ORDER BY event,name", (entry_id or -1,)).fetchall()
     manager_lines.append("Chips used: " + (", ".join(f"{row['name']} GW{row['event']}" for row in chips_used) if chips_used else "none"))
     chips = conn.execute("SELECT * FROM chip_definitions ORDER BY start_event,id").fetchall()
@@ -418,6 +506,9 @@ def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | Non
         gaps.append("No manager or squad data: Team ID is not configured.")
     if manual_free_transfers is None:
         gaps.append("Free transfers are manual; verify them in the FPL UI.")
+    if value_state is not None and value_state.get("status") != "OK":
+        detail = "; ".join(value_state.get("mismatches") or value_state.get("data_gaps") or [])
+        gaps.append(f"Manager realisable value {value_state.get('status')}: {detail or 'value unavailable'}.")
     unplaced_pending = repo.unplaced_pending_fixture_rows(conn, event_id, 8)
     if unplaced_pending:
         fixture_details = "; ".join(
@@ -445,6 +536,7 @@ def build_report(conn: sqlite3.Connection, config: dict[str, Any], gw: int | Non
         "freshness": _freshness(conn),
         "season": config.get("season", "2026/27"),
         "deadline": deadline,
+        "manager_value_state": value_state,
         "sections": sections,
     }
 

@@ -133,9 +133,9 @@ def validate_market_config(config: dict[str, Any]) -> dict[str, Any]:
 
     for key in (
         "require_complete",
+        "require_event_finished_if_available",
         "require_event_data_checked_if_available",
         "require_fixtures_finished",
-        "require_fixtures_not_provisional_if_available",
     ):
         _require_bool(completion.get(key), f"gameweek_completion.{key}")
         if not completion[key]:
@@ -385,6 +385,13 @@ def assess_gameweek_completion(conn: sqlite3.Connection, gw: int, config: dict[s
     if event is None:
         blockers.append(f"GW{gw} is not present in events")
     else:
+        event_finished = event.get("finished")
+        if event_finished is None:
+            basis.append("events.finished unavailable")
+        elif event_finished == 1:
+            basis.append("events.finished=true")
+        else:
+            blockers.append("events.finished is not true")
         data_checked = event.get("data_checked")
         if data_checked is None:
             basis.append("events.data_checked unavailable")
@@ -401,11 +408,9 @@ def assess_gameweek_completion(conn: sqlite3.Connection, gw: int, config: dict[s
     )
     if fixtures:
         basis.append(f"{finished_count}/{len(fixtures)} fixtures finished")
-        basis.append(f"{provisional_count} provisional fixtures")
+        basis.append(f"{provisional_count} fixtures with finished_provisional=true (metadata only)")
     if completion["require_fixtures_finished"] and finished_count != len(fixtures):
         blockers.append(f"{len(fixtures) - finished_count} target-GW fixtures are unfinished")
-    if completion["require_fixtures_not_provisional_if_available"] and provisional_count:
-        blockers.append(f"{provisional_count} target-GW fixtures are provisional")
     if started_unfinished:
         blockers.append(f"{started_unfinished} target-GW fixtures are started but unfinished")
     return {
@@ -1791,21 +1796,39 @@ def render_market_markdown(report: dict[str, Any]) -> str:
                 ],
             )
         )
-    lines.extend(["", "GW summary: threshold_hits_in_gw is counted from fixture-level hits only."])
-    lines.extend(
-        _markdown_table(
-            ["Player ID", "Player", "Threshold Hits", "Official DC Pts"],
-            [
-                [
-                    row["player_id"],
-                    row["player_name"],
-                    row["threshold_hits_in_gw"],
-                    _format(row["official_defcon_points"]),
-                ]
-                for row in defcon.get("gw_summary", [])
-            ],
-        )
+    summary_rows = sorted(
+        (
+            row
+            for row in defcon.get("gw_summary", [])
+            if row.get("threshold_hits_in_gw", 0) > 0
+        ),
+        key=lambda row: (-row["threshold_hits_in_gw"], row["player_id"]),
     )
+    lines.extend(
+        [
+            "",
+            "GW summary: threshold_hits_in_gw is counted from fixture-level hits only.",
+            "",
+            f"Rows: {len(summary_rows)}",
+        ]
+    )
+    if summary_rows:
+        lines.extend(
+            _markdown_table(
+                ["Player ID", "Player", "Threshold Hits", "Official DC Pts"],
+                [
+                    [
+                        row["player_id"],
+                        row["player_name"],
+                        row["threshold_hits_in_gw"],
+                        _format(row["official_defcon_points"]),
+                    ]
+                    for row in summary_rows
+                ],
+            )
+        )
+    else:
+        lines.append("No players recorded a defensive-contribution threshold hit in this Gameweek.")
 
     minutes = sections["minutes_watch"]
     lines.extend(["", "## Minutes Watch", "", "Baseline: previous completed team fixtures; blanks are excluded and DGW fixtures count separately."])

@@ -24,6 +24,7 @@ All timestamps stored by the application are UTC ISO-8601 strings. FPL prices re
 - `fpl_entry_id`: `null` is valid and keeps the whole fetch/report workflow usable before a Team ID is configured.
 - `paths`: database, raw-response, and report locations.
 - `manual_overrides.free_transfers`: current free transfers are not exposed by the public API; leave null or enter the value manually. Reports label it `[MANUAL]`.
+- Exact event-scoped manager-entered transfer state is stored in `manager_manual_state`; exact transfer-screen selling prices are stored separately in `manager_selling_prices`. Selling prices never overwrite official `player_snapshots.now_cost`.
 - `strategy`: the current risk posture and chip-plan notes.
 - `report`: fixture horizons, scouting freshness, and whether player data covers the squad/watchlist or every player.
 
@@ -88,7 +89,19 @@ DEFCON uses only proven fixture-level `player_gameweeks.defensive_contribution` 
 
 Official FPL facts are written by fetch and manager sync to `events`, `teams`, `players`, `player_snapshots`, `fixtures`, `player_gameweeks`, `manager_state`, `squad_picks`, and `manager_chips`. Scouting is a separate append-only stream in `scouting_notes`; it never writes a scouting value into a fact table. Human strategy lives in `watchlist`, `decisions`, and `strategy`.
 
+Manager-entered bank, free transfers, and selling prices are a separate event-scoped manual layer. Affordability uses the resolved bank and effective selling prices for outgoing players plus official current market prices for incoming players; missing acquisition/selling evidence is a data gap, not a fallback to `now_cost`.
+
 Reports label official facts `[FACT]`, researched beliefs `[SCOUTING]`, transparent calculations `[DERIVED]`, and manager-entered values `[MANUAL]`. Scouting values include their confidence and observation timestamp, and expired/old notes are marked `STALE`.
+
+## Self-adjusting team value
+
+Schema version 3 adds the append-only `manager_player_acquisitions` ledger. It preserves each purchase stint (`entry_id`, player, acquired event, integer-tenths purchase price, optional sale event/timestamp, source, and audit timestamps); a partial unique index permits only one active stint for an entry/player. The existing `manager_selling_prices` table remains the exact manager-screen evidence layer and now records `market_price_at_capture` when known.
+
+The normal manager sync also calls the public `entry/{entry_id}/transfers/` endpoint. Its exact `element_in`, `element_out`, `event`, `time`, `element_in_cost`, and `element_out_cost` fields are persisted in the manager raw response and reconciled idempotently into the ledger. A repeated sync does not create duplicate stints, and a later purchase of a previously sold player creates a new stint. If that endpoint is unavailable, the sync surfaces `ACQUISITION PRICE DATA GAP`; an explicitly known purchase can be recorded through `repositories.insert_manager_acquisition`, but the system never guesses it from a later market price. Public current-event picks can remain unavailable before the deadline, so transfer history or the next exact squad snapshot is the evidence boundary.
+
+For purchase price `P` and current official `now_cost` `C`, the engine uses integer tenths: `C` when `C <= P`, otherwise `P + floor((C-P)/2)`. `effective_selling_price` returns structured provenance and one of `AUTO_CALCULATED`, `MANUAL_FALLBACK`, `VERIFIED_BY_MANUAL`, `DATA_GAP`, or `MISMATCH`. A manual value verifies the calculation only when its captured market price is comparable; a changed market price makes that snapshot stale and cannot freeze the automatic calculation. Same-market disagreement is surfaced as `SELLING PRICE MISMATCH`.
+
+`realisable_squad_value(entry_id, event)` sums effective values for a verified exact target squad, or for the latest complete squad only when the public transfer history proves the intervening changes. Affordability uses event-scoped `manager_manual_state` first, then legacy `manager_state.free_transfers_manual`; bank uses exact manual state first and an exact API manager row only when available. Missing evidence remains `DATA GAP`, and outgoing values never fall back to official market price.
 
 ## Scouting format
 

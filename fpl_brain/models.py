@@ -275,3 +275,40 @@ class PicksRecord:
     active_chip: str | None = None
     automatic_subs: list[dict[str, Any]] = field(default_factory=list)
     raw_json: Raw = field(default_factory=dict)
+
+
+@dataclass
+class ManagerTransferRecord:
+    """One exact transfer-history row from the public manager endpoint."""
+
+    entry_id: int
+    element_in: int
+    element_out: int
+    event: int
+    time: str | None = None
+    element_in_cost: int | None = None
+    element_out_cost: int | None = None
+    raw_json: Raw = field(default_factory=dict)
+
+
+@dataclass
+class PlayerSeasonHistoryRecord:
+    """One official element-summary `history_past` season row.
+
+    Official fields proven present: `season_name`, `starts`, `minutes`
+    (plus scoring/identity context).  Appearances are NOT an official field;
+    any match-count estimate downstream needs an explicit modelling
+    assumption rather than pretending this row carries one.
+    """
+
+    player_id: int
+    season_name: str
+    minutes: int | None = None
+    starts: int | None = None
+    total_points: int | None = None
+    goals_scored: int | None = None
+    assists: int | None = None
+    clean_sheets: int | None = None
+    bonus: int | None = None
+    saves: int | None = None
+    raw_json: Raw = field(default_factory=dict)

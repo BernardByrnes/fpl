@@ -209,6 +209,14 @@ class FplClient:
     def get_entry_history(self, entry_id: int) -> dict[str, Any]:
         return self._get(f"entry/{int(entry_id)}/history/", "dict", f"entry_history_{int(entry_id)}")  # type: ignore[return-value]
 
+    def get_entry_transfers(self, entry_id: int) -> list[Any] | None:
+        """Return the public transfer history, or None when the endpoint is unavailable."""
+
+        try:
+            return self._get(f"entry/{int(entry_id)}/transfers/", "list", f"entry_{int(entry_id)}_transfers")  # type: ignore[return-value]
+        except FplNotFoundError:
+            return None
+
     def get_entry_picks(self, entry_id: int, event: int) -> dict[str, Any] | None:
         try:
             return self._get(

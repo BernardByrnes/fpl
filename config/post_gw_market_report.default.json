@@ -9,9 +9,9 @@
   },
   "gameweek_completion": {
     "require_complete": true,
+    "require_event_finished_if_available": true,
     "require_event_data_checked_if_available": true,
-    "require_fixtures_finished": true,
-    "require_fixtures_not_provisional_if_available": true
+    "require_fixtures_finished": true
   },
   "numeric_format": {
     "price_decimals": 1,

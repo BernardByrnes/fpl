@@ -11,6 +11,7 @@ import fpl_brain.market_report as market_report_module
 from fpl_brain.config import DEFAULT_CONFIG
 from fpl_brain.database import connect_database
 from fpl_brain.market_report import (
+    assess_gameweek_completion,
     build_market_report,
     IncompleteGameweekError,
     load_market_config,
@@ -122,6 +123,74 @@ def _complete_event(conn, event, fixtures):
             [EventRecord(id=event, name=f"Gameweek {event}", finished=1, data_checked=1, is_previous=1)],
         )
         repo.upsert_fixtures(conn, fixtures)
+
+
+def _assess_completion(tmp_path, event, fixture):
+    config = _brain_config(tmp_path, entry_id=None)
+    path = config["paths"]["database"]
+    conn = connect_database(path)
+    fixture_team_ids = sorted({int(fixture.team_h), int(fixture.team_a)})
+    with conn:
+        repo.upsert_teams(
+            conn,
+            [TeamRecord(id=team_id, name=f"Team {team_id}", short_name=f"T{team_id}") for team_id in fixture_team_ids],
+        )
+        repo.upsert_events(conn, [event])
+        repo.upsert_fixtures(conn, [fixture])
+    conn.close()
+
+    read_conn = open_read_only_database(path)
+    try:
+        return assess_gameweek_completion(read_conn, event.id, load_market_config())
+    finally:
+        read_conn.close()
+
+
+def test_completion_accepts_finished_provisional_fixture_after_event_is_final(tmp_path):
+    result = _assess_completion(
+        tmp_path,
+        EventRecord(id=1, name="Gameweek 1", finished=1, data_checked=1),
+        FixtureRecord(id=101, event=1, team_h=1, team_a=2, finished=1, finished_provisional=1, raw_json={}),
+    )
+
+    assert result["status"] == "complete"
+    assert result["blockers"] == []
+    assert result["fixtures_provisional"] == 1
+
+
+def test_completion_rejects_unfinished_provisional_fixture(tmp_path):
+    result = _assess_completion(
+        tmp_path,
+        EventRecord(id=1, name="Gameweek 1", finished=0, data_checked=0),
+        FixtureRecord(id=101, event=1, team_h=1, team_a=2, finished=0, finished_provisional=1, raw_json={}),
+    )
+
+    assert result["status"] == "incomplete_or_unverifiable"
+    assert "events.finished is not true" in result["blockers"]
+    assert "events.data_checked is not true" in result["blockers"]
+    assert "1 target-GW fixtures are unfinished" in result["blockers"]
+
+
+def test_completion_rejects_unfinished_event_even_when_fixture_is_finished(tmp_path):
+    result = _assess_completion(
+        tmp_path,
+        EventRecord(id=1, name="Gameweek 1", finished=0, data_checked=1),
+        FixtureRecord(id=101, event=1, team_h=1, team_a=2, finished=1, finished_provisional=1, raw_json={}),
+    )
+
+    assert result["status"] == "incomplete_or_unverifiable"
+    assert result["blockers"] == ["events.finished is not true"]
+
+
+def test_completion_rejects_unchecked_event_with_finished_fixture(tmp_path):
+    result = _assess_completion(
+        tmp_path,
+        EventRecord(id=1, name="Gameweek 1", finished=1, data_checked=0),
+        FixtureRecord(id=101, event=1, team_h=1, team_a=2, finished=1, finished_provisional=1, raw_json={}),
+    )
+
+    assert result["status"] == "incomplete_or_unverifiable"
+    assert result["blockers"] == ["events.data_checked is not true"]
 
 
 def test_market_report_uses_completed_fixture_rows_for_zero_minute_nonappearance_only(tmp_path):
@@ -276,6 +345,21 @@ def test_market_report_defcon_is_per_fixture_and_never_uses_snapshot_or_gw_sum(t
     assert summary[2]["threshold_hits_in_gw"] == 2
     assert summary[3]["threshold_hits_in_gw"] == 0
     assert summary[1]["official_defcon_points"] is None
+    assert len(json.loads(render_market_json(report))["sections"]["defensive_contributions"]["gw_summary"]) == 3
+
+    markdown = render_market_markdown(report)
+    summary_markdown = markdown.split("GW summary:", 1)[1].split("\n## Minutes Watch", 1)[0]
+    assert "Hitting Mid" in summary_markdown
+    assert "Near Defender" not in summary_markdown
+    assert "DGW Mid" not in summary_markdown
+    assert "### DEF scoring group" in markdown
+    assert "### MID/FWD scoring group" in markdown
+
+    empty_report = copy.deepcopy(report)
+    for row in empty_report["sections"]["defensive_contributions"]["gw_summary"]:
+        row["threshold_hits_in_gw"] = 0
+    empty_summary_markdown = render_market_markdown(empty_report).split("GW summary:", 1)[1].split("\n## Minutes Watch", 1)[0]
+    assert "No players recorded a defensive-contribution threshold hit in this Gameweek." in empty_summary_markdown
 
 
 def test_market_report_defcon_and_squad_emit_data_gaps_when_source_data_is_missing(tmp_path):
@@ -390,6 +474,9 @@ def test_market_report_is_deterministic_renders_agree_and_caps_non_squad_candida
     assert json_first == render_market_json(second)
     assert markdown_first == render_market_markdown(second)
     assert "generated" not in first
+    assert len(first["sections"]["defensive_contributions"]["gw_summary"]) == len(players)
+    assert all(row["threshold_hits_in_gw"] == 0 for row in first["sections"]["defensive_contributions"]["gw_summary"])
+    assert "No players recorded a defensive-contribution threshold hit in this Gameweek." in markdown_first
     candidates = first["scout_candidates"]["candidates"]
     assert first["scout_candidates"]["market_triggered_count"] == 8
     assert len(candidates) == 8

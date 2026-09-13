@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import pytest
+
 from fpl_brain.parsers import (
     parse_bootstrap,
     parse_element_summary,
     parse_entry,
     parse_entry_history,
+    parse_entry_transfers,
     parse_event_live,
     parse_snapshot,
 )
@@ -56,6 +59,23 @@ def test_summary_history_and_empty_live_are_benign(fixture_json):
     history = parse_entry_history(fixture_json("entry_history_sample.json"))
     assert history.current == []
     assert history.past[0].overall_rank is not None
+
+
+def test_transfer_history_parser_preserves_exact_costs_and_rejects_missing_cost():
+    rows = parse_entry_transfers([{
+        "entry": 241392,
+        "element_in": 20,
+        "element_out": 10,
+        "event": 4,
+        "time": "2026-09-07T10:00:00Z",
+        "element_in_cost": 55,
+        "element_out_cost": 50,
+    }])
+    assert rows[0].entry_id == 241392
+    assert rows[0].element_in_cost == 55
+    assert rows[0].element_out_cost == 50
+    with pytest.raises(ValueError, match="exact required field"):
+        parse_entry_transfers([{"entry": 241392, "element_in": 20, "element_out": 10, "event": 4}])
 
 
 def test_event_live_double_gameweek_splits_explain_rows_without_event_total_duplication():

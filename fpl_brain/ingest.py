@@ -12,15 +12,18 @@ from .config import config_path
 from .database import connect_database
 from .parsers import (
     parse_bootstrap,
+    parse_element_history_past,
     parse_element_summary,
     parse_entry,
     parse_entry_history,
     parse_entry_picks,
+    parse_entry_transfers,
     parse_event_live,
     parse_fixtures,
     validate_bootstrap_payload,
 )
 from . import repositories as repo
+from . import ingest_provenance as provenance
 from .utils import ensure_directory, utc_now
 
 LOGGER = logging.getLogger(__name__)
@@ -93,8 +96,23 @@ def run_fetch(
                 with conn:
                     repo.finish_fetch_run(conn, run_id, "failed", endpoints_ok=endpoints_ok, endpoints_failed=[{"endpoint": "bootstrap-static", "error": str(exc)}], error_message=str(exc))
             raise
+
         endpoints_ok.append("bootstrap-static")
+        generation: provenance.BootstrapGeneration | None = None
         if not dry_run and conn is not None and run_id is not None:
+            # Completeness decision BEFORE any destructive write.  A generation
+            # that cannot be established as complete enough must not be allowed
+            # to redefine the official player pool (mark_absent_players).
+            previous_generation = provenance.load_latest_generation(raw_dir)
+            generation = provenance.build_generation(
+                payload=bootstrap_payload,
+                parsed_count=len(records.players),
+                persisted_count=0,
+                captured_at=captured_at,
+                run_id=run_id,
+                previous=previous_generation,
+                allow_large_drop=bool(config.get("allow_large_player_pool_drop", False)),
+            )
             try:
                 with conn:
                     repo.upsert_events(conn, records.events, captured_at)
@@ -102,9 +120,45 @@ def run_fetch(
                     repo.upsert_teams(conn, records.teams, captured_at)
                     repo.upsert_positions(conn, records.positions, captured_at)
                     seen = repo.upsert_players(conn, records.players, captured_at)
-                    repo.mark_absent_players(conn, seen)
+                    if generation.accepted:
+                        repo.mark_absent_players(conn, seen)
+                    else:
+                        LOGGER.error(
+                            "bootstrap generation not accepted (%s): %s; skipping the destructive "
+                            "mark_absent_players step so the official player pool is not redefined",
+                            generation.acceptance_rule,
+                            list(generation.rejection_reasons),
+                        )
                     snapshot_count = repo.insert_snapshots(conn, records.snapshots, run_id)
-                LOGGER.info("bootstrap stored teams=%s players=%s snapshots=%s", len(records.teams), len(seen), snapshot_count)
+                    # Persist the generation INSIDE SQLite so the accepted pool
+                    # identity travels into every execution snapshot.  Rejected
+                    # generations are recorded for audit but are never read as
+                    # authoritative (the reader filters accepted=1).
+                    repo.record_bootstrap_generation(
+                        conn,
+                        captured_at=generation.captured_at,
+                        accepted=generation.accepted,
+                        official_element_count=generation.official_element_count,
+                        parsed_count=generation.parsed_count,
+                        persisted_count=len(seen),
+                        element_ids=generation.element_ids,
+                        element_ids_sha256=generation.element_id_sha256,
+                        availability_counts=generation.availability_counts,
+                        club_player_counts=generation.club_player_counts,
+                        acceptance_rule=generation.acceptance_rule,
+                        acceptance_rule_version=provenance.ACCEPTANCE_RULE_VERSION,
+                        rejection_reasons=generation.rejection_reasons,
+                        fetch_run_id=run_id,
+                    )
+                generation = provenance.with_persisted_count(generation, len(seen))
+                # The JSON is a human/audit REPORT only.  The causal authority is
+                # the bootstrap_generations row inside the database.
+                provenance.write_generation(raw_dir, generation)
+                LOGGER.info(
+                    "bootstrap stored teams=%s players=%s snapshots=%s generation=%s accepted=%s",
+                    len(records.teams), len(seen), snapshot_count,
+                    generation.acceptance_rule, generation.accepted,
+                )
             except Exception as exc:
                 with conn:
                     repo.finish_fetch_run(conn, run_id, "failed", current_event, endpoints_ok, [{"endpoint": "bootstrap-static", "error": str(exc)}], str(exc))
@@ -144,6 +198,17 @@ def run_fetch(
                     if not dry_run and conn is not None:
                         with conn:
                             repo.upsert_player_gameweeks(conn, detail_rows, captured_at)
+                            claimed = {
+                                (int(row.event), int(row.fixture_id))
+                                for row in detail_rows
+                                if row.event is not None and row.fixture_id is not None
+                            }
+                            repo.prune_stale_element_summary_placeholders(conn, player_id, claimed)
+                            repo.upsert_player_season_histories(
+                                conn,
+                                parse_element_history_past(payload, player_id),
+                                captured_at,
+                            )
                 except FplApiError as exc:
                     endpoint_failures.append({"endpoint": f"element-summary/{player_id}", "error": str(exc)})
                     LOGGER.warning("element summary failed for %s: %s", player_id, exc)
@@ -166,8 +231,15 @@ def run_fetch(
                 endpoint_failures.append({"endpoint": f"event/{live_gw}/live", "error": str(exc)})
                 LOGGER.warning("event live failed: %s", exc)
 
-        status = "partial" if endpoint_failures else "success"
+        generation_rejected = generation is not None and not generation.accepted
+        status = "partial" if (endpoint_failures or generation_rejected) else "success"
         if not dry_run and conn is not None and run_id is not None:
+            if generation_rejected and generation is not None:
+                endpoint_failures.append({
+                    "endpoint": "bootstrap-static",
+                    "error": provenance.DIAG_INGEST_INCOMPLETE,
+                    "detail": list(generation.rejection_reasons),
+                })
             with conn:
                 repo.finish_fetch_run(conn, run_id, status, current_event, endpoints_ok, endpoint_failures)
             counts = _result_counts(conn)
@@ -182,6 +254,7 @@ def run_fetch(
             "summaries": summary_count,
             "counts": counts,
             "endpoints_failed": endpoint_failures,
+            "bootstrap_generation": None if generation is None else generation.as_dict(),
         }
     except Exception as exc:
         if not dry_run and conn is not None and run_id is not None:
@@ -257,6 +330,27 @@ def run_manager_sync(
                     repo.finish_fetch_run(conn, run_id, "failed", endpoints_ok=endpoints_ok, endpoints_failed=[{"endpoint": "entry", "error": str(exc)}], error_message=str(exc))
             raise
 
+        transfers_payload: list[Any] | None = None
+        transfer_records: list[Any] = []
+        transfers_available = False
+        acquisition_result: dict[str, Any] = {
+            "status": "data_gap",
+            "message": "ACQUISITION PRICE DATA GAP - transfer history unavailable",
+            "inserted": 0,
+            "closed": 0,
+        }
+        try:
+            transfers_payload = client.get_entry_transfers(int(entry_id))
+            if transfers_payload is not None:
+                transfer_records = parse_entry_transfers(transfers_payload)
+                transfers_available = True
+                endpoints_ok.append(f"entry/{entry_id}/transfers")
+            else:
+                LOGGER.warning("transfer history unavailable for entry %s", entry_id)
+        except (FplApiError, ValueError, TypeError, AttributeError) as exc:
+            failures.append({"endpoint": f"entry/{entry_id}/transfers", "error": str(exc)})
+            LOGGER.warning("transfer history failed: %s", exc)
+
         target_event = event or entry.current_event or (repo.current_or_next_event(conn) if conn is not None else 1)
         if all_events:
             target_events = list(range(1, int(target_event) + 1))
@@ -290,12 +384,25 @@ def run_manager_sync(
                     config.get("manual_overrides", {}).get("free_transfers"),
                     run_id,
                     int(target_event),
-                    {"entry": entry_payload, "history": history_payload},
+                    {
+                        "entry": entry_payload,
+                        "history": history_payload,
+                        "transfers": transfers_payload,
+                        "transfers_endpoint_available": transfers_available,
+                    },
                     captured_at,
                 )
                 repo.upsert_manager_chips(conn, int(entry_id), history.chips)
                 for target, picks in parsed_picks:
                     picks_written += repo.upsert_squad_picks(conn, int(entry_id), target, picks.picks, captured_at)
+                acquisition_result = repo.reconcile_manager_acquisitions(
+                    conn,
+                    int(entry_id),
+                    int(target_event),
+                    transfer_records,
+                    transfers_available,
+                    captured_at=captured_at,
+                )
         status = "partial" if failures else "success"
         if not dry_run and conn is not None and run_id is not None:
             with conn:
@@ -307,6 +414,7 @@ def run_manager_sync(
             "picks_written": picks_written,
             "endpoints_failed": failures,
             "run_id": run_id,
+            "acquisitions": acquisition_result,
         }
     finally:
         client.close()

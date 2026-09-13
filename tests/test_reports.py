@@ -6,7 +6,7 @@ import json
 from fpl_brain import repositories as repo
 from fpl_brain.config import DEFAULT_CONFIG
 from fpl_brain.database import connect_database
-from fpl_brain.models import EntryRecord, EventRecord, FixtureRecord, PickRecord, PlayerRecord, PlayerSnapshotRecord, PositionRecord, TeamRecord
+from fpl_brain.models import EntryRecord, EventRecord, FixtureRecord, HistoryRow, PickRecord, PlayerRecord, PlayerSnapshotRecord, PositionRecord, TeamRecord
 from fpl_brain.reports import build_report, render_json, render_markdown
 
 
@@ -384,4 +384,89 @@ def test_report_formats_percentage_point_deltas_without_binary_float_noise(tmp_p
     markdown = render_markdown(build_report(conn, config, 1))
     assert "(3.3pp)" in markdown
     assert "3.299999" not in markdown
+    conn.close()
+
+
+def test_report_renders_event_scoped_manual_state_and_separate_prices(tmp_path):
+    config = _config(tmp_path)
+    config["fpl_entry_id"] = 241392
+    conn = connect_database(config["paths"]["database"])
+    with conn:
+        repo.upsert_events(conn, [EventRecord(id=4, name="Gameweek 4")])
+        repo.upsert_players(
+            conn,
+            [
+                PlayerRecord(id=1, web_name="Calafiori", full_name="Riccardo Calafiori"),
+                PlayerRecord(id=2, web_name="Joao Pedro", full_name="Joao Pedro"),
+            ],
+        )
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(
+            conn,
+            [
+                PlayerSnapshotRecord(player_id=1, captured_at="2026-09-07T00:00:00Z", now_cost=57, raw_json={}),
+                PlayerSnapshotRecord(player_id=2, captured_at="2026-09-07T00:00:00Z", now_cost=77, raw_json={}),
+            ],
+            run,
+        )
+        repo.upsert_manual_manager_state(conn, 241392, 4, 3, 0, captured_at="2026-09-07T12:00:00Z")
+        repo.upsert_manager_selling_prices(
+            conn,
+            241392,
+            4,
+            {1: 56, 2: 76},
+            captured_at="2026-09-07T12:00:00Z",
+        )
+
+    markdown = render_markdown(build_report(conn, config, 4))
+    assert "Manual manager state: GW4 | free transfers 3 | bank" in markdown
+    assert "selling-value snapshot" in markdown
+    assert "Riccardo Calafiori: official market" in markdown
+    assert "manager selling" in markdown
+    assert "5.7m" in markdown
+    assert "5.6m" in markdown
+    assert "7.7m" in markdown
+    assert "7.6m" in markdown
+    assert repo.latest_snapshot(conn, 1)["now_cost"] == 57
+    assert repo.latest_snapshot(conn, 2)["now_cost"] == 77
+    conn.close()
+
+
+def test_report_renders_self_adjusting_manager_value_state(tmp_path):
+    config = _config(tmp_path)
+    config["fpl_entry_id"] = 99
+    conn = connect_database(config["paths"]["database"])
+    with conn:
+        repo.upsert_events(conn, [EventRecord(id=2, name="Gameweek 2")])
+        repo.upsert_positions(conn, [PositionRecord(id=1, singular_name_short="GKP")])
+        repo.upsert_players(
+            conn,
+            [PlayerRecord(id=player_id, web_name=f"P{player_id}", full_name=f"Player {player_id}", element_type=1) for player_id in range(1, 16)],
+        )
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(
+            conn,
+            [PlayerSnapshotRecord(player_id=player_id, captured_at="2026-09-07T00:00:00Z", now_cost=55, raw_json={}) for player_id in range(1, 16)],
+            run,
+        )
+        repo.insert_manager_state(
+            conn,
+            EntryRecord(entry_id=99, player_name="Manager", team_name="Team", bank=0, team_value=825, total_transfers=0),
+            HistoryRow(event=2, bank=0, value=825, total_transfers=0),
+            None,
+            3,
+            None,
+            2,
+            {"transfers": [], "transfers_endpoint_available": True},
+            "2026-09-07T01:00:00Z",
+        )
+        repo.upsert_squad_picks(conn, 99, 2, [PickRecord(player_id=player_id, position=player_id, raw_json={}) for player_id in range(1, 16)])
+        for player_id in range(1, 16):
+            repo.insert_manager_acquisition(conn, 99, player_id, 1, 55, source="verified_initial_squad")
+        repo.upsert_manual_manager_state(conn, 99, 2, 3, 0, captured_at="2026-09-07T02:00:00Z")
+        repo.upsert_manager_selling_prices(conn, 99, 2, {player_id: 55 for player_id in range(1, 16)}, market_prices_at_capture={player_id: 55 for player_id in range(1, 16)})
+    markdown = render_markdown(build_report(conn, config, 2))
+    assert "Manager value state: OK" in markdown
+    assert "Official squad market value: £82.5m | Realisable selling value: £82.5m" in markdown
+    assert "purchase £5.5m | market £5.5m | calculated sell £5.5m | manual snapshot £5.5m | effective sell £5.5m" in markdown
     conn.close()

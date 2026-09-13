@@ -4,12 +4,16 @@ from fpl_brain import repositories as repo
 from fpl_brain.database import connect_database
 from fpl_brain.metrics import (
     attacking_and_defensive_outlook,
+    calculate_selling_price,
+    effective_selling_price,
     fixture_outlook,
     minutes_reliability,
     points_per_million,
+    realisable_squad_value,
+    transfer_affordability,
     trend,
 )
-from fpl_brain.models import EventRecord, FixtureRecord, PlayerGameweekRecord, PlayerRecord, PlayerSnapshotRecord, PositionRecord, TeamRecord
+from fpl_brain.models import EntryRecord, EventRecord, FixtureRecord, HistoryRow, PickRecord, PlayerGameweekRecord, PlayerRecord, PlayerSnapshotRecord, PositionRecord, TeamRecord
 
 
 def test_metrics_are_transparent_and_handle_blanks_doubles(tmp_path):
@@ -318,4 +322,184 @@ def test_minutes_reliability_returns_none_for_pure_preseason_schedule_minutes_ze
         )
     assert repo.gameweek_rows(conn, 1, 5) == []
     assert minutes_reliability(conn, 1, 5) is None
+    conn.close()
+
+
+def test_transfer_affordability_uses_selling_prices_and_official_market_prices(tmp_path):
+    conn = connect_database(tmp_path / "fpl.db")
+    with conn:
+        repo.upsert_players(
+            conn,
+            [
+                PlayerRecord(id=10, web_name="Maguire", full_name="Harry Maguire"),
+                PlayerRecord(id=11, web_name="Rodon", full_name="Joe Rodon"),
+                PlayerRecord(id=20, web_name="DeCuyper", full_name="Maxim De Cuyper"),
+                PlayerRecord(id=21, web_name="Other", full_name="Other Defender"),
+            ],
+        )
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(
+            conn,
+            [
+                PlayerSnapshotRecord(player_id=10, captured_at="2026-09-07T00:00:00Z", now_cost=51, raw_json={}),
+                PlayerSnapshotRecord(player_id=11, captured_at="2026-09-07T00:00:00Z", now_cost=45, raw_json={}),
+                PlayerSnapshotRecord(player_id=20, captured_at="2026-09-07T00:00:00Z", now_cost=47, raw_json={}),
+                PlayerSnapshotRecord(player_id=21, captured_at="2026-09-07T00:00:00Z", now_cost=47, raw_json={}),
+            ],
+            run,
+        )
+        repo.upsert_manual_manager_state(conn, 241392, 4, 3, 0, captured_at="2026-09-07T12:00:00Z")
+        repo.upsert_manager_selling_prices(
+            conn,
+            241392,
+            4,
+            {10: 50, 11: 44},
+            captured_at="2026-09-07T12:00:00Z",
+        )
+
+    one_for_one = transfer_affordability(conn, 241392, 4, [10], [20])
+    assert one_for_one["status"] == "AFFORDABLE"
+    assert one_for_one["bank"] == 0
+    assert one_for_one["selling_prices"] == {10: 50}
+    assert one_for_one["official_market_prices"] == {20: 47}
+    assert one_for_one["available_funds"] == 3
+
+    insufficient = transfer_affordability(conn, 241392, 4, [11], [20])
+    assert insufficient["status"] == "INSUFFICIENT_FUNDS"
+    assert insufficient["available_funds"] == -3
+    assert insufficient["shortfall"] == 3
+
+    two_for_two = transfer_affordability(conn, 241392, 4, [10, 11], [20, 21])
+    assert two_for_two["status"] == "AFFORDABLE"
+    assert two_for_two["available_funds"] == 0
+    assert two_for_two["outgoing_selling_value"] == 94
+    assert two_for_two["incoming_market_value"] == 94
+    conn.close()
+
+
+def test_transfer_affordability_does_not_fallback_to_official_price_for_missing_selling_price(tmp_path):
+    conn = connect_database(tmp_path / "fpl.db")
+    with conn:
+        repo.upsert_players(
+            conn,
+            [
+                PlayerRecord(id=30, web_name="Outgoing", full_name="Outgoing Player"),
+                PlayerRecord(id=31, web_name="Incoming", full_name="Incoming Player"),
+            ],
+        )
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(
+            conn,
+            [
+                PlayerSnapshotRecord(player_id=30, captured_at="2026-09-07T00:00:00Z", now_cost=50, raw_json={}),
+                PlayerSnapshotRecord(player_id=31, captured_at="2026-09-07T00:00:00Z", now_cost=47, raw_json={}),
+            ],
+            run,
+        )
+        repo.upsert_manual_manager_state(conn, 241392, 4, 3, 0, captured_at="2026-09-07T12:00:00Z")
+
+    result = transfer_affordability(conn, 241392, 4, [30], [31])
+    assert result["status"] == "DATA_GAP"
+    assert result["available_funds"] is None
+    assert any("selling price unavailable" in message for message in result["data_gaps"])
+    conn.close()
+
+
+def test_selling_price_formula_and_stale_manual_snapshot(tmp_path):
+    assert [calculate_selling_price(55, market) for market in (55, 56, 57, 58, 59)] == [55, 55, 56, 56, 57]
+    assert [calculate_selling_price(55, market) for market in (55, 54, 53)] == [55, 54, 53]
+    conn = connect_database(tmp_path / "fpl.db")
+    with conn:
+        repo.upsert_players(conn, [PlayerRecord(id=1, web_name="Player", full_name="Player")])
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(conn, [PlayerSnapshotRecord(player_id=1, captured_at="2026-09-01T00:00:00Z", now_cost=57, raw_json={})], run)
+        repo.insert_manager_acquisition(conn, 99, 1, 1, 55, source="verified_initial_squad")
+        repo.upsert_manager_selling_prices(conn, 99, 4, {1: 56}, market_prices_at_capture={1: 57}, captured_at="2026-09-01T12:00:00Z")
+    assert effective_selling_price(conn, 99, 4, 1)["status"] == "VERIFIED_BY_MANUAL"
+    with conn:
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(conn, [PlayerSnapshotRecord(player_id=1, captured_at="2026-09-02T00:00:00Z", now_cost=59, raw_json={})], run)
+    value = effective_selling_price(conn, 99, 4, 1)
+    assert value["status"] == "AUTO_CALCULATED"
+    assert value["calculated_selling_price"] == 57
+    assert value["effective_selling_price"] == 57
+    conn.close()
+
+
+def test_same_market_manual_mismatch_is_not_silently_overridden(tmp_path):
+    conn = connect_database(tmp_path / "fpl.db")
+    with conn:
+        repo.upsert_players(conn, [PlayerRecord(id=1, web_name="Player", full_name="Player")])
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(conn, [PlayerSnapshotRecord(player_id=1, captured_at="2026-09-01T00:00:00Z", now_cost=57, raw_json={})], run)
+        repo.insert_manager_acquisition(conn, 99, 1, 1, 55, source="verified_initial_squad")
+        repo.upsert_manager_selling_prices(conn, 99, 4, {1: 55}, market_prices_at_capture={1: 57})
+    result = effective_selling_price(conn, 99, 4, 1)
+    assert result["status"] == "MISMATCH"
+    assert result["effective_selling_price"] is None
+    conn.close()
+
+
+def test_manager_planning_state_precedence_is_event_scoped(tmp_path):
+    conn = connect_database(tmp_path / "fpl.db")
+    with conn:
+        repo.insert_manager_state(
+            conn,
+            EntryRecord(entry_id=99, bank=30, team_value=1000, total_transfers=1),
+            HistoryRow(event=4, bank=30, total_transfers=1),
+            None,
+            1,
+            None,
+            4,
+            {},
+            "2026-09-07T00:00:00Z",
+        )
+        repo.upsert_manual_manager_state(conn, 99, 4, 3, 0, captured_at="2026-09-07T12:00:00Z")
+    manual = repo.manager_planning_state(conn, 99, 4)
+    assert manual["free_transfers"] == 3 and manual["free_transfers_source"] == "manual"
+    assert manual["bank"] == 0 and manual["bank_source"] == "manual"
+    with conn:
+        repo.upsert_manual_manager_state(conn, 99, 4, None, None, captured_at="2026-09-07T13:00:00Z")
+    unavailable = repo.manager_planning_state(conn, 99, 4)
+    assert unavailable["free_transfers"] is None and unavailable["bank"] is None
+    with conn:
+        conn.execute("DELETE FROM manager_manual_state WHERE entry_id=99 AND event=4")
+    legacy = repo.manager_planning_state(conn, 99, 4)
+    assert legacy["free_transfers"] == 1 and legacy["free_transfers_source"] == "legacy_manager_state"
+    assert legacy["bank"] == 30 and legacy["bank_source"] == "manager_state"
+    conn.close()
+
+
+def test_price_change_updates_realisable_value_and_affordability_without_new_manual_input(tmp_path):
+    conn = connect_database(tmp_path / "fpl.db")
+    with conn:
+        repo.upsert_positions(conn, [PositionRecord(id=1, singular_name_short="GKP")])
+        repo.upsert_players(
+            conn,
+            [PlayerRecord(id=player_id, web_name=f"P{player_id}", full_name=f"Player {player_id}", element_type=1) for player_id in range(1, 16)]
+            + [PlayerRecord(id=20, web_name="Incoming", full_name="Incoming", element_type=1)],
+        )
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(
+            conn,
+            [PlayerSnapshotRecord(player_id=player_id, captured_at="2026-09-01T00:00:00Z", now_cost=57 if player_id == 1 else 55, raw_json={}) for player_id in range(1, 16)]
+            + [PlayerSnapshotRecord(player_id=20, captured_at="2026-09-01T00:00:00Z", now_cost=57, raw_json={})],
+            run,
+        )
+        repo.upsert_squad_picks(conn, 99, 4, [PickRecord(player_id=player_id, position=player_id, raw_json={}) for player_id in range(1, 16)])
+        for player_id in range(1, 16):
+            repo.insert_manager_acquisition(conn, 99, player_id, 1, 55, source="verified_initial_squad")
+        repo.upsert_manual_manager_state(conn, 99, 4, 3, 0)
+        repo.upsert_manager_selling_prices(conn, 99, 4, {1: 56}, market_prices_at_capture={1: 57})
+    old_value = realisable_squad_value(conn, 99, 4)
+    assert old_value["realisable_selling_value"] == 56 + (14 * 55)
+    with conn:
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(conn, [PlayerSnapshotRecord(player_id=1, captured_at="2026-09-02T00:00:00Z", now_cost=59, raw_json={})], run)
+    new_value = realisable_squad_value(conn, 99, 4)
+    assert new_value["realisable_selling_value"] == 57 + (14 * 55)
+    route = transfer_affordability(conn, 99, 4, [1], [20])
+    assert route["status"] == "AFFORDABLE"
+    assert route["selling_prices"] == {1: 57}
+    assert route["available_funds"] == 0
     conn.close()

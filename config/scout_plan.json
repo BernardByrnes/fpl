@@ -1,8 +1,87 @@
 {
   "_note": "Weekly manual scout input for the Luna brief generator. All fields are optional; a missing or empty file is valid. player ids are FPL element ids. custom_questions maps player id (as string) to a list of question strings.",
-  "gameweek": null,
+  "gameweek": 3,
   "captaincy_candidates": [],
-  "transfer_candidates": [],
-  "extra_players": [],
-  "custom_questions": {}
+  "transfer_candidates": [
+    367,
+    449,
+    115,
+    379,
+    398
+  ],
+  "extra_players": [
+    {
+      "player_id": 329,
+      "tier": 1,
+      "question": "Assess injury severity, expected return, training status, GW3 availability, and likely start probability if fit."
+    },
+    {
+      "player_id": 124,
+      "tier": 1,
+      "question": "Assess tactical role, expected minutes, set-piece involvement, early-return process, and competition for the position."
+    },
+    {
+      "player_id": 368,
+      "tier": 1,
+      "question": "Assess exact tactical position, attacking freedom, set-piece or penalty responsibility, expected minutes, and ceiling impact of a deeper role."
+    },
+    {
+      "player_id": 427,
+      "tier": 1,
+      "question": "Assess right-wing versus central role, expected minutes, penalty responsibility, attacking responsibility, and late-transfer impact."
+    },
+    {
+      "player_id": 346,
+      "tier": 1,
+      "question": "Assess fitness, expected minutes, penalty responsibility, striker competition, substitution pattern, and likelihood of 70-90 minutes."
+    },
+    {
+      "player_id": 8,
+      "tier": 1,
+      "question": "Assess rotation risk, expected minutes, exact role, positional competition, and attacking licence."
+    },
+    {
+      "player_id": 497,
+      "tier": 1,
+      "question": "Assess whether he is a viable playing goalkeeper or primarily a non-playing bench asset."
+    }
+  ],
+  "custom_questions": {
+    "329": [
+      "What is the latest reliable injury, training, and return evidence before GW3?"
+    ],
+    "124": [
+      "Has his role or set-piece responsibility changed, and is early output supported by involvement?"
+    ],
+    "368": [
+      "Is his deeper role materially reducing attacking freedom or expected FPL ceiling?"
+    ],
+    "427": [
+      "Has his role, penalties, or minutes security changed after Manchester United transfer activity?"
+    ],
+    "346": [
+      "Is there reliable evidence that he can sustain a regular 70-90 minute striker role?"
+    ],
+    "8": [
+      "What is the current rotation and role picture after Arsenal's transfer activity?"
+    ],
+    "497": [
+      "Is there current evidence that he is first-choice or a realistic playing option?"
+    ],
+    "367": [
+      "Does the current tactical role and minutes pattern justify retaining him as a serious monitored candidate?"
+    ],
+    "449": [
+      "Is the role secure, and what defensive or attacking licence is he currently showing?"
+    ],
+    "115": [
+      "What is the current role and minutes pathway, and is the move to this league settled enough to assess?"
+    ],
+    "379": [
+      "What is the current availability, role, and minutes security after deadline-day activity?"
+    ],
+    "398": [
+      "What is the current role and expected-minutes picture after deadline-day activity?"
+    ]
+  }
 }

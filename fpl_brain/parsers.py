@@ -13,6 +13,7 @@ from .models import (
     HistoryRow,
     ManagerChipRecord,
     ManagerHistory,
+    ManagerTransferRecord,
     PickRecord,
     PicksRecord,
     PlayerGameweekRecord,
@@ -559,6 +560,34 @@ def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweek
     return records
 
 
+def parse_element_history_past(payload: dict[str, Any], player_id: int) -> list["PlayerSeasonHistoryRecord"]:
+    """Parse official prior-season rows exactly as the endpoint provides them."""
+
+    from .models import PlayerSeasonHistoryRecord  # local import avoids module cycles
+
+    records: list[PlayerSeasonHistoryRecord] = []
+    for value in _items(payload, "history_past"):
+        season_name = _string(value, "season_name")
+        if season_name is None:
+            continue
+        records.append(
+            PlayerSeasonHistoryRecord(
+                player_id=int(player_id),
+                season_name=str(season_name),
+                minutes=_integer(value, "minutes"),
+                starts=_integer(value, "starts"),
+                total_points=_integer(value, "total_points"),
+                goals_scored=_integer(value, "goals_scored"),
+                assists=_integer(value, "assists"),
+                clean_sheets=_integer(value, "clean_sheets"),
+                bonus=_integer(value, "bonus"),
+                saves=_integer(value, "saves"),
+                raw_json=dict(value),
+            )
+        )
+    return records
+
+
 def parse_entry(payload: dict[str, Any]) -> EntryRecord | None:
     entry_id = _integer(payload, "id")
     if entry_id is None:
@@ -609,6 +638,40 @@ def parse_entry_history(payload: dict[str, Any]) -> ManagerHistory:
         if name is not None and event is not None:
             chips.append(ManagerChipRecord(name=name, event=event, time=_string(value, "time")))
     return ManagerHistory(current=current, past=past, chips=chips)
+
+
+def parse_entry_transfers(payload: list[Any]) -> list[ManagerTransferRecord]:
+    """Parse exact public transfer-history rows without reconstructing costs."""
+
+    if not isinstance(payload, list):
+        raise ValueError("Transfer history response must be a list")
+    records: list[ManagerTransferRecord] = []
+    for value in payload:
+        if not isinstance(value, dict):
+            raise ValueError("Transfer history rows must be objects")
+        required = {
+            "entry_id": _integer(value, "entry"),
+            "element_in": _integer(value, "element_in"),
+            "element_out": _integer(value, "element_out"),
+            "event": _integer(value, "event"),
+            "element_in_cost": _integer(value, "element_in_cost"),
+            "element_out_cost": _integer(value, "element_out_cost"),
+        }
+        if any(item is None for item in required.values()):
+            raise ValueError("Transfer history row is missing an exact required field")
+        records.append(
+            ManagerTransferRecord(
+                entry_id=int(required["entry_id"]),
+                element_in=int(required["element_in"]),
+                element_out=int(required["element_out"]),
+                event=int(required["event"]),
+                time=_string(value, "time"),
+                element_in_cost=int(required["element_in_cost"]),
+                element_out_cost=int(required["element_out_cost"]),
+                raw_json=dict(value),
+            )
+        )
+    return records
 
 
 def parse_entry_picks(payload: dict[str, Any]) -> PicksRecord:

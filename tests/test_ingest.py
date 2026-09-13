@@ -8,7 +8,7 @@ import pytest
 import fpl_brain.ingest as ingest
 from fpl_brain.config import DEFAULT_CONFIG
 from fpl_brain.database import connect_database
-from fpl_brain.models import PlayerRecord, TeamRecord
+from fpl_brain.models import PickRecord, PlayerRecord, PlayerSnapshotRecord, TeamRecord
 from fpl_brain.parsers import BootstrapValidationError
 
 
@@ -153,3 +153,47 @@ def test_unexpected_fetch_failure_preserves_primary_error_when_finalisation_fail
             ingest.run_fetch(config, summaries="all")
     assert "Fetch-run failure finalisation failed" in caplog.text
     assert any("fetch-run bookkeeping failure" in note for note in getattr(raised.value, "__notes__", []))
+
+
+def test_manager_sync_persists_transfer_history_and_reconciles_initial_acquisitions(monkeypatch, tmp_path):
+    config = _config(tmp_path)
+    config["fpl_entry_id"] = 99
+    conn = connect_database(config["paths"]["database"])
+    from fpl_brain import repositories as repo
+
+    with conn:
+        repo.upsert_players(
+            conn,
+            [PlayerRecord(id=player_id, web_name=f"P{player_id}", full_name=f"Player {player_id}") for player_id in range(1, 16)],
+        )
+        run = repo.create_fetch_run(conn, "fetch_fpl")
+        repo.insert_snapshots(
+            conn,
+            [PlayerSnapshotRecord(player_id=player_id, captured_at="2026-08-20T00:00:00Z", now_cost=55, cost_change_start=0, raw_json={}) for player_id in range(1, 16)],
+            run,
+        )
+        repo.upsert_squad_picks(conn, 99, 1, [PickRecord(player_id=player_id, position=player_id, raw_json={}) for player_id in range(1, 16)])
+    conn.close()
+
+    class ManagerClient(FakeClient):
+        def get_entry(self, entry_id):
+            return {"id": entry_id, "player_first_name": "Test", "player_last_name": "Manager", "name": "Team", "current_event": 2, "last_deadline_bank": 0, "last_deadline_value": 825, "last_deadline_total_transfers": 0}
+
+        def get_entry_history(self, entry_id):
+            return {"current": [{"event": 1, "bank": 0, "value": 825, "total_transfers": 0, "event_transfers": 0}], "past": [], "chips": []}
+
+        def get_entry_picks(self, entry_id, event):
+            return None
+
+        def get_entry_transfers(self, entry_id):
+            return []
+
+    monkeypatch.setattr(ingest, "FplClient", ManagerClient)
+    result = ingest.run_manager_sync(config, event=2)
+    assert result["status"] == "success"
+    assert result["acquisitions"]["status"] == "success"
+    conn = connect_database(config["paths"]["database"])
+    assert conn.execute("SELECT COUNT(*) FROM manager_player_acquisitions WHERE entry_id=99 AND sold_event IS NULL").fetchone()[0] == 15
+    raw = conn.execute("SELECT raw_json FROM manager_state WHERE entry_id=99 ORDER BY id DESC LIMIT 1").fetchone()[0]
+    assert '"transfers":[]' in raw
+    conn.close()
