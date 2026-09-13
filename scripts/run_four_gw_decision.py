@@ -71,6 +71,33 @@ def _suppress_transfer_recommendation(decision: dict, *, reason: str, extra: dic
     return suppressed
 
 
+def _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy) -> list[int]:
+    """Role-relevant player ids for the FINAL preferred route, sorted.
+
+    Exactly: every player transferred IN, every player transferred OUT, and the
+    preferred route's captain and vice.  Deliberately NOT the certified squad
+    (R4B.2c integration correction 1).  Extracted so the caller cannot
+    accidentally derive it from a pre-escalation route: the only input that names
+    the route is ``preferred_key``.
+    """
+
+    ids: set[int] = set()
+    for event_transfers in (transfers_by_route.get(preferred_key) or {}).values():
+        for move in event_transfers:
+            ids.add(int(move["in"]))
+            ids.add(int(move["out"]))
+    if lineup_policy is not None:
+        for attribute in ("captain_id", "vice_captain_id"):
+            value = (
+                getattr(lineup_policy, attribute, None)
+                if not isinstance(lineup_policy, dict)
+                else lineup_policy.get(attribute)
+            )
+            if value is not None:
+                ids.add(int(value))
+    return sorted(ids)
+
+
 SEED = 20260911
 #: Stage-1 (screening) draw count.  This is the count ACTUALLY used to build the
 #: shared per-event world matrices for every event, and it is what the artifact
@@ -531,11 +558,48 @@ def main(argv=None) -> int:
             stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
             cache_dir=Path(args.cache_dir),
         )
-        # From here on the DECISION is taken at the higher-fidelity budget: `result`
-        # is the refined finalist-only result, and Stage 1 is reported separately.
-        # This keeps the documented `result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)`
-        # consumption path below exactly as the confidence contract requires.
-        result = refinement["refined"]
+        stage2_result = refinement["refined"]
+
+        # --- R4B.2b REPAIR: stability FIRST, so the final ranking is known ------
+        # The gate may run the ONE bounded escalation (the next supported search
+        # breadth, at the Stage-2 draw budget, in the SAME worlds).  Its widened
+        # result is captured through a sink because the stability REPORT is
+        # serialized into the artifact and a world matrix must never be.  The
+        # leader-change comparison is always Stage-2 versus Stage-1: the gate asks
+        # whether widening the search changes the answer the narrow budget gave.
+        leader_change = fr.analyze_leader_change(stage1_result, stage2_result)
+        escalated_sink: dict = {}
+        t_stability = time.time()
+        stability = fr.assess_search_stability(
+            refined_result=stage2_result,
+            leader_change=leader_change,
+            canonical_paired=refinement["canonical_paired_near_tie"],
+            escalation=_escalation_runner(
+                universe=universe, initial_state=source_state, scenario=scenario,
+                player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
+                stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
+                prebuilt_worlds=refinement.get("prebuilt_worlds"),
+                finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
+            ),
+            config=fr.StabilityGateConfig(current_beam=int(args.beam)),
+            escalated_result_sink=escalated_sink,
+        )
+        stability_seconds = time.time() - t_stability
+        escalated_result = escalated_sink.get("result")
+
+        # §4: after an escalation the FINAL ranking is the widened-search ranking,
+        # evaluated on the same Stage-2 worlds.  Without an escalation it is the
+        # Stage-2 finalist ranking.
+        final = fr.final_ranking_after_escalation(
+            stage2_result=stage2_result, escalated_result=escalated_result,
+        )
+        # From here on the DECISION is taken at the final supported evaluation
+        # budget: `result` is that final result (widened when the escalation ran),
+        # and both Stage 1 and the Stage-2-only ranking are reported separately.
+        # This also keeps the documented
+        # `result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)` consumption path exactly
+        # as the confidence contract requires.
+        result = final["result"]
 
         transfers_by_route = {}
         for route_id, record in (result.get("routes") or {}).items():
@@ -575,48 +639,35 @@ def main(argv=None) -> int:
         )
         source_conn.close()
 
-        # --- R4B.2b: the ONE canonical paired record, aligned to the DECISION ---
-        # §5 requires route_a to be the FINAL preferred leader.  The decision layer
-        # is authoritative for which route that is (it may in principle exclude a
-        # route the optimizer ranked first), so the record is published against the
-        # route the DECISION prefers, with the next-ranked refined route as the
-        # comparator.  `route_b` is never an arbitrary pick.
-        optimizer_leader = refinement["final_ranking"]["preferred_route_id"]
+        # --- R4B.2b REPAIR §5: canonical paired record from the FINAL ranking ---
+        # route_a is the FINAL preferred route and route_b is the ACTUAL next-ranked
+        # route in the FINAL (post-escalation) ranking — not the old Stage-2
+        # finalist runner-up.  The decision layer is authoritative for which route
+        # is preferred (it may in principle exclude a route the optimizer ranked
+        # first), so it is passed in explicitly and the comparator follows from the
+        # FINAL ranking.
         decision_preferred = (decision.get("transfer_recommendation") or {}).get("preferred_route_id")
-        final_leader = decision_preferred or optimizer_leader
-        comparator = fr.runner_up_for(result, final_leader)
-        canonical = (
-            None if final_leader is None or comparator is None
-            else fr.canonical_paired_record(
-                result, leader_route_id=final_leader, runner_up_route_id=comparator)
+        final = fr.final_ranking_after_escalation(
+            stage2_result=stage2_result,
+            escalated_result=escalated_result,
+            preferred_route_id=decision_preferred or final["final_ranking"]["preferred_route_id"],
         )
-        refinement["optimizer_ranked_leader_route_id"] = optimizer_leader
+        final_leader = final["final_ranking"]["preferred_route_id"]
+        comparator = final["final_ranking"]["runner_up_route_id"]
+        canonical = final["canonical_paired_near_tie"]
+        refinement["stage2_finalist_ranking"] = {
+            "preferred_route_id": final["stage2_leader_route_id"],
+            "runner_up_route_id": None,
+        }
+        refinement["optimizer_ranked_leader_route_id"] = final["stage2_leader_route_id"]
+        refinement["final_rank_1_route_id"] = final["final_rank_1_route_id"]
+        refinement["ranking_source"] = final["ranking_source"]
+        refinement["comparator_source"] = final["comparator_source"]
+        refinement["canonical_alignment"] = final["canonical_alignment"]
         refinement["canonical_paired_near_tie"] = canonical
-        refinement["canonical_alignment"] = (
-            "OPTIMIZER_RANK_1" if final_leader == optimizer_leader else "ALIGNED_TO_DECISION_PREFERRED"
-        )
-        refinement["final_ranking"] = {"preferred_route_id": final_leader, "runner_up_route_id": comparator}
-        refinement["simulation_fidelity"]["final_ranking"] = dict(refinement["final_ranking"])
+        refinement["final_ranking"] = dict(final["final_ranking"])
+        refinement["simulation_fidelity"]["final_ranking"] = dict(final["final_ranking"])
         refinement["simulation_fidelity"]["canonical_paired_near_tie"] = canonical
-        result["canonical_paired_near_tie"] = canonical
-
-        # --- R4B.2b: leader change + ONE bounded search-stability escalation ----
-        leader_change = fr.analyze_leader_change(stage1_result, result)
-        t_stability = time.time()
-        stability = fr.assess_search_stability(
-            refined_result=result,
-            leader_change=leader_change,
-            canonical_paired=canonical,
-            escalation=_escalation_runner(
-                universe=universe, initial_state=source_state, scenario=scenario,
-                player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
-                stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
-                prebuilt_worlds=refinement.get("prebuilt_worlds"),
-                finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
-            ),
-            config=fr.StabilityGateConfig(current_beam=int(args.beam)),
-        )
-        stability_seconds = time.time() - t_stability
         refinement["leader_change"] = leader_change
         refinement["stability"] = stability
         refinement["simulation_fidelity"]["leader_change"] = leader_change
@@ -626,14 +677,22 @@ def main(argv=None) -> int:
             "stage2_refinement_seconds": round(t_refine - t0 - search_seconds, 3),
             "stability_seconds": round(stability_seconds, 3),
         }
+        result["canonical_paired_near_tie"] = canonical
         print(
             f"refinement: finalists={len(refinement['finalist_selection']['finalist_route_ids'])} "
             f"stage2_draws={int(args.stage2_draws)} prefix="
             f"{(refinement.get('prefix_invariance') or {}).get('status')} "
             f"leader_change={leader_change['changed']}/{leader_change['accepted']} "
             f"stability={stability['state']} escalation={stability['escalation_used']} "
+            f"ranking_source={final['ranking_source']} "
             f"({stability_seconds:.1f}s)"
         )
+        if escalated_result is not None:
+            print(
+                f"  escalation to beam {stability['escalation_beam']} re-ranked "
+                f"{len(result.get('routes') or {})} routes on the Stage-2 worlds; "
+                f"final leader {final_leader} (Stage-2 leader was {final['stage2_leader_route_id']})"
+            )
         if canonical is None:
             print(
                 f"confidence: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED}: no canonical paired record for "
@@ -646,28 +705,15 @@ def main(argv=None) -> int:
         # Paired CRN near-tie is CONSUMED from the route comparison when the result
         # exposes it; otherwise it is reported unavailable and the state cannot claim
         # a near tie.
-        # --- ROLE-RELEVANT PLAYER SET (R4B.2c integration correction 1) ---------
-        # NOT the certified squad.  After the preferred route is known, the players
-        # whose role drives the recommendation's thesis are: everyone transferred IN,
-        # everyone transferred OUT, and the preferred route's captain and vice.
+        # --- ROLE-RELEVANT PLAYER SET (R4B.2c integration correction 1, REPAIR §6) --
+        # NOT the certified squad.  The players whose role drives the
+        # recommendation's thesis are: everyone transferred IN, everyone transferred
+        # OUT, and the armband, **of the FINAL preferred route** — so a widened
+        # search that changes the preferred route also moves the role-relevant set.
         # A transfer-IN player is usually NOT in the pre-transfer certified squad and
         # must nevertheless be evaluated.
-        role_relevant_ids: set[int] = set()
-        preferred_key = preferred_route_id or lineup_route_id
-        for event_transfers in (transfers_by_route.get(preferred_key) or {}).values():
-            for move in event_transfers:
-                role_relevant_ids.add(int(move["in"]))
-                role_relevant_ids.add(int(move["out"]))
-        if lineup_policy is not None:
-            for attribute in ("captain_id", "vice_captain_id"):
-                value = (
-                    getattr(lineup_policy, attribute, None)
-                    if not isinstance(lineup_policy, dict)
-                    else lineup_policy.get(attribute)
-                )
-                if value is not None:
-                    role_relevant_ids.add(int(value))
-        role_relevant_players = sorted(role_relevant_ids)
+        preferred_key = final_leader or preferred_route_id or lineup_route_id
+        role_relevant_players = _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy)
 
         # --- CANONICAL PAIRED CRN DIAGNOSTIC (integration correction 2) --------
         # Exactly one canonical record: the FINAL preferred leader versus its

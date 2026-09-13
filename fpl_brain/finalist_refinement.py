@@ -467,6 +467,60 @@ def analyze_leader_change(stage1_result: Mapping[str, Any], refined_result: Mapp
     return report
 
 
+def final_ranking_after_escalation(
+    *,
+    stage2_result: Mapping[str, Any],
+    escalated_result: Mapping[str, Any] | None = None,
+    preferred_route_id: str | None = None,
+    paired_key: str = PAIRED_SOURCE_KEY,
+) -> dict[str, Any]:
+    """The FINAL ranking, and its canonical paired record, from the FINAL result.
+
+    When the single escalation ran, the widened-search result IS the final
+    ranking: §4 requires the numerically preferred route at the final supported
+    evaluation budget to be the final preferred route, and §5 requires
+    ``canonical_paired_near_tie.route_b`` to be the actual next-ranked route in
+    that FINAL ranking — never the old Stage-2 finalist runner-up.
+
+    ``preferred_route_id`` lets the caller pass the route the DECISION layer
+    prefers, so ``route_a`` is the final preferred route even if the decision
+    layer were to exclude the numerically first record.  This function re-ranks
+    nothing and scores nothing: it only names the final leader/comparator and
+    reads the paired CRN record that already exists for that pair.
+    """
+
+    escalated = escalated_result is not None
+    result = escalated_result if escalated else stage2_result
+    stage2_ranked = ranked_route_ids(stage2_result)
+    final_ranked = ranked_route_ids(result)
+    stage2_leader = stage2_ranked[0] if stage2_ranked else None
+    final_rank1 = final_ranked[0] if final_ranked else None
+    leader = preferred_route_id or final_rank1
+    comparator = runner_up_for(result, leader)
+    canonical = (
+        None if leader is None or comparator is None
+        else canonical_paired_record(result, leader_route_id=leader, runner_up_route_id=comparator,
+                                     paired_key=paired_key)
+    )
+    return {
+        "ranking_source": "ESCALATED_FINAL_RANKING" if escalated else "STAGE2_FINALIST_RANKING",
+        "escalated": bool(escalated),
+        "result": result,
+        "stage2_leader_route_id": stage2_leader,
+        "final_rank_1_route_id": final_rank1,
+        "final_ranking": {"preferred_route_id": leader, "runner_up_route_id": comparator},
+        "canonical_paired_near_tie": canonical,
+        "canonical_alignment": (
+            "DECISION_PREFERRED_IS_RANK_1" if leader == final_rank1
+            else "ALIGNED_TO_DECISION_PREFERRED"
+        ),
+        "comparator_source": (
+            "FINAL_WIDENED_RANKING" if escalated else "STAGE2_FINALIST_RANKING"
+        ),
+        "diagnostic": None if canonical is not None else DIAG_PAIRED_DIAGNOSTIC_UNAVAILABLE,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Search-stability gate (at most ONE bounded escalation)
 # ---------------------------------------------------------------------------
@@ -495,6 +549,7 @@ def assess_search_stability(
     escalation_beam_override: int | None = None,
     config: StabilityGateConfig | None = None,
     paired_key: str = PAIRED_SOURCE_KEY,
+    escalated_result_sink: dict | None = None,
 ) -> dict[str, Any]:
     """Decide ``SEARCH_BUDGET_STABLE`` / ``SEARCH_NOT_STABLE_AT_CURRENT_BUDGET``.
 
@@ -504,7 +559,16 @@ def assess_search_stability(
     run's result; the caller is responsible for forcing the refined finalists in
     so the comparison is well defined.  A broader search never changes the
     objective, and nothing here re-ranks routes.
+
+    ``escalated_result_sink`` is an optional out-parameter: when supplied, the gate
+    sets ``sink["result"]`` to the escalated run's result (or ``None`` when no
+    escalation ran).  It is the ONLY way the caller can obtain the widened result
+    without putting a world matrix into the serialized stability report.  The key
+    is always written, so a caller can never read a stale value.
     """
+
+    if escalated_result_sink is not None:
+        escalated_result_sink["result"] = None
 
     settings = config or StabilityGateConfig()
     ranked = ranked_route_ids(refined_result)
@@ -598,6 +662,8 @@ def assess_search_stability(
         return report
 
     report["breadth_check_performed"] = True
+    if escalated_result_sink is not None:
+        escalated_result_sink["result"] = escalated
     escalated_ranked = ranked_route_ids(escalated)
     escalated_leader = escalated_ranked[0] if escalated_ranked else None
     escalated_signature = (
@@ -969,6 +1035,7 @@ __all__ = [
     "canonical_route_signature",
     "compare_world_prefix",
     "decision_rank_key",
+    "final_ranking_after_escalation",
     "finalist_partials",
     "near_tie_verdict",
     "paired_between",
