@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Sequence
 
-from . import analytics, repositories as repo
+from . import analytics, history_completeness as hc, repositories as repo
 from .utils import parse_utc, utc_now
 
 MINUTES_MODEL_VERSION = "minutes_v1.6.0"
@@ -432,6 +432,11 @@ def project_player_fixture(
     classified_rows = classify_evidence_rows(
         evidence_rows, snapshot_history=snapshot_history, config=config
     )
+    placeholder_rows = [row for row in classified_rows if row.get("history_placeholder")]
+    if placeholder_rows:
+        # Report rather than absorb: a completed fixture whose row holds no
+        # official observation must not look like a quiet non-selection.
+        flags.append(hc.DIAG_COMPLETED_EVENT_PLACEHOLDER_ROW)
     observation_rows = [
         row for row in classified_rows if row["evidence_class"] in _START_OBSERVATION_CLASSES
     ]
@@ -718,6 +723,15 @@ def project_player_fixture(
             "prior_start_rate": _round(prior_start),
         },
         "evidence_classes": evidence_class_counts,
+        "history_completeness": {
+            "placeholder_rows": len(placeholder_rows),
+            "detail": (
+                "no completed-fixture placeholder rows"
+                if not placeholder_rows
+                else f"{hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE}: completed fixture(s) "
+                     "carry no official observation and are excluded from start evidence"
+            ),
+        },
         "role_evidence": {
             "prior_role_strength": prior_role_strength,
             "prior_role_discontinuity": role_discontinuity,
@@ -964,6 +978,19 @@ def classify_evidence_rows(
         row["availability_status_at_event"] = status
         row["availability_chance_at_event"] = chance
         row["availability_basis"] = basis
+
+        if row.get("history_placeholder"):
+            # The fixture is complete but the row carries no official
+            # observation.  That is NOT a did-not-play -- a real DNP is all
+            # explicit zeros -- so it must not enter the start-rate denominator
+            # as negative selection evidence.  Keep the class UNKNOWN and say why,
+            # so the gap is visible rather than silently absorbed.
+            row["evidence_class"] = EVIDENCE_UNKNOWN
+            row["evidence_reason"] = (
+                "completed fixture carries a placeholder row with no official observation"
+            )
+            out.append(row)
+            continue
 
         if starts is None or minutes is None:
             row["evidence_class"] = EVIDENCE_UNKNOWN

@@ -36,7 +36,7 @@ import sqlite3
 from dataclasses import dataclass, fields
 from typing import Any, Iterable, Mapping
 
-from . import analytics, repositories as repo
+from . import analytics, history_completeness as hc, repositories as repo
 from .utils import parse_utc, utc_now
 
 PLAYER_RATE_MODEL_VERSION = "player_rates_v1.0.0"
@@ -308,6 +308,11 @@ def current_rate_evidence(
     the Minutes model) with minutes > 0 contribute exposure.  A DGW contributes
     both fixtures independently.  A played row with missing xG/xA is excluded
     and flagged, never silently counted as zero.
+
+    A completed-fixture row that carries no official observation at all is a
+    stale schedule placeholder.  It contributes no exposure (it holds none) but
+    it is REPORTED, never silently dropped: silence here would shrink the fitted
+    exposure while the bundle still claimed to be certified history.
     """
 
     field_name = COMPONENT_HISTORY_FIELD[component]
@@ -316,8 +321,14 @@ def current_rate_evidence(
     total = 0.0
     played_rows = 0
     missing = 0
+    placeholders: list[dict[str, Any]] = []
     fixtures: list[int] = []
     for row in rows:
+        if row.get("history_placeholder"):
+            placeholders.append(
+                {"event": row.get("event"), "fixture_id": row.get("fixture_id")}
+            )
+            continue
         row_minutes = row.get("minutes")
         if row_minutes is None or float(row_minutes) <= 0:
             continue
@@ -332,6 +343,8 @@ def current_rate_evidence(
     flags: list[str] = []
     if missing:
         flags.append("CURRENT_XG_DATA_GAP")
+    if placeholders:
+        flags.append(hc.DIAG_COMPLETED_EVENT_PLACEHOLDER_ROW)
     rate = (total / minutes * 90.0) if minutes > 0 else None
     return {
         "current_minutes": minutes,
@@ -340,6 +353,9 @@ def current_rate_evidence(
         "played_rows": played_rows,
         "fixtures": fixtures,
         "missing_xg_rows": missing,
+        "placeholder_rows": sorted(
+            placeholders, key=lambda item: (item["event"] or 0, item["fixture_id"] or 0)
+        ),
         "flags": flags,
     }
 
@@ -486,6 +502,13 @@ def _project_component(
         flags.append("CORRUPT_HISTORICAL_FIELD")
     if prior.get("prior_source") in {"position_pooled", "league_pooled"}:
         data_gaps.append("no same-player historical xG prior; pooled prior used")
+    if evidence["placeholder_rows"]:
+        # Report the gap instead of letting the exposure shrink in silence.
+        data_gaps.append(
+            f"{hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE}: "
+            f"{len(evidence['placeholder_rows'])} completed-fixture row(s) carry no official "
+            "observation and contribute no exposure"
+        )
 
     return {
         "player_id": int(player_id),

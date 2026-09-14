@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping
 
 from .planning import PlanningContext
 from .utils import utc_now
+from . import repositories as repo
 
 BASELINE_MODEL_FAMILY = "baseline"
 MINUTES_MODEL_FAMILY = "minutes_v1"
@@ -69,6 +70,7 @@ SOURCE_SNAPSHOT_FILES = (
     "fpl_brain/analytics.py",
     "fpl_brain/calibration.py",
     "fpl_brain/database.py",
+    "fpl_brain/history_completeness.py",
     "fpl_brain/joint_minutes.py",
     "fpl_brain/minutes_coherence.py",
     "fpl_brain/minutes_model.py",
@@ -641,7 +643,16 @@ def completed_rows_as_of(
     if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
-    return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(sql, tuple(params)).fetchall():
+        record = dict(row)
+        # A completed-fixture row that carries no official observation is a stale
+        # schedule placeholder, NOT a did-not-play: a real DNP is all explicit
+        # zeros.  Consumers must report the gap rather than read it as absence of
+        # the player.  Flagged once here so every consumer shares one definition.
+        record["history_placeholder"] = repo.row_is_scheduled_placeholder(record)
+        out.append(record)
+    return out
 
 
 def snapshot_status_evidence(conn: sqlite3.Connection, player_id: int, cutoff: str) -> dict[str, Any]:

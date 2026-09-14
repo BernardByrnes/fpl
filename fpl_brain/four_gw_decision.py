@@ -446,6 +446,19 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
         raise DecisionCertificationRequired(
             "decision_search_permitted is not true: " + "; ".join(str(r) for r in reasons)
         )
+    # Defence in depth.  A certification minted after the historical-input repair
+    # carries the completeness audit itself; when that audit says the required
+    # completed-event history is not there, the artifact is not actionable even if
+    # the permission flag were somehow stale.  An artifact without the block is
+    # unaffected, so pre-repair certifications stay readable.
+    completeness = payload.get("history_completeness")
+    if isinstance(completeness, Mapping) and completeness.get("complete") is not True:
+        from . import history_completeness as hc
+
+        raise DecisionCertificationRequired(
+            f"{hc.blocking_reason_token(completeness)}: the certification's completed-event history "
+            f"audit is not complete ({completeness.get('reasons')})"
+        )
     if payload.get("route_search_executed") is not False or payload.get(
         "transfer_execution_performed"
     ) is not False:

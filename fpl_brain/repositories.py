@@ -415,6 +415,26 @@ def _gameweek_has_performance(values: dict[str, Any]) -> bool:
     return True
 
 
+# Public alias: completeness/provenance code must read the SAME column set the
+# upsert path uses, so the two definitions cannot drift apart.
+GAMEWEEK_PERFORMANCE_COLUMNS = _GAMEWEEK_PERFORMANCE_COLUMNS
+
+
+def row_is_scheduled_placeholder(values: Mapping[str, Any]) -> bool:
+    """True when a player-fixture row carries no official observation at all.
+
+    Measured against the certified R5 source snapshot: a REAL official row
+    populates every performance column, because a genuine did-not-play is all
+    explicit zeros (``minutes=0``, ``starts=0``, ``total_points=0`` ...,
+    ``expected_goals=0.0``).  A schedule placeholder instead has ``minutes``
+    0/NULL and every remaining performance column NULL.  "No performance
+    evidence" is therefore exactly the placeholder signature, and it is never a
+    claim that the player did not play.
+    """
+
+    return not _gameweek_has_performance(dict(values))
+
+
 def _gameweek_record_values(record: PlayerGameweekRecord, fixture_id: int, timestamp: str) -> dict[str, Any]:
     values = {column: getattr(record, column) for column in _GAMEWEEK_DATA_COLUMNS if column != "updated_at"}
     values.update({"player_id": record.player_id, "event": record.event, "fixture_id": fixture_id, "updated_at": timestamp})

@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -32,6 +32,7 @@ from fpl_brain import (
     execution,
     execution_snapshot,
     four_gw_decision as fg,
+    history_completeness as hc,
 )
 from fpl_brain.config import config_path, load_config
 from fpl_brain.database import connect_database, connect_readonly_database
@@ -90,6 +91,7 @@ def decide_search_permission(
     horizon_status: Any,
     data_snapshot_sha256: Any,
     snapshot_error: str | None = None,
+    history_completeness: Mapping[str, Any] | None = None,
 ) -> tuple[bool, list[str]]:
     """Authorisation is COMPUTED from the conditions, never asserted.
 
@@ -97,6 +99,13 @@ def decide_search_permission(
     inline form read an undefined local (``horizon_status``) and was only ever
     checked by a source-text assertion, so the defect survived the accepted suite
     while making the certification artifact impossible to write.
+
+    ``history_completeness`` is the audit from ``history_completeness.audit_history_completeness``
+    evaluated against the SAME immutable snapshot.  It is optional so the rule
+    stays callable without a database, but when it is supplied an incomplete
+    history WITHHOLDS permission: a bundle may never be certified as fresh while
+    an officially completed event's required player history is missing.  The
+    reason is the canonical token so an operator can grep the artifact.
     """
 
     reasons: list[str] = []
@@ -110,6 +119,10 @@ def decide_search_permission(
         reasons.append("no data snapshot identity")
     if snapshot_error:
         reasons.append(str(snapshot_error))
+    if history_completeness is not None and not history_completeness.get("complete"):
+        blocker = hc.blocking_reason_token(history_completeness)
+        detail = history_completeness.get("reasons") or []
+        reasons.append(blocker if not detail else f"{blocker} ({', '.join(str(item) for item in detail)})")
     return (not reasons), reasons
 
 
@@ -435,16 +448,35 @@ def main(argv: list[str] | None = None) -> int:
         execution_snapshot.assert_snapshot_unchanged(snapshot)
     except execution_snapshot.SnapshotError as failure:
         snapshot_error = str(failure)
+    # Required completed-event history, audited on the SAME immutable snapshot the
+    # predictions were generated from.  An unevaluable invariant WITHHOLDS rather
+    # than crashes, and an incomplete one carries the canonical blocker token.
+    try:
+        history_audit: dict[str, Any] = hc.audit_history_completeness(
+            source_conn, planning_event=int(events[0]), cutoff=effective_cutoff
+        )
+    except Exception as failure:  # noqa: BLE001 - withholding is the contract
+        history_audit = {
+            "schema": hc.HISTORY_COMPLETENESS_SCHEMA,
+            "planning_event": int(events[0]),
+            "cutoff": str(effective_cutoff),
+            "complete": False,
+            "blocker": hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE,
+            "reasons": [f"UNRESOLVED: {type(failure).__name__}: {failure}"],
+            "detail": "the history-completeness audit could not be evaluated",
+        }
     permitted, permit_reasons = decide_search_permission(
         temporal_status=artifact["temporal_status"],
         dependency_validation=artifact["dependency_validation"],
         horizon_status=horizon_status,
         data_snapshot_sha256=artifact["data_snapshot_sha256"],
         snapshot_error=snapshot_error,
+        history_completeness=history_audit,
     )
     artifact["decision_search_permitted"] = permitted
     artifact["decision_search_permitted_reasons"] = permit_reasons
     artifact["decision_search_horizon_status"] = horizon_status
+    artifact["history_completeness"] = history_audit
     artifact_path = OUT_DIR / "certification_artifact.json"
     artifact_path.write_text(
         json.dumps(artifact, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"
