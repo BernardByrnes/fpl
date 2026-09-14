@@ -88,9 +88,31 @@ class CertifiedBundle:
     def bundle_identity(self) -> str:
         """Deterministic identity of this bundle (exact ids + identities)."""
 
-        return "sha256:" + hashlib.sha256(
-            json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"), default=str).encode()
-        ).hexdigest()
+        return canonical_bundle_identity(self.as_dict())
+
+
+def canonical_bundle_identity(bundle: Mapping[str, Any]) -> str:
+    """Identity of a bundle in its persisted ``as_dict`` shape.
+
+    ONE algorithm, shared by the producer (``CertifiedBundle.bundle_identity``) and
+    by any consumer that must recompute an identity from stored bytes, so a
+    declared ``certified_bundle_identity`` label can be checked against the
+    ``certified_bundles`` a decision actually consumes.  Keep in step with
+    ``CertifiedBundle.as_dict``: those seven fields ARE the identity.
+    """
+
+    canonical = {
+        "event": int(bundle["event"]),
+        "cutoff": bundle.get("cutoff"),
+        "runs": {key: int(value) for key, value in (bundle.get("runs") or {}).items()},
+        "model_versions": dict(bundle.get("model_versions") or {}),
+        "code_snapshot_sha256": bundle.get("code_snapshot_sha256"),
+        "data_snapshot_sha256": bundle.get("data_snapshot_sha256"),
+        "planning_context_hash": bundle.get("planning_context_hash"),
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
 
 
 def _run(conn: sqlite3.Connection, run_id: int) -> Mapping[str, Any] | None:

@@ -357,6 +357,25 @@ def _base_world_for_bundles(conn):
         )
 
 
+def _bound_bundle(event: int = 5) -> dict:
+    """A canonical bundle in its persisted as_dict shape.
+
+    The declared ``certified_bundle_identity`` must BIND the bundles a decision
+    consumes, so fixtures build the label with the production algorithm.
+    """
+
+    return {
+        "event": event,
+        "cutoff": "2026-09-12T19:20:00Z",
+        "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
+                 "xpts_v1": 4, "monte_carlo_v1": 5},
+        "model_versions": {},
+        "code_snapshot_sha256": "codehash",
+        "data_snapshot_sha256": "d" * 64,
+        "planning_context_hash": None,
+    }
+
+
 def _artifact(**overrides):
     payload = {
         "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
@@ -373,13 +392,9 @@ def _artifact(**overrides):
         # the audit and declare the gated entry point among its covered code.
         "history_completeness": {"complete": True, "blocker": None, "reasons": []},
         "certification_wiring": fg.certification_wiring_identity(),
-        "certified_bundles": {
-            "5": {
-                "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
-                         "xpts_v1": 4, "monte_carlo_v1": 5},
-                "data_snapshot_sha256": "d" * 64,
-            }
-        },
+        "events": [5],
+        "certified_bundles": {"5": _bound_bundle()},
+        "certified_bundle_identity": {"5": cb.canonical_bundle_identity(_bound_bundle())},
     }
     payload.update(overrides)
     return payload
@@ -418,6 +433,10 @@ def test_i_decision_runner_refuses_a_mismatched_certified_bundle(tmp_path):
     path.write_text(json.dumps(_artifact()), encoding="utf-8")
     bad = json.loads(path.read_text(encoding="utf-8"))
     bad["certified_bundles"]["5"]["runs"]["xpts_v1"] = 7
+    # Keep the artifact internally BOUND (the declared identity must describe the
+    # bundles consumed), so the failure exercised here is the downstream dependency
+    # incoherence rather than the identity-binding check.
+    bad["certified_bundle_identity"]["5"] = cb.canonical_bundle_identity(bad["certified_bundles"]["5"])
     path.write_text(json.dumps(bad), encoding="utf-8")
     artifact = fg.load_certification_artifact(path)
     with pytest.raises(cb.BundleIncoherent) as caught:

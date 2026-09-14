@@ -15,6 +15,7 @@ import pytest
 
 from fpl_brain import causality as cx
 from fpl_brain import execution_snapshot as es
+from fpl_brain import certified_bundle as cb
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import repositories as repo
 from fpl_brain.database import connect_database
@@ -323,6 +324,25 @@ def test_h_production_with_a_snapshot_is_accepted(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _bound_bundle(event: int = 5) -> dict:
+    """A canonical bundle in its persisted as_dict shape.
+
+    The declared ``certified_bundle_identity`` must BIND the bundles a decision
+    consumes, so fixtures build the label with the production algorithm.
+    """
+
+    return {
+        "event": event,
+        "cutoff": "2026-09-12T19:20:00Z",
+        "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
+                 "xpts_v1": 4, "monte_carlo_v1": 5},
+        "model_versions": {},
+        "code_snapshot_sha256": "codehash",
+        "data_snapshot_sha256": "d" * 64,
+        "planning_context_hash": None,
+    }
+
+
 def _artifact(**overrides):
     payload = {
         "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
@@ -337,13 +357,9 @@ def _artifact(**overrides):
         # the audit and declare the gated entry point among its covered code.
         "history_completeness": {"complete": True, "blocker": None, "reasons": []},
         "certification_wiring": fg.certification_wiring_identity(),
-        "certified_bundles": {
-            "5": {
-                "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
-                         "xpts_v1": 4, "monte_carlo_v1": 5},
-                "data_snapshot_sha256": "d" * 64,
-            }
-        },
+        "events": [5],
+        "certified_bundles": {"5": _bound_bundle()},
+        "certified_bundle_identity": {"5": cb.canonical_bundle_identity(_bound_bundle())},
     }
     payload.update(overrides)
     return payload

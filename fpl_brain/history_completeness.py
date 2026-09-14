@@ -238,6 +238,18 @@ def structural_audit(
 # ---------------------------------------------------------------------------
 
 
+# The ONE predicate that defines "in-progress evidence".  The residual anchor and
+# the in-progress sum MUST use it identically: an anchor drawn from a broader scope
+# would excuse a residual with a row the model's own causal boundary excludes.
+# It mirrors ``analytics.completed_rows_as_of`` exactly (both the player's event
+# label AND the fixture's event must sit before the planning event).
+IN_PROGRESS_PREDICATE = (
+    "f.finished != 1 AND f.started = 1"
+    " AND pg.event < ? AND f.event < ?"
+    " AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)"
+)
+
+
 def anchored_residual_players(
     conn: sqlite3.Connection, *, planning_event: int, cutoff: str
 ) -> set[int]:
@@ -246,17 +258,17 @@ def anchored_residual_players(
     This is the only admissible explanation for an aggregate that runs ahead of
     the completed history: the residual must come from a fixture the player
     himself has a slot in.  The anchor is derived from the player's own rows, not
-    from his current club, so nothing about historical membership is inferred
-    from the present squad — a player whose history was never ingested at all has
-    no anchor and therefore cannot have a residual excused.
+    from his current club, so nothing about historical membership is inferred from
+    the present squad, and a player whose history was never ingested has no anchor.
+    Defined by ``IN_PROGRESS_PREDICATE``, the same predicate the in-progress sum
+    uses, so the two cannot drift.
     """
 
     rows = conn.execute(
-        """SELECT DISTINCT pg.player_id
-             FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
-            WHERE f.finished != 1 AND f.started = 1
-              AND pg.event < ? AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
-        (int(planning_event), str(cutoff)),
+        f"""SELECT DISTINCT pg.player_id
+              FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
+             WHERE {IN_PROGRESS_PREDICATE}""",
+        (int(planning_event), int(planning_event), str(cutoff)),
     ).fetchall()
     return {int(row[0]) for row in rows}
 
@@ -330,13 +342,13 @@ def reconciliation_audit(
         conn,
         f"""SELECT pg.player_id, {select}
               FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
-             WHERE f.finished != 1 AND f.started = 1
-               AND pg.event < ? AND f.event < ?
-               AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
+             WHERE {IN_PROGRESS_PREDICATE}
              GROUP BY pg.player_id""",
         params,
     )
-    anchored = anchored_residual_players(conn, planning_event=planning_event, cutoff=cutoff)
+    # The anchor IS the in-progress row set: deriving it from the same sums makes
+    # alignment structural rather than a second query that could drift.
+    anchored = set(in_progress)
     explainable_teams = started_unfinished_team_ids(conn, planning_event=planning_event, cutoff=cutoff)
 
     teams = {

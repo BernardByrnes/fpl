@@ -8,6 +8,8 @@ older official payload (for example after a player's club context changed).
 
 from __future__ import annotations
 
+import json
+
 from fpl_brain import repositories as repo
 from fpl_brain.database import connect_database
 from fpl_brain.models import (
@@ -146,7 +148,15 @@ def test_rescheduled_fixture_placeholder_grain_migrates(tmp_path):
     conn.close()
 
 
-def test_club_change_leaves_no_stale_orphan_placeholders(tmp_path):
+def test_club_change_prunes_unstarted_orphans_and_keeps_owed_ones(tmp_path):
+    """Sol F1: the current club is NOT evidence about membership at kickoff.
+
+    Fixture 201 (finished, so it has started) belonged to the player's previous
+    club and carries an unresolved placeholder, so it must be RETAINED (fail safe)
+    until authoritative history resolves it.  Fixture 202 has not started, so its
+    stale placeholder is still pruned, and the performance row survives.
+    """
+
     conn = connect_database(tmp_path / "fpl.db")
     _seed_world(conn)
     with conn:
@@ -154,13 +164,15 @@ def test_club_change_leaves_no_stale_orphan_placeholders(tmp_path):
         repo.upsert_fixtures(
             conn,
             [
-                FixtureRecord(id=201, event=2, team_h=2, team_a=10, finished=1, raw_json={}),
+                FixtureRecord(id=201, event=2, team_h=2, team_a=10, kickoff_time="2026-08-30T13:00:00Z",
+                              finished=1, started=1, raw_json={}),
                 FixtureRecord(id=202, event=3, team_h=2, team_a=11, finished=0, raw_json={}),
             ],
         )
         repo.upsert_fixtures(
             conn,
-            [FixtureRecord(id=102, event=2, team_h=1, team_a=2, finished=1, started=1, raw_json={})],
+            [FixtureRecord(id=102, event=2, team_h=1, team_a=2, kickoff_time="2026-08-30T13:00:00Z",
+                           finished=1, started=1, raw_json={})],
         )
         repo.upsert_player_gameweeks(
             conn,
@@ -171,10 +183,15 @@ def test_club_change_leaves_no_stale_orphan_placeholders(tmp_path):
                 PlayerGameweekRecord(player_id=10, event=2, fixture_id=102, minutes=90, total_points=4, source="element_summary", raw_json={}),
             ],
         )
+        # No point-in-time capture exists for this player, so membership at the
+        # 201 kickoff cannot be disproved -> the owed slot is retained.
         changed = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 103)})
-    assert changed >= 2
+    assert changed == 1
     assert conn.execute(
-        "SELECT COUNT(*) FROM player_gameweeks WHERE player_id=10 AND fixture_id IN (201, 202)"
+        "SELECT COUNT(*) FROM player_gameweeks WHERE player_id=10 AND fixture_id=201"
+    ).fetchone()[0] == 1, "a started placeholder must not be deleted because the club changed"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM player_gameweeks WHERE player_id=10 AND fixture_id=202"
     ).fetchone()[0] == 0
     # The performance row survives and a legitimate current-club placeholder stays.
     assert conn.execute(
@@ -274,18 +291,129 @@ def test_unstarted_placeholder_is_pruned_normally(tmp_path):
     conn.close()
 
 
-def test_started_placeholder_for_another_club_is_still_pruned(tmp_path):
-    """A former club's slot is not this player's required evidence; it may go."""
+# ---------------------------------------------------------------------------
+# Sol F1 — membership at kickoff decides, never the player's current club.
+#
+# Club A (team 1) hosts team 2 in event 2 and the fixture has kicked off.  The
+# player now sits at team 11, and an unresolved placeholder for the Club A
+# fixture is on file.  Deletion of a STARTED placeholder requires causally valid
+# evidence; the current club is not such evidence.
+# ---------------------------------------------------------------------------
+
+KICKOFF = "2026-09-06T14:00:00Z"
+BEFORE_KICKOFF = "2026-09-05T12:00:00Z"
+
+
+def _seed_transfer_world(conn, *, club_at_kickoff=None):
+    with conn:
+        repo.upsert_teams(
+            conn,
+            [TeamRecord(id=1, name="ClubA"), TeamRecord(id=2, name="Two"), TeamRecord(id=11, name="ClubC")],
+        )
+        # The player is at Club C NOW; Club A is a former club.
+        repo.upsert_players(conn, [PlayerRecord(id=10, web_name="Mover", full_name="Mover", team_id=11)])
+        repo.upsert_events(
+            conn,
+            [
+                EventRecord(id=2, finished=1, data_checked=1, raw_json={}),
+                EventRecord(id=3, finished=0, data_checked=0, raw_json={}),
+            ],
+        )
+        repo.upsert_fixtures(
+            conn,
+            [FixtureRecord(id=103, event=2, team_h=1, team_a=2, kickoff_time=KICKOFF,
+                           finished=1, started=1, raw_json={})],
+        )
+        if club_at_kickoff is not None:
+            run_id = repo.create_fetch_run(conn, "test", None, BEFORE_KICKOFF)
+            conn.execute(
+                "INSERT INTO player_snapshots(player_id, fetch_run_id, captured_at, raw_json)"
+                " VALUES (10, ?, ?, ?)",
+                (run_id, BEFORE_KICKOFF, json.dumps({"id": 10, "team": club_at_kickoff})),
+            )
+
+
+def _placeholder(conn, event, fixture_id):
+    with conn:
+        repo.upsert_player_gameweeks(
+            conn,
+            [PlayerGameweekRecord(player_id=10, event=event, fixture_id=fixture_id, minutes=0,
+                                  source="element_summary", raw_json={})],
+        )
+
+
+def _rows(conn, fixture_id):
+    return conn.execute(
+        "SELECT COUNT(*) FROM player_gameweeks WHERE player_id=10 AND fixture_id=?",
+        (fixture_id,),
+    ).fetchone()[0]
+
+
+def test_F1A_started_former_club_placeholder_survives_the_transfer(tmp_path):
+    """A: joined at kickoff, moved afterwards -> the owed slot must not vanish."""
 
     conn = connect_database(tmp_path / "fpl.db")
-    _seed_world(conn)
+    _seed_transfer_world(conn, club_at_kickoff=1)     # official capture before kickoff: Club A
+    _placeholder(conn, 2, 103)
     with conn:
-        # fixture 301 involves teams 2 and 3; the player is at team 1.
-        repo.upsert_fixtures(conn, [FixtureRecord(id=301, event=2, team_h=2, team_a=3,
-                                                  finished=1, started=1, raw_json={})])
-    _placeholder_row(conn, 2, 301)
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 0
+    assert _rows(conn, 103) == 1
+    conn.close()
+
+
+def test_F1B_point_in_time_evidence_of_an_earlier_move_allows_pruning(tmp_path):
+    """B: official evidence proves he had already left BEFORE kickoff -> prune."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=11)    # already at Club C before kickoff
+    _placeholder(conn, 2, 103)
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 1
+    assert _rows(conn, 103) == 0
+    conn.close()
+
+
+def test_F1C_started_placeholder_without_club_at_kickoff_proof_is_retained(tmp_path):
+    """C: no point-in-time capture -> unprovable -> fail safe (retain)."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=None)
+    _placeholder(conn, 2, 103)
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 0
+    assert _rows(conn, 103) == 1
+    conn.close()
+
+
+def test_F1D_started_placeholder_with_authoritative_replacement_is_pruned(tmp_path):
+    """D: the observation is represented at a claimed pair -> the label may go."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=1)
+    _placeholder(conn, 2, 103)
+    _placeholder(conn, 3, 103)                        # authoritative replacement row
     with conn:
         deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 103)})
     assert deleted == 1
-    assert _row_count(conn, 2, 301) == 0
+    assert _rows(conn, 103) == 1                      # exactly one row left, at the claimed pair
+    assert conn.execute(
+        "SELECT COUNT(*) FROM player_gameweeks WHERE player_id=10 AND event=2 AND fixture_id=103"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_F1E_not_started_placeholder_prunes_normally(tmp_path):
+    """E: an unstarted slot is prospective, not owed -> unchanged behaviour."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_world(conn)
+    _placeholder(conn, 3, 104)
+    with conn:
+        repo.upsert_fixtures(conn, [FixtureRecord(id=104, event=4, team_h=1, team_a=2, finished=0, raw_json={})])
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(4, 104)})
+    assert deleted == 1
+    assert _rows(conn, 104) == 0
     conn.close()

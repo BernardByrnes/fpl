@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from fpl_brain import analytics
+from fpl_brain import certified_bundle as cb
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import history_completeness as hc
 from fpl_brain import minutes_model
@@ -393,22 +394,14 @@ def test_H5_decision_runner_refuses_an_artifact_with_an_incomplete_audit(tmp_pat
     incomplete = _audit(conn)
     conn.close()
 
-    def _artifact(history_completeness):
-        return {
-            "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
-            "temporal_status": "CAUSAL",
-            "dependency_validation": "COHERENT",
-            "certified_bundles": {"5": {"runs": {}}},
-            "data_snapshot_sha256": "d" * 64,
-            "decision_search_permitted": True,
-            "route_search_executed": False,
-            "transfer_execution_performed": False,
-            "certification_wiring": fg.certification_wiring_identity(),
-            "history_completeness": history_completeness,
-        }
+    def _payload(history_completeness):
+        return _artifact(
+            fg.CERTIFICATION_ARTIFACT_SCHEMA,
+            history_completeness=history_completeness,
+        )
 
     path = tmp_path / "artifact.json"
-    path.write_text(json.dumps(_artifact(incomplete)), encoding="utf-8")
+    path.write_text(json.dumps(_payload(incomplete)), encoding="utf-8")
     with pytest.raises(fg.DecisionCertificationRequired) as failure:
         fg.load_certification_artifact(path)
     assert hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE in str(failure.value)
@@ -416,9 +409,9 @@ def test_H5_decision_runner_refuses_an_artifact_with_an_incomplete_audit(tmp_pat
     # A complete audit is readable; an ABSENT audit on a current-schema artifact is
     # not, even though every authorisation field still says permitted.
     complete = dict(incomplete, complete=True, blocker=None, reasons=[])
-    path.write_text(json.dumps(_artifact(complete)), encoding="utf-8")
+    path.write_text(json.dumps(_payload(complete)), encoding="utf-8")
     assert fg.load_certification_artifact(path)["decision_search_permitted"] is True
-    path.write_text(json.dumps(_artifact(None)), encoding="utf-8")
+    path.write_text(json.dumps(_payload(None)), encoding="utf-8")
     with pytest.raises(fg.DecisionCertificationRequired) as failure:
         fg.load_certification_artifact(path)
     assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)
@@ -686,12 +679,38 @@ def _wiring(*, entry_point=fg.CERTIFIER_ENTRY_POINT, covered=None, entry_sha="a"
     }
 
 
+def _bundle(event=5, runs=None, data_snapshot_sha256="d" * 64):
+    """A canonical bundle in its persisted ``as_dict`` shape."""
+
+    return {
+        "event": event,
+        "cutoff": CUTOFF,
+        "runs": dict(runs if runs is not None else {"minutes_v1": 1, "team_strength_v1": 2,
+                                                    "player_rates_v1": 3, "xpts_v1": 4,
+                                                    "monte_carlo_v1": 5}),
+        "model_versions": {"minutes_v1": "minutes_v1.6.0"},
+        "code_snapshot_sha256": "codehash",
+        "data_snapshot_sha256": data_snapshot_sha256,
+        "planning_context_hash": None,
+    }
+
+
+def _bound_bundles(events=(5,)):
+    """Bundles plus the canonical identities that bind them."""
+
+    bundles = {str(event): _bundle(event) for event in events}
+    return bundles, {event: cb.canonical_bundle_identity(bundle) for event, bundle in bundles.items()}
+
+
 def _artifact(schema, **overrides):
+    bundles, identities = _bound_bundles()
     payload = {
         "schema": schema,
+        "events": [5],
         "temporal_status": "CAUSAL",
         "dependency_validation": "COHERENT",
-        "certified_bundles": {"5": {"runs": {}}},
+        "certified_bundles": bundles,
+        "certified_bundle_identity": identities,
         "data_snapshot_sha256": "d" * 64,
         "decision_search_permitted": True,
         "route_search_executed": False,
@@ -739,7 +758,9 @@ def test_D_legacy_v1_without_the_audit_needs_a_recognised_identity(tmp_path, mon
     payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1, certification_wiring=None)
     payload["planning_cutoff"] = CUTOFF
     payload["data_snapshot_sha256"] = "d" * 64
-    payload["certified_bundle_identity"] = {"5": "sha256:" + "b" * 64}
+    payload["certified_bundle_identity"] = {
+        "5": cb.canonical_bundle_identity(payload["certified_bundles"]["5"])
+    }
     payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
 
     # Not on the allowlist -> refused, even though the identity is self-consistent.
@@ -996,6 +1017,36 @@ def test_F3_reconciliation_ignores_a_mislabelled_row_the_consumer_cannot_read(tm
 
 
 # ---------------------------------------------------------------------------
+# Sol F3 — the residual anchor must match the consumer's causal boundary exactly.
+# ---------------------------------------------------------------------------
+
+
+def test_F3b_anchor_must_match_the_consumer_event_boundary(tmp_path):
+    """A row whose FIXTURE event is at/after planning cannot anchor a residual.
+
+    The in-progress bucket and the anchor share one predicate, so relabelling the
+    fixture out of the consumer's causal window removes it from both: the residual
+    is then unexplained and certification fails closed.
+    """
+
+    _config_, conn = _seed(
+        tmp_path, event4_final=False, event4_row=PLACEHOLDER_ROW,
+        aggregate_minutes=360, fixture4_finished=False,
+    )
+    with conn:
+        conn.execute("UPDATE fixtures SET event=6 WHERE id=4")
+    audit = _audit(conn)
+    minutes = audit["reconciliation"]["per_field"]["minutes"]
+    assert audit["reconciliation"]["anchored_player_count"] == 0
+    assert minutes["residuals_permitted_by_own_anchor_row"] == 0
+    assert minutes["unexplained_players"] == len(PLAYERS)
+    assert [row["player_id"] for row in minutes["unexplained"]] == list(PLAYERS)
+    assert audit["complete"] is False
+    assert hc.DIAG_AGGREGATE_HISTORY_RECONCILIATION_FAILED in audit["reasons"]
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
 # F2 — legacy status is an explicit, self-verifying identity, not a schema label.
 # ---------------------------------------------------------------------------
 
@@ -1040,7 +1091,6 @@ def test_F2C_stale_producer_v1_at_a_later_cutoff_is_rejected():
 
     payload = _r5_v1_payload()
     payload["planning_cutoff"] = "2026-10-20T08:00:00Z"
-    payload["events"] = [7, 8, 9, 10]
     payload["data_snapshot_sha256"] = "f" * 64
     payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
     assert payload["four_gw_certification_identity"] not in fg.LEGACY_CERTIFICATION_IDENTITIES
@@ -1090,6 +1140,94 @@ def test_F2F_recognised_legacy_identity_with_an_incomplete_audit_still_fails():
     assert hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE in str(failure.value)
 
 
+def test_F2C_v1_with_a_complete_audit_cannot_bypass_the_identity_requirement(tmp_path):
+    """Every v1 artifact is a legacy artifact, audit or no audit (Sol 2A)."""
+
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1, certification_wiring=None,
+                        history_completeness=_complete_audit())
+    path = _write(tmp_path, payload, name="v1_with_audit.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    message = str(failure.value)
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in message
+    assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in message
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2E_allowlisted_identity_copied_onto_altered_events_is_rejected():
+    payload = _r5_v1_payload()
+    payload["events"] = [6, 7, 8, 9]          # identity left untouched on purpose
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "altered_events.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in str(failure.value)
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2F2_altered_bundles_under_the_old_identity_label_are_rejected():
+    """The declared label must BIND the bundles a decision would consume (Sol 2B)."""
+
+    payload = _r5_v1_payload()
+    payload["certified_bundles"]["5"]["runs"]["minutes_v1"] = 9999
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "swapped.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in str(failure.value)
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2G_altered_bundles_with_a_recomputed_identity_lose_legacy_status():
+    payload = _r5_v1_payload()
+    payload["certified_bundles"]["5"]["runs"]["minutes_v1"] = 9999
+    payload["certified_bundle_identity"]["5"] = cb.canonical_bundle_identity(payload["certified_bundles"]["5"])
+    # Recomputing the label changes the certification identity, so the artifact is
+    # internally consistent but no longer the recognised legacy certification.
+    assert payload["four_gw_certification_identity"] != fg.certification_identity_of(payload)
+    payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "recomputed.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in str(failure.value)
+
+
+def test_F2I_v2_with_self_consistent_bundles_passes(tmp_path):
+    events = (5, 6, 7, 8)
+    bundles, identities = _bound_bundles(events)
+    payload = _artifact(
+        fg.CERTIFICATION_ARTIFACT_SCHEMA,
+        events=list(events),
+        certified_bundles=bundles,
+        certified_bundle_identity=identities,
+        history_completeness=_complete_audit(),
+    )
+    payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
+    path = _write(tmp_path, payload, name="v2_bound.json")
+    assert fg.load_certification_artifact(path)["schema"] == fg.CERTIFICATION_ARTIFACT_SCHEMA_V2
+
+
+def test_F2J_v2_with_a_mismatched_bundle_identity_fails_closed(tmp_path):
+    events = (5,)
+    bundles, identities = _bound_bundles(events)
+    identities["5"] = "sha256:" + "9" * 64
+    payload = _artifact(
+        fg.CERTIFICATION_ARTIFACT_SCHEMA,
+        events=list(events),
+        certified_bundles=bundles,
+        certified_bundle_identity=identities,
+        history_completeness=_complete_audit(),
+    )
+    path = _write(tmp_path, payload, name="v2_mismatch.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in str(failure.value)
+
+
 # ---------------------------------------------------------------------------
 # F6 — the real producer -> real consumer seam.
 # ---------------------------------------------------------------------------
@@ -1108,14 +1246,16 @@ def test_F6_real_certifier_artifact_loads_through_the_real_loader(tmp_path):
         # side-effect free, so this seam test touches no database at all.
         source_db_identity={"path": str(tmp_path / "absent_live.db")},
     )
+    events = (5, 6, 7, 8)
+    bundles, identities = _bound_bundles(events)
     history_audit = _complete_audit()
     artifact = certifier.build_certification_artifact(
         run_uuid="00000000-0000-0000-0000-000000000000",
         planning_cutoff=CUTOFF,
-        events=[5, 6, 7, 8],
+        events=list(events),
         snapshot=snapshot,
-        certified={"5": {"runs": {"minutes_v1": 1}}},
-        bundle_identity={"5": "sha256:" + "a" * 64},
+        certified=bundles,
+        bundle_identity=identities,
         manager_state={"event": 5, "bank_tenths": 7},
         model_versions=[("minutes_v1", "minutes_v1.6.0")],
         execution_started_at=CUTOFF,

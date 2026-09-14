@@ -494,6 +494,38 @@ def upsert_player_gameweeks(
     return count
 
 
+def _official_club_at(conn: sqlite3.Connection, player_id: int, moment: str | None) -> int | None:
+    """The player's official club as of ``moment``, from point-in-time captures.
+
+    Uses the latest official bootstrap capture at or before ``moment`` and reads
+    the element's ``team`` field, which is the only causally valid evidence about
+    which club the player belonged to *then*.  Returns ``None`` when no capture
+    establishes it; callers must FAIL SAFE on ``None``.  The player's CURRENT club
+    is deliberately not consulted: it says nothing about membership at kickoff.
+    """
+
+    if moment is None:
+        return None
+    row = conn.execute(
+        "SELECT raw_json FROM player_snapshots WHERE player_id=? AND captured_at<=?"
+        " ORDER BY captured_at DESC, id DESC LIMIT 1",
+        (int(player_id), str(moment)),
+    ).fetchone()
+    if row is None or not row["raw_json"]:
+        return None
+    try:
+        payload = json.loads(row["raw_json"])
+    except (TypeError, ValueError):
+        return None
+    team = payload.get("team") if isinstance(payload, dict) else None
+    if team is None:
+        return None
+    try:
+        return int(team)
+    except (TypeError, ValueError):
+        return None
+
+
 def prune_stale_element_summary_placeholders(
     conn: sqlite3.Connection,
     player_id: int,
@@ -508,31 +540,30 @@ def prune_stale_element_summary_placeholders(
     context changed between syncs, or because the fixture was officially
     reassigned to another event — and otherwise stay in the canonical grain
     forever, where they corrupt appearance and fixture counts.  Performance
-    rows and sentinel/blank rows are never touched; a placeholder whose
-    fixture still involves the player's current club without reassignment
-    evidence is retained instead of pruned.
+    rows and sentinel/blank rows are never touched.
 
-    STARTED-FIXTURE PROTECTION
-    --------------------------
-    A placeholder holds no observation, so deleting one normally only removes a
-    stale *slot*.  But once the fixture it points at has STARTED, that slot is
-    the only surviving evidence that this player-fixture observation is still
-    owed, and a row that does not exist cannot be reported as a gap.  For a
-    fixture that involves the player's CURRENT club — the only fixtures whose
-    observations he can be required to have — a started placeholder is therefore
-    only removed once authoritative replacement evidence proves the observation
-    is represented at the pair the payload now claims (``fixture_started``):
+    PROSPECTIVE vs OWED slots
+    -------------------------
+    For a fixture that has NOT started the slot is prospective: the pre-existing
+    rule stands and an unclaimed placeholder belonging to the player's current
+    club is retained while any other is pruned.
 
-      * fixture has NOT started  -> prune normally (the slot is not yet owed);
-      * fixture HAS started and the payload's claimed pair already holds a row
-        -> delete this stale label, because the observation is represented there;
-      * fixture HAS started and no replacement exists -> RETAIN, so the owed
-        observation surfaces later as ``COMPLETED_EVENT_PLACEHOLDER_ROW`` in the
-        certified-history audit instead of disappearing from it.
+    Once the fixture HAS STARTED the placeholder is the only surviving evidence
+    that this player-fixture observation is unresolved, and a row that does not
+    exist cannot be reported as a gap.  Deletion then requires causally valid
+    evidence, and the player's CURRENT club is NOT such evidence — it is not proof
+    of membership at kickoff:
 
-    Retaining a slot is visible and recoverable; deleting an owed observation is
-    neither.  Nothing is fabricated here: no zeros, no synthetic observations,
-    and a row is never relocated to a club the player is not currently at.
+      * point-in-time official captures prove the player belonged to a club that
+        did not play this fixture at kickoff -> safely pruned (the placeholder was
+        already invalid before the fixture began);
+      * authoritative replacement exists at a pair the payload itself claims
+        -> the stale label is removed because the observation is represented;
+      * otherwise -> RETAIN (fail safe), so an owed observation surfaces later as
+        ``COMPLETED_EVENT_PLACEHOLDER_ROW`` instead of disappearing from the audit.
+
+    Nothing is fabricated: no zeros, no synthetic observations, and no row is ever
+    relocated to a club the player is not currently at.
     """
 
     claimed = {(int(event), int(fixture_id)) for event, fixture_id in claimed_pairs}
@@ -557,22 +588,23 @@ def prune_stale_element_summary_placeholders(
         if stored is None or _gameweek_has_performance(dict(stored)):
             continue
         fixture = conn.execute(
-            "SELECT team_h, team_a, started, finished FROM fixtures WHERE id=?", (int(fixture_id),)
+            "SELECT team_h, team_a, started, finished, kickoff_time FROM fixtures WHERE id=?",
+            (int(fixture_id),),
         ).fetchone()
-        involves_current_club = (
-            fixture is not None
-            and current_team is not None
-            and current_team in (fixture["team_h"], fixture["team_a"])
+        if fixture is None:
+            # Cannot establish anything about this fixture; retaining is the
+            # recoverable choice, deleting is not.
+            continue
+        involves_current_club = current_team is not None and current_team in (
+            fixture["team_h"], fixture["team_a"]
         )
-        fixture_started = fixture is not None and (
-            bool(fixture["started"]) or bool(fixture["finished"])
-        )
+        fixture_started = bool(fixture["started"]) or bool(fixture["finished"])
         if int(fixture_id) in claimed_fixtures:
-            # Same physical fixture, officially reassigned to another event: the
-            # local (event, fixture) label is stale by the payload itself.  For a
-            # STARTED fixture of the player's current club the stale label may go
-            # only once the observation is represented at a claimed pair.
-            if involves_current_club and fixture_started:
+            # The payload itself says this fixture belongs to another event, so the
+            # local (event, fixture) label is stale.  For a STARTED fixture the
+            # observation must survive the relabel, so the stale label may go only
+            # once the observation is represented at one of the claimed pairs.
+            if fixture_started:
                 present = {
                     int(row[0])
                     for row in conn.execute(
@@ -589,13 +621,32 @@ def prune_stale_element_summary_placeholders(
             )
             deleted += 1
             continue
-        if involves_current_club:
+        if not fixture_started:
+            # Prospective slot: unchanged behaviour (the current club's planned
+            # fixture is kept, anything else stale is removed).
+            if involves_current_club:
+                continue
+            conn.execute(
+                "DELETE FROM player_gameweeks WHERE player_id=? AND event=? AND fixture_id=?",
+                (int(player_id), int(event), int(fixture_id)),
+            )
+            deleted += 1
             continue
-        conn.execute(
-            "DELETE FROM player_gameweeks WHERE player_id=? AND event=? AND fixture_id=?",
-            (int(player_id), int(event), int(fixture_id)),
-        )
-        deleted += 1
+        # The fixture HAS started, so the placeholder is the only surviving evidence
+        # of an unresolved observation.  Membership at kickoff is decided by
+        # point-in-time official captures, NEVER by today's club.
+        club_at_kickoff = _official_club_at(conn, int(player_id), fixture["kickoff_time"])
+        if club_at_kickoff is not None and club_at_kickoff not in (
+            fixture["team_h"], fixture["team_a"]
+        ):
+            # Provably not this player's fixture before it began.
+            conn.execute(
+                "DELETE FROM player_gameweeks WHERE player_id=? AND event=? AND fixture_id=?",
+                (int(player_id), int(event), int(fixture_id)),
+            )
+            deleted += 1
+            continue
+        # Owed, or membership at kickoff unprovable: fail safe (retain).
     return deleted
 
 
