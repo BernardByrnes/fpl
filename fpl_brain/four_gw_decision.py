@@ -856,8 +856,18 @@ def route_for_decision(
     The comparator's per-event records do not carry the transfer list (that
     lives in the submitted route steps), so callers pass
     ``transfers_by_event`` explicitly when the board needs the sequence.
+
+    This is the ``route_comparator`` boundary only: a ``route_optimizer`` record (which
+    carries ``per_event``/``actions``) raises instead of being adapted into an incomplete
+    route, because adapting it silently is exactly the R5-P0-01 defect.
     """
 
+    if route_record_shape(comparison_route) == "optimizer":
+        raise DecisionRouteShapeError(
+            "DECISION_ROUTE_SHAPE_MISMATCH: route_for_decision received a route_optimizer "
+            "record (it carries 'per_event'/'actions'); use optimizer_route_for_decision / "
+            "optimizer_routes_for_decision for optimizer records"
+        )
     transfers_by_event = dict(transfers_by_event or {})
     per_event = [
         {
@@ -894,13 +904,186 @@ def routes_for_decision(
     *,
     transfers_by_route: Mapping[str, Mapping[int, Sequence[Mapping[str, Any]]]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Adapt every route in a ``compare_routes`` result for the decision layer."""
+    """Adapt every route in a ``compare_routes`` result for the decision layer.
+
+    This is the ``route_comparator`` boundary only.  A ``route_optimizer`` result must go
+    through :func:`optimizer_routes_for_decision`; feeding an optimizer record to this
+    function raises :class:`DecisionRouteShapeError` instead of silently producing an
+    incomplete route (see ``R5-P0-01``).
+    """
 
     transfers_by_route = dict(transfers_by_route or {})
     return [
         route_for_decision(record, route_id=str(route_id), transfers_by_event=transfers_by_route.get(str(route_id)))
         for route_id, record in sorted(routes.items())
     ]
+
+
+# ---------------------------------------------------------------------------
+# The decision layer's canonical route record — ONE declared boundary per source schema
+# ---------------------------------------------------------------------------
+#
+# ``route_eligibility`` / ``build_decision_board`` consume exactly one shape.  Two upstream
+# producers emit routes in DIFFERENT schemas, so there are exactly two adapters, and each
+# reads only its own declared schema:
+#
+#   route_comparator  -> route_for_decision            (``events`` + ``terminal_state``)
+#   route_optimizer   -> optimizer_route_for_decision  (``per_event`` + ``actions`` + top-level
+#                                                       ``terminal_ft`` / ``terminal_bank_tenths``)
+#
+# THE CANONICAL RECORD (what both adapters return, and all the board reads):
+#   route_id, valid, per_event[
+#       event, mean_gross_core, hit_points, policy, transfers[{out,in}],
+#       bank_after_tenths, next_bank_tenths, next_free_transfers
+#   ], terminal_ft, terminal_bank_tenths, chip_used, errors
+#
+# Why this boundary is explicit rather than a set of ``.get()`` fallbacks: the R5-P0-01
+# defect was SILENT.  Feeding an optimizer record to the comparator adapter produced
+# ``per_event == []`` and null terminal accounting, which ``route_eligibility`` then
+# correctly reported as an incomplete route — so every route was excluded and the board
+# was empty, with nothing anywhere saying "wrong schema".  A single declared mapping per
+# producer, plus a loud error when the WRONG producer's record arrives, is what makes that
+# failure impossible to repeat quietly.
+CANONICAL_DECISION_ROUTE_KEYS: tuple = (
+    "route_id", "valid", "per_event", "terminal_ft", "terminal_bank_tenths", "chip_used",
+    "errors",
+)
+CANONICAL_DECISION_PER_EVENT_KEYS: tuple = (
+    "event", "mean_gross_core", "hit_points", "policy", "transfers", "bank_after_tenths",
+    "next_bank_tenths", "next_free_transfers",
+)
+OPTIMIZER_ROUTE_DISCRIMINATORS: tuple = ("per_event", "actions")
+COMPARATOR_ROUTE_DISCRIMINATORS: tuple = ("events", "terminal_state")
+
+
+class DecisionRouteShapeError(ValueError):
+    """A route record was handed to the adapter for a different producer's schema."""
+
+
+def route_record_shape(record: Mapping[str, Any]) -> str:
+    """Which declared producer schema a route record belongs to.
+
+    ``"optimizer"`` / ``"comparator"`` by discriminator key, else ``"unknown"``.  The
+    discriminators are the keys only that producer emits, so this cannot be satisfied by
+    coincidence for a route that has one shape and not the other.
+    """
+
+    keys = set(record or ())
+    if keys & set(OPTIMIZER_ROUTE_DISCRIMINATORS):
+        return "optimizer"
+    if keys & set(COMPARATOR_ROUTE_DISCRIMINATORS):
+        return "comparator"
+    return "unknown"
+
+
+def _optimizer_transfers(record: Mapping[str, Any]) -> dict[int, list[dict[str, int]]]:
+    """Per-event transfer list from a ``route_optimizer`` record's serialized ``actions``."""
+
+    out: dict[int, list[dict[str, int]]] = {}
+    for action in record.get("actions") or []:
+        out[int(action["event"])] = [
+            {"out": int(move["out"]), "in": int(move["in"])}
+            for move in (action.get("transfers") or [])
+        ]
+    return out
+
+
+def optimizer_route_for_decision(
+    record: Mapping[str, Any],
+    *,
+    route_id: str | None = None,
+) -> dict[str, Any]:
+    """Adapt a ``route_optimizer`` route record into the canonical decision record.
+
+    ``route_optimizer.optimize`` reports ``per_event`` (event, kind, hit points, gross/net
+    CORE, selected policy), the serialized per-event ``actions`` (transfer list, bank after
+    the event's batch, free transfers after it) and the route's TERMINAL ``ft``/bank at the
+    top level.  This maps exactly those fields onto the canonical record — nothing is
+    invented and nothing is defaulted: a genuinely absent event, transfer list or terminal
+    value stays absent/None so :func:`route_eligibility` still fails it closed with
+    ``MISSING_EVENT_EVALUATION`` / ``TERMINAL_ACCOUNTING_MISSING``.
+    """
+
+    shape = route_record_shape(record)
+    if shape == "comparator":
+        raise DecisionRouteShapeError(
+            "DECISION_ROUTE_SHAPE_MISMATCH: optimizer_route_for_decision received a "
+            "route_comparator record (it carries 'events'/'terminal_state'); use "
+            "route_for_decision/routes_for_decision for comparator records"
+        )
+
+    transfers_by_event = _optimizer_transfers(record)
+    per_event = [
+        {
+            "event": int(item["event"]),
+            "mean_gross_core": item.get("mean_gross_core"),
+            "hit_points": int(item.get("hit_points") or 0),
+            "policy": item.get("policy"),
+            # The optimizer's action for this event is where the transfer list and the
+            # post-batch bank / free transfers live; absent means absent, not empty.
+            "transfers": list(transfers_by_event.get(int(item["event"]), [])),
+            "bank_after_tenths": _optimizer_event_accounting(record, int(item["event"]), "bank_after"),
+            "next_bank_tenths": _optimizer_event_accounting(record, int(item["event"]), "bank_after"),
+            "next_free_transfers": _optimizer_event_accounting(record, int(item["event"]), "ft_after"),
+        }
+        for item in (record.get("per_event") or [])
+    ]
+    return {
+        "route_id": str(route_id if route_id is not None else record.get("route_id")),
+        "valid": bool(record.get("valid")),
+        "per_event": per_event,
+        "terminal_ft": record.get("terminal_ft"),
+        "terminal_bank_tenths": record.get("terminal_bank_tenths"),
+        # A route_optimizer route never activates a chip (chip modelling is out of scope).
+        "chip_used": None,
+        "errors": [],
+    }
+
+
+def _optimizer_event_accounting(record: Mapping[str, Any], event: int, field: str):
+    """One per-event accounting value from the optimizer's serialized actions.
+
+    ``None`` when the event has no action or the action does not carry the field: the
+    decision layer must be able to tell "not recorded" from "zero".
+    """
+
+    for action in record.get("actions") or []:
+        if int(action["event"]) == int(event):
+            value = action.get(field)
+            return None if value is None else int(value)
+    return None
+
+
+def optimizer_routes_for_decision(
+    routes: Mapping[str, Mapping[str, Any]],
+    *,
+    transfers_by_route: Mapping[str, Mapping[int, Sequence[Mapping[str, Any]]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Adapt every route in a ``route_optimizer.optimize`` result for the decision layer.
+
+    This is the boundary the production runner must use.  ``transfers_by_route`` is accepted
+    for signature symmetry with :func:`routes_for_decision` and is NOT needed: an optimizer
+    record already carries its transfers on the serialized actions.
+    """
+
+    return [
+        optimizer_route_for_decision(record, route_id=str(route_id))
+        for route_id, record in sorted(routes.items())
+    ]
+
+
+def canonical_decision_route(record: Mapping[str, Any], *, route_id: str | None = None) -> dict[str, Any]:
+    """The canonical decision record for a route of EITHER declared schema.
+
+    One entry point for callers that legitimately do not know which producer they hold
+    (for example a report that reads a saved artifact).  It dispatches on the declared
+    discriminator keys and never guesses field-by-field; an unrecognised record is adapted
+    as a comparator record only when it has no optimizer discriminator at all.
+    """
+
+    if route_record_shape(record) == "optimizer":
+        return optimizer_route_for_decision(record, route_id=route_id)
+    return route_for_decision(record, route_id=route_id)
 
 
 def lineup_policy_for_route(

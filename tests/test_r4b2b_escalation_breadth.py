@@ -434,12 +434,26 @@ def test_role_relevant_players_follow_the_final_preferred_route():
 
 
 def test_runner_order_adopts_the_final_result_before_the_decision_and_confidence():
-    """§4/§6 wiring: widening happens before the board, canonical and confidence."""
+    """§4/§6 wiring: widening happens before the board, canonical and confidence.
+
+    The route-adaptation literal is matched over the KNOWN adapter names rather than one
+    hard-coded spelling: R5-P0-01 intentionally moved the runner onto
+    ``optimizer_routes_for_decision``, and a single ``source.index`` would silently stop
+    guarding the ordering the moment the call is renamed - the same brittleness that let
+    R5-P0-01 survive a green suite.
+    """
 
     source = (REPO_ROOT / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
     stability_at = source.index("stability = fr.assess_search_stability(")
     adopt_at = source.index("final = fr.final_ranking_after_escalation(")
-    board_at = source.index("fg.routes_for_decision(")
+    board_at = min(
+        (at for at in (source.find("fg.routes_for_decision("),
+                       source.find("fg.optimizer_routes_for_decision("),
+                       source.find("fg.canonical_decision_route("))
+         if at != -1),
+        default=-1,
+    )
+    assert board_at != -1, "the runner must adapt its routes for the decision layer"
     evaluate_at = source.index("decision = fg.evaluate_four_gw_decision(")
     canonical_at = source.rindex("fr.final_ranking_after_escalation(")
     confidence_at = source.index("confidence = dc.classify_decision_confidence(")

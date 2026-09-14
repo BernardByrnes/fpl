@@ -74,6 +74,24 @@ def _suppress_transfer_recommendation(decision: dict, *, reason: str, extra: dic
 HEARTBEAT_INTERVAL_SECONDS = 60.0
 
 
+def _stage_timings(*, search_seconds: float, refine_started: float, refine_finished: float,
+                   stability_seconds: float) -> dict:
+    """The artifact's per-stage wall times.
+
+    ``stage2_refinement_seconds`` must measure the Stage-2 refinement ITSELF.  The previous
+    expression subtracted the Stage-1 search time from a timestamp taken BEFORE the
+    refinement, so it reported the (near-zero) gap between the two statements instead of the
+    refinement; the R5 final acceptance run consequently recorded 0.0 s for a ~59-minute
+    Stage 2 (telemetry only - nothing downstream read it).
+    """
+
+    return {
+        "stage1_seconds": round(float(search_seconds), 3),
+        "stage2_refinement_seconds": round(max(0.0, float(refine_finished) - float(refine_started)), 3),
+        "stability_seconds": round(float(stability_seconds), 3),
+    }
+
+
 def _scheduled_workers(result) -> int | None:
     """The worker count an optimizer result actually ran with (None when sequential).
 
@@ -651,6 +669,7 @@ def main(argv=None) -> int:
             exact_cache=run_exact_cache, cancel_probe=cancel_probe,
             parallel_workers=parallel_workers,
         )
+        t_refine_finished = time.time()
         stage2_result = refinement["refined"]
         stage2_parallel = (stage2_result.get("parallel_exact") or {}).get("worker_count")
         print(f"exact cache: {len(run_exact_cache)} entries after the Stage-2 refinement; "
@@ -707,7 +726,13 @@ def main(argv=None) -> int:
                 int(action["event"]): [{"out": int(m["out"]), "in": int(m["in"])} for m in action.get("transfers") or []]
                 for action in (record.get("actions") or [])
             }
-        routes = fg.routes_for_decision(result.get("routes") or {}, transfers_by_route=transfers_by_route)
+        # R5-P0-01: `result` is a route_optimizer result, so it must cross the OPTIMIZER
+        # boundary.  `routes_for_decision` is the comparator boundary and would adapt every
+        # optimizer route to an empty per_event with null terminal accounting, which the
+        # eligibility gate then (correctly) reported as an incomplete route - excluding every
+        # route and emitting no recommendation at all.
+        routes = fg.optimizer_routes_for_decision(
+            result.get("routes") or {}, transfers_by_route=transfers_by_route)
         baseline = next((row["route_id"] for row in routes if not any(r["transfers"] for r in row["per_event"])), None)
         # First pass: the transfer decision.  The H1 lineup is then taken from the
         # PREFERRED route (or, when suppressed, from the baseline) so the
@@ -772,11 +797,9 @@ def main(argv=None) -> int:
         refinement["stability"] = stability
         refinement["simulation_fidelity"]["leader_change"] = leader_change
         refinement["simulation_fidelity"]["stability"] = stability
-        refinement["timing_s"] = {
-            "stage1_seconds": round(search_seconds, 3),
-            "stage2_refinement_seconds": round(t_refine - t0 - search_seconds, 3),
-            "stability_seconds": round(stability_seconds, 3),
-        }
+        refinement["timing_s"] = _stage_timings(
+            search_seconds=search_seconds, refine_started=t_refine,
+            refine_finished=t_refine_finished, stability_seconds=stability_seconds)
         result["canonical_paired_near_tie"] = canonical
         print(
             f"refinement: finalists={len(refinement['finalist_selection']['finalist_route_ids'])} "
