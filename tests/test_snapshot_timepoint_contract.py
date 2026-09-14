@@ -333,6 +333,10 @@ def _artifact(**overrides):
         "route_search_executed": False,
         "transfer_execution_performed": False,
         "decision_search_permitted": True,
+        # Schema v2 (history-completeness contract): a NEW certification must carry
+        # the audit and declare the gated entry point among its covered code.
+        "history_completeness": {"complete": True, "blocker": None, "reasons": []},
+        "certification_wiring": fg.certification_wiring_identity(),
         "certified_bundles": {
             "5": {
                 "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,

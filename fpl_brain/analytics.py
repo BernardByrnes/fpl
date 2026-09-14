@@ -81,6 +81,10 @@ SOURCE_SNAPSHOT_FILES = (
     "fpl_brain/substitution_model.py",
     "fpl_brain/team_model.py",
     "fpl_brain/xpts.py",
+    # The certification ENTRY POINT is in the identity on purpose: the
+    # history-completeness gate lives in its wiring, so a change to that wiring
+    # must change the certified code identity rather than pass unnoticed.
+    "scripts/certify_gw5_gw8.py",
     "scripts/freeze_predictions.py",
 )
 

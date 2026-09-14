@@ -399,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
     artifact = {
-        "schema": "fpl_brain.certification_artifact.v1",
+        "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
         "execution_run_uuid": run_identity.run_uuid,
         "planning_cutoff": effective_cutoff,
         "events": events,
@@ -408,6 +408,11 @@ def main(argv: list[str] | None = None) -> int:
         "data_snapshot_path": snapshot.path,
         "data_snapshot_source_db_identity": snapshot.source_db_identity,
         "code_snapshot_sha256": analytics.source_snapshot_sha256(),
+        # Which code identity covered this certification, and the exact bytes of the
+        # entry point whose wiring carries the history-completeness gate.  A v2
+        # consumer refuses the artifact unless it declares the entry point covered,
+        # so a certification minted without the gate cannot pass as current.
+        "certification_wiring": fg.certification_wiring_identity(),
         "certified_bundles": certified,
         "certified_bundle_identity": bundle_identity,
         "four_gw_certification_identity": "sha256:" + __import__("hashlib").sha256(

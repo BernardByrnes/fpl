@@ -401,7 +401,56 @@ class DecisionCertificationRequired(RuntimeError):
         self.detail = detail
 
 
-CERTIFICATION_ARTIFACT_SCHEMA = "fpl_brain.certification_artifact.v1"
+# --- certification artifact contract ---------------------------------------
+# v1 is the LEGACY contract: it predates the certified-history repair and may
+# legitimately omit ``history_completeness``.  It is grandfathered by an EXPLICIT,
+# auditable condition (its declared schema), never by "the field is missing".
+# v2 is the contract for every certification minted from the history-completeness
+# repair onwards and REQUIRES the audit, so the new gate can never be omitted
+# silently by an older entry point.
+CERTIFICATION_ARTIFACT_SCHEMA_V1 = "fpl_brain.certification_artifact.v1"
+CERTIFICATION_ARTIFACT_SCHEMA_V2 = "fpl_brain.certification_artifact.v2"
+CERTIFICATION_ARTIFACT_SCHEMA = CERTIFICATION_ARTIFACT_SCHEMA_V2
+LEGACY_CERTIFICATION_ARTIFACT_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V1,)
+SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V1, CERTIFICATION_ARTIFACT_SCHEMA_V2)
+# Schemas that must carry the history audit; anything newer inherits the rule.
+HISTORY_COMPLETENESS_REQUIRED_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V2,)
+
+# The certification entry point whose wiring contains the history-completeness
+# gate.  It is part of SOURCE_SNAPSHOT_FILES, and every v2 artifact must declare
+# it as covered, so a consumer can prove the gate was in the producing wiring.
+CERTIFIER_ENTRY_POINT = "scripts/certify_gw5_gw8.py"
+
+DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING = "CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING"
+DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING = "CERTIFICATION_WIRING_IDENTITY_MISSING"
+
+
+def certification_artifact_requires_history_completeness(schema: Any) -> bool:
+    """True when this schema must carry a complete history audit."""
+
+    return str(schema) in set(HISTORY_COMPLETENESS_REQUIRED_SCHEMAS)
+
+
+def certification_wiring_identity(root: str | Path | None = None) -> dict[str, Any]:
+    """The code-identity block every v2 certification must carry.
+
+    One definition, used by the certifier that writes the block and by the
+    contracts that assert it: the entry point whose wiring contains the
+    history-completeness gate, its exact bytes, and the file set the composite
+    ``code_snapshot_sha256`` covered.
+    """
+
+    import hashlib
+    from pathlib import Path as _Path
+
+    from . import analytics
+
+    base = _Path(root) if root is not None else _Path(__file__).resolve().parents[1]
+    return {
+        "entry_point": CERTIFIER_ENTRY_POINT,
+        "entry_point_sha256": hashlib.sha256((base / CERTIFIER_ENTRY_POINT).read_bytes()).hexdigest(),
+        "covered_source_files": list(analytics.SOURCE_SNAPSHOT_FILES),
+    }
 
 
 def load_certification_artifact(path: str | Path) -> dict[str, Any]:
@@ -410,6 +459,13 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     Fails closed with ``DECISION_CERTIFICATION_REQUIRED`` when the artifact is
     absent, malformed, or does not carry the fields a decision needs.  There is no
     fallback to latest-per-family discovery anywhere in this path.
+
+    The certification contract is versioned.  ``v2`` requires the
+    history-completeness audit and the certification-wiring identity, so a
+    certification minted without the gate cannot pass as current; ``v1`` is the
+    legacy contract and may omit the audit.  Absence is grandfathered ONLY by the
+    artifact's own declared legacy schema -- never by a missing field, and never by
+    inferring PASS.
     """
 
     import json
@@ -422,9 +478,10 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
         payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     except Exception as exc:  # malformed artifact must not be silently ignored
         raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
-    if payload.get("schema") != CERTIFICATION_ARTIFACT_SCHEMA:
+    if payload.get("schema") not in SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS:
         raise DecisionCertificationRequired(
-            f"artifact schema {payload.get('schema')!r} != {CERTIFICATION_ARTIFACT_SCHEMA!r}"
+            f"artifact schema {payload.get('schema')!r} is not one of "
+            f"{list(SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS)!r}"
         )
     if str(payload.get("temporal_status") or "").upper() != "CAUSAL":
         raise DecisionCertificationRequired(
@@ -449,8 +506,7 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     # Defence in depth.  A certification minted after the historical-input repair
     # carries the completeness audit itself; when that audit says the required
     # completed-event history is not there, the artifact is not actionable even if
-    # the permission flag were somehow stale.  An artifact without the block is
-    # unaffected, so pre-repair certifications stay readable.
+    # the permission flag were somehow stale.
     completeness = payload.get("history_completeness")
     if isinstance(completeness, Mapping) and completeness.get("complete") is not True:
         from . import history_completeness as hc
@@ -459,6 +515,30 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
             f"{hc.blocking_reason_token(completeness)}: the certification's completed-event history "
             f"audit is not complete ({completeness.get('reasons')})"
         )
+    # A NEW certification must not be able to omit the audit.  Absence is only
+    # grandfathered by the artifact's own declared legacy schema -- never by the
+    # mere fact that the field is missing, and never silently inferred as PASS.
+    if certification_artifact_requires_history_completeness(payload.get("schema")):
+        if not isinstance(completeness, Mapping):
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING}: certification schema "
+                f"{payload.get('schema')!r} requires a history_completeness audit and none is present; "
+                "a missing audit is never inferred as PASS"
+            )
+        wiring = payload.get("certification_wiring")
+        covered = list(wiring.get("covered_source_files") or []) if isinstance(wiring, Mapping) else []
+        if not isinstance(wiring, Mapping) or CERTIFIER_ENTRY_POINT not in covered:
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING}: certification schema "
+                f"{payload.get('schema')!r} must declare {CERTIFIER_ENTRY_POINT!r} among its covered "
+                "source files, so the consumer can prove the producing wiring carried the "
+                "history-completeness gate"
+            )
+        if not wiring.get("entry_point_sha256"):
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING}: certification schema "
+                f"{payload.get('schema')!r} carries no entry-point code identity"
+            )
     if payload.get("route_search_executed") is not False or payload.get(
         "transfer_execution_performed"
     ) is not False:
