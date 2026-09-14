@@ -74,6 +74,19 @@ def _suppress_transfer_recommendation(decision: dict, *, reason: str, extra: dic
 HEARTBEAT_INTERVAL_SECONDS = 60.0
 
 
+def _scheduled_workers(result) -> int | None:
+    """The worker count an optimizer result actually ran with (None when sequential).
+
+    Read from the result's own ``parallel_exact`` block, so the artifact records what
+    RAN rather than what was requested.
+    """
+
+    if not isinstance(result, dict):
+        return None
+    block = result.get("parallel_exact")
+    return None if not isinstance(block, dict) else block.get("worker_count")
+
+
 def _cancel_probe(guard, *, heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS):
     """A safe-boundary probe: canonical cancel check + periodic lease heartbeat.
 
@@ -142,6 +155,31 @@ STAGE1_DRAWS = 2_000
 #: finalists at this budget, with the same seed and the same certified inputs, and
 #: the artifact reports the count that actually ran.
 STAGE2_DRAWS = fr.STAGE2_DRAWS
+
+#: P3.1 — production worker count for the 10,000-draw exact-evaluation paths ONLY.
+#:
+#: One exact (event, squad) evaluation at 10,000 draws costs ~190-230 s and Stage 2 needs 84
+#: of them, so the finalist refinement plus the ONE bounded escalation dominate the decision
+#: run.  P3 proved a 4-worker pool reproduces those evaluations BIT-IDENTICALLY on the real
+#: certified fixture (18 real unit comparisons, 0 mismatches) and measured 53.9 s/unit against
+#: 230.5 s sequential (4.28x), which brings the modelled full Stage-2 from 3.91 h to ~70 min.
+#:
+#: This constant is deliberately explicit rather than a library default:
+#: ``route_optimizer.optimize(parallel_workers=...)`` still defaults to ``None`` (sequential)
+#: and ``parallel_exact.DEFAULT_WORKER_COUNT`` still defaults to 1, so no caller inherits a
+#: process pool by accident.
+#:
+#: STAGE 1 STAYS SEQUENTIAL.  The P3 acceptance target was the 10,000-draw Stage-2/escalation
+#: path; a 2,000-draw Stage-1 evaluation is ~48 s, so a pool would add spawn/matrix-load
+#: overhead for a small gain and would need its own equivalence proof.  The Stage-1
+#: `stage1_result` search call below therefore passes no `parallel_workers`.
+#:
+#: (Note on wording: this block deliberately does not spell the Stage-1 call as source
+#: text, because `tests/test_r4b2a_search_coverage.py` greps this file for the first
+#: occurrence of the search call to assert that screening and discovery run before it.
+#: A comment mentioning the call would satisfy that grep earlier than the real call.)
+PRODUCTION_PARALLEL_EXACT_WORKERS = 4
+
 DIAG_PREDICTIVE_GENERATION_MISMATCH = "PREDICTIVE_GENERATION_MISMATCH"
 DIAG_DECISION_EVENT_MISMATCH = "DECISION_EVENT_MISMATCH"
 FAMILY_KINDS = {
@@ -258,6 +296,13 @@ def main(argv=None) -> int:
     parser.add_argument("--singles-per-out", type=int, default=4)
     parser.add_argument("--max-transfers-per-event", type=int, default=2)
     parser.add_argument(
+        "--parallel-workers", type=int, default=PRODUCTION_PARALLEL_EXACT_WORKERS,
+        help="P3.1 worker processes for the 10,000-draw FINALIST and ESCALATION exact "
+             "evaluations only (Stage 1 stays sequential).  1 disables the pool and runs the "
+             "sequential evaluator in-process. The exact evaluations are bit-identical either "
+             "way; this changes scheduling only.",
+    )
+    parser.add_argument(
         "--stage2-draws", type=int, default=STAGE2_DRAWS,
         help="Monte Carlo draws per event for the Stage-2 FINALIST-ONLY refinement. "
              "Must be strictly greater than the Stage-1 draw count; the artifact "
@@ -308,6 +353,10 @@ def main(argv=None) -> int:
         guard = guard_ctx.__enter__()
         entered_guard = guard_ctx
         print(f"execution guard: run_uuid={guard.run_uuid} hard_stop={guard.run().hard_stop_at}")
+        parallel_workers = int(args.parallel_workers)
+        print(f"P3.1 parallel exact evaluation: stage2+escalation workers={parallel_workers} "
+              f"(stage1 sequential); "
+              f"{'pool' if parallel_workers > 1 else 'sequential evaluator'}")
         entry_id = int(config["fpl_entry_id"])
         cutoff = str(args.cutoff)
         deadline_of = {
@@ -600,9 +649,12 @@ def main(argv=None) -> int:
             stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
             cache_dir=Path(args.cache_dir),
             exact_cache=run_exact_cache, cancel_probe=cancel_probe,
+            parallel_workers=parallel_workers,
         )
         stage2_result = refinement["refined"]
-        print(f"exact cache: {len(run_exact_cache)} entries after the Stage-2 refinement")
+        stage2_parallel = (stage2_result.get("parallel_exact") or {}).get("worker_count")
+        print(f"exact cache: {len(run_exact_cache)} entries after the Stage-2 refinement; "
+              f"stage2 parallel workers={stage2_parallel}")
 
         # --- R4B.2b REPAIR: stability FIRST, so the final ranking is known ------
         # The gate may run the ONE bounded escalation (the next supported search
@@ -626,6 +678,7 @@ def main(argv=None) -> int:
                 finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
                 exact_cache=run_exact_cache,
                 cancel_probe=cancel_probe,
+                parallel_workers=parallel_workers,
             ),
             config=fr.StabilityGateConfig(current_beam=int(args.beam)),
             escalated_result_sink=escalated_sink,
@@ -886,6 +939,15 @@ def main(argv=None) -> int:
                 "no_recommendation": True,
             },
             "simulation_fidelity": refinement["simulation_fidelity"],
+            "parallel_exact_scheduling": {
+                "requested": parallel_workers,
+                "stage2_workers": stage2_parallel,
+                "escalation_workers": _scheduled_workers(escalated_result),
+                "stage1_workers": None,
+                "stage1_note": "Stage 1 stays sequential by design (see "
+                               "PRODUCTION_PARALLEL_EXACT_WORKERS)",
+                "semantics": "SCHEDULING_ONLY_BIT_IDENTICAL",
+            },
             "canonical_paired_near_tie": canonical,
             "fixture_horizon": fixture_horizon,
             "decision_confidence": confidence,
@@ -926,7 +988,8 @@ def main(argv=None) -> int:
 
 def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundles, conn,
                        base_config, stage1_result, stage2_draws, prebuilt_worlds,
-                       finalist_partials, exact_cache=None, cancel_probe=None):
+                       finalist_partials, exact_cache=None, cancel_probe=None,
+                       parallel_workers=None):
     """The ONE bounded search-breadth escalation, as a closure over one beam width.
 
     Runs the next SUPPORTED search budget (the next beam width in
@@ -948,6 +1011,7 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
             prebuilt_worlds=prebuilt_worlds, required_routes=list(finalist_partials),
             nested_prior=ro.nested_budget_view(stage1_result),
             exact_cache=exact_cache, cancel_probe=cancel_probe,
+            parallel_workers=parallel_workers,
         )
 
     return run

@@ -831,6 +831,7 @@ def refine_finalists(
     optimizer: Callable[..., Mapping[str, Any]] | None = None,
     exact_cache: dict | None = None,
     cancel_probe: Callable[[], None] | None = None,
+    parallel_workers: int | None = None,
 ) -> dict[str, Any]:
     """Re-evaluate ONLY the finalists at ``stage2_draws`` and rank them.
 
@@ -843,6 +844,11 @@ def refine_finalists(
     canonical squad identity, draw count, seed and world provenance — so a hit can
     only occur for a literally identical evaluation.  ``cancel_probe``, when given,
     is called at safe boundaries only (see ``optimize``/``run_search``).
+
+    ``parallel_workers`` is SCHEDULING only and is forwarded verbatim to
+    ``route_optimizer.optimize``; ``None`` keeps the library default (sequential).  The
+    production runner opts in explicitly and auditable so that a caller reading the
+    runner can see the choice; nothing here defaults it to a pool.
     """
 
     selection = dict(finalist_selection or select_finalists(stage1_result))
@@ -910,7 +916,7 @@ def refine_finalists(
         bundles=bundles, conn=conn, config=refined_config, cache_dir=None,
         world_provider=world_provider, prebuilt_worlds=prebuilt_worlds,
         required_routes=partials, nested_prior=None, exact_cache=exact_cache,
-        cancel_probe=cancel_probe,
+        cancel_probe=cancel_probe, parallel_workers=parallel_workers,
     )
     refined = dict(refined)
 
