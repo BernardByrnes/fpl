@@ -273,8 +273,8 @@ def test_F_aggregate_advanced_by_unfinished_fixture_is_permitted(tmp_path):
     minutes = reconciliation["per_field"]["minutes"]
     assert minutes["enforced"] is True
     # 360 aggregate vs 270 completed history: the 90-minute residual is permitted
-    # because team 1 has a started-but-unfinished fixture.
-    assert minutes["residuals_permitted_by_unfinished_fixtures"] == len(PLAYERS)
+    # because each player holds his OWN row on the started-but-unfinished fixture.
+    assert minutes["residuals_permitted_by_own_anchor_row"] == len(PLAYERS)
     assert minutes["unexplained_players"] == 0
     assert reconciliation["complete"] is True
     conn.close()
@@ -327,6 +327,7 @@ def _permission_base(**overrides):
         dependency_validation="COHERENT",
         horizon_status=certifier.fg.DECISION_HORIZON_COMPLETE,
         data_snapshot_sha256="d" * 64,
+        history_completeness=_complete_audit(),
     )
     base.update(overrides)
     return base
@@ -358,11 +359,16 @@ def test_H2_permission_granted_when_history_is_complete(tmp_path):
     conn.close()
 
 
-def test_H3_permission_unchanged_when_the_audit_is_not_supplied():
-    """Backwards compatible: the rule stays callable with no database."""
+def test_H3_permission_api_cannot_be_called_without_the_history_audit():
+    """A new caller must not obtain permission merely by omitting the gate (F5)."""
 
-    permitted, reasons = certifier.decide_search_permission(**_permission_base())
-    assert permitted is True, reasons
+    kwargs = _permission_base()
+    kwargs.pop("history_completeness")
+    with pytest.raises(TypeError):
+        certifier.decide_search_permission(**kwargs)
+    # ...and an explicitly malformed audit cannot masquerade as complete evidence.
+    with pytest.raises(AttributeError):
+        certifier.decide_search_permission(**_permission_base(history_completeness=None))
 
 
 def test_H4_r5_shaped_audit_does_not_refuse_permission(tmp_path):
@@ -381,8 +387,6 @@ def test_H4_r5_shaped_audit_does_not_refuse_permission(tmp_path):
 def test_H5_decision_runner_refuses_an_artifact_with_an_incomplete_audit(tmp_path):
     """Defence in depth in the CONSUMER, not just the producer."""
 
-    from fpl_brain import four_gw_decision as fg
-
     _config_, conn = _seed(
         tmp_path, event4_final=True, event4_row=PLACEHOLDER_ROW, aggregate_minutes=360, fixture4_finished=True
     )
@@ -391,7 +395,7 @@ def test_H5_decision_runner_refuses_an_artifact_with_an_incomplete_audit(tmp_pat
 
     def _artifact(history_completeness):
         return {
-            "schema": "fpl_brain.certification_artifact.v1",
+            "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
             "temporal_status": "CAUSAL",
             "dependency_validation": "COHERENT",
             "certified_bundles": {"5": {"runs": {}}},
@@ -399,6 +403,7 @@ def test_H5_decision_runner_refuses_an_artifact_with_an_incomplete_audit(tmp_pat
             "decision_search_permitted": True,
             "route_search_executed": False,
             "transfer_execution_performed": False,
+            "certification_wiring": fg.certification_wiring_identity(),
             "history_completeness": history_completeness,
         }
 
@@ -408,12 +413,15 @@ def test_H5_decision_runner_refuses_an_artifact_with_an_incomplete_audit(tmp_pat
         fg.load_certification_artifact(path)
     assert hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE in str(failure.value)
 
-    # A complete audit, and an artifact without the block, both stay readable.
+    # A complete audit is readable; an ABSENT audit on a current-schema artifact is
+    # not, even though every authorisation field still says permitted.
     complete = dict(incomplete, complete=True, blocker=None, reasons=[])
     path.write_text(json.dumps(_artifact(complete)), encoding="utf-8")
     assert fg.load_certification_artifact(path)["decision_search_permitted"] is True
     path.write_text(json.dumps(_artifact(None)), encoding="utf-8")
-    assert fg.load_certification_artifact(path)["decision_search_permitted"] is True
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)
 
 
 # ---------------------------------------------------------------------------
@@ -725,13 +733,36 @@ def test_C_new_schema_with_audit_absent_is_rejected(tmp_path):
     assert "never inferred as PASS" in message
 
 
-def test_D_legacy_v1_artifact_without_the_audit_is_still_readable(tmp_path):
-    """The accepted R5 artifact keeps loading, via its DECLARED schema."""
+def test_D_legacy_v1_without_the_audit_needs_a_recognised_identity(tmp_path, monkeypatch):
+    """The legacy door is an explicit, self-verifying identity -- not the schema."""
 
-    path = _write(tmp_path, _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1, certification_wiring=None))
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1, certification_wiring=None)
+    payload["planning_cutoff"] = CUTOFF
+    payload["data_snapshot_sha256"] = "d" * 64
+    payload["certified_bundle_identity"] = {"5": "sha256:" + "b" * 64}
+    payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
+
+    # Not on the allowlist -> refused, even though the identity is self-consistent.
+    path = _write(tmp_path, payload, name="v1_unrecognised.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in str(failure.value)
+
+    # Recognised AND self-consistent -> readable without the audit.
+    monkeypatch.setattr(
+        fg, "LEGACY_CERTIFICATION_IDENTITIES",
+        (*fg.LEGACY_CERTIFICATION_IDENTITIES, payload["four_gw_certification_identity"]),
+    )
     loaded = fg.load_certification_artifact(path)
     assert loaded["schema"] == fg.CERTIFICATION_ARTIFACT_SCHEMA_V1
     assert "history_completeness" not in loaded
+
+    # Recognised but NOT self-consistent (a different cutoff with the same label) -> refused.
+    forged = dict(payload, planning_cutoff="2026-11-01T00:00:00Z")
+    forged_path = _write(tmp_path, forged, name="v1_forged.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(forged_path)
+    assert "does not match" in str(failure.value)
 
 
 @pytest.mark.skipif(
@@ -746,7 +777,7 @@ def test_D2_the_real_accepted_r5_artifact_still_loads():
 
 
 def test_E_missing_audit_never_grants_legacy_status_by_absence(tmp_path):
-    """Legacy status comes from the declared schema, not from a missing field."""
+    """Legacy status comes from a recognised identity, not from a missing field."""
 
     # 1. An unrecognised schema is rejected outright - it cannot inherit legacy status.
     path = _write(tmp_path, _artifact("fpl_brain.certification_artifact.v3"), name="unknown.json")
@@ -754,16 +785,18 @@ def test_E_missing_audit_never_grants_legacy_status_by_absence(tmp_path):
         fg.load_certification_artifact(path)
     assert "is not one of" in str(failure.value)
 
-    # 2. Same payload, audit absent: v1 passes (legacy) but v2 fails. The ONLY
-    #    difference is the declared schema.
+    # 2. Audit absent: BOTH schemas are refused, for their own explicit reasons.
     v1 = _write(tmp_path, _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1, certification_wiring=None), name="v1.json")
     v2 = _write(tmp_path, _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V2), name="v2.json")
-    assert fg.load_certification_artifact(v1)["schema"] == fg.CERTIFICATION_ARTIFACT_SCHEMA_V1
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(v1)
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in str(failure.value)
+    assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)
     with pytest.raises(fg.DecisionCertificationRequired) as failure:
         fg.load_certification_artifact(v2)
     assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)
 
-    # 3. A PRESENT but incomplete audit defeats legacy status.
+    # 3. A PRESENT but incomplete audit defeats legacy status at every version.
     legacy_bad = _write(
         tmp_path,
         _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1,
@@ -868,3 +901,249 @@ def test_H_certifier_writes_the_current_schema_not_a_hardcoded_version():
     assert fg.CERTIFICATION_ARTIFACT_SCHEMA_V1 in fg.SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS
     assert fg.certification_artifact_requires_history_completeness(fg.CERTIFICATION_ARTIFACT_SCHEMA_V2) is True
     assert fg.certification_artifact_requires_history_completeness(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1) is False
+
+
+# ---------------------------------------------------------------------------
+# F1 — an owed observation must not become invisible.
+# ---------------------------------------------------------------------------
+
+
+def test_F1_missing_completed_history_cannot_be_masked_by_an_unfinished_fixture(tmp_path):
+    """The independent review's counterexample, driven through the REAL lifecycle.
+
+    The reviewer hand-deleted a completed fixture's row and the audit reported
+    complete=True because a coincident unfinished fixture excused the residual.
+    The repair is a lifecycle one: nothing deletes that row any more, so the owed
+    observation survives as a placeholder and the structural check fails closed.
+    """
+
+    _config_, conn = _seed(
+        tmp_path, event4_final=False, event4_row=PLACEHOLDER_ROW,
+        aggregate_minutes=360, fixture4_finished=False,
+    )
+    # Degrade the completed GW3 row to a bare placeholder, then let the canonical
+    # prune decide its fate exactly as a refresh would (the payload has relocated
+    # fixture 3 to event 4 and offers no replacement row).
+    with conn:
+        conn.execute(
+            "UPDATE player_gameweeks SET minutes=0, starts=NULL, total_points=NULL, goals_scored=NULL,"
+            " assists=NULL, clean_sheets=NULL, goals_conceded=NULL, saves=NULL, bonus=NULL, bps=NULL,"
+            " yellow_cards=NULL, red_cards=NULL, penalties_saved=NULL, penalties_missed=NULL,"
+            " own_goals=NULL, influence=NULL, creativity=NULL, threat=NULL, ict_index=NULL,"
+            " expected_goals=NULL, expected_assists=NULL, expected_goal_involvements=NULL,"
+            " expected_goals_conceded=NULL, defensive_contribution=NULL WHERE event=3"
+        )
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 1, {(4, 3)})
+    assert deleted == 0, "a started current-club placeholder must survive without replacement"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM player_gameweeks WHERE player_id=1 AND event=3 AND fixture_id=3"
+    ).fetchone()[0] == 1
+
+    audit = _audit(conn)
+    assert audit["structural"]["placeholder_rows"] >= 1
+    assert audit["complete"] is False
+    assert hc.DIAG_COMPLETED_EVENT_PLACEHOLDER_ROW in audit["reasons"]
+    # ...and the coincident unfinished fixture does NOT excuse it.
+    assert audit["blocker"] == hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE
+    conn.close()
+
+
+def test_F1b_residual_explanation_requires_the_players_own_row(tmp_path):
+    """A never-ingested player has no anchor, so his residual cannot be excused.
+
+    The anchor is the player's OWN row on a started-unfinished fixture -- not his
+    club's -- so nothing about historical club membership is inferred.
+    """
+
+    _config_, conn = _seed(
+        tmp_path, event4_final=False, event4_row=PLACEHOLDER_ROW,
+        aggregate_minutes=360, fixture4_finished=False,
+    )
+    # Drop EVERY row for player 2, including the in-progress anchor row.
+    with conn:
+        conn.execute("DELETE FROM player_gameweeks WHERE player_id=2")
+    reconciliation = hc.reconciliation_audit(conn, planning_event=PLANNING_EVENT, cutoff=CUTOFF)
+    minutes = reconciliation["per_field"]["minutes"]
+    assert minutes["unexplained_players"] == 1
+    assert [row["player_id"] for row in minutes["unexplained"]] == [2]
+    assert reconciliation["complete"] is False
+    # Team 1 still HAS an unfinished fixture, so a club-level rule would have
+    # excused this residual; the player's own anchor is what stops it.
+    assert 1 in reconciliation["explainable_team_ids"]
+    conn.close()
+
+
+def test_F3_reconciliation_ignores_a_mislabelled_row_the_consumer_cannot_read(tmp_path):
+    """Reconciliation must use the consumer predicate (both event boundaries)."""
+
+    _config_, conn = _seed(
+        tmp_path, event4_final=False, event4_row=COMPLETE_ROW,
+        aggregate_minutes=270, fixture4_finished=False,
+    )
+    # Relabel event 3's fixture to an event at/after the planning event: the
+    # consumers cannot read it (f.event < planning fails), so the reconciliation
+    # must not count it either.
+    with conn:
+        conn.execute("UPDATE fixtures SET event=6 WHERE id=3")
+    reconciliation = hc.reconciliation_audit(conn, planning_event=PLANNING_EVENT, cutoff=CUTOFF)
+    minutes = reconciliation["per_field"]["minutes"]
+    # 90+90 readable minutes per player against a 270 aggregate: if the mislabelled
+    # row were counted the history would EXCEED the aggregate (a false failure).
+    assert minutes["history_exceeds_aggregate_players"] == 0
+    assert minutes["unexplained_players"] == 0
+    assert minutes["residuals_permitted_by_own_anchor_row"] == 0
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# F2 — legacy status is an explicit, self-verifying identity, not a schema label.
+# ---------------------------------------------------------------------------
+
+R5_ARTIFACT = Path("K:/FPL/data/exports/four_gw/gw05/certification_artifact.json")
+
+
+def _r5_v1_payload():
+    return json.loads(R5_ARTIFACT.read_text(encoding="utf-8"))
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2A_real_r5_v1_is_grandfathered_by_its_recognised_identity():
+    payload = _r5_v1_payload()
+    identity = payload["four_gw_certification_identity"]
+    assert identity in fg.LEGACY_CERTIFICATION_IDENTITIES
+    assert identity == fg.certification_identity_of(payload), "the legacy identity must be self-consistent"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "r5.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = fg.load_certification_artifact(path)
+    assert loaded["schema"] == fg.CERTIFICATION_ARTIFACT_SCHEMA_V1
+    assert loaded["decision_search_permitted"] is True
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2B_r5_shaped_v1_with_a_changed_identity_is_rejected():
+    payload = _r5_v1_payload()
+    payload["four_gw_certification_identity"] = "sha256:" + "0" * 64
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "r5_clone.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    message = str(failure.value)
+    assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in message
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in message
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2C_stale_producer_v1_at_a_later_cutoff_is_rejected():
+    """An old certifier re-run for a NEW horizon computes a NEW identity."""
+
+    payload = _r5_v1_payload()
+    payload["planning_cutoff"] = "2026-10-20T08:00:00Z"
+    payload["events"] = [7, 8, 9, 10]
+    payload["data_snapshot_sha256"] = "f" * 64
+    payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
+    assert payload["four_gw_certification_identity"] not in fg.LEGACY_CERTIFICATION_IDENTITIES
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "stale.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in str(failure.value)
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2D_recognised_identity_copied_onto_a_different_artifact_is_rejected():
+    """Copying the allowlisted label must not launder a different certification."""
+
+    payload = _r5_v1_payload()
+    payload["planning_cutoff"] = "2026-10-20T08:00:00Z"          # identity left untouched on purpose
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "forged.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    assert fg.DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED in str(failure.value)
+    assert "does not match" in str(failure.value)
+
+
+def test_F2E_arbitrary_v1_without_audit_or_identity_is_rejected(tmp_path):
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA_V1, certification_wiring=None)
+    payload.pop("four_gw_certification_identity", None)
+    path = _write(tmp_path, payload, name="arbitrary_v1.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_F2F_recognised_legacy_identity_with_an_incomplete_audit_still_fails():
+    payload = _r5_v1_payload()
+    payload["history_completeness"] = _complete_audit(
+        complete=False, blocker=hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE, reasons=["x"]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "legacy_bad.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.load_certification_artifact(path)
+    assert hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE in str(failure.value)
+
+
+# ---------------------------------------------------------------------------
+# F6 — the real producer -> real consumer seam.
+# ---------------------------------------------------------------------------
+
+
+def test_F6_real_certifier_artifact_loads_through_the_real_loader(tmp_path):
+    """Exercise the ACTUAL certifier construction and the ACTUAL loader."""
+
+    from types import SimpleNamespace
+
+    snapshot = SimpleNamespace(
+        data_snapshot_sha256="e" * 64,
+        created_at=CUTOFF,
+        path=str(tmp_path / "snapshot.db"),
+        # A non-existent live path makes live_source_drift informational-only and
+        # side-effect free, so this seam test touches no database at all.
+        source_db_identity={"path": str(tmp_path / "absent_live.db")},
+    )
+    history_audit = _complete_audit()
+    artifact = certifier.build_certification_artifact(
+        run_uuid="00000000-0000-0000-0000-000000000000",
+        planning_cutoff=CUTOFF,
+        events=[5, 6, 7, 8],
+        snapshot=snapshot,
+        certified={"5": {"runs": {"minutes_v1": 1}}},
+        bundle_identity={"5": "sha256:" + "a" * 64},
+        manager_state={"event": 5, "bank_tenths": 7},
+        model_versions=[("minutes_v1", "minutes_v1.6.0")],
+        execution_started_at=CUTOFF,
+    )
+    permitted, reasons = certifier.decide_search_permission(
+        temporal_status=artifact["temporal_status"],
+        dependency_validation=artifact["dependency_validation"],
+        horizon_status=certifier.fg.DECISION_HORIZON_COMPLETE,
+        data_snapshot_sha256=artifact["data_snapshot_sha256"],
+        history_completeness=history_audit,
+    )
+    artifact["history_completeness"] = history_audit
+    artifact["decision_search_permitted"] = permitted
+    artifact["decision_search_permitted_reasons"] = reasons
+
+    # The real producer emits v2 with both required blocks.
+    assert artifact["schema"] == fg.CERTIFICATION_ARTIFACT_SCHEMA_V2
+    assert "history_completeness" in artifact and "certification_wiring" in artifact
+    assert artifact["certification_wiring"]["entry_point"] == fg.CERTIFIER_ENTRY_POINT
+
+    path = tmp_path / "artifact.json"
+    path.write_text(json.dumps(artifact, default=str), encoding="utf-8")
+    loaded = fg.load_certification_artifact(path)
+    assert loaded["decision_search_permitted"] is True
+
+    # Removing the audit makes the SAME artifact unusable.
+    artifact.pop("history_completeness")
+    path.write_text(json.dumps(artifact, default=str), encoding="utf-8")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)

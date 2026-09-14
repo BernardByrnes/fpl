@@ -419,6 +419,9 @@ def test_j_certifier_authorisation_is_executable_not_merely_present():
         dependency_validation="COHERENT",
         horizon_status=fg.DECISION_HORIZON_COMPLETE,
         data_snapshot_sha256="d" * 64,
+        # The history-completeness audit is a REQUIRED argument (F5): permission
+        # can never be obtained by simply not evaluating the gate.
+        history_completeness={"complete": True, "blocker": None, "reasons": []},
     )
     permitted, reasons = certifier.decide_search_permission(**base)
     assert permitted is True, reasons

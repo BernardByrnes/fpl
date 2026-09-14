@@ -416,6 +416,18 @@ SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V1, CE
 # Schemas that must carry the history audit; anything newer inherits the rule.
 HISTORY_COMPLETENESS_REQUIRED_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V2,)
 
+# An OLD producer copy still declares v1, so the schema ALONE cannot be the legacy
+# test -- accepting v1 by schema would let a stale certifier mint an audit-free
+# artifact that the current consumer accepts.  Legacy compatibility is therefore
+# granted only to explicitly recognised historical certification identities
+# (four_gw_certification_identity), not to whatever merely looks old.
+LEGACY_CERTIFICATION_IDENTITIES = (
+    # Accepted R5 GW5-GW8 certification, planning cutoff 2026-09-14T08:14:22Z.
+    # Minted before the history-completeness repair; audited read-only and still
+    # valid at its own cutoff (GW3 required, GW4 correctly not required).
+    "sha256:264cd90e56a3e85fc03ec10324688acba06b3d4903ed96dc90ca1d73685a8bb5",
+)
+
 # The certification entry point whose wiring contains the history-completeness
 # gate.  It is part of SOURCE_SNAPSHOT_FILES, and every v2 artifact must declare
 # it as covered, so a consumer can prove the gate was in the producing wiring.
@@ -423,6 +435,7 @@ CERTIFIER_ENTRY_POINT = "scripts/certify_gw5_gw8.py"
 
 DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING = "CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING"
 DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING = "CERTIFICATION_WIRING_IDENTITY_MISSING"
+DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED = "LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED"
 
 
 def certification_artifact_requires_history_completeness(schema: Any) -> bool:
@@ -451,6 +464,29 @@ def certification_wiring_identity(root: str | Path | None = None) -> dict[str, A
         "entry_point_sha256": hashlib.sha256((base / CERTIFIER_ENTRY_POINT).read_bytes()).hexdigest(),
         "covered_source_files": list(analytics.SOURCE_SNAPSHOT_FILES),
     }
+
+
+def certification_identity_of(payload: Mapping[str, Any]) -> str:
+    """Recompute an artifact's own certification identity from its own fields.
+
+    ``four_gw_certification_identity`` is a pure function of the cutoff, the
+    per-event bundle identities and the data snapshot identity, so a consumer can
+    verify it without any code-drift assumption.  That is what makes the legacy
+    allowlist an identity test rather than a forgeable label: copying a recognised
+    identity onto a different artifact fails this check.
+    """
+
+    import hashlib
+    import json as _json
+
+    fingerprint = {
+        "cutoff": payload.get("planning_cutoff"),
+        "bundles": payload.get("certified_bundle_identity") or {},
+        "data_snapshot_sha256": payload.get("data_snapshot_sha256"),
+    }
+    return "sha256:" + hashlib.sha256(
+        _json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def load_certification_artifact(path: str | Path) -> dict[str, Any]:
@@ -516,8 +552,9 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
             f"audit is not complete ({completeness.get('reasons')})"
         )
     # A NEW certification must not be able to omit the audit.  Absence is only
-    # grandfathered by the artifact's own declared legacy schema -- never by the
-    # mere fact that the field is missing, and never silently inferred as PASS.
+    # grandfathered for an EXPLICITLY RECOGNISED historical certification
+    # identity -- never for a mere schema label, an old-looking cutoff, or the
+    # simple fact that the field is missing, and never inferred as PASS.
     if certification_artifact_requires_history_completeness(payload.get("schema")):
         if not isinstance(completeness, Mapping):
             raise DecisionCertificationRequired(
@@ -538,6 +575,22 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
             raise DecisionCertificationRequired(
                 f"{DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING}: certification schema "
                 f"{payload.get('schema')!r} carries no entry-point code identity"
+            )
+    elif not isinstance(completeness, Mapping):
+        identity = str(payload.get("four_gw_certification_identity") or "")
+        recognised = identity in set(LEGACY_CERTIFICATION_IDENTITIES)
+        self_consistent = identity == certification_identity_of(payload)
+        if not (recognised and self_consistent):
+            detail = (
+                "not a recognised legacy identity" if not recognised
+                else "the identity does not match this artifact's own cutoff/bundles/snapshot"
+            )
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING}: "
+                f"{DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED}: schema "
+                f"{payload.get('schema')!r} may omit the history_completeness audit only for a recognised "
+                f"AND self-consistent historical certification identity ({detail}); "
+                f"{identity or '<none>'!r} is not a grandfathered legacy certification"
             )
     if payload.get("route_search_executed") is not False or payload.get(
         "transfer_execution_performed"

@@ -511,6 +511,28 @@ def prune_stale_element_summary_placeholders(
     rows and sentinel/blank rows are never touched; a placeholder whose
     fixture still involves the player's current club without reassignment
     evidence is retained instead of pruned.
+
+    STARTED-FIXTURE PROTECTION
+    --------------------------
+    A placeholder holds no observation, so deleting one normally only removes a
+    stale *slot*.  But once the fixture it points at has STARTED, that slot is
+    the only surviving evidence that this player-fixture observation is still
+    owed, and a row that does not exist cannot be reported as a gap.  For a
+    fixture that involves the player's CURRENT club — the only fixtures whose
+    observations he can be required to have — a started placeholder is therefore
+    only removed once authoritative replacement evidence proves the observation
+    is represented at the pair the payload now claims (``fixture_started``):
+
+      * fixture has NOT started  -> prune normally (the slot is not yet owed);
+      * fixture HAS started and the payload's claimed pair already holds a row
+        -> delete this stale label, because the observation is represented there;
+      * fixture HAS started and no replacement exists -> RETAIN, so the owed
+        observation surfaces later as ``COMPLETED_EVENT_PLACEHOLDER_ROW`` in the
+        certified-history audit instead of disappearing from it.
+
+    Retaining a slot is visible and recoverable; deleting an owed observation is
+    neither.  Nothing is fabricated here: no zeros, no synthetic observations,
+    and a row is never relocated to a club the player is not currently at.
     """
 
     claimed = {(int(event), int(fixture_id)) for event, fixture_id in claimed_pairs}
@@ -534,21 +556,40 @@ def prune_stale_element_summary_placeholders(
         ).fetchone()
         if stored is None or _gameweek_has_performance(dict(stored)):
             continue
+        fixture = conn.execute(
+            "SELECT team_h, team_a, started, finished FROM fixtures WHERE id=?", (int(fixture_id),)
+        ).fetchone()
+        involves_current_club = (
+            fixture is not None
+            and current_team is not None
+            and current_team in (fixture["team_h"], fixture["team_a"])
+        )
+        fixture_started = fixture is not None and (
+            bool(fixture["started"]) or bool(fixture["finished"])
+        )
         if int(fixture_id) in claimed_fixtures:
-            # Same physical fixture, officially reassigned to another event:
-            # the local (event, fixture) label is stale by the payload itself.
+            # Same physical fixture, officially reassigned to another event: the
+            # local (event, fixture) label is stale by the payload itself.  For a
+            # STARTED fixture of the player's current club the stale label may go
+            # only once the observation is represented at a claimed pair.
+            if involves_current_club and fixture_started:
+                present = {
+                    int(row[0])
+                    for row in conn.execute(
+                        "SELECT event FROM player_gameweeks WHERE player_id=? AND fixture_id=?",
+                        (int(player_id), int(fixture_id)),
+                    ).fetchall()
+                }
+                replacement_events = {pair[0] for pair in claimed if pair[1] == int(fixture_id)}
+                if not (replacement_events & present):
+                    continue
             conn.execute(
                 "DELETE FROM player_gameweeks WHERE player_id=? AND event=? AND fixture_id=?",
                 (int(player_id), int(event), int(fixture_id)),
             )
             deleted += 1
             continue
-        fixture = conn.execute(
-            "SELECT team_h, team_a FROM fixtures WHERE id=?", (int(fixture_id),)
-        ).fetchone()
-        if fixture is not None and current_team is not None and current_team in (
-            fixture["team_h"], fixture["team_a"]
-        ):
+        if involves_current_club:
             continue
         conn.execute(
             "DELETE FROM player_gameweeks WHERE player_id=? AND event=? AND fixture_id=?",

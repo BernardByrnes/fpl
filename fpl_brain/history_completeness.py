@@ -238,14 +238,38 @@ def structural_audit(
 # ---------------------------------------------------------------------------
 
 
+def anchored_residual_players(
+    conn: sqlite3.Connection, *, planning_event: int, cutoff: str
+) -> set[int]:
+    """Players who hold their OWN row on a started-but-unfinished pre-cutoff fixture.
+
+    This is the only admissible explanation for an aggregate that runs ahead of
+    the completed history: the residual must come from a fixture the player
+    himself has a slot in.  The anchor is derived from the player's own rows, not
+    from his current club, so nothing about historical membership is inferred
+    from the present squad — a player whose history was never ingested at all has
+    no anchor and therefore cannot have a residual excused.
+    """
+
+    rows = conn.execute(
+        """SELECT DISTINCT pg.player_id
+             FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
+            WHERE f.finished != 1 AND f.started = 1
+              AND pg.event < ? AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
+        (int(planning_event), str(cutoff)),
+    ).fetchall()
+    return {int(row[0]) for row in rows}
+
+
 def started_unfinished_team_ids(
     conn: sqlite3.Connection, *, planning_event: int, cutoff: str
 ) -> set[int]:
     """Teams with a pre-cutoff fixture that has started but is not finished.
 
-    These are the only fixtures whose minutes the official aggregate can contain
-    while the event-specific history cannot yet hold them, so they are the sole
-    legitimate explanation for an aggregate that runs ahead of the history.
+    Informational only.  A club having such a fixture is NOT sufficient to excuse
+    a residual -- the player must hold his own row on it
+    (``anchored_residual_players``) -- because an unfetched or pruned observation
+    would otherwise be masked by a team-mate's unfinished fixture.
     """
 
     rows = conn.execute(
@@ -275,24 +299,30 @@ def reconciliation_audit(
 ) -> dict[str, Any]:
     """Official aggregate minus the history the models can actually read.
 
-    The residual is permitted only when the player's club has a started-but-
-    unfinished pre-cutoff fixture, which is the one thing that can legitimately
-    put minutes into the aggregate without putting them into the history.  An
-    unexplained positive residual (history missing) and a negative residual
+    The residual is permitted only when the PLAYER HIMSELF holds a row on a
+    started-but-unfinished pre-cutoff fixture, which is the one thing that can
+    legitimately put minutes into the aggregate without putting them into the
+    history.  A club-level explanation is deliberately NOT enough: it would mask a
+    pruned or never-ingested observation behind a team-mate's unfinished fixture.
+    An unexplained positive residual (history missing) and a negative residual
     (history exceeding the official cumulative total) both fail closed.
     """
 
     analytics = _import_analytics()
     fields = (HARD_RECONCILED_FIELD,) + DIAGNOSTIC_RECONCILED_FIELDS
     select = ", ".join(f"SUM(pg.{f}) AS {f}" for f in fields)
-    params = (int(planning_event), str(cutoff))
+    # The row predicate is the consumer one (analytics.completed_rows_as_of): both
+    # the player's event label AND the fixture's event must sit before the planning
+    # event, so the reconciliation measures exactly the rows the models can read.
+    params = (int(planning_event), int(planning_event), str(cutoff))
 
     history = _row_sums(
         conn,
         f"""SELECT pg.player_id, {select}
               FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
              WHERE f.finished = 1 AND f.started = 1
-               AND pg.event < ? AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
+               AND pg.event < ? AND f.event < ?
+               AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
              GROUP BY pg.player_id""",
         params,
     )
@@ -301,10 +331,12 @@ def reconciliation_audit(
         f"""SELECT pg.player_id, {select}
               FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
              WHERE f.finished != 1 AND f.started = 1
-               AND pg.event < ? AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
+               AND pg.event < ? AND f.event < ?
+               AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
              GROUP BY pg.player_id""",
         params,
     )
+    anchored = anchored_residual_players(conn, planning_event=planning_event, cutoff=cutoff)
     explainable_teams = started_unfinished_team_ids(conn, planning_event=planning_event, cutoff=cutoff)
 
     teams = {
@@ -339,14 +371,14 @@ def reconciliation_audit(
             }
             if residual < 0:
                 exceed.append(entry)
-            elif team in explainable_teams:
+            elif player_id in anchored:
                 permitted += 1
             else:
                 missing.append(entry)
         per_field[field] = {
             "enforced": field == HARD_RECONCILED_FIELD,
             "players_checked": checked,
-            "residuals_permitted_by_unfinished_fixtures": permitted,
+            "residuals_permitted_by_own_anchor_row": permitted,
             "unexplained_players": len(missing),
             "history_exceeds_aggregate_players": len(exceed),
             "unexplained": missing[:MAX_REPORTED_PLAYERS],
@@ -360,14 +392,15 @@ def reconciliation_audit(
         "hard_field": HARD_RECONCILED_FIELD,
         "diagnostic_fields": list(DIAGNOSTIC_RECONCILED_FIELDS),
         "explainable_team_ids": sorted(explainable_teams),
+        "anchored_player_count": len(anchored),
         "per_field": per_field,
         "complete": bool(hard["complete"]),
         "detail": (
-            "the official aggregate is fully accounted for by completed history plus "
-            "started-but-unfinished fixtures"
+            "the official aggregate is fully accounted for by completed history plus each "
+            "player's own started-but-unfinished fixture rows"
             if hard["complete"]
             else "the official aggregate advanced beyond the completed history with no "
-                 "unfinished fixture to explain it"
+                 "unfinished fixture of the player's own to explain it"
         ),
     }
 
