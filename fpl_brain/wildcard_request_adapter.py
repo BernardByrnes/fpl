@@ -221,7 +221,15 @@ def build_wildcard_request(
     conn: sqlite3.Connection | None = None,
     pool_binding: wc.WildcardPoolBinding | None = None,
     canonical_route: Any | None = None,
-    route_evaluation: Mapping[str, Any] | None = None,
+    #: Authoritative evaluation INPUTS for the canonical route: the world
+    #: matrices the route engine used plus the position resolver and run
+    #: configuration.  NOT an evaluation RESULT -- the converter calls
+    #: ``route_optimizer.exact_evaluate`` itself, so there is no channel for a
+    #: caller to supply a numeric SAVE value.
+    route_worlds_by_event: Mapping[int, Any] | None = None,
+    route_positions_of: Any | None = None,
+    route_config: Any | None = None,
+    route_events: Sequence[int] | None = None,
     club_of: Mapping[int, int] | None = None,
 ) -> wc.WildcardRequest:
     """Assemble an authoritative ``WildcardRequest``, or refuse.
@@ -342,16 +350,24 @@ def build_wildcard_request(
                 "WildcardSaveRoute, not both",
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
-        if route_evaluation is None:
+        if route_worlds_by_event is None or route_positions_of is None:
             raise WildcardAdapterError(
                 f"{wc.WC_SAVE_ROUTE_INVALID}: the canonical route must be accompanied by its "
-                "exact-evaluation result (the source of mean_net_core)",
+                "authoritative evaluation INPUTS (world matrices and the position resolver); "
+                "the SAVE value is evaluated internally and is never caller-supplied",
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
+        # The converter validates the route (PASS 1), evaluates that SAME route
+        # canonically (PASS 2) and builds the DTO from the canonical values
+        # (PASS 3).  Nothing numeric is forwarded from here.
         route = wildcard_save_route.wildcard_save_route_from_canonical_route(
-            canonical_route, route_evaluation,
+            canonical_route,
             planning_event=int(manager.planning_event), horizon=certified.horizon,
             rules=rules, expected_horizon=certified.horizon.events[:4], club_of=club_of,
+            worlds_by_event=route_worlds_by_event,
+            positions_of=route_positions_of,
+            config=route_config,
+            events=route_events,
         )
     elif route is not None and conn is not None:
         # A production call (a live connection is present) may not take a

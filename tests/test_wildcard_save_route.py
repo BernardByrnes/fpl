@@ -475,8 +475,22 @@ def test_D_B_the_adapter_refuses_a_synthetic_route_in_production(tmp_path):
     conn.close()
 
 
-def test_D_B2_the_adapter_requires_the_routes_exact_evaluation_when_canonical():
+def test_D_B2_the_adapter_requires_the_authoritative_evaluation_INPUTS():
+    """The production adapter demands the evaluation INPUTS, never a result.
+
+    This is the stale-call-site regression: the adapter must reach the
+    converter's internal exact_evaluate through the authoritative inputs, and
+    there must be no argument through which caller-supplied numbers could travel.
+    """
+
+    import inspect
+
     from fpl_brain import wildcard_request_adapter as ad
+
+    parameters = inspect.signature(ad.build_wildcard_request).parameters
+    assert "route_evaluation" not in parameters
+    assert "route_worlds_by_event" in parameters and "route_positions_of" in parameters
+
     from tests.test_wildcard_request_adapter import (
         _certified, _legal_owned, _manager, _pool,
     )
@@ -488,9 +502,9 @@ def test_D_B2_the_adapter_requires_the_routes_exact_evaluation_when_canonical():
         ad.build_wildcard_request(
             _manager(players, owned), _certified(players), None,
             rules=RULES, data_snapshot_sha256="sha256:" + "d" * 64,
-            canonical_route=_canonical_route(meta), route_evaluation=None,
+            canonical_route=_canonical_route(meta),
         )
-    assert "exact-evaluation result" in str(exc.value)
+    assert "INPUTS" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

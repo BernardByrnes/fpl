@@ -397,3 +397,148 @@ def test_adapter_O_overlapping_wc_definitions_refuse():
     evaluation = wc.evaluate_wildcard(request)
     assert wc.WC_WINDOW_AMBIGUOUS in evaluation.reason_codes
     assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+# ---------------------------------------------------------------------------
+# §4 — the REAL production path: adapter -> converter -> exact_evaluate -> request
+# ---------------------------------------------------------------------------
+
+
+def _canonical_route_fixture(players, owned):
+    """A genuine canonical PartialRoute built from apply_transfer_batch.
+
+    Mirrors the route engine's own construction: one canonical transition per
+    event, each carrying before_state / squad_after / next_event_state.
+    """
+
+    from fpl_brain import route_optimizer as ro
+    from fpl_brain import transfer_state as ts
+
+    meta = {int(pid): ts.PlayerMeta(player_id=int(pid), position=players[int(pid)].position,
+                                    club_id=int(players[int(pid)].club_id))
+            for pid in owned}
+    price = {int(pid): int(players[int(pid)].market_price_tenths) for pid in owned}
+    state = ts.RouteState(
+        event=PLANNING_EVENT,
+        players=tuple(ts.RoutePlayer(player_id=p, position=meta[p].position,
+                                     club_id=meta[p].club_id, purchase_price_tenths=price[p])
+                      for p in sorted(owned)),
+        bank_tenths=30, free_transfers=1, event_start_free_transfers=1,
+    )
+    actions = []
+    for event in range(PLANNING_EVENT, PLANNING_EVENT + 4):
+        snapshot = ts.PriceSnapshot(event=int(event), prices=price)
+        transition = ts.apply_transfer_batch(state, ts.TransferBatch.roll(), snapshot, meta)
+        nxt = transition.next_event_state
+        actions.append({
+            "event": int(event), "kind": "ROLL", "batch": ts.TransferBatch.roll(),
+            "transition": transition, "hit_points": 0, "delta_3gw": 0.0,
+            "squad_ids": tuple(sorted(int(p.player_id) for p in nxt.players)),
+            "ft_after": int(nxt.free_transfers), "bank_after": int(nxt.bank_tenths),
+        })
+        state = nxt
+
+    class _Partial:
+        def __init__(self):
+            self.actions = tuple(actions)
+            self.state = state
+            self.hits = 0
+
+    return _Partial()
+
+
+def _route_worlds(partial, players):
+    from fpl_brain import route_optimizer as ro
+
+    worlds = {}
+    for event, squad in ro.route_event_squads(partial):
+        ids = tuple(sorted(int(p) for p in squad))
+        worlds[int(event)] = {
+            "worlds": 1, "player_ids": list(ids),
+            "core": {pid: [1.0] for pid in ids},
+            "minutes": {pid: [90.0] for pid in ids},
+        }
+    return worlds
+
+
+def _route_positions(players):
+    def positions_of(squad_ids):
+        return {int(p): players[int(p)].position for p in squad_ids if int(p) in players}
+
+    return positions_of
+
+
+def test_adapter_P_production_happy_path_reaches_exact_evaluate():
+    """THE regression for the stale call site.
+
+    A valid canonical route plus authoritative evaluation inputs must flow
+    build_wildcard_request -> converter -> exact_evaluate -> a valid
+    WildcardRequest, with no refusal and no TypeError, and WITHOUT any
+    caller-supplied evaluation result.
+    """
+
+    import inspect
+
+    from fpl_brain import route_optimizer as ro
+
+    players = _pool()
+    owned = _legal_owned(players)
+
+    # there is no evaluation-RESULT parameter on the production adapter any more
+    parameters = inspect.signature(ad.build_wildcard_request).parameters
+    assert "route_evaluation" not in parameters
+    assert "route_worlds_by_event" in parameters
+
+    partial = _canonical_route_fixture(players, owned)
+    request = ad.build_wildcard_request(
+        _manager(players, owned), _certified(players), None,
+        rules=RULES, data_snapshot_sha256=SNAPSHOT,
+        canonical_route=partial,
+        route_worlds_by_event=_route_worlds(partial, players),
+        route_positions_of=_route_positions(players),
+        route_config=ro.OptimizerConfig(),
+        route_events=tuple(range(PLANNING_EVENT, PLANNING_EVENT + 4)),
+    )
+
+    assert isinstance(request, wc.WildcardRequest)
+    assert request.save_route is not None
+    assert len(request.save_route.events) == 4
+    # the values are the canonical exact evaluation of THIS route
+    evaluation = ro.exact_evaluate(
+        partial, worlds_by_event=_route_worlds(partial, players),
+        positions_of=_route_positions(players), cache={},
+        config=ro.OptimizerConfig(), events=tuple(range(PLANNING_EVENT, PLANNING_EVENT + 4)),
+    )
+    expected = {int(r["event"]): float(r["mean_net_core"]) for r in evaluation["per_event"]}
+    assert [e.mean_net_core for e in request.save_route.events] == \
+           [expected[e.event] for e in request.save_route.events]
+
+    # and the full decision still runs, review-only
+    decision = wc.evaluate_wildcard(request)
+    assert decision.candidate_metrics["mean_paired_uplift"] is not None or decision.reason_codes
+
+
+def test_adapter_Q_no_caller_supplied_evaluation_result_exists():
+    """There is no production argument representing caller-authoritative values."""
+
+    import inspect
+
+    for name in ("route_evaluation", "evaluation", "route_values", "mean_net_core"):
+        assert name not in inspect.signature(ad.build_wildcard_request).parameters, name
+    assert "evaluation" not in inspect.signature(
+        ad.wildcard_save_route.wildcard_save_route_from_canonical_route
+    ).parameters
+
+
+def test_adapter_R_missing_authoritative_inputs_refuses():
+    """Without the authoritative inputs the adapter refuses rather than inventing."""
+
+    players = _pool()
+    owned = _legal_owned(players)
+    partial = _canonical_route_fixture(players, owned)
+    with pytest.raises(ad.WildcardAdapterError) as exc:
+        ad.build_wildcard_request(
+            _manager(players, owned), _certified(players), None,
+            rules=RULES, data_snapshot_sha256=SNAPSHOT, canonical_route=partial,
+        )
+    assert "authoritative evaluation INPUTS" in str(exc.value)
