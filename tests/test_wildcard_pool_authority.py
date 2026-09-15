@@ -45,10 +45,13 @@ def _universe_with_extra(players, extra_id=999):
 
     augmented = dict(players)
     events = {}
+    # Finding B gives rows their own COMPLETE predictive identity; this fixture
+    # (added by Finding C, before B) is adapted mechanically to that field.
+    reference = next(iter(players[min(players)].events.values()))
     for event in players[min(players)].events:
         events[event] = wc.WildcardPlayerEvent(
             event=event, expected_points=99.0, expected_minutes=90.0, p_start=1.0,
-            availability=1.0, fixture_count=1, cutoff=CUTOFF, generation=GENERATION,
+            availability=1.0, fixture_count=1, identity=reference.identity,
         )
     augmented[extra_id] = wc.WildcardPlayer(
         player_id=extra_id, position="FWD", club_id=1, market_price_tenths=40,
@@ -296,6 +299,7 @@ def _worlds_for(players, events=range(5, 13)):
             minutes[pid] = [0.0 if entry is None else float(entry.expected_minutes)]
             core[pid] = [0.0 if entry is None else float(entry.expected_points)]
         worlds[int(event)] = wc.WildcardWorldInputs(
+            event=int(event),
             worlds=1, player_ids=ids, minutes=minutes, core=core
         )
     return worlds
