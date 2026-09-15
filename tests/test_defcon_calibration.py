@@ -100,3 +100,58 @@ def test_logistic_fit_handles_a_separable_design_without_diverging():
     design = [[1.0, 6.0 + i] for i in range(30)]
     w = vc._logistic_fit(design, [1] * 30)
     assert all(math.isfinite(x) for x in w)
+
+
+def test_logistic_fit_returns_weights_in_design_column_order():
+    """Pin the convention that was silently transposed in the first report.
+
+    ``[1.0, x]`` must yield ``[intercept, slope]``.  A regression test is the
+    right place for this: the failure mode is not an exception, it is two
+    plausible numbers describing the wrong model, and it produced an apparent
+    "negative calibration slope" that survived into a written report.
+    """
+
+    # a design whose intercept is clearly ~0 and slope clearly ~1
+    design = [[1.0, math.log(0.5 / 0.5)] for _ in range(3)]  # degenerate, guard only
+    w = vc._logistic_fit(design, [1, 0, 1])
+    assert all(math.isfinite(x) for x in w)
+
+    # a well-conditioned case: outcome probability rises steeply with x
+    rng = random.Random(3)
+    pairs = []
+    for _ in range(2000):
+        x = rng.uniform(-3.0, 3.0)
+        p = vc._sigmoid(0.2 + 2.0 * x)
+        pairs.append(([1.0, x], 1 if rng.random() < p else 0))
+    w = vc._logistic_fit([d for d, _ in pairs], [y for _, y in pairs])
+    assert w[0] == pytest.approx(0.2, abs=0.15)   # w[0] is the INTERCEPT
+    assert w[1] == pytest.approx(2.0, abs=0.15)   # w[1] is the SLOPE
+    # and the sign convention matters: a positive slope must not be reported negative
+    assert w[1] > 0.0
+
+
+def test_platt_fit_agrees_with_the_standard_calibration_regression():
+    """Platt IS the standard logistic calibration regression — same estimand.
+
+    ``platt_fit`` and a hand-rolled ``y ~ 1 + logit(p)`` design must return the
+    same coefficients, since they are the same call.  If they ever diverge, one
+    of the two has started fitting a different model.
+    """
+
+    pairs = _synthetic()
+    a, b = vc.platt_fit(pairs)
+    w = vc._logistic_fit([[1.0, vc._logit(p)] for p, _ in pairs], [y for _, y in pairs])
+    assert (a, b) == pytest.approx((w[0], w[1]), rel=0, abs=1e-12)
+
+
+def test_rank_correlation_below_one_is_ties_not_reversal():
+    """Clipping collapses distinct raw values; it must never reverse them."""
+
+    a, b = vc.platt_fit(_synthetic())
+    raw = [1e-9, 1e-8, 1e-7, 0.01, 0.2, 0.6, 0.9]  # several below the clip floor
+    cal = [vc.platt_apply(p, (a, b)) for p in raw]
+    for i in range(len(raw)):
+        for j in range(len(raw)):
+            if raw[i] < raw[j]:
+                assert cal[i] <= cal[j] + 1e-18  # monotone: never a strict reversal
+    assert vc._spearman(raw, cal) <= 1.0

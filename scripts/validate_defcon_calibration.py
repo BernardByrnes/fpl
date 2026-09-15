@@ -240,7 +240,12 @@ def _solve(matrix: list[list[float]], vector: list[float]) -> list[float]:
 
 def _logistic_fit(design: list[list[float]], outcomes: list[int], *, ridge: float = 1e-8,
                   iterations: int = 100) -> list[float]:
-    """Newton-Raphson (IRLS) logistic regression — pure Python."""
+    """Newton-Raphson (IRLS) logistic regression — pure Python.
+
+    Returns weights in DESIGN-COLUMN ORDER.  Callers that pass ``[1.0, x]`` get
+    ``[intercept, slope]``; do not reorder them, because a transposed unpack
+    yields two plausible-looking numbers that describe the wrong model.
+    """
 
     k = len(design[0])
     w = [0.0] * k
@@ -429,9 +434,14 @@ def main() -> int:
         entry = metrics(pooled_probs[name], pooled_hits)
         entry["fold_wins"] = fold_wins[name]
         entry["folds"] = folds
-        # calibration slope/intercept: regress outcome on logit(calibrated p)
+        # Standard logistic calibration: logit(P(y=1)) = intercept + slope*logit(p).
+        # ``_logistic_fit`` returns weights in DESIGN-COLUMN order, and the design
+        # here is [1.0, x], so w[0] is the INTERCEPT (the constant column) and
+        # w[1] is the SLOPE.  Unpacking these the other way round silently
+        # transposes the two statistics — which is exactly what happened on the
+        # first pass and produced an apparent "negative calibration slope".
         design = [[1.0, _logit(p)] for p in pooled_probs[name]]
-        slope, intercept = _logistic_fit(design, pooled_hits)
+        intercept, slope = _logistic_fit(design, pooled_hits)
         entry["calibration_slope"] = slope
         entry["calibration_intercept"] = intercept
         rolling[name] = entry
