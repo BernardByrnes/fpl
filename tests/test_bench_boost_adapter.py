@@ -116,7 +116,14 @@ def _seed(conn, *, picks_event: int = EVENT, picks: list[tuple[int, int, bool, b
                        raw_json={})
             for pid, slot, captain, vice in picks
         ])
+        # Idempotent: a test that needs two canonical reads on one store must not
+        # trip the acquisition uniqueness constraint.
+        already_owned = {
+            int(row["player_id"]) for row in repo.active_manager_acquisitions(conn, ENTRY)
+        }
         for pid in SQUAD:
+            if pid in already_owned:
+                continue
             repo.insert_manager_acquisition(conn, ENTRY, pid, 1, 45,
                                             source="official_transfer_history", created_at=now)
         conn.execute(
@@ -318,8 +325,10 @@ def test_K2_a_snapshot_mismatch_alone_refuses(conn):
             ad.BenchBoostCertifiedInputs(horizon_binding=_binding(), worlds=_worlds(snapshot=other)),
             allow_unverified_manager_state=True,
         )
-    assert caught.value.reasons[0] == ad.BB_HORIZON_MISMATCH
-    assert "data snapshot" in str(caught.value)
+    # The refusal names the SNAPSHOT rather than reporting it as a horizon
+    # mismatch: the two are different failures and must be distinguishable.
+    assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+    assert "different capture" in str(caught.value)
 
 
 def test_K3_the_snapshot_mismatch_is_visible_in_the_binding_diagnostic():
@@ -957,6 +966,7 @@ def _evaluation_with_snapshot(evaluation: cd.ChipEvaluation, snapshot: str) -> c
         calibration_status=evaluation.calibration_status,
         evidence={**evaluation.evidence, "data_snapshot_sha256": snapshot},
         execution_permitted=evaluation.execution_permitted,
+        data_snapshot_bound=evaluation.data_snapshot_bound,
     )
 
 
@@ -1007,8 +1017,8 @@ def test_P2B_a_binding_world_snapshot_mismatch_refuses(conn):
             ),
             allow_unverified_manager_state=True,
         )
-    assert caught.value.reasons[0] == ad.BB_HORIZON_MISMATCH
-    assert "data snapshot" in str(caught.value)
+    assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+    assert "different capture" in str(caught.value)
 
 
 def test_P2B_an_evaluation_from_another_snapshot_refuses_before_arbitration(conn):
@@ -1119,3 +1129,333 @@ def test_P2A_the_relabel_cannot_pass_while_canonical_authority_exists(conn):
         with pytest.raises(ad.BenchBoostAdapterError) as caught:
             ad.build_bench_boost_request(forged, _certified(), conn=conn, **kwargs)
         assert caught.value.reasons[0] == ad.BB_CALLER_STATE_DISAGREES
+
+
+# ---------------------------------------------------------------------------
+# FINAL SNAPSHOT AUTHORITY — the omission bypass (Sol's remaining P2)
+# ---------------------------------------------------------------------------
+
+
+def test_snap_a_fully_coherent_family_passes(conn):
+    """binding = A, worlds = A, evaluation = A, arbiter context = A."""
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    assert evaluation.evidence["data_snapshot_sha256"] == _SNAP_A
+    assert evaluation.data_snapshot_bound is True, "a BB value is snapshot-bound"
+    decision = _decide(evaluation, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert decision.recommended_action == cd.CHIP_ACTION_BB
+    assert decision.evidence["data_snapshot_sha256"] == _SNAP_A
+    assert cd.DIAG_CHIP_DATA_SNAPSHOT_MISMATCH not in decision.reason_codes
+
+
+def test_snap_b_an_empty_world_snapshot_refuses(conn):
+    """binding = A, worlds = "": the identity is the artifact's OWN evidence."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    for empty in ("", "   "):
+        with pytest.raises(ad.BenchBoostAdapterError) as caught:
+            ad.build_bench_boost_request(
+                state,
+                ad.BenchBoostCertifiedInputs(
+                    horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=empty),
+                ),
+                conn=conn,
+            )
+        assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+        assert "world inputs" in str(caught.value)
+
+
+def test_snap_c_all_world_snapshots_empty_refuses(conn):
+    """The all-empty variant is the same refusal, not a silently skipped check."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(
+                horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=""),
+            ),
+            conn=conn,
+        )
+    assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+
+
+def test_snap_d_an_empty_binding_snapshot_refuses(conn):
+    """binding = "", worlds = A: nothing for the worlds to be coherent with."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    for empty in ("", "   "):
+        with pytest.raises(ad.BenchBoostAdapterError) as caught:
+            ad.build_bench_boost_request(
+                state,
+                ad.BenchBoostCertifiedInputs(
+                    horizon_binding=_binding_held_at(empty), worlds=_worlds(snapshot=_SNAP_A),
+                ),
+                conn=conn,
+            )
+        assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+        assert "horizon binding" in str(caught.value)
+
+
+def test_snap_e_a_world_snapshot_mismatch_refuses(conn):
+    """binding = A, worlds = B: retained from the previous repair."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(
+                horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_B),
+            ),
+            conn=conn,
+        )
+    assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+
+
+def test_snap_f_an_empty_evaluation_snapshot_refuses_at_arbitration(conn):
+    """binding = A, evaluation snapshot = "": the omission bypass, closed.
+
+    This is the fail-open path Sol found: the evaluation declares the field but
+    empties it, so a presence-gated comparison skipped it and the uplift reached
+    the decision.
+    """
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    for emptied in ("", "   "):
+        foreign = _evaluation_with_snapshot(evaluation, emptied)
+        assert foreign.data_snapshot_bound is True
+        decision = _decide(foreign, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+        assert decision.status == cd.STATUS_INSUFFICIENT_EVIDENCE
+        assert decision.recommended_action == cd.CHIP_ACTION_NO_CHIP
+        assert cd.DIAG_CHIP_DATA_SNAPSHOT_MISMATCH in decision.reason_codes
+        assert decision.candidate_metrics == {}, "no numeric evaluation may reach arbitration"
+
+
+def test_snap_f2_a_wholly_missing_evaluation_snapshot_also_refuses(conn):
+    """The field being ABSENT is refused too, not just present-and-empty."""
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    stripped = cd.ChipEvaluation(
+        action=evaluation.action, evaluator_version=evaluation.evaluator_version,
+        candidate_metrics=dict(evaluation.candidate_metrics), uncertainty=dict(evaluation.uncertainty),
+        reason_codes=tuple(evaluation.reason_codes), calibration_status=evaluation.calibration_status,
+        evidence={k: v for k, v in evaluation.evidence.items() if k != "data_snapshot_sha256"},
+        execution_permitted=evaluation.execution_permitted,
+        data_snapshot_bound=evaluation.data_snapshot_bound,
+    )
+    assert "data_snapshot_sha256" not in stripped.evidence
+    decision = _decide(stripped, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert decision.status == cd.STATUS_INSUFFICIENT_EVIDENCE
+    assert cd.DIAG_CHIP_DATA_SNAPSHOT_MISMATCH in decision.reason_codes
+
+
+def test_snap_g_an_evaluation_from_another_snapshot_refuses(conn):
+    """binding = A, evaluation = B: retained from the previous repair."""
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    foreign = _evaluation_with_snapshot(evaluation, _SNAP_B)
+    decision = _decide(foreign, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert decision.status == cd.STATUS_INSUFFICIENT_EVIDENCE
+    assert cd.DIAG_CHIP_DATA_SNAPSHOT_MISMATCH in decision.reason_codes
+
+
+def test_snap_a2_legacy_presence_gated_evaluations_are_unaffected(conn):
+    """A non-snapshot-bound evaluation keeps its exact established semantics.
+
+    Triple Captain and the legacy synthetic fixtures predate the identity
+    contract.  Narrowing production Bench Boost must not narrow them, or an
+    accepted chip would be re-opened by a BB repair.
+    """
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    legacy = cd.ChipEvaluation(
+        action=evaluation.action, evaluator_version=evaluation.evaluator_version,
+        candidate_metrics=dict(evaluation.candidate_metrics), uncertainty=dict(evaluation.uncertainty),
+        reason_codes=tuple(evaluation.reason_codes), calibration_status=evaluation.calibration_status,
+        evidence={k: v for k, v in evaluation.evidence.items() if k != "data_snapshot_sha256"},
+        execution_permitted=evaluation.execution_permitted,
+        data_snapshot_bound=False,
+    )
+    decision = _decide(legacy, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert cd.DIAG_CHIP_DATA_SNAPSHOT_MISMATCH not in decision.reason_codes
+    assert decision.candidate_metrics["mean_paired_uplift"] == pytest.approx(20.0)
+
+
+# ---------------------------------------------------------------------------
+# FINAL SNAPSHOT AUTHORITY — the pure evaluator's own contract
+# ---------------------------------------------------------------------------
+
+
+def test_snap_the_evaluator_refuses_an_empty_world_snapshot_without_the_adapter(conn):
+    """No other call path may turn an unidentified world set into a value."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    # Build the request through the declared-simulation path so the ADAPTER's
+    # snapshot gate is bypassed and the evaluator's own gate is what fires.
+    request = ad.build_bench_boost_request(
+        state,
+        ad.BenchBoostCertifiedInputs(
+            horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_A),
+        ),
+        allow_unverified_manager_state=True,
+    )
+    blind = bb.BenchBoostRequest(
+        worlds=cd.ChipWorldInputs(
+            worlds=request.worlds.worlds, player_ids=request.worlds.player_ids,
+            minutes=request.worlds.minutes, core=request.worlds.core,
+            planning_event=request.worlds.planning_event,
+            horizon_events=request.worlds.horizon_events,
+            certification_identity=request.worlds.certification_identity,
+            data_snapshot_sha256="", world_seed=request.worlds.world_seed,
+            world_identity=request.worlds.world_identity,
+        ),
+        horizon_binding=request.horizon_binding, policy=request.policy,
+        positions=dict(request.positions),
+    )
+    with pytest.raises(cd.ChipInputError) as caught:
+        bb.evaluate_bench_boost(blind)
+    assert cd.DIAG_CHIP_CERTIFICATION_REQUIRED in caught.value.reasons
+    assert "no data snapshot identity" in str(caught.value)
+
+
+def test_snap_the_evaluator_refuses_an_empty_binding_snapshot(conn):
+    """And the binding side is checked by the evaluator too."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    request = ad.build_bench_boost_request(
+        state,
+        ad.BenchBoostCertifiedInputs(
+            horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_A),
+        ),
+        allow_unverified_manager_state=True,
+    )
+    blind = bb.BenchBoostRequest(
+        worlds=request.worlds,
+        horizon_binding=cd.ChipHorizonBinding(
+            planning_event=EVENT, horizon_events=cd.canonical_chip_horizon(EVENT),
+            certification_identity=_STRONG, data_snapshot_sha256="",
+        ),
+        policy=request.policy, positions=dict(request.positions),
+    )
+    with pytest.raises(cd.ChipInputError) as caught:
+        bb.evaluate_bench_boost(blind)
+    assert cd.DIAG_CHIP_CERTIFICATION_REQUIRED in caught.value.reasons
+
+
+def test_snap_the_evaluation_reports_the_snapshot_it_was_calculated_under(conn):
+    """The evaluation's own identity, not something stamped on afterwards."""
+
+    for snapshot in (_SNAP_A, _SNAP_B):
+        evaluation = _bb_evaluation(conn, snapshot)
+        assert evaluation.evidence["data_snapshot_sha256"] == snapshot
+        assert evaluation.evidence["data_snapshot_sha256"] == snapshot
+
+
+def test_snap_the_evaluator_never_infers_the_world_identity_from_the_binding(conn):
+    """A world set with no identity is refused, never relabelled from the binding."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    request = ad.build_bench_boost_request(
+        state,
+        ad.BenchBoostCertifiedInputs(
+            horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_A),
+        ),
+        allow_unverified_manager_state=True,
+    )
+    blind = bb.BenchBoostRequest(
+        worlds=cd.ChipWorldInputs(
+            worlds=request.worlds.worlds, player_ids=request.worlds.player_ids,
+            minutes=request.worlds.minutes, core=request.worlds.core,
+            planning_event=request.worlds.planning_event,
+            horizon_events=request.worlds.horizon_events,
+            certification_identity=request.worlds.certification_identity,
+            data_snapshot_sha256="", world_seed=request.worlds.world_seed,
+            world_identity=request.worlds.world_identity,
+        ),
+        horizon_binding=request.horizon_binding, policy=request.policy,
+        positions=dict(request.positions),
+    )
+    with pytest.raises(cd.ChipInputError):
+        bb.evaluate_bench_boost(blind)
+    # The worlds object is untouched: no stamping happened on the way through.
+    assert blind.worlds.data_snapshot_sha256 == ""
+
+
+# ---------------------------------------------------------------------------
+# FINAL SNAPSHOT AUTHORITY — the exact four-GW context
+# ---------------------------------------------------------------------------
+
+
+def test_fourgw_the_horizon_is_exactly_four_consecutive_unique_events():
+    events = cd.canonical_chip_horizon(EVENT)
+    assert events == (5, 6, 7, 8)
+    assert len(events) == 4
+    assert len(set(events)) == 4
+    assert list(events) == list(range(events[0], events[0] + 4)), "contiguous"
+
+
+@pytest.mark.parametrize("bad,label", [
+    ((5, 6, 7), "three"),
+    ((5, 6, 7, 8, 9), "five"),
+    ((5, 6, 6, 8), "duplicate"),
+    ((5, 6, 7, 9), "non-contiguous"),
+    ((4, 6, 7, 8), "skips an event"),
+])
+def test_fourgw_a_non_canonical_horizon_refuses(bad, label):
+    with pytest.raises(cd.ChipInputError) as caught:
+        cd.ChipHorizonBinding(planning_event=EVENT, horizon_events=bad, certification_identity=_STRONG)
+    assert cd.DIAG_CHIP_HORIZON_NOT_CANONICAL in caught.value.reasons, label
+
+
+def test_fourgw_four_coherent_snapshot_events_pass(conn):
+    """Four consecutive, unique events under ONE non-empty snapshot family.
+
+    Bench Boost's world input is a single certified matrix carrying the horizon,
+    so the four events share one snapshot identity by construction -- there is no
+    per-event channel through which an event could fall outside the family.
+    """
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    assert evaluation.evidence["horizon_events"] == list(cd.canonical_chip_horizon(EVENT))
+    assert evaluation.candidate_metrics["horizon_events"] == list(cd.canonical_chip_horizon(EVENT))
+    assert evaluation.evidence["data_snapshot_sha256"] == _SNAP_A
+    assert evaluation.evidence["data_snapshot_sha256"] != ""
+
+
+def test_fourgw_a_differing_snapshot_family_refuses(conn):
+    """The one family the horizon has must be the binding's; B is refused."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(
+                horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_B),
+            ),
+            conn=conn,
+        )
+    assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED
+
+
+def test_fourgw_an_emptied_snapshot_family_refuses(conn):
+    """An event cannot leave the certified family by emptying the identity."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(
+                horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=""),
+            ),
+            conn=conn,
+        )
+    assert caught.value.reasons[0] == ad.BB_DATA_SNAPSHOT_REQUIRED

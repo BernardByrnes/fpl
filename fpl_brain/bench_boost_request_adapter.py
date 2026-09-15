@@ -67,6 +67,11 @@ BB_CALLER_STATE_DISAGREES = "BENCH_BOOST_CALLER_STATE_DISAGREES_WITH_CANONICAL"
 #: caller holding only a hand-made state has no authority to assert positions,
 #: clubs or a lineup, so it must say so explicitly.
 BB_CANONICAL_AUTHORITY_REQUIRED = "BENCH_BOOST_CANONICAL_AUTHORITY_REQUIRED"
+#: The certified identity is mandatory for a production Bench Boost request.  The
+#: shared comparison is presence-gated, so an OMITTED snapshot would otherwise
+#: bypass coherence entirely; production refuses a missing, empty or differing
+#: identity rather than skipping the check.
+BB_DATA_SNAPSHOT_REQUIRED = "BENCH_BOOST_DATA_SNAPSHOT_REQUIRED"
 BB_HORIZON_MISMATCH = "BENCH_BOOST_CERTIFIED_HORIZON_MISMATCH"
 
 
@@ -424,6 +429,34 @@ def build_bench_boost_request(
         # submitted lineup is the correct authority.  ``lineup_source_event``
         # carries that fact into the report; nothing is silently substituted.
         pass
+
+    # The certified identity must be PRESENT before anything numeric happens.
+    # The shared comparison is presence-gated (an object that declares no
+    # snapshot makes no claim), which is right for legacy synthetic flows but
+    # fail-open for a production request: dropping the field would bypass
+    # coherence entirely.  Production Bench Boost therefore requires an explicit
+    # non-empty snapshot on BOTH sides, and their exact equality, here -- before
+    # a Bench Boost value can be produced at all.
+    binding_snapshot = str(binding.data_snapshot_sha256 or "").strip()
+    world_snapshot = str(certified.worlds.data_snapshot_sha256 or "").strip()
+    if not binding_snapshot:
+        raise BenchBoostAdapterError(
+            f"{BB_DATA_SNAPSHOT_REQUIRED}: the certified horizon binding carries no data snapshot "
+            "identity; a Bench Boost decision cannot be bound to an unidentified capture",
+            reasons=(BB_DATA_SNAPSHOT_REQUIRED,),
+        )
+    if not world_snapshot:
+        raise BenchBoostAdapterError(
+            f"{BB_DATA_SNAPSHOT_REQUIRED}: the certified world inputs carry no data snapshot identity; "
+            "the identity is the artifact's own evidence and is never inferred from the binding",
+            reasons=(BB_DATA_SNAPSHOT_REQUIRED,),
+        )
+    if world_snapshot != binding_snapshot:
+        raise BenchBoostAdapterError(
+            f"{BB_DATA_SNAPSHOT_REQUIRED}: the world inputs were produced from a different capture than "
+            f"the certified binding authorises",
+            reasons=(BB_DATA_SNAPSHOT_REQUIRED,),
+        )
 
     request = bb.BenchBoostRequest(
         worlds=certified.worlds,

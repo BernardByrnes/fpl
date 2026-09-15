@@ -421,6 +421,18 @@ class ChipEvaluation:
     #: exact established semantics -- only an evaluator that knows its own value
     #: model is uncalibrated sets this False.
     execution_permitted: bool = True
+    #: Whether this evaluation is BOUND to a data snapshot identity.
+    #:
+    #: Defaults to False so every pre-existing evaluator keeps its exact
+    #: established semantics, including the shared presence-gated comparison (an
+    #: evaluation that declares no snapshot makes no claim to contradict).
+    #:
+    #: An evaluator whose number is computed from certified predictive worlds sets
+    #: this True, and its snapshot may then never be OMITTED, EMPTY or DIFFERENT:
+    #: the arbiter refuses instead of skipping the comparison.  Without it a
+    #: production request could bypass snapshot coherence simply by dropping the
+    #: field -- a fail-open bypass, not a legacy compatibility requirement.
+    data_snapshot_bound: bool = False
 
     @property
     def mean_uplift(self) -> float | None:
@@ -789,29 +801,28 @@ def decide_chip_action(
             DIAG_CHIP_EVALUATION_ACTION_MISMATCH,
             f"evaluation mapping key disagrees with the evaluation's own action for {mismatched_keys}",
         )
+    # The two snapshot rules, in one place so the refusal and the reason code can
+    # never disagree about WHY an evaluation was rejected:
+    #   * presence-gated (legacy): an evaluation that declares no snapshot makes
+    #     no claim to contradict;
+    #   * presence-REQUIRED (snapshot-bound): a missing or empty snapshot is
+    #     itself a disagreement, so the check cannot be bypassed by omitting it.
+    def snapshot_disagrees(evaluation: ChipEvaluation) -> bool:
+        declared = evaluation.evidence.get("data_snapshot_sha256")
+        if bool(getattr(evaluation, "data_snapshot_bound", False)):
+            return not declared or str(declared) != str(data_snapshot_sha256)
+        return bool(declared) and str(declared) != str(data_snapshot_sha256)
+
     foreign = sorted(
         action
         for action, evaluation in supplied.items()
         if str(evaluation.evidence.get("certification_identity") or "") != str(certification_identity)
         or tuple(int(event) for event in (evaluation.evidence.get("horizon_events") or ())) != events
         or int(evaluation.evidence.get("planning_event") or -1) != planning_event
-        # An evaluation that was produced from a DIFFERENT data snapshot may not
-        # be arbitrated under this binding, even when the horizon and the
-        # certification identity agree.  Compared whenever the evaluation
-        # declares a snapshot; an evaluation that declares none makes no claim to
-        # contradict (every production evaluator emits its worlds' own value).
-        or (
-            bool(evaluation.evidence.get("data_snapshot_sha256"))
-            and str(evaluation.evidence.get("data_snapshot_sha256")) != str(data_snapshot_sha256)
-        )
+        or snapshot_disagrees(evaluation)
     )
     if foreign:
-        snapshot_foreign = sorted(
-            action
-            for action in foreign
-            if bool(supplied[action].evidence.get("data_snapshot_sha256"))
-            and str(supplied[action].evidence.get("data_snapshot_sha256")) != str(data_snapshot_sha256)
-        )
+        snapshot_foreign = sorted(action for action in foreign if snapshot_disagrees(supplied[action]))
         return refuse(
             DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH,
             f"evaluation(s) {foreign} were produced for a different horizon, certification identity "
