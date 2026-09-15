@@ -20,6 +20,10 @@ from fpl_brain import transfer_state as ts
 RULES = sr.SeasonRules(season="2026/27")
 IDENTITY = "sha256:" + "c" * 64
 SNAPSHOT = "sha256:" + "d" * 64
+CUTOFF = "2026-09-12T19:20:00Z"
+SOURCE_SNAPSHOT = "sha256:" + "5" * 64
+GENERATION = "generation-2026-09-12T19:20:00Z"
+CONFIG_ID = "sha256:" + "7" * 64
 
 CLUBS = tuple(range(1, 11))
 COMPOSITION = ts.POSITION_COMPOSITION
@@ -36,6 +40,7 @@ def _player(pid, position, club, price, points, *, p_start=1.0, availability=1.0
             event: wc.WildcardPlayerEvent(
                 event=event, expected_points=points, expected_minutes=90.0 * p_start,
                 p_start=p_start, availability=availability, fixture_count=1,
+                cutoff=CUTOFF, generation=GENERATION,
             )
             for event in events
         },
@@ -95,6 +100,20 @@ def _chip_rows(planning_event, *, windows=((2, 19), (20, 38)), used=False):
     return rows
 
 
+def _value_binding(planning_event=5, *, events=None, cutoff=CUTOFF, snapshot=SNAPSHOT,
+                   source=SOURCE_SNAPSHOT, generation=GENERATION, config_id=CONFIG_ID):
+    horizon = wc.wildcard_horizon(planning_event, length=8)
+    if events is not None:
+        horizon = wc.WildcardHorizonSpec(version=horizon.version, events=tuple(events),
+                                         weights=tuple(1.0 / len(events) for _ in events),
+                                         decay=horizon.decay, terminal_weight=0.0)
+    return wc.value_horizon_binding(
+        planning_event, horizon, decision_cutoff=cutoff, data_snapshot_sha256=snapshot,
+        source_snapshot_sha256=source, prediction_generation=generation,
+        model_config_identity=config_id,
+    )
+
+
 def _request(players, owned_ids, **overrides):
     base = dict(
         planning_event=5,
@@ -111,6 +130,7 @@ def _request(players, owned_ids, **overrides):
         data_snapshot_sha256=SNAPSHOT,
         event_start_free_transfers=2,
         chip_availability=_chip_rows(5),
+        value_horizon_binding=_value_binding(5),
     )
     base.update(overrides)
     return wc.WildcardRequest(**base)
@@ -358,7 +378,8 @@ def test_G_a_missing_projection_excludes_the_player_rather_than_zeroing_him():
     request = _request(players, _legal_owned_ids(players))
     scores, stats = wc.screen_players(request)
     assert incomplete not in scores
-    assert incomplete in stats["excluded_missing_projection_ids"]
+    assert incomplete in stats["excluded_ids"]
+    assert stats["excluded_reasons"][incomplete] == wc.WC_MISSING_PROJECTION
     assert stats["excluded_missing_projection"] >= 1
     assert all(math.isfinite(v) for v in scores.values())
 
@@ -372,7 +393,8 @@ def test_H_the_second_chip_window_supplies_the_expiry():
     players = _pool()
     request = _request(players, _legal_owned_ids(players), planning_event=25,
                        horizon=wc.wildcard_horizon(25, length=8),
-                       horizon_binding=_binding(25), chip_availability=_chip_rows(25))
+                       horizon_binding=_binding(25), chip_availability=_chip_rows(25),
+                       value_horizon_binding=_value_binding(25))
     assert wc.resolve_wildcard_expiry(request) == 38
 
 
@@ -386,7 +408,8 @@ def test_I_overlapping_active_windows_fail_closed():
     players = _pool()
     request = _request(players, _legal_owned_ids(players), planning_event=25,
                        horizon=wc.wildcard_horizon(25, length=8), horizon_binding=_binding(25),
-                       chip_availability=_chip_rows(25, windows=((20, 30), (24, 38))))
+                       chip_availability=_chip_rows(25, windows=((20, 30), (24, 38))),
+                       value_horizon_binding=_value_binding(25))
     assert wc.resolve_wildcard_expiry(request) is wc.EXPIRY_AMBIGUOUS
     evaluation = wc.evaluate_wildcard(request)
     assert wc.WC_WINDOW_AMBIGUOUS in evaluation.reason_codes
@@ -401,10 +424,10 @@ def test_I2_an_ambiguous_window_is_not_resolved_by_row_order():
     backward = list(reversed(forward))
     players_a = _request(players, _legal_owned_ids(players), planning_event=25,
                          horizon=wc.wildcard_horizon(25, length=8), horizon_binding=_binding(25),
-                         chip_availability=forward)
+                         chip_availability=forward, value_horizon_binding=_value_binding(25))
     players_b = _request(players, _legal_owned_ids(players), planning_event=25,
                          horizon=wc.wildcard_horizon(25, length=8), horizon_binding=_binding(25),
-                         chip_availability=backward)
+                         chip_availability=backward, value_horizon_binding=_value_binding(25))
     assert wc.resolve_wildcard_expiry(players_a) is wc.EXPIRY_AMBIGUOUS
     assert wc.resolve_wildcard_expiry(players_b) is wc.EXPIRY_AMBIGUOUS
 
@@ -450,7 +473,7 @@ def test_K_future_outcomes_outside_the_horizon_cannot_change_the_selection():
         for event in range(13, 20):
             extra[event] = wc.WildcardPlayerEvent(
                 event=event, expected_points=999.0, expected_minutes=90.0, p_start=1.0,
-                availability=1.0, fixture_count=1,
+                availability=1.0, fixture_count=1, cutoff=CUTOFF, generation=GENERATION,
             )
         mutated[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
                                          player.market_price_tenths, extra, player.web_name)
@@ -605,3 +628,109 @@ def test_chip_core_contracts_cannot_be_widened_by_this_evaluator():
     assert len(evaluation.evidence["horizon_events"]) == cd.CHIP_HORIZON_LENGTH
     # while its OWN value horizon is longer
     assert len(evaluation.evidence["wildcard_horizon"]["events"]) == 8
+
+
+# ---------------------------------------------------------------------------
+# §1/§2 — value-horizon certification binding
+# ---------------------------------------------------------------------------
+
+
+def _with_row_override(players, pid, event, **fields):
+    player = players[pid]
+    events = dict(player.events)
+    entry = events[event]
+    events[event] = wc.WildcardPlayerEvent(
+        event=entry.event, expected_points=fields.get("expected_points", entry.expected_points),
+        expected_minutes=entry.expected_minutes, p_start=fields.get("p_start", entry.p_start),
+        availability=entry.availability, fixture_count=entry.fixture_count,
+        cutoff=fields.get("cutoff", entry.cutoff), generation=fields.get("generation", entry.generation),
+    )
+    players[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
+                                     player.market_price_tenths, events, player.web_name)
+    return players
+
+
+def test_P2_A_a_projection_from_a_different_run_refuses():
+    players = _with_row_override(_pool(), 7, 9, generation="generation-OTHER")
+    evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+    assert evaluation.reason_codes
+
+
+def test_P2_B_a_projection_from_a_different_cutoff_refuses():
+    players = _with_row_override(_pool(), 7, 9, cutoff="2026-09-13T00:00:00Z")
+    evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_P2_C_a_different_data_snapshot_refuses():
+    players = _pool()
+    request = _request(players, _legal_owned_ids(players),
+                       value_horizon_binding=_value_binding(5, snapshot="sha256:" + "9" * 64))
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.WC_VALUE_BINDING_MISMATCH in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_P2_D_the_binding_is_individually_coherent():
+    players = _pool()
+    request = _request(players, _legal_owned_ids(players),
+                       value_horizon_binding=_value_binding(5, config_id="sha256:" + "8" * 64))
+    assert wc.validate_projections(request) == []
+
+
+def test_P2_E_a_non_contiguous_horizon_refuses():
+    horizon = wc.wildcard_horizon(5, length=8)
+    broken = wc.WildcardHorizonSpec(version=horizon.version, events=(5, 6, 7, 9, 10, 11, 12, 13),
+                                    weights=tuple(1.0 / 8 for _ in range(8)), decay=0.82,
+                                    terminal_weight=0.0)
+    with pytest.raises(wc.WildcardInputError):
+        wc.value_horizon_binding(5, broken, decision_cutoff=CUTOFF, data_snapshot_sha256=SNAPSHOT,
+                                 source_snapshot_sha256=SOURCE_SNAPSHOT,
+                                 prediction_generation=GENERATION, model_config_identity=CONFIG_ID)
+
+
+def test_P2_F_a_coherent_eight_event_horizon_passes():
+    players = _pool()
+    request = _request(players, _legal_owned_ids(players))
+    assert wc.validate_projections(request) == []
+    evaluation = wc.evaluate_wildcard(request)
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is not None
+    binding = evaluation.evidence["wildcard_value_horizon"]
+    assert len(binding["event_ids"]) == 8
+    assert binding["prediction_generation"] == GENERATION
+
+
+def test_P2_G_a_missing_binding_refuses_entirely():
+    players = _pool()
+    request = _request(players, _legal_owned_ids(players), value_horizon_binding=None)
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.WC_VALUE_BINDING_MISMATCH in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_P2_H_nonfinite_projections_fail_closed():
+    players = _with_row_override(_pool(), 7, 9, expected_points=float("nan"))
+    evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
+    assert wc.WC_PROJECTION_INVALID in evaluation.reason_codes
+
+
+def test_P2_I_impossible_probabilities_fail_closed():
+    players = _with_row_override(_pool(), 7, 9, p_start=1.7)
+    evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
+    assert wc.WC_PROJECTION_INVALID in evaluation.reason_codes
+
+
+def test_P2_J_the_exclusion_audit_is_never_truncated():
+    players = _pool()
+    for pid in (5, 7, 9, 11):
+        player = players[pid]
+        short = {e: v for e, v in player.events.items() if e < 10}
+        players[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
+                                         player.market_price_tenths, short, player.web_name)
+    request = _request(players, _legal_owned_ids(players))
+    scores, stats = wc.screen_players(request)
+    assert stats["excluded_missing_projection"] == 4
+    assert len(stats["excluded_ids"]) == 4          # full evidence, never truncated
+    assert set(stats["excluded_reasons"]) == {5, 7, 9, 11}
+    assert all(pid not in scores for pid in (5, 7, 9, 11))

@@ -74,6 +74,10 @@ WC_PRICING_UNAVAILABLE = "WILDCARD_PRICING_BASIS_UNAVAILABLE"
 WC_MANAGER_STATE_INCOHERENT = "WILDCARD_MANAGER_STATE_INCOHERENT"
 WC_FRONTIER_EMPTY = "WILDCARD_OPTIMIZER_FRONTIER_EMPTY"
 WC_HORIZON_INVALID = "WILDCARD_HORIZON_INVALID"
+WC_VALUE_BINDING_MISMATCH = "WILDCARD_VALUE_HORIZON_BINDING_MISMATCH"
+WC_PROJECTION_IDENTITY_MISMATCH = "WILDCARD_PROJECTION_IDENTITY_MISMATCH"
+WC_PROJECTION_INVALID = "WILDCARD_PROJECTION_INVALID"
+WC_PROJECTION_DUPLICATE = "WILDCARD_PROJECTION_DUPLICATE"
 
 WC_REASON_POSITIVE = "WILDCARD_UPLIFT_POSITIVE"
 WC_REASON_NOT_COMPETITIVE = "WILDCARD_NOT_COMPETITIVE"
@@ -153,6 +157,115 @@ class WildcardHorizonSpec:
             raise WildcardInputError(f"event {event} is outside the horizon") from exc
 
 
+@dataclass(frozen=True)
+class WildcardValueHorizonBinding:
+    """The certified identity of the LONGER Wildcard valuation horizon.
+
+    Distinct from ``chip_decision.ChipHorizonBinding``, which stays exactly four
+    events for the chip-DECISION contract.  This one binds the 6-10 event value
+    horizon, and every projection row the evaluator consumes must belong to it.
+    A request-level string is NOT sufficient: arbitrary rows could otherwise be
+    inserted under a matching label, so the rows carry their own identity and are
+    checked individually (§2).
+    """
+
+    planning_event: int
+    event_ids: tuple[int, ...]
+    decision_cutoff: str
+    data_snapshot_sha256: str
+    source_snapshot_sha256: str
+    prediction_generation: str
+    model_config_identity: str
+    horizon_version: str
+
+    def __post_init__(self) -> None:
+        problems = self.problems()
+        if problems:
+            raise WildcardInputError(
+                f"{WC_VALUE_BINDING_MISMATCH}: {'; '.join(problems)}",
+                reasons=(WC_VALUE_BINDING_MISMATCH,),
+            )
+
+    def problems(self) -> list[str]:
+        found: list[str] = []
+        events = tuple(int(e) for e in self.event_ids)
+        if not (WILDCARD_HORIZON_MIN_EVENTS <= len(events) <= WILDCARD_HORIZON_MAX_EVENTS):
+            found.append(f"horizon length {len(events)} outside "
+                         f"{WILDCARD_HORIZON_MIN_EVENTS}-{WILDCARD_HORIZON_MAX_EVENTS}")
+        if len(set(events)) != len(events):
+            found.append("duplicate events")
+        if events and events[0] != int(self.planning_event):
+            found.append(f"first event {events[0]} != planning event {self.planning_event}")
+        if events and events != tuple(range(events[0], events[0] + len(events))):
+            found.append(f"events {list(events)} are not contiguous")
+        for name in ("decision_cutoff", "data_snapshot_sha256", "source_snapshot_sha256",
+                     "prediction_generation", "model_config_identity", "horizon_version"):
+            if not str(getattr(self, name) or "").strip():
+                found.append(f"{name} is empty")
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "planning_event": int(self.planning_event),
+            "event_ids": [int(e) for e in self.event_ids],
+            "decision_cutoff": str(self.decision_cutoff),
+            "data_snapshot_sha256": str(self.data_snapshot_sha256),
+            "source_snapshot_sha256": str(self.source_snapshot_sha256),
+            "prediction_generation": str(self.prediction_generation),
+            "model_config_identity": str(self.model_config_identity),
+            "horizon_version": str(self.horizon_version),
+        }
+
+    def identity(self) -> str:
+        from .analytics import canonical_hash
+
+        return canonical_hash(self.as_dict())
+
+    def disagreements_with(self, chip_binding: Any) -> list[str]:
+        """Where this value binding fails to agree with the chip DECISION binding.
+
+        The two are different contracts and neither is widened, but they must
+        describe the same planning event, cutoff and data snapshot, or the play
+        and save arms would be valued against different worlds.
+        """
+
+        found: list[str] = []
+        if int(getattr(chip_binding, "planning_event", -1)) != int(self.planning_event):
+            found.append("planning event differs from the chip decision binding")
+        chip_snapshot = getattr(chip_binding, "data_snapshot_sha256", None)
+        if chip_snapshot and str(chip_snapshot) != str(self.data_snapshot_sha256):
+            found.append("data snapshot differs from the chip decision binding")
+        chip_cutoff = getattr(chip_binding, "decision_cutoff", None)
+        if chip_cutoff is not None and str(chip_cutoff) != str(self.decision_cutoff):
+            found.append("decision cutoff differs from the chip decision binding")
+        chip_events = tuple(int(e) for e in getattr(chip_binding, "horizon_events", ()) or ())
+        if chip_events and not set(chip_events).issubset(set(self.event_ids)):
+            found.append("the chip decision events are not inside the value horizon")
+        return found
+
+
+def value_horizon_binding(
+    planning_event: int,
+    horizon: "WildcardHorizonSpec",
+    *,
+    decision_cutoff: str,
+    data_snapshot_sha256: str,
+    source_snapshot_sha256: str,
+    prediction_generation: str,
+    model_config_identity: str,
+) -> WildcardValueHorizonBinding:
+    return WildcardValueHorizonBinding(
+        planning_event=int(planning_event),
+        event_ids=tuple(int(e) for e in horizon.events),
+        decision_cutoff=str(decision_cutoff),
+        data_snapshot_sha256=str(data_snapshot_sha256),
+        source_snapshot_sha256=str(source_snapshot_sha256),
+        prediction_generation=str(prediction_generation),
+        model_config_identity=str(model_config_identity),
+        horizon_version=str(horizon.version),
+    )
+
+
 def wildcard_horizon(
     planning_event: int,
     *,
@@ -181,7 +294,13 @@ def wildcard_horizon(
 
 @dataclass(frozen=True)
 class WildcardPlayerEvent:
-    """One player's projection for one event, from certified inputs only."""
+    """One player's projection for one event, from certified inputs only.
+
+    ``cutoff`` and ``generation`` are this ROW's own provenance.  They are
+    checked against the value-horizon binding individually, because a binding
+    that only covers the request cannot stop an arbitrary row being inserted
+    under a matching label.
+    """
 
     event: int
     expected_points: float
@@ -189,6 +308,29 @@ class WildcardPlayerEvent:
     p_start: float
     availability: float
     fixture_count: int = 1
+    cutoff: str = ""
+    generation: str = ""
+
+    def problems(self, binding: "WildcardValueHorizonBinding | None" = None) -> list[str]:
+        found: list[str] = []
+        for name in ("expected_points", "expected_minutes", "p_start", "availability"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                found.append(f"{name}={value!r} is not finite")
+        for name in ("expected_points", "expected_minutes"):
+            if float(getattr(self, name)) < 0.0:
+                found.append(f"{name} is negative")
+        for name in ("p_start", "availability"):
+            if not 0.0 <= float(getattr(self, name)) <= 1.0:
+                found.append(f"{name}={getattr(self, name)!r} is not a probability")
+        if int(self.fixture_count) < 0:
+            found.append("fixture_count is negative")
+        if binding is not None:
+            if str(self.cutoff) != str(binding.decision_cutoff):
+                found.append(f"cutoff {self.cutoff!r} != bound {binding.decision_cutoff!r}")
+            if str(self.generation) != str(binding.prediction_generation):
+                found.append(f"generation {self.generation!r} != bound {binding.prediction_generation!r}")
+        return found
 
 
 @dataclass(frozen=True)
@@ -235,6 +377,10 @@ class WildcardRequest:
     explicit_sell_rebuy: FrozenSetCapable = ()
     position_frontier_size: int = 6
     improvement_passes: int = 3
+    #: The longer VALUE horizon, bound separately.  Optional only so that a
+    #: caller who supplies nothing cannot accidentally look certified: the
+    #: evaluator refuses when it is absent.
+    value_horizon_binding: WildcardValueHorizonBinding | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +392,35 @@ def _available(player: WildcardPlayer, horizon: WildcardHorizonSpec) -> bool:
     """A player is screenable only if EVERY horizon event has a projection."""
 
     return all(player.at(event) is not None for event in horizon.events)
+
+
+def validate_projections(request: WildcardRequest) -> list[str]:
+    """Every projection row must belong to the bound value-horizon generation.
+
+    Checked for EVERY row the evaluator can consume — screening, squad
+    evaluation, captaincy and horizon valuation all read the same rows — so a
+    current/latest row cannot be injected into a historical replay.
+    """
+
+    binding = request.value_horizon_binding
+    problems: list[str] = []
+    if binding is None:
+        return [f"{WC_VALUE_BINDING_MISMATCH}: no value-horizon binding supplied"]
+    problems.extend(binding.problems())
+    problems.extend(binding.disagreements_with(request.horizon_binding))
+    if tuple(int(e) for e in binding.event_ids) != tuple(int(e) for e in request.horizon.events):
+        problems.append("the horizon spec and the value binding describe different events")
+    if str(binding.horizon_version) != str(request.horizon.version):
+        problems.append("the horizon spec and the value binding disagree on the horizon version")
+    for player_id, player in sorted(request.players.items()):
+        if int(player_id) != int(player.player_id):
+            problems.append(f"player key {player_id} disagrees with the row id {player.player_id}")
+        for event, entry in sorted(player.events.items()):
+            if int(event) != int(entry.event):
+                problems.append(f"player {player_id}: key {event} disagrees with row event {entry.event}")
+            for detail in entry.problems(binding):
+                problems.append(f"player {player_id} event {event}: {detail}")
+    return problems
 
 
 def screen_players(request: WildcardRequest) -> tuple[dict[int, float], dict[str, Any]]:
@@ -271,10 +446,17 @@ def screen_players(request: WildcardRequest) -> tuple[dict[int, float], dict[str
             # consideration (that is the pool's job, not the screen's).
             total += weight * float(entry.expected_points) * max(0.0, min(1.0, float(entry.availability)))
         scores[int(player_id)] = total
+    reasons = {int(pid): WC_MISSING_PROJECTION for pid in missing}
     return scores, {
         "screened": len(scores),
         "excluded_missing_projection": len(missing),
-        "excluded_missing_projection_ids": sorted(missing)[:50],
+        # FULL machine-readable exclusion evidence — never truncated, so the
+        # audit can account for every official player.
+        "excluded_ids": sorted(reasons),
+        "excluded_reasons": {int(k): v for k, v in sorted(reasons.items())},
+        # a short human-readable sample is ALSO provided, but it never replaces
+        # the full evidence above
+        "excluded_sample": sorted(reasons)[:20],
     }
 
 
@@ -865,6 +1047,8 @@ def _refuse(request: WildcardRequest, token: str, detail: str, *, reasons: Seque
             "planning_event": int(request.planning_event),
             "refusal_detail": detail,
             "wildcard_horizon": request.horizon.as_dict(),
+            "wildcard_value_horizon": (request.value_horizon_binding.as_dict()
+                                        if request.value_horizon_binding else None),
             "wildcard_evaluator_version": WILDCARD_EVALUATOR_VERSION,
             "wildcard_quantitative_capability": "SUPPORTED_REVIEW_ONLY",
             "executable": False,
@@ -925,6 +1109,14 @@ def evaluate_wildcard(request: WildcardRequest):
     """
 
     from . import chip_decision as cd
+
+    projection_problems = validate_projections(request)
+    if projection_problems:
+        first = projection_problems[0]
+        token = (WC_VALUE_BINDING_MISMATCH if "binding" in first or "horizon" in first
+                 else WC_PROJECTION_INVALID)
+        return _refuse(request, token, "; ".join(projection_problems[:8]),
+                       reasons=(token,))
 
     incoherent = _incoherent_reasons(request)
     if incoherent:
@@ -1057,6 +1249,8 @@ def evaluate_wildcard(request: WildcardRequest):
             "horizon_events": list(request.horizon_binding.horizon_events),
             "planning_event": int(request.planning_event),
             "wildcard_horizon": request.horizon.as_dict(),
+            "wildcard_value_horizon": request.value_horizon_binding.as_dict(),
+            "wildcard_value_horizon_identity": request.value_horizon_binding.identity(),
             "wildcard_evaluator_version": WILDCARD_EVALUATOR_VERSION,
             "wildcard_quantitative_capability": "SUPPORTED_REVIEW_ONLY",
             "no_global_optimum_claim": True,
