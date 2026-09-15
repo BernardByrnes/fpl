@@ -50,8 +50,15 @@ _CAPTURED_AT = "2026-09-12T08:00:00Z"
 
 
 def _seed(conn, *, picks_event: int = EVENT, picks: list[tuple[int, int, bool, bool]] | None = None,
-          bboost_windows=((2, 19), (20, 38)), used_bboost_events=(), players=SQUAD) -> None:
-    """Seed a minimal but canonical world: players, chips, and captured picks."""
+          bboost_windows=((2, 19), (20, 38)), used_bboost_events=(), players=SQUAD,
+          positions=None, clubs=None) -> None:
+    """Seed a minimal but canonical world: players, chips, and captured picks.
+
+    ``positions`` and ``clubs`` override the canonical player labels so a
+    deliberately illegal canonical squad can be constructed; ``is_starting`` is
+    not settable through ``PickRecord`` because the canonical writer derives it
+    from the slot, which is exactly the rule under test.
+    """
 
     now = _CAPTURED_AT
     with conn:
@@ -69,8 +76,9 @@ def _seed(conn, *, picks_event: int = EVENT, picks: list[tuple[int, int, bool, b
             for event in range(1, 39)
         ])
         repo.upsert_players(conn, [
-            PlayerRecord(id=pid, web_name=f"P{pid}", full_name=f"Player {pid}", team_id=CLUB[pid],
-                         element_type=POSITION_SHORT[POSITION_ID[pid]])
+            PlayerRecord(id=pid, web_name=f"P{pid}", full_name=f"Player {pid}",
+                         team_id=(clubs if clubs is not None else CLUB)[pid],
+                         element_type=POSITION_SHORT[(positions if positions is not None else POSITION_ID)[pid]])
             for pid in players
         ])
         run = repo.create_fetch_run(conn, "fetch_fpl", started_at=now)
@@ -146,11 +154,12 @@ def _worlds(*, planning_event: int = EVENT, identity: str = _STRONG, snapshot: s
     )
 
 
-def _binding(*, planning_event: int = EVENT, identity: str = _STRONG, events=None) -> cd.ChipHorizonBinding:
+def _binding(*, planning_event: int = EVENT, identity: str = _STRONG, events=None,
+             snapshot: str = _SNAPSHOT) -> cd.ChipHorizonBinding:
     return cd.ChipHorizonBinding(
         planning_event=int(planning_event),
         horizon_events=events if events is not None else cd.canonical_chip_horizon(int(planning_event)),
-        certification_identity=identity, data_snapshot_sha256=_SNAPSHOT,
+        certification_identity=identity, data_snapshot_sha256=snapshot,
     )
 
 
@@ -221,12 +230,12 @@ def test_I2_an_illegal_fifteen_refuses_at_the_adapter(conn):
         policy=ml.ManagerPolicy(starter_ids=(1, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15),
                                 bench_gk_id=2, bench_outfield_order=(5, 6, 7),
                                 captain_id=13, vice_captain_id=8),
-        positions=state.positions, chip_availability=state.chip_availability,
-        lineup_source_event=state.lineup_source_event,
+        positions=state.positions, clubs=state.clubs,
+        chip_availability=state.chip_availability, lineup_source_event=state.lineup_source_event,
     )
     assert any("not legal" in problem for problem in broken.problems())
     with pytest.raises(ad.BenchBoostAdapterError) as caught:
-        ad.build_bench_boost_request(broken, _certified())
+        ad.build_bench_boost_request(broken, _certified(), allow_unverified_manager_state=True)
     assert caught.value.reasons[0] == ad.BB_MANAGER_STATE_MISSING
 
 
@@ -258,6 +267,7 @@ def test_J_a_predictive_event_mismatch_refuses(conn):
     with pytest.raises(ad.BenchBoostAdapterError) as caught:
         ad.build_bench_boost_request(
             state, ad.BenchBoostCertifiedInputs(horizon_binding=_binding(), worlds=_worlds(planning_event=6)),
+            allow_unverified_manager_state=True,
         )
     assert caught.value.reasons[0] == ad.BB_HORIZON_MISMATCH
 
@@ -284,23 +294,43 @@ def test_K_a_predictive_identity_mismatch_refuses(conn):
             ad.BenchBoostCertifiedInputs(
                 horizon_binding=_binding(), worlds=_worlds(identity="sha256:" + "f" * 64),
             ),
+            allow_unverified_manager_state=True,
         )
     assert caught.value.reasons[0] == ad.BB_HORIZON_MISMATCH
 
 
-def test_K2_a_snapshot_mismatch_alone_does_not_pass_silently(conn):
+def test_K2_a_snapshot_mismatch_alone_refuses(conn):
+    """The binding snapshot and the world snapshot must be the SAME identity.
+
+    The event window and the certification identity can agree while the data
+    snapshot differs, and that used to pass: a world set built from snapshot A
+    could be evaluated against a binding authorised for snapshot D.  The mismatch
+    is now a refusal, and no numeric evaluation is produced.
+    """
+
     _seed(conn)
     state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
-    # The binding and the worlds agree with each other but not with the manager
-    # context's declared snapshot: the adapter must carry the WORLDS' snapshot
-    # through, never substitute its own.
-    request = ad.build_bench_boost_request(
-        state, ad.BenchBoostCertifiedInputs(
-            horizon_binding=_binding(), worlds=_worlds(snapshot="sha256:" + "a" * 64),
-        ),
-        conn=conn,
-    )
-    assert request.worlds.data_snapshot_sha256 == "sha256:" + "a" * 64
+    other = "sha256:" + "a" * 64
+    assert other != _SNAPSHOT
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(horizon_binding=_binding(), worlds=_worlds(snapshot=other)),
+            allow_unverified_manager_state=True,
+        )
+    assert caught.value.reasons[0] == ad.BB_HORIZON_MISMATCH
+    assert "data snapshot" in str(caught.value)
+
+
+def test_K3_the_snapshot_mismatch_is_visible_in_the_binding_diagnostic():
+    """``matches_worlds`` itself names the snapshot, not just the horizon."""
+
+    problems = _binding().matches_worlds(_worlds(snapshot="sha256:" + "a" * 64))
+    assert any("data snapshot" in problem for problem in problems), problems
+
+
+def test_K4_matching_snapshots_pass():
+    assert _binding().matches_worlds(_worlds(snapshot=_SNAPSHOT)) == []
 
 
 def test_L_a_missing_projection_or_world_refuses(conn):
@@ -337,19 +367,21 @@ def test_M_a_caller_supplied_squad_cannot_override_canonical_authority(conn):
 
     _seed(conn)
     state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
-    # Swap a squad member for a player the manager does not own.
+    # Swap a bench MID for a MID the manager does not own, so the forged fifteen
+    # satisfies the FULL composition and club rules and only the canonical
+    # manager state can reveal it.
     with conn:
         repo.upsert_players(conn, [PlayerRecord(id=99, web_name="Impostor", full_name="Impostor",
-                                                team_id=11, element_type=4)])
+                                                team_id=11, element_type=3)])
     forged = ad.BenchBoostManagerState(
         entry_id=state.entry_id, planning_event=state.planning_event,
-        # Bench MID 12 swapped for an unowned player 99, consistently everywhere.
         squad_ids=tuple(sorted((set(SQUAD) - {12}) | {99})),
         policy=ml.ManagerPolicy(
             starter_ids=XI, bench_gk_id=BENCH_GK, bench_outfield_order=(6, 7, 99),
             captain_id=CAPTAIN, vice_captain_id=VICE,
         ),
-        positions={**state.positions, 99: "FWD"},
+        positions={**state.positions, 99: "MID"},
+        clubs={**state.clubs, 99: 11},
         chip_availability=state.chip_availability, lineup_source_event=state.lineup_source_event,
     )
     assert forged.problems() == [], "the forged state is internally consistent by construction"
@@ -369,8 +401,8 @@ def test_M2_a_forged_lineup_for_the_real_squad_also_refuses(conn):
             starter_ids=XI, bench_gk_id=BENCH_GK, bench_outfield_order=(6, 7, 12),
             captain_id=14, vice_captain_id=9,
         ),
-        positions=state.positions, chip_availability=state.chip_availability,
-        lineup_source_event=state.lineup_source_event,
+        positions=state.positions, clubs=state.clubs,
+        chip_availability=state.chip_availability, lineup_source_event=state.lineup_source_event,
     )
     with pytest.raises(ad.BenchBoostAdapterError) as caught:
         ad.build_bench_boost_request(forged, _certified(), conn=conn)
@@ -386,11 +418,11 @@ def test_M3_without_a_connection_the_canonical_state_is_still_required(conn):
         entry_id=state.entry_id, planning_event=state.planning_event, squad_ids=state.squad_ids,
         policy=ml.ManagerPolicy(starter_ids=XI[:9], bench_gk_id=BENCH_GK,
                                 bench_outfield_order=(6, 7, 12), captain_id=CAPTAIN, vice_captain_id=VICE),
-        positions=state.positions, chip_availability=state.chip_availability,
-        lineup_source_event=state.lineup_source_event,
+        positions=state.positions, clubs=state.clubs,
+        chip_availability=state.chip_availability, lineup_source_event=state.lineup_source_event,
     )
     with pytest.raises(ad.BenchBoostAdapterError):
-        ad.build_bench_boost_request(broken, _certified())
+        ad.build_bench_boost_request(broken, _certified(), allow_unverified_manager_state=True)
 
 
 def test_a_missing_lineup_capture_refuses(conn):
@@ -577,7 +609,7 @@ def test_R_a_used_chip_in_the_live_window_refuses(conn):
     _seed(conn, used_bboost_events=(EVENT,))
     state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
     assert ad._chip_available(state.chip_availability, planning_event=EVENT) is False
-    evaluation = bb.evaluate_bench_boost(ad.build_bench_boost_request(state, _certified()))
+    evaluation = bb.evaluate_bench_boost(ad.build_bench_boost_request(state, _certified(), allow_unverified_manager_state=True))
     decision = _decide(evaluation, availability=_chip_rows(available=False, used=True))
     # An ineligible action can never be recommended, and it cannot borrow
     # another action's availability.
@@ -596,6 +628,7 @@ def test_R2_an_expired_chip_refuses(conn):
             ad.BenchBoostCertifiedInputs(
                 horizon_binding=_binding(planning_event=30), worlds=_worlds(planning_event=30),
             ),
+            conn=conn,
         )
     )
     expired = [{"name": "bboost", "available_for_event": False, "used": False, "expired": True,
@@ -659,3 +692,430 @@ def test_T3_the_evaluator_refuses_a_mismatched_bound_horizon():
     assert set(caught.value.reasons) & {
         cd.DIAG_CHIP_HORIZON_NOT_CANONICAL, cd.DIAG_CHIP_PLANNING_EVENT_MISMATCH,
     }
+
+
+# ---------------------------------------------------------------------------
+# P2-A — CANONICAL POSITION / SQUAD-LEGALITY AUTHORITY (Sol repair)
+# ---------------------------------------------------------------------------
+
+
+def _state_with(conn, *, positions, clubs):
+    """A state carrying the given labels, so one rule can be isolated.
+
+    Assumes the store is already seeded; it deliberately does NOT re-derive the
+    labels, which is the whole point of the forged-state tests below.
+    """
+
+    base = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    return ad.BenchBoostManagerState(
+        entry_id=base.entry_id, planning_event=base.planning_event, squad_ids=base.squad_ids,
+        policy=base.policy, positions=positions, clubs=clubs,
+        chip_availability=base.chip_availability, lineup_source_event=base.lineup_source_event,
+    )
+
+
+def test_P2A_canonical_position_map_passes(conn):
+    """The canonical map is accepted and IS the map the evaluator receives."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    assert state.positions == POSITION_ID
+    assert state.clubs == CLUB
+    assert state.problems() == []
+    request = ad.build_bench_boost_request(state, _certified(), conn=conn)
+    assert request.positions == POSITION_ID
+
+
+def test_P2A_a_def_mid_label_swap_on_the_same_fifteen_refuses(conn):
+    """Sol's counterexample: identical ids and a superficially legal squad.
+
+    Swapping DEF/MID between bench players 6 and 12 keeps the fifteen, the
+    composition (2 GKP / 5 DEF / 5 MID / 3 FWD), the club counts and the starting
+    XI legal -- yet it changes which autosubs are legal, and therefore the chip's
+    value.  Only canonical authority can reveal it, so it must refuse.
+    """
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    swapped = {**state.positions, 6: "MID", 12: "DEF"}
+    assert swapped != state.positions
+    forged = _state_with(conn, positions=swapped, clubs=state.clubs)
+    # Locally the forged state is perfectly legal -- that is the whole point.
+    assert forged.problems() == [], forged.problems()
+    assert ml.policy_legality_errors(forged.policy, swapped) == []
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(forged, _certified(), conn=conn)
+    assert caught.value.reasons[0] == ad.BB_CALLER_STATE_DISAGREES
+    assert "position" in str(caught.value)
+
+
+def test_P2A_a_club_relabel_refuses(conn):
+    """The club map is canonical too, not a caller's label."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    forged = _state_with(conn, positions=state.positions, clubs={**state.clubs, 6: 99})
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(forged, _certified(), conn=conn)
+    assert caught.value.reasons[0] == ad.BB_CALLER_STATE_DISAGREES
+    assert "club" in str(caught.value)
+
+
+def test_P2A_a_legal_2_5_5_3_squad_passes(conn):
+    _seed(conn)
+    assert _state_with(conn, positions=POSITION_ID, clubs=CLUB).problems() == []
+
+
+#: Compositions that keep a LEGAL ELEVEN fieldable -- which is exactly why the
+#: lineup engine alone never caught them, and why the squad check exists.
+_ILLEGAL_BUT_FIELDABLE = {
+    "2/4/6/3": {6: "MID", 7: "MID", 12: "DEF"},   # DEF 4, MID 6
+    "2/5/4/4": {12: "FWD"},                        # MID 4, FWD 4
+}
+
+
+@pytest.mark.parametrize("label,composition", sorted(_ILLEGAL_BUT_FIELDABLE.items()))
+def test_P2A_an_illegal_composition_refuses_even_when_an_xi_is_fieldable(conn, label, composition):
+    """Sol's second finding: the FIFTEEN must be legal, not merely an eleven.
+
+    A surplus player simply sits on the bench, so a 2/4/6/3 squad fields a legal
+    XI and passed before.  It must refuse now, and the lineup engine must NOT be
+    the thing that catches it -- otherwise this test would prove nothing.
+    """
+
+    _seed(conn)
+    positions = {**POSITION_ID, **composition}
+    counts = {}
+    for pid in SQUAD:
+        counts[positions[pid]] = counts.get(positions[pid], 0) + 1
+    assert {k: counts.get(k, 0) for k in ("GKP", "DEF", "MID", "FWD")} != ad.ts.POSITION_COMPOSITION
+
+    state = _state_with(conn, positions=positions, clubs=CLUB)
+    assert ml.policy_legality_errors(state.policy, positions) == [], (
+        f"{label}: the fixture must keep a legal eleven, or the squad check is untested"
+    )
+    problems = state.problems()
+    assert any("POSITION_INVALID" in problem for problem in problems), (label, problems)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(state, _certified(), allow_unverified_manager_state=True)
+    assert caught.value.reasons[0] == ad.BB_MANAGER_STATE_MISSING
+
+
+def test_P2A_the_composition_matrix_from_the_review(conn):
+    """The exact matrix the review asked for, at the squad-legality level."""
+
+    _seed(conn)
+    legal = _state_with(conn, positions=POSITION_ID, clubs=CLUB)
+    assert legal.problems() == [], "2/5/5/3 must PASS"
+
+    for label, composition in (
+        ("2/4/6/3", {6: "MID", 7: "MID"}),
+        ("1/6/5/3", {2: "DEF", 6: "DEF", 7: "DEF"}),
+    ):
+        positions = {**POSITION_ID, **composition}
+        counts = {}
+        for pid in SQUAD:
+            counts[positions[pid]] = counts.get(positions[pid], 0) + 1
+        assert len(counts) and sum(counts.values()) == 15
+        state = _state_with(conn, positions=positions, clubs=CLUB)
+        problems = state.problems()
+        assert any("POSITION_INVALID" in problem for problem in problems), (label, problems)
+        with pytest.raises(ad.BenchBoostAdapterError):
+            ad.build_bench_boost_request(state, _certified(), allow_unverified_manager_state=True)
+
+
+def test_P2A_the_composition_error_names_the_position(conn):
+    _seed(conn)
+    state = _state_with(conn, positions={**POSITION_ID, 7: "MID"}, clubs=CLUB)
+    problems = state.problems()
+    assert any("DEF=4 != 5" in problem for problem in problems), problems
+    assert any("MID=6 != 5" in problem for problem in problems), problems
+
+
+def test_P2A_a_duplicate_player_refuses(conn):
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    duped = ad.BenchBoostManagerState(
+        entry_id=state.entry_id, planning_event=state.planning_event,
+        squad_ids=tuple((*state.squad_ids[:-1], state.squad_ids[0])),
+        policy=state.policy, positions=state.positions, clubs=state.clubs,
+        chip_availability=state.chip_availability, lineup_source_event=state.lineup_source_event,
+    )
+    assert any("SQUAD_NOT_15_UNIQUE" in problem for problem in duped.problems())
+    with pytest.raises(ad.BenchBoostAdapterError):
+        ad.build_bench_boost_request(duped, _certified(), allow_unverified_manager_state=True)
+
+
+def test_P2A_a_wrong_total_count_refuses(conn):
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    short = ad.BenchBoostManagerState(
+        entry_id=state.entry_id, planning_event=state.planning_event, squad_ids=state.squad_ids[:-1],
+        policy=state.policy, positions=state.positions, clubs=state.clubs,
+        chip_availability=state.chip_availability, lineup_source_event=state.lineup_source_event,
+    )
+    assert any("SQUAD_NOT_15_UNIQUE" in problem for problem in short.problems())
+    with pytest.raises(ad.BenchBoostAdapterError):
+        ad.build_bench_boost_request(short, _certified(), allow_unverified_manager_state=True)
+
+
+def test_P2A_four_players_from_one_club_refuse(conn):
+    """Sol's third finding: the club limit needs canonical club ids.
+
+    ``manager_worlds.resolve_squad`` discards them, so before the repair the
+    three-per-club rule was uncheckable and four teammates passed.  The four span
+    the XI and the bench, so the refusal cannot depend on the arrangement.
+    """
+
+    clubs = {**CLUB, 3: 11, 4: 11}   # players 1, 11, 3, 4 -> four at club 11
+    _seed(conn, clubs=clubs)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    assert caught.value.reasons[0] == ad.BB_MANAGER_STATE_MISSING
+    assert "CLUB_LIMIT_EXCEEDED" in str(caught.value)
+    assert "CLUB_LIMIT_EXCEEDED: {11: 4}" in str(caught.value)
+
+
+def test_P2A_exactly_three_from_one_club_passes(conn):
+    """The limit is <= 3, so three is legal and must not be refused."""
+
+    clubs = {**CLUB, 3: 11}          # players 1, 11, 3 -> exactly three at club 11
+    _seed(conn, clubs=clubs)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    assert state.problems() == []
+    request = ad.build_bench_boost_request(state, _certified(), conn=conn)
+    assert bb.evaluate_bench_boost(request).action == cd.CHIP_ACTION_BB
+
+
+def test_P2A_the_club_ids_survive_the_canonical_read(conn):
+    """The club map is retrieved, not defaulted away."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    assert set(state.clubs) == set(SQUAD)
+    assert set(state.clubs.values()) == set(CLUB.values())
+
+
+def test_P2A_an_unknown_position_or_club_refuses(conn):
+    """An unknown label must never satisfy a composition count."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    positions = {pid: value for pid, value in state.positions.items() if pid != 7}
+    assert any("UNKNOWN_POSITION" in problem for problem in
+               _state_with(conn, positions=positions, clubs=state.clubs).problems())
+
+    clubs = {pid: value for pid, value in state.clubs.items() if pid != 7}
+    assert any("UNKNOWN_CLUB" in problem for problem in
+               _state_with(conn, positions=state.positions, clubs=clubs).problems())
+
+
+def test_P2A_the_player_authority_describes_every_squad_member(conn):
+    """A squad member the player authority cannot describe refuses, never defaults."""
+
+    _seed(conn)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad._canonical_positions_and_clubs(conn, [*SQUAD, 987654])
+    assert caught.value.reasons[0] == ad.BB_MANAGER_STATE_MISSING
+    assert "987654" in str(caught.value)
+
+
+def test_P2A_the_shared_helper_matches_the_constant_authority():
+    """One rule set: the helper consumes the module the transition path owns."""
+
+    assert ad.ts.POSITION_COMPOSITION == {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
+    assert ad.ts.SQUAD_TEAM_LIMIT == 3
+    assert ad.ts.SQUAD_SIZE == 15
+    assert ad.ts.squad_composition_errors(SQUAD, POSITION_ID, CLUB) == []
+
+
+def test_P2A_the_shared_helper_rejects_every_illegal_shape():
+    """The helper itself, exercised directly, so its own rule is pinned."""
+
+    assert ad.ts.squad_composition_errors(SQUAD, {**POSITION_ID, 7: "MID"}, CLUB) != []
+    assert ad.ts.squad_composition_errors(SQUAD[:14], POSITION_ID, CLUB) != []
+    assert ad.ts.squad_composition_errors((*SQUAD[:14], SQUAD[0]), POSITION_ID, CLUB) != []
+    assert ad.ts.squad_composition_errors(SQUAD, POSITION_ID, {**CLUB, 2: 11, 3: 11}) != []
+    # Unknown labels never count towards a required position or club.
+    assert ad.ts.squad_composition_errors(SQUAD, {**POSITION_ID, 7: "COACH"}, CLUB) != []
+    assert ad.ts.squad_composition_errors(SQUAD, POSITION_ID, {k: v for k, v in CLUB.items() if k != 7}) != []
+
+
+# ---------------------------------------------------------------------------
+# P2-B — SNAPSHOT IDENTITY COHERENCE (Sol repair)
+# ---------------------------------------------------------------------------
+
+_SNAP_A = "sha256:" + "a" * 64
+_SNAP_B = "sha256:" + "b" * 64
+
+
+def _evaluation_with_snapshot(evaluation: cd.ChipEvaluation, snapshot: str) -> cd.ChipEvaluation:
+    return cd.ChipEvaluation(
+        action=evaluation.action, evaluator_version=evaluation.evaluator_version,
+        candidate_metrics=dict(evaluation.candidate_metrics),
+        uncertainty=dict(evaluation.uncertainty), reason_codes=tuple(evaluation.reason_codes),
+        calibration_status=evaluation.calibration_status,
+        evidence={**evaluation.evidence, "data_snapshot_sha256": snapshot},
+        execution_permitted=evaluation.execution_permitted,
+    )
+
+
+def _binding_held_at(snapshot: str) -> cd.ChipHorizonBinding:
+    return cd.ChipHorizonBinding(
+        planning_event=EVENT, horizon_events=cd.canonical_chip_horizon(EVENT),
+        certification_identity=_STRONG, data_snapshot_sha256=snapshot,
+    )
+
+
+def _bb_evaluation(conn, snapshot: str = _SNAP_A):
+    """A real BB evaluation whose binding, worlds and evidence all use ``snapshot``."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    request = ad.build_bench_boost_request(
+        state,
+        ad.BenchBoostCertifiedInputs(
+            horizon_binding=_binding_held_at(snapshot), worlds=_worlds(snapshot=snapshot),
+        ),
+        conn=conn,
+    )
+    return bb.evaluate_bench_boost(request)
+
+
+def test_P2B_a_coherent_snapshot_family_passes(conn):
+    """binding = world = evaluation = arbiter context, all snapshot A."""
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    assert evaluation.evidence["data_snapshot_sha256"] == _SNAP_A
+    decision = _decide(evaluation, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert decision.recommended_action == cd.CHIP_ACTION_BB
+    assert decision.evidence["data_snapshot_sha256"] == _SNAP_A
+    assert cd.DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH not in decision.reason_codes
+    assert decision.candidate_metrics["mean_paired_uplift"] == pytest.approx(20.0)
+
+
+def test_P2B_a_binding_world_snapshot_mismatch_refuses(conn):
+    """binding = A, world = B: no numeric evaluation may be produced."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(
+                horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_B),
+            ),
+            allow_unverified_manager_state=True,
+        )
+    assert caught.value.reasons[0] == ad.BB_HORIZON_MISMATCH
+    assert "data snapshot" in str(caught.value)
+
+
+def test_P2B_an_evaluation_from_another_snapshot_refuses_before_arbitration(conn):
+    """binding = A, evaluation = B: the arbiter must not admit it."""
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    assert evaluation.evidence["data_snapshot_sha256"] == _SNAP_A
+    foreign = _evaluation_with_snapshot(evaluation, _SNAP_B)
+    decision = _decide(foreign, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert decision.status == cd.STATUS_INSUFFICIENT_EVIDENCE
+    assert decision.recommended_action == cd.CHIP_ACTION_NO_CHIP
+    assert cd.DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH in decision.reason_codes
+    assert cd.DIAG_CHIP_DATA_SNAPSHOT_MISMATCH in decision.reason_codes
+    assert decision.candidate_metrics == {}, "no numeric evaluation may reach arbitration"
+
+
+def test_P2B_the_same_evaluation_is_admitted_when_the_snapshot_coheres(conn):
+    """The control: the identical evaluation passes when its snapshot matches.
+
+    Without this, the refusal above could be caused by anything else about the
+    evaluation rather than by the snapshot it declares.
+    """
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    coherent = _evaluation_with_snapshot(evaluation, _SNAP_A)
+    decision = _decide(coherent, availability=_chip_rows(), horizon_binding=_binding_held_at(_SNAP_A))
+    assert cd.DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH not in decision.reason_codes
+    assert decision.candidate_metrics["mean_paired_uplift"] == pytest.approx(20.0)
+
+
+def test_P2B_a_snapshot_disagreement_is_reported_as_a_snapshot_problem():
+    """The cause is machine-readable, not merely a horizon message."""
+
+    binding = _binding_held_at(_SNAP_A)
+    problems = binding.matches_worlds(_worlds(snapshot=_SNAP_B))
+    assert any("data snapshot" in problem for problem in problems)
+    assert not any("horizon" in problem for problem in problems)
+    assert binding.matches_worlds(_worlds(snapshot=_SNAP_A)) == []
+
+
+def test_P2B_a_binding_without_a_snapshot_makes_no_claim():
+    """A binding that declares no snapshot is not a claim about any snapshot."""
+
+    binding = cd.ChipHorizonBinding(
+        planning_event=EVENT, horizon_events=cd.canonical_chip_horizon(EVENT),
+        certification_identity=_STRONG, data_snapshot_sha256=None,
+    )
+    assert binding.matches_worlds(_worlds(snapshot=_SNAP_B)) == []
+
+
+def test_P2B_the_four_event_horizon_has_one_snapshot_authority(conn):
+    """No partial snapshot family exists for BB, and the one it has is checked.
+
+    Bench Boost's world input is a single certified matrix bound to the four-event
+    horizon (Triple Captain's shape), so a "three events on A, one on B" family is
+    not representable: there is exactly one snapshot for the horizon, and the
+    binding must agree with it.  A caller cannot smuggle a per-event variant in,
+    because there is no per-event channel to smuggle it through -- the only
+    degrees of freedom are binding vs worlds, and that pair is now compared.
+    """
+
+    evaluation = _bb_evaluation(conn, _SNAP_A)
+    assert len(evaluation.evidence["horizon_events"]) == 4
+    assert evaluation.evidence["horizon_events"] == list(cd.canonical_chip_horizon(EVENT))
+    assert evaluation.evidence["data_snapshot_sha256"] == _SNAP_A
+
+    # And the mismatching variant refuses rather than evaluating three events.
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError):
+        ad.build_bench_boost_request(
+            state,
+            ad.BenchBoostCertifiedInputs(
+                horizon_binding=_binding_held_at(_SNAP_A), worlds=_worlds(snapshot=_SNAP_B),
+            ),
+            allow_unverified_manager_state=True,
+        )
+
+
+def test_P2A_a_state_without_canonical_authority_refuses_by_default(conn):
+    """The production API fails closed: no connection, no authority, no request.
+
+    Positions, clubs and the lineup are canonical facts.  A caller holding only a
+    hand-made state has nothing to assert them from, so building a request from
+    one is refused unless the caller explicitly declares a simulation.
+    """
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    with pytest.raises(ad.BenchBoostAdapterError) as caught:
+        ad.build_bench_boost_request(state, _certified())
+    assert caught.value.reasons[0] == ad.BB_CANONICAL_AUTHORITY_REQUIRED
+    assert "canonical manager state" in str(caught.value)
+
+    # The explicit opt-out is the only way through the pure path.
+    request = ad.build_bench_boost_request(
+        state, _certified(), allow_unverified_manager_state=True,
+    )
+    assert request.positions == POSITION_ID
+
+
+def test_P2A_the_relabel_cannot_pass_while_canonical_authority_exists(conn):
+    """No combination of flags lets a relabel through when the store is present."""
+
+    _seed(conn)
+    state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
+    forged = _state_with(conn, positions={**state.positions, 6: "MID", 12: "DEF"}, clubs=state.clubs)
+    for kwargs in ({}, {"allow_unverified_manager_state": True}):
+        with pytest.raises(ad.BenchBoostAdapterError) as caught:
+            ad.build_bench_boost_request(forged, _certified(), conn=conn, **kwargs)
+        assert caught.value.reasons[0] == ad.BB_CALLER_STATE_DISAGREES

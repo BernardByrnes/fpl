@@ -97,6 +97,58 @@ class PlayerMeta:
     club_id: int
 
 
+def squad_composition_errors(
+    squad_ids: Iterable[int],
+    positions: Mapping[int, str],
+    clubs: Mapping[int, int],
+) -> list[str]:
+    """Full FPL squad legality for an AUTHORITATIVE fifteen, in one place.
+
+    THE SAME RULE the atomic transfer transition enforces on its final squad
+    (``apply_transfer_batch``), stated over a different input shape so a caller
+    holding a squad and its canonical metadata can check it without inventing a
+    second rule set.  The numbers come from the module constants, so the two
+    cannot drift.
+
+    It is deliberately STRICTER than a lineup check: the exact composition is
+    required of the whole fifteen, not merely of a starting XI.  A squad of
+    2 GKP / 4 DEF / 6 MID / 3 FWD is illegal even when a legal eleven can be
+    fielded from it (the surplus midfielder simply sits on the bench), and a
+    squad with four players from one club is illegal however they are arranged.
+
+    A player with an unknown position or club is an error, never a silent zero:
+    an unowned label must not be able to satisfy a count.
+    """
+
+    errors: list[str] = []
+    ids = [int(pid) for pid in squad_ids]
+    if len(ids) != SQUAD_SIZE or len(set(ids)) != SQUAD_SIZE:
+        errors.append(f"SQUAD_NOT_15_UNIQUE: {len(ids)} rows, {len(set(ids))} distinct")
+
+    counts = {position: 0 for position in (*OUTFIELD_POSITIONS, "GKP")}
+    for pid in ids:
+        position = positions.get(int(pid))
+        if position not in counts:
+            errors.append(f"UNKNOWN_POSITION: {int(pid)}={position!r}")
+            continue
+        counts[position] += 1
+    for position, required in POSITION_COMPOSITION.items():
+        if counts.get(position, 0) != required:
+            errors.append(f"POSITION_INVALID: {position}={counts.get(position, 0)} != {required}")
+
+    club_counts: dict[int, int] = {}
+    for pid in ids:
+        club = clubs.get(int(pid))
+        if club is None:
+            errors.append(f"UNKNOWN_CLUB: {int(pid)}")
+            continue
+        club_counts[int(club)] = club_counts.get(int(club), 0) + 1
+    over = {club: count for club, count in club_counts.items() if count > SQUAD_TEAM_LIMIT}
+    if over:
+        errors.append(f"CLUB_LIMIT_EXCEEDED: {over}")
+    return errors
+
+
 @dataclass(frozen=True)
 class RoutePlayer:
     player_id: int

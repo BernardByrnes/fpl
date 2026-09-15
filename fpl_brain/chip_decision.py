@@ -98,6 +98,9 @@ DIAG_CHIP_HORIZON_NOT_CANONICAL = "CHIP_HORIZON_NOT_CANONICAL"
 DIAG_CHIP_PLANNING_EVENT_MISMATCH = "CHIP_PLANNING_EVENT_MISMATCH"
 DIAG_CHIP_CERTIFICATION_HORIZON_MISMATCH = "CHIP_CERTIFICATION_HORIZON_MISMATCH"
 DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH = "CHIP_EVALUATION_CONTEXT_MISMATCH"
+#: Raised when the disagreement is specifically the DATA snapshot identity, so a
+#: cross-snapshot arbitration is distinguishable from a horizon mismatch.
+DIAG_CHIP_DATA_SNAPSHOT_MISMATCH = "CHIP_DATA_SNAPSHOT_MISMATCH"
 DIAG_CHIP_EVALUATION_ACTION_MISMATCH = "CHIP_EVALUATION_ACTION_MISMATCH"
 DIAG_CHIP_EVALUATOR_UNCALIBRATED = "CHIP_EVALUATOR_VALUE_MODEL_UNCALIBRATED"
 DIAG_CHIP_NO_ACTIVE_WINDOW = "CHIP_NO_ACTIVE_WINDOW_FOR_ACTION"
@@ -559,6 +562,14 @@ class ChipHorizonBinding:
             )
         if str(worlds.certification_identity) != str(self.certification_identity):
             problems.append("worlds certification identity is not the authorised one")
+        # The DATA snapshot is part of the certified context, not decoration: a
+        # world set built from snapshot A may not be evaluated against a binding
+        # authorised for snapshot D, even when the event window and the
+        # certification identity agree.  Compared whenever both sides declare one
+        # (a binding that carries no snapshot is not a claim about any snapshot).
+        if self.data_snapshot_sha256 and worlds.data_snapshot_sha256:
+            if str(worlds.data_snapshot_sha256) != str(self.data_snapshot_sha256):
+                problems.append("worlds data snapshot is not the certified one")
         return problems
 
 
@@ -784,11 +795,28 @@ def decide_chip_action(
         if str(evaluation.evidence.get("certification_identity") or "") != str(certification_identity)
         or tuple(int(event) for event in (evaluation.evidence.get("horizon_events") or ())) != events
         or int(evaluation.evidence.get("planning_event") or -1) != planning_event
+        # An evaluation that was produced from a DIFFERENT data snapshot may not
+        # be arbitrated under this binding, even when the horizon and the
+        # certification identity agree.  Compared whenever the evaluation
+        # declares a snapshot; an evaluation that declares none makes no claim to
+        # contradict (every production evaluator emits its worlds' own value).
+        or (
+            bool(evaluation.evidence.get("data_snapshot_sha256"))
+            and str(evaluation.evidence.get("data_snapshot_sha256")) != str(data_snapshot_sha256)
+        )
     )
     if foreign:
+        snapshot_foreign = sorted(
+            action
+            for action in foreign
+            if bool(supplied[action].evidence.get("data_snapshot_sha256"))
+            and str(supplied[action].evidence.get("data_snapshot_sha256")) != str(data_snapshot_sha256)
+        )
         return refuse(
             DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH,
-            f"evaluation(s) {foreign} were produced for a different horizon or certification identity",
+            f"evaluation(s) {foreign} were produced for a different horizon, certification identity "
+            f"or data snapshot",
+            extra=(DIAG_CHIP_DATA_SNAPSHOT_MISMATCH,) if snapshot_foreign else (),
         )
 
     # 6. one chip per Gameweek
