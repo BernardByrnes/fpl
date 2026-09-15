@@ -357,6 +357,25 @@ def _base_world_for_bundles(conn):
         )
 
 
+def _bound_bundle(event: int = 5) -> dict:
+    """A canonical bundle in its persisted as_dict shape.
+
+    The declared ``certified_bundle_identity`` must BIND the bundles a decision
+    consumes, so fixtures build the label with the production algorithm.
+    """
+
+    return {
+        "event": event,
+        "cutoff": "2026-09-12T19:20:00Z",
+        "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
+                 "xpts_v1": 4, "monte_carlo_v1": 5},
+        "model_versions": {},
+        "code_snapshot_sha256": "codehash",
+        "data_snapshot_sha256": "d" * 64,
+        "planning_context_hash": None,
+    }
+
+
 def _artifact(**overrides):
     payload = {
         "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
@@ -369,13 +388,13 @@ def _artifact(**overrides):
         "route_search_executed": False,
         "transfer_execution_performed": False,
         "decision_search_permitted": True,
-        "certified_bundles": {
-            "5": {
-                "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,
-                         "xpts_v1": 4, "monte_carlo_v1": 5},
-                "data_snapshot_sha256": "d" * 64,
-            }
-        },
+        # Schema v2 (history-completeness contract): a NEW certification must carry
+        # the audit and declare the gated entry point among its covered code.
+        "history_completeness": {"complete": True, "blocker": None, "reasons": []},
+        "certification_wiring": fg.certification_wiring_identity(),
+        "events": [5],
+        "certified_bundles": {"5": _bound_bundle()},
+        "certified_bundle_identity": {"5": cb.canonical_bundle_identity(_bound_bundle())},
     }
     payload.update(overrides)
     return payload
@@ -414,6 +433,10 @@ def test_i_decision_runner_refuses_a_mismatched_certified_bundle(tmp_path):
     path.write_text(json.dumps(_artifact()), encoding="utf-8")
     bad = json.loads(path.read_text(encoding="utf-8"))
     bad["certified_bundles"]["5"]["runs"]["xpts_v1"] = 7
+    # Keep the artifact internally BOUND (the declared identity must describe the
+    # bundles consumed), so the failure exercised here is the downstream dependency
+    # incoherence rather than the identity-binding check.
+    bad["certified_bundle_identity"]["5"] = cb.canonical_bundle_identity(bad["certified_bundles"]["5"])
     path.write_text(json.dumps(bad), encoding="utf-8")
     artifact = fg.load_certification_artifact(path)
     with pytest.raises(cb.BundleIncoherent) as caught:
@@ -435,13 +458,21 @@ def test_i_valid_artifact_yields_exact_certified_run_ids(tmp_path):
 
 
 def test_i_artifact_missing_an_event_is_refused(tmp_path):
+    """An event the artifact does not certify can never be consumed.
+
+    The refusal now happens at the horizon gate, before any bundle lookup: the
+    consumed horizon must EQUAL the certified horizon, so requesting event 6 from a
+    five-only certification is refused outright rather than after discovery.
+    """
+
     conn = connect_database(tmp_path / "fpl.db")
     _base_world_for_bundles(conn)
     path = tmp_path / "art.json"
     path.write_text(json.dumps(_artifact()), encoding="utf-8")
     artifact = fg.load_certification_artifact(path)
-    with pytest.raises(fg.DecisionCertificationRequired, match="covers no bundle"):
+    with pytest.raises(fg.DecisionCertificationRequired) as caught:
         fg.event_support_from_certification(conn, artifact, events=[5, 6], cutoff="2026-09-12T19:00:00Z")
+    assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH in str(caught.value)
     conn.close()
 
 

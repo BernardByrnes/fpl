@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -32,6 +32,7 @@ from fpl_brain import (
     execution,
     execution_snapshot,
     four_gw_decision as fg,
+    history_completeness as hc,
 )
 from fpl_brain.config import config_path, load_config
 from fpl_brain.database import connect_database, connect_readonly_database
@@ -89,6 +90,7 @@ def decide_search_permission(
     dependency_validation: Any,
     horizon_status: Any,
     data_snapshot_sha256: Any,
+    history_completeness: Mapping[str, Any],
     snapshot_error: str | None = None,
 ) -> tuple[bool, list[str]]:
     """Authorisation is COMPUTED from the conditions, never asserted.
@@ -97,6 +99,14 @@ def decide_search_permission(
     inline form read an undefined local (``horizon_status``) and was only ever
     checked by a source-text assertion, so the defect survived the accepted suite
     while making the certification artifact impossible to write.
+
+    ``history_completeness`` is REQUIRED -- it is the audit from
+    ``history_completeness.audit_history_completeness`` evaluated against the SAME
+    immutable snapshot -- so a caller cannot obtain permission merely by
+    forgetting to evaluate the gate.  An incomplete audit WITHHOLDS permission:
+    a bundle may never be certified as fresh while an officially completed
+    event's required player history is missing.  The canonical token is always in
+    the reason so an operator can grep the artifact.
     """
 
     reasons: list[str] = []
@@ -110,6 +120,10 @@ def decide_search_permission(
         reasons.append("no data snapshot identity")
     if snapshot_error:
         reasons.append(str(snapshot_error))
+    if not history_completeness.get("complete"):
+        blocker = hc.blocking_reason_token(history_completeness)
+        detail = history_completeness.get("reasons") or []
+        reasons.append(blocker if not detail else f"{blocker} ({', '.join(str(item) for item in detail)})")
     return (not reasons), reasons
 
 
@@ -129,6 +143,76 @@ def certified_horizon_status(conn, artifact, events, cutoff) -> str:
         last_event=fg.season_last_event_from_db(conn),
     )
     return str(horizon["status"])
+
+
+def build_certification_artifact(
+    *,
+    run_uuid: str,
+    planning_cutoff: str,
+    events: Sequence[int],
+    snapshot: Any,
+    certified: Mapping[str, Any],
+    bundle_identity: Mapping[str, str],
+    manager_state: Mapping[str, Any],
+    model_versions: Sequence[tuple[str, str]],
+    execution_started_at: Any,
+) -> dict[str, Any]:
+    """Construct the authoritative certification artifact payload.
+
+    Extracted from ``main`` so the producer/consumer SEAM is testable: this is the
+    exact construction the certification path performs, and its output must load
+    through ``four_gw_decision.load_certification_artifact``.  ``decision_search_permitted``
+    is deliberately seeded ``None`` and filled in only by the computed authorisation
+    step, so it can never be a flag that is merely asserted.
+    """
+
+    import hashlib
+
+    return {
+        "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
+        "execution_run_uuid": run_uuid,
+        "planning_cutoff": planning_cutoff,
+        "events": list(events),
+        "data_snapshot_sha256": snapshot.data_snapshot_sha256,
+        "data_snapshot_created_at": snapshot.created_at,
+        "data_snapshot_path": snapshot.path,
+        "data_snapshot_source_db_identity": snapshot.source_db_identity,
+        "code_snapshot_sha256": analytics.source_snapshot_sha256(),
+        # Which code identity covered this certification, and the exact bytes of the
+        # entry point whose wiring carries the history-completeness gate.  A v2
+        # consumer refuses the artifact unless it declares the entry point covered,
+        # so a certification minted without the gate cannot pass as current.
+        "certification_wiring": fg.certification_wiring_identity(),
+        "certified_bundles": certified,
+        "certified_bundle_identity": bundle_identity,
+        "four_gw_certification_identity": "sha256:" + hashlib.sha256(
+            json.dumps(
+                {"cutoff": planning_cutoff, "bundles": bundle_identity,
+                 "data_snapshot_sha256": snapshot.data_snapshot_sha256},
+                sort_keys=True, separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+        "manager_state_identity": manager_state,
+        "model_versions": [{"model_family": m, "model_version": v} for m, v in model_versions],
+        "dependency_validation": "COHERENT",
+        "dependency_validation_detail": None,
+        "temporal_status": "CAUSAL",
+        "temporal_detail": {
+            "rule": "planning_cutoff <= data_snapshot_created_at <= execution_started_at_utc (+/- skew)",
+            "planning_cutoff": planning_cutoff,
+            "data_snapshot_created_at": snapshot.created_at,
+            "execution_started_at": execution_started_at,
+        },
+        "live_source_drift": execution_snapshot.live_source_drift(snapshot),
+        # FACTUAL execution fields: what this certification did or did not do.
+        "route_search_executed": False,
+        "transfer_execution_performed": False,
+        # AUTHORIZATION field the decision runner must check.  True only when the
+        # four conditions below hold; it is deliberately separate from the factual
+        # fields so it cannot be a flag that is ignored while search proceeds.
+        "decision_search_permitted": None,
+        "decision_search_permitted_reasons": [],
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -385,46 +469,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         }
     )
-    artifact = {
-        "schema": "fpl_brain.certification_artifact.v1",
-        "execution_run_uuid": run_identity.run_uuid,
-        "planning_cutoff": effective_cutoff,
-        "events": events,
-        "data_snapshot_sha256": snapshot.data_snapshot_sha256,
-        "data_snapshot_created_at": snapshot.created_at,
-        "data_snapshot_path": snapshot.path,
-        "data_snapshot_source_db_identity": snapshot.source_db_identity,
-        "code_snapshot_sha256": analytics.source_snapshot_sha256(),
-        "certified_bundles": certified,
-        "certified_bundle_identity": bundle_identity,
-        "four_gw_certification_identity": "sha256:" + __import__("hashlib").sha256(
-            json.dumps(
-                {"cutoff": effective_cutoff, "bundles": bundle_identity,
-                 "data_snapshot_sha256": snapshot.data_snapshot_sha256},
-                sort_keys=True, separators=(",", ":"),
-            ).encode()
-        ).hexdigest(),
-        "manager_state_identity": manager_state,
-        "model_versions": [{"model_family": m, "model_version": v} for m, v in model_versions],
-        "dependency_validation": "COHERENT",
-        "dependency_validation_detail": None,
-        "temporal_status": "CAUSAL",
-        "temporal_detail": {
-            "rule": "planning_cutoff <= data_snapshot_created_at <= execution_started_at_utc (+/- skew)",
-            "planning_cutoff": effective_cutoff,
-            "data_snapshot_created_at": snapshot.created_at,
-            "execution_started_at": run_identity.started_at,
-        },
-        "live_source_drift": execution_snapshot.live_source_drift(snapshot),
-        # FACTUAL execution fields: what this certification did or did not do.
-        "route_search_executed": False,
-        "transfer_execution_performed": False,
-        # AUTHORIZATION field the decision runner must check.  True only when the
-        # four conditions below hold; it is deliberately separate from the factual
-        # fields so it cannot be a flag that is ignored while search proceeds.
-        "decision_search_permitted": None,
-        "decision_search_permitted_reasons": [],
-    }
+    artifact = build_certification_artifact(
+        run_uuid=run_identity.run_uuid,
+        planning_cutoff=effective_cutoff,
+        events=events,
+        snapshot=snapshot,
+        certified=certified,
+        bundle_identity=bundle_identity,
+        manager_state=manager_state,
+        model_versions=model_versions,
+        execution_started_at=run_identity.started_at,
+    )
     # Authorisation is computed, never asserted.
     try:
         horizon_status = certified_horizon_status(conn, artifact, events, effective_cutoff)
@@ -435,16 +490,35 @@ def main(argv: list[str] | None = None) -> int:
         execution_snapshot.assert_snapshot_unchanged(snapshot)
     except execution_snapshot.SnapshotError as failure:
         snapshot_error = str(failure)
+    # Required completed-event history, audited on the SAME immutable snapshot the
+    # predictions were generated from.  An unevaluable invariant WITHHOLDS rather
+    # than crashes, and an incomplete one carries the canonical blocker token.
+    try:
+        history_audit: dict[str, Any] = hc.audit_history_completeness(
+            source_conn, planning_event=int(events[0]), cutoff=effective_cutoff
+        )
+    except Exception as failure:  # noqa: BLE001 - withholding is the contract
+        history_audit = {
+            "schema": hc.HISTORY_COMPLETENESS_SCHEMA,
+            "planning_event": int(events[0]),
+            "cutoff": str(effective_cutoff),
+            "complete": False,
+            "blocker": hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE,
+            "reasons": [f"UNRESOLVED: {type(failure).__name__}: {failure}"],
+            "detail": "the history-completeness audit could not be evaluated",
+        }
     permitted, permit_reasons = decide_search_permission(
         temporal_status=artifact["temporal_status"],
         dependency_validation=artifact["dependency_validation"],
         horizon_status=horizon_status,
         data_snapshot_sha256=artifact["data_snapshot_sha256"],
         snapshot_error=snapshot_error,
+        history_completeness=history_audit,
     )
     artifact["decision_search_permitted"] = permitted
     artifact["decision_search_permitted_reasons"] = permit_reasons
     artifact["decision_search_horizon_status"] = horizon_status
+    artifact["history_completeness"] = history_audit
     artifact_path = OUT_DIR / "certification_artifact.json"
     artifact_path.write_text(
         json.dumps(artifact, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"

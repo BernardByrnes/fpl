@@ -656,6 +656,9 @@ def test_14c_certifier_resolves_the_horizon_from_the_certified_support(tmp_path)
     _bundle_world(conn)
     cutoff = "2026-09-12T19:00:00Z"
     artifact = {
+        # The certified horizon must be DECLARED: the consumed horizon is required
+        # to equal it, so an artifact that does not state one authorises nothing.
+        "events": [5],
         "certified_bundles": {
             "5": {
                 "runs": {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3,

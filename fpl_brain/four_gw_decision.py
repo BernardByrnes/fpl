@@ -401,7 +401,142 @@ class DecisionCertificationRequired(RuntimeError):
         self.detail = detail
 
 
-CERTIFICATION_ARTIFACT_SCHEMA = "fpl_brain.certification_artifact.v1"
+# --- certification artifact contract ---------------------------------------
+# v1 is the LEGACY contract: it predates the certified-history repair and may
+# legitimately omit ``history_completeness``.  It is grandfathered by an EXPLICIT,
+# auditable condition (its declared schema), never by "the field is missing".
+# v2 is the contract for every certification minted from the history-completeness
+# repair onwards and REQUIRES the audit, so the new gate can never be omitted
+# silently by an older entry point.
+CERTIFICATION_ARTIFACT_SCHEMA_V1 = "fpl_brain.certification_artifact.v1"
+CERTIFICATION_ARTIFACT_SCHEMA_V2 = "fpl_brain.certification_artifact.v2"
+CERTIFICATION_ARTIFACT_SCHEMA = CERTIFICATION_ARTIFACT_SCHEMA_V2
+LEGACY_CERTIFICATION_ARTIFACT_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V1,)
+SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V1, CERTIFICATION_ARTIFACT_SCHEMA_V2)
+# Schemas that must carry the history audit; anything newer inherits the rule.
+HISTORY_COMPLETENESS_REQUIRED_SCHEMAS = (CERTIFICATION_ARTIFACT_SCHEMA_V2,)
+
+# An OLD producer copy still declares v1, so the schema ALONE cannot be the legacy
+# test -- accepting v1 by schema would let a stale certifier mint an audit-free
+# artifact that the current consumer accepts.  Legacy compatibility is therefore
+# granted only to explicitly recognised historical certification identities
+# (four_gw_certification_identity), not to whatever merely looks old.
+LEGACY_CERTIFICATION_IDENTITIES = (
+    # Accepted R5 GW5-GW8 certification, planning cutoff 2026-09-14T08:14:22Z.
+    # Minted before the history-completeness repair; audited read-only and still
+    # valid at its own cutoff (GW3 required, GW4 correctly not required).
+    "sha256:264cd90e56a3e85fc03ec10324688acba06b3d4903ed96dc90ca1d73685a8bb5",
+)
+
+# The certification entry point whose wiring contains the history-completeness
+# gate.  It is part of SOURCE_SNAPSHOT_FILES, and every v2 artifact must declare
+# it as covered, so a consumer can prove the gate was in the producing wiring.
+CERTIFIER_ENTRY_POINT = "scripts/certify_gw5_gw8.py"
+
+DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING = "CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING"
+DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING = "CERTIFICATION_WIRING_IDENTITY_MISSING"
+DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED = "LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED"
+DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH = "CERTIFICATION_BUNDLE_IDENTITY_MISMATCH"
+DIAG_CERTIFICATION_EVENT_SET_MISMATCH = "CERTIFICATION_EVENT_SET_MISMATCH"
+
+
+def certification_artifact_requires_history_completeness(schema: Any) -> bool:
+    """True when this schema must carry a complete history audit."""
+
+    return str(schema) in set(HISTORY_COMPLETENESS_REQUIRED_SCHEMAS)
+
+
+def certification_wiring_identity(root: str | Path | None = None) -> dict[str, Any]:
+    """The code-identity block every v2 certification must carry.
+
+    One definition, used by the certifier that writes the block and by the
+    contracts that assert it: the entry point whose wiring contains the
+    history-completeness gate, its exact bytes, and the file set the composite
+    ``code_snapshot_sha256`` covered.
+    """
+
+    import hashlib
+    from pathlib import Path as _Path
+
+    from . import analytics
+
+    base = _Path(root) if root is not None else _Path(__file__).resolve().parents[1]
+    return {
+        "entry_point": CERTIFIER_ENTRY_POINT,
+        "entry_point_sha256": hashlib.sha256((base / CERTIFIER_ENTRY_POINT).read_bytes()).hexdigest(),
+        "covered_source_files": list(analytics.SOURCE_SNAPSHOT_FILES),
+    }
+
+
+def _assert_bundle_identities_bind(payload: Mapping[str, Any]) -> None:
+    """Prove the declared bundle identities describe the bundles actually consumed.
+
+    ``event_support_from_certification`` reads ``certified_bundles``; the
+    certification identity hashes the declared ``certified_bundle_identity``.
+    Unless the two correspond, an artifact could keep a recognised label while
+    swapping the bundles underneath it.  The canonical identity is recomputed with
+    the SAME algorithm the producer uses (``certified_bundle.canonical_bundle_identity``),
+    so this holds for legacy and current artifacts alike and no shape is special-cased.
+    """
+
+    from . import certified_bundle as cb
+
+    declared = payload.get("certified_bundle_identity") or {}
+    bundles = payload.get("certified_bundles") or {}
+    mismatches: list[str] = []
+    # The declared horizon must BE the certified bundle set, so an altered `events`
+    # list cannot silently re-point the decision at a horizon the artifact does
+    # not certify.  (This binds events without redefining the certification
+    # identity, which would invalidate the recognised legacy value.)
+    declared_events = sorted(int(event) for event in (payload.get("events") or []))
+    bundle_events = sorted(int(event) for event in bundles)
+    if declared_events != bundle_events:
+        mismatches.append(
+            f"declared events {declared_events} do not match the certified bundle events {bundle_events}"
+        )
+    for event, bundle in bundles.items():
+        if not isinstance(bundle, Mapping):
+            mismatches.append(f"event {event}: bundle is not an object")
+            continue
+        try:
+            recomputed = cb.canonical_bundle_identity(bundle)
+        except (KeyError, TypeError, ValueError) as failure:
+            mismatches.append(f"event {event}: bundle is malformed ({failure})")
+            continue
+        if str(declared.get(str(event))) != recomputed:
+            mismatches.append(
+                f"event {event}: declared {str(declared.get(str(event)))[:23]}... does not bind the "
+                f"bundles consumed (recomputed {recomputed[:23]}...)"
+            )
+    if mismatches:
+        raise DecisionCertificationRequired(
+            f"{DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH}: the certification's declared bundle "
+            "identities do not bind the certified bundles a decision would consume: "
+            + "; ".join(mismatches)
+        )
+
+
+def certification_identity_of(payload: Mapping[str, Any]) -> str:
+    """Recompute an artifact's own certification identity from its own fields.
+
+    ``four_gw_certification_identity`` is a pure function of the cutoff, the
+    per-event bundle identities and the data snapshot identity, so a consumer can
+    verify it without any code-drift assumption.  That is what makes the legacy
+    allowlist an identity test rather than a forgeable label: copying a recognised
+    identity onto a different artifact fails this check.
+    """
+
+    import hashlib
+    import json as _json
+
+    fingerprint = {
+        "cutoff": payload.get("planning_cutoff"),
+        "bundles": payload.get("certified_bundle_identity") or {},
+        "data_snapshot_sha256": payload.get("data_snapshot_sha256"),
+    }
+    return "sha256:" + hashlib.sha256(
+        _json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def load_certification_artifact(path: str | Path) -> dict[str, Any]:
@@ -410,6 +545,13 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     Fails closed with ``DECISION_CERTIFICATION_REQUIRED`` when the artifact is
     absent, malformed, or does not carry the fields a decision needs.  There is no
     fallback to latest-per-family discovery anywhere in this path.
+
+    The certification contract is versioned.  ``v2`` requires the
+    history-completeness audit and the certification-wiring identity, so a
+    certification minted without the gate cannot pass as current; ``v1`` is the
+    legacy contract and may omit the audit.  Absence is grandfathered ONLY by the
+    artifact's own declared legacy schema -- never by a missing field, and never by
+    inferring PASS.
     """
 
     import json
@@ -422,9 +564,10 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
         payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     except Exception as exc:  # malformed artifact must not be silently ignored
         raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
-    if payload.get("schema") != CERTIFICATION_ARTIFACT_SCHEMA:
+    if payload.get("schema") not in SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS:
         raise DecisionCertificationRequired(
-            f"artifact schema {payload.get('schema')!r} != {CERTIFICATION_ARTIFACT_SCHEMA!r}"
+            f"artifact schema {payload.get('schema')!r} is not one of "
+            f"{list(SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS)!r}"
         )
     if str(payload.get("temporal_status") or "").upper() != "CAUSAL":
         raise DecisionCertificationRequired(
@@ -446,6 +589,78 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
         raise DecisionCertificationRequired(
             "decision_search_permitted is not true: " + "; ".join(str(r) for r in reasons)
         )
+    # Defence in depth.  A certification minted after the historical-input repair
+    # carries the completeness audit itself; when that audit says the required
+    # completed-event history is not there, the artifact is not actionable even if
+    # the permission flag were somehow stale.
+    completeness = payload.get("history_completeness")
+    if isinstance(completeness, Mapping) and completeness.get("complete") is not True:
+        from . import history_completeness as hc
+
+        raise DecisionCertificationRequired(
+            f"{hc.blocking_reason_token(completeness)}: the certification's completed-event history "
+            f"audit is not complete ({completeness.get('reasons')})"
+        )
+    # A NEW certification must not be able to omit the audit.  Absence is only
+    # grandfathered for an EXPLICITLY RECOGNISED historical certification
+    # identity -- never for a mere schema label, an old-looking cutoff, or the
+    # simple fact that the field is missing, and never inferred as PASS.
+    # The declared per-event bundle identities must BIND the bundles a decision
+    # actually consumes.  ``certified_bundle_identity`` is the label the
+    # certification identity hashes, while ``certified_bundles`` is what
+    # ``event_support_from_certification`` reads, so without this check a payload
+    # could keep the allowlisted label and swap the bundles underneath it.
+    _assert_bundle_identities_bind(payload)
+    schema = payload.get("schema")
+    completeness = payload.get("history_completeness")
+    if certification_artifact_requires_history_completeness(schema):
+        # v2: the audit and the wiring identity are mandatory.
+        if not isinstance(completeness, Mapping):
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING}: certification schema "
+                f"{schema!r} requires a history_completeness audit and none is present; "
+                "a missing audit is never inferred as PASS"
+            )
+        wiring = payload.get("certification_wiring")
+        covered = list(wiring.get("covered_source_files") or []) if isinstance(wiring, Mapping) else []
+        if not isinstance(wiring, Mapping) or CERTIFIER_ENTRY_POINT not in covered:
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING}: certification schema {schema!r} must "
+                f"declare {CERTIFIER_ENTRY_POINT!r} among its covered source files, so the consumer can "
+                "prove the producing wiring carried the history-completeness gate"
+            )
+        if not wiring.get("entry_point_sha256"):
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING}: certification schema {schema!r} carries "
+                "no entry-point code identity"
+            )
+    else:
+        # EVERY v1 artifact is a legacy artifact, so the recognised, self-consistent
+        # identity is required UNCONDITIONALLY -- not merely when the audit happens
+        # to be absent.  Otherwise a stale producer could satisfy the schema and
+        # then become acceptable simply by adding {"complete": true}.
+        identity = str(payload.get("four_gw_certification_identity") or "")
+        recognised = identity in set(LEGACY_CERTIFICATION_IDENTITIES)
+        self_consistent = identity == certification_identity_of(payload)
+        if not (recognised and self_consistent):
+            detail = (
+                "not a recognised legacy identity" if not recognised
+                else "the identity does not match this artifact's own cutoff/bundles/snapshot"
+            )
+            raise DecisionCertificationRequired(
+                f"{DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING}: "
+                f"{DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED}: schema {schema!r} is a legacy "
+                f"artifact, which requires a recognised AND self-consistent historical certification "
+                f"identity ({detail}); {identity or '<none>'!r} is not a grandfathered legacy certification"
+            )
+    # A PRESENT audit must be complete at every version.
+    if isinstance(completeness, Mapping) and completeness.get("complete") is not True:
+        from . import history_completeness as hc
+
+        raise DecisionCertificationRequired(
+            f"{hc.blocking_reason_token(completeness)}: the certification's completed-event history "
+            f"audit is not complete ({completeness.get('reasons')})"
+        )
     if payload.get("route_search_executed") is not False or payload.get(
         "transfer_execution_performed"
     ) is not False:
@@ -455,6 +670,17 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def canonical_event_horizon(values: Iterable[Any] | None) -> tuple[int, ...]:
+    """Canonical (sorted, int) horizon for an exact-identity comparison.
+
+    Order is canonicalised, duplicates are NOT collapsed: a horizon that repeats
+    an event therefore fails an equality test deterministically instead of being
+    silently normalised into acceptance.
+    """
+
+    return tuple(sorted(int(event) for event in (values or ())))
+
+
 def event_support_from_certification(
     conn: sqlite3.Connection,
     certification: Mapping[str, Any],
@@ -462,7 +688,23 @@ def event_support_from_certification(
     events: Iterable[int],
     cutoff: str,
 ) -> dict[int, dict[str, Any]]:
-    """Support derived from a CERTIFICATION ARTIFACT's exact certified run ids."""
+    """Support derived from a CERTIFICATION ARTIFACT's exact certified run ids.
+
+    The horizon a decision CONSUMES must equal the horizon the artifact CERTIFIED.
+    A caller-supplied subset is not authorisation: a certification for five events
+    must never authorize a four-event consumer, nor the reverse.  The comparison is
+    canonical (sorted ints) and exact, so subsets, supersets, duplicates and
+    reorderings are all refused before any support is returned.
+    """
+
+    requested = canonical_event_horizon(events)
+    certified = canonical_event_horizon(certification.get("events"))
+    if requested != certified:
+        raise DecisionCertificationRequired(
+            f"{DIAG_CERTIFICATION_EVENT_SET_MISMATCH}: the decision horizon {list(requested)} must equal "
+            f"the certified horizon {list(certified)}; a certification authorises exactly its own events "
+            "(no subset, superset, duplicate or reordering)"
+        )
 
     bundles = certification.get("certified_bundles") or {}
     selected = {
