@@ -78,6 +78,8 @@ WC_VALUE_BINDING_MISMATCH = "WILDCARD_VALUE_HORIZON_BINDING_MISMATCH"
 WC_PROJECTION_IDENTITY_MISMATCH = "WILDCARD_PROJECTION_IDENTITY_MISMATCH"
 WC_PROJECTION_INVALID = "WILDCARD_PROJECTION_INVALID"
 WC_PROJECTION_DUPLICATE = "WILDCARD_PROJECTION_DUPLICATE"
+WC_WORLD_INPUTS_MISSING = "WILDCARD_WORLD_INPUTS_MISSING"
+WC_WORLD_INPUTS_MALFORMED = "WILDCARD_WORLD_INPUTS_MALFORMED"
 
 WC_REASON_POSITIVE = "WILDCARD_UPLIFT_POSITIVE"
 WC_REASON_NOT_COMPETITIVE = "WILDCARD_NOT_COMPETITIVE"
@@ -349,6 +351,60 @@ class WildcardPlayer:
 
 
 @dataclass(frozen=True)
+class WildcardWorldInputs:
+    """Per-event, per-world minutes and core points — the ACCEPTED world shape.
+
+    Mirrors the chip core's ``ChipWorldInputs`` deliberately: a plain matrix, not
+    a model object, so a replacement projection/world generator feeds the
+    Wildcard valuation without any Wildcard change.  The accepted lineup engine
+    consumes these worlds directly, so appearance, captain fallback, bench order,
+    formation-legal autosubs and the goalkeeper-only goalkeeper substitution are
+    all resolved by ``manager_lineup`` rather than approximated here.
+    """
+
+    worlds: int
+    player_ids: tuple[int, ...]
+    minutes: Mapping[int, Sequence[float]]
+    core: Mapping[int, Sequence[float]]
+
+    def __post_init__(self) -> None:
+        problems = self.problems()
+        if problems:
+            raise WildcardInputError(
+                f"{WC_WORLD_INPUTS_MALFORMED}: {'; '.join(problems[:6])}",
+                reasons=(WC_WORLD_INPUTS_MALFORMED,),
+            )
+
+    def problems(self) -> list[str]:
+        found: list[str] = []
+        if int(self.worlds) <= 0:
+            found.append(f"worlds={self.worlds} must be positive")
+            return found
+        for player_id in self.player_ids:
+            pid = int(player_id)
+            minutes = self.minutes.get(pid)
+            core = self.core.get(pid)
+            if minutes is None or core is None:
+                found.append(f"player {pid} has no minutes/core series")
+                continue
+            if len(minutes) != int(self.worlds) or len(core) != int(self.worlds):
+                found.append(f"player {pid} series length != {int(self.worlds)}")
+                continue
+            for index, value in enumerate(minutes):
+                if not math.isfinite(float(value)) or float(value) < 0.0:
+                    found.append(f"player {pid} world {index} minutes={value!r} is invalid")
+                    break
+            for index, value in enumerate(core):
+                if not math.isfinite(float(value)):
+                    found.append(f"player {pid} world {index} core={value!r} is not finite")
+                    break
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"worlds": int(self.worlds), "players": len(self.player_ids)}
+
+
+@dataclass(frozen=True)
 class WildcardRequest:
     """Everything the evaluator consumes.  Nothing here is a football model."""
 
@@ -381,6 +437,10 @@ class WildcardRequest:
     #: caller who supplies nothing cannot accidentally look certified: the
     #: evaluator refuses when it is absent.
     value_horizon_binding: WildcardValueHorizonBinding | None = None
+    #: Per-event world matrices the ACCEPTED lineup engine resolves over.  An
+    #: event with no world inputs is a hard failure: the event value is never
+    #: approximated from start probabilities.
+    worlds_by_event: Mapping[int, WildcardWorldInputs] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +467,40 @@ def validate_projections(request: WildcardRequest) -> list[str]:
     if binding is None:
         return [f"{WC_VALUE_BINDING_MISMATCH}: no value-horizon binding supplied"]
     problems.extend(binding.problems())
-    problems.extend(binding.disagreements_with(request.horizon_binding))
+    # Every binding-level problem carries the binding token as its prefix, so
+    # the caller always reports the correct refusal token rather than a
+    # projection one.
+    for detail in binding.disagreements_with(request.horizon_binding):
+        problems.append(f"{WC_VALUE_BINDING_MISMATCH}: {detail}")
     if tuple(int(e) for e in binding.event_ids) != tuple(int(e) for e in request.horizon.events):
-        problems.append("the horizon spec and the value binding describe different events")
+        problems.append(
+            f"{WC_VALUE_BINDING_MISMATCH}: the horizon spec and the value binding "
+            "describe different events"
+        )
     if str(binding.horizon_version) != str(request.horizon.version):
-        problems.append("the horizon spec and the value binding disagree on the horizon version")
+        problems.append(
+            f"{WC_VALUE_BINDING_MISMATCH}: the horizon spec and the value binding "
+            "disagree on the horizon version"
+        )
+    # Every horizon event must carry world inputs, and those worlds must cover
+    # EVERY supplied player: a partially covered world matrix would let the
+    # accepted resolver treat a missing player as an implicit non-appearance.
+    if not request.worlds_by_event:
+        problems.append(f"{WC_WORLD_INPUTS_MISSING}: no world inputs supplied for any horizon event")
+    else:
+        supplied = {int(pid) for pid in request.players}
+        for event in request.horizon.events:
+            world_inputs = request.worlds_by_event.get(int(event))
+            if world_inputs is None:
+                problems.append(f"{WC_WORLD_INPUTS_MISSING}: no world inputs for event {event}")
+                continue
+            covered = {int(pid) for pid in world_inputs.player_ids}
+            uncovered = sorted(supplied - covered)
+            if uncovered:
+                problems.append(
+                    f"event {event}: {len(uncovered)} supplied players have no world series "
+                    f"(e.g. {uncovered[:5]})"
+                )
     for player_id, player in sorted(request.players.items()):
         if int(player_id) != int(player.player_id):
             problems.append(f"player key {player_id} disagrees with the row id {player.player_id}")
@@ -750,47 +839,78 @@ def _best_xi(
     return (best[1], best[0]) if best else ([], 0.0)
 
 
-def _armband_uplift(request: WildcardRequest, xi: Sequence[int], event: int) -> float:
-    """Expected captaincy uplift for one event.
+def _mean_core(request: WildcardRequest, player_id: int, event: int) -> float:
+    """Mean core points for one player at one event, from the bound worlds."""
 
-    The accepted rule is that the armband holder scores twice, falling back to
-    the vice only when the captain does not appear.  For an expected-value
-    horizon this is E[uplift] = p_cap * pts_cap + (1 - p_cap) * p_vice * pts_vice,
-    which reproduces ``manager_lineup.captain_multiplier`` exactly in the
-    deterministic cases (captain always plays, or never plays).
+    worlds = request.worlds_by_event.get(int(event))
+    if worlds is None:
+        return 0.0
+    series = worlds.core.get(int(player_id)) or ()
+    return (sum(float(v) for v in series) / len(series)) if series else 0.0
+
+
+def _event_policy(
+    request: WildcardRequest, squad: Sequence[int], event: int
+) -> manager_lineup.ManagerPolicy | None:
+    """The fifteen the manager would field: best legal XI, armband on its best.
+
+    Choosing WHICH eleven to start, and who wears the armband, is the management
+    decision this evaluator makes.  The VALUE of that decision is then resolved
+    by the accepted engine over worlds — the armband is never approximated with a
+    start-probability shortcut, and the bench is never scored directly.
     """
 
-    if len(xi) < 2:
-        return 0.0
-
-    def payload(player_id: int) -> tuple[float, float]:
-        entry = request.players[player_id].at(event)
-        if entry is None:
-            return 0.0, 0.0
-        availability = max(0.0, min(1.0, float(entry.availability)))
-        return float(entry.p_start) * availability, float(entry.expected_points) * availability
-
-    ranked = sorted(xi, key=lambda pid: (-payload(pid)[1], pid))
-    captain, vice = ranked[0], ranked[1]
-    p_cap, pts_cap = payload(captain)
-    p_vice, pts_vice = payload(vice)
-    return p_cap * pts_cap + (1.0 - p_cap) * p_vice * pts_vice
-
-
-def _bench_value(request: WildcardRequest, squad: Sequence[int], xi: Sequence[int], event: int) -> float:
-    """Bench matters through autosubs and injury cover — never four dead slots."""
-
+    xi, _ = _best_xi(request, squad, event)
+    if len(xi) != manager_lineup.XI_SIZE:
+        return None
     bench = [pid for pid in squad if pid not in set(xi)]
+    bench_gk = [pid for pid in bench if request.players[pid].position == "GKP"]
+    bench_out = [pid for pid in bench if request.players[pid].position != "GKP"]
+    if len(bench_gk) != 1 or len(bench_out) != manager_lineup.OUTFIELD_BENCH_SIZE:
+        return None
+    ranked = sorted(xi, key=lambda pid: (-_mean_core(request, pid, event), pid))
+    return manager_lineup.ManagerPolicy(
+        starter_ids=tuple(sorted(xi)),
+        bench_gk_id=int(bench_gk[0]),
+        bench_outfield_order=tuple(sorted(bench_out, key=lambda pid: (-_mean_core(request, pid, event), pid))),
+        captain_id=int(ranked[0]),
+        vice_captain_id=int(ranked[1]),
+    )
+
+
+def _event_value(request: WildcardRequest, squad: Sequence[int], event: int) -> float:
+    """Expected event points for a squad, resolved by the ACCEPTED engine.
+
+    For every supplied world the legal lineup, captain fallback and outfield /
+    goalkeeper autosubs are resolved by ``manager_lineup.resolve_world`` and the
+    armband by ``manager_lineup.captain_multiplier`` — the same semantics the
+    accepted manager-world engine uses.  The event value is the mean world total.
+    Bench Boost is never active: only the resolved counted XI scores, so the four
+    bench slots contribute solely through legal autosubs.
+    """
+
+    worlds = request.worlds_by_event.get(int(event))
+    if worlds is None:
+        raise WildcardInputError(
+            f"{WC_WORLD_INPUTS_MISSING}: no world inputs for event {event}",
+            reasons=(WC_WORLD_INPUTS_MISSING,),
+        )
+    policy = _event_policy(request, squad, event)
+    if policy is None:
+        # A squad that cannot field a legal XI/bench has no event value; it is
+        # reported as zero rather than being silently scored on a partial lineup.
+        return 0.0
+    positions = {int(pid): request.players[int(pid)].position for pid in squad}
     total = 0.0
-    for player_id in bench:
-        entry = request.players[player_id].at(event)
-        if entry is None:
-            continue
-        # A bench player only scores when he covers a non-appearing starter, so
-        # his contribution is discounted by the chance he is actually needed.
-        need = 1.0 - min(1.0, float(entry.availability))
-        total += float(entry.expected_points) * max(0.0, min(1.0, float(entry.availability))) * (0.35 + 0.65 * need)
-    return total
+    for world in range(worlds.worlds):
+        minutes = {int(pid): float(worlds.minutes[int(pid)][world]) for pid in squad}
+        core = {int(pid): float(worlds.core[int(pid)][world]) for pid in squad}
+        outcome = manager_lineup.resolve_world(
+            policy, positions, minutes, core, require_player_ids=list(squad)
+        )
+        extra, _ = manager_lineup.captain_multiplier(policy, minutes, core)
+        total += sum(core[pid] for pid in outcome.counted_ids) + extra
+    return total / worlds.worlds
 
 
 def _minutes_security(request: WildcardRequest, squad: Sequence[int]) -> float:
@@ -880,8 +1000,7 @@ def evaluate_squad(request: WildcardRequest, squad: Sequence[int]) -> WildcardSq
     near = 0.0
     medium = 0.0
     for index, event in enumerate(horizon.events):
-        xi, xi_points = _best_xi(request, squad, event)
-        value = xi_points + _armband_uplift(request, xi, event) + _bench_value(request, squad, xi, event)
+        value = _event_value(request, squad, event)
         event_points[event] = value
         weighted = horizon.weight_for(event) * value
         horizon_points += weighted
@@ -1110,11 +1229,27 @@ def evaluate_wildcard(request: WildcardRequest):
 
     from . import chip_decision as cd
 
+    expiry_event = resolve_wildcard_expiry(request)
+    if expiry_event is EXPIRY_UNRESOLVED:
+        return _refuse(request, WC_WINDOW_UNRESOLVED,
+                       "the active Wildcard window could not be resolved from the canonical chip state",
+                       reasons=(WC_WINDOW_UNRESOLVED,))
+    if expiry_event is EXPIRY_AMBIGUOUS:
+        return _refuse(request, WC_WINDOW_AMBIGUOUS,
+                       "more than one Wildcard window is active for this event; refusing rather than guessing",
+                       reasons=(WC_WINDOW_AMBIGUOUS,))
+
     projection_problems = validate_projections(request)
     if projection_problems:
-        first = projection_problems[0]
-        token = (WC_VALUE_BINDING_MISMATCH if "binding" in first or "horizon" in first
-                 else WC_PROJECTION_INVALID)
+        # The first problem carries its own token prefix; never guess it from a
+        # substring, or a world-inputs failure would be reported as a binding one.
+        first = str(projection_problems[0])
+        token = WC_PROJECTION_INVALID
+        for candidate in (WC_VALUE_BINDING_MISMATCH, WC_WORLD_INPUTS_MISSING,
+                          WC_WORLD_INPUTS_MALFORMED, WC_PROJECTION_INVALID):
+            if first.startswith(candidate):
+                token = candidate
+                break
         return _refuse(request, token, "; ".join(projection_problems[:8]),
                        reasons=(token,))
 
@@ -1129,16 +1264,6 @@ def evaluate_wildcard(request: WildcardRequest):
     # Resolve the ACTIVE Wildcard window first: the chip window is a
     # precondition for evaluating the chip at all, so an unresolved or ambiguous
     # window must fail fast rather than after a full screen.
-    expiry_event = resolve_wildcard_expiry(request)
-    if expiry_event is EXPIRY_UNRESOLVED:
-        return _refuse(request, WC_WINDOW_UNRESOLVED,
-                       "the active Wildcard window could not be resolved from the canonical chip state",
-                       reasons=(WC_WINDOW_UNRESOLVED,))
-    if expiry_event is EXPIRY_AMBIGUOUS:
-        return _refuse(request, WC_WINDOW_AMBIGUOUS,
-                       "more than one Wildcard window is active for this event; refusing rather than guessing",
-                       reasons=(WC_WINDOW_AMBIGUOUS,))
-
     scores, screen_stats = screen_players(request)
     if not scores:
         return _refuse(request, WC_INCOMPLETE_PLAYER_POOL, "no player had a projection for every horizon event")
@@ -1162,11 +1287,15 @@ def evaluate_wildcard(request: WildcardRequest):
 
     # Each retained candidate is re-evaluated through the SAME public function,
     # so the selected squad is not merely the one the frontier happened to like.
-    ranked = sorted((evaluate_squad(request, c.squad) for c in candidates), key=lambda v: (-v.objective, v.squad))
+    try:
+        ranked = sorted((evaluate_squad(request, c.squad) for c in candidates),
+                        key=lambda v: (-v.objective, v.squad))
+        # --- SAVE arm: keep the squad, play the legal normal route, KEEP the chip.
+        save_current = evaluate_squad(request, request.owned_ids)
+    except WildcardInputError as exc:
+        token = (exc.reasons[0] if exc.reasons else WC_WORLD_INPUTS_MISSING)
+        return _refuse(request, token, str(exc), reasons=tuple(exc.reasons))
     play = ranked[0]
-
-    # --- SAVE arm: keep the squad, play the legal normal route, KEEP the chip.
-    save_current = evaluate_squad(request, request.owned_ids)
     save_total = float(request.save_route_value) if request.save_route_value is not None else save_current.objective
     if request.save_route_expected_hits:
         save_total -= request.rules.transfer_hit_cost * int(request.save_route_expected_hits)

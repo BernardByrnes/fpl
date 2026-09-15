@@ -131,9 +131,33 @@ def _request(players, owned_ids, **overrides):
         event_start_free_transfers=2,
         chip_availability=_chip_rows(5),
         value_horizon_binding=_value_binding(5),
+        worlds_by_event=_default_worlds(players),
     )
     base.update(overrides)
     return wc.WildcardRequest(**base)
+
+
+def _default_worlds(players, *, events=range(5, 13)):
+    """One deterministic world per event, from the players' own projections.
+
+    A single world in which everyone appears at their expected minutes and scores
+    their expected points.  Enough for the accounting and certification tests,
+    which do not exercise the lineup engine's world handling.
+    """
+
+    ids = tuple(sorted(players))
+    worlds = {}
+    for event in events:
+        minutes = {}
+        core = {}
+        for pid in ids:
+            entry = players[pid].at(event)
+            minutes[pid] = [0.0 if entry is None else float(entry.expected_minutes)]
+            core[pid] = [0.0 if entry is None else float(entry.expected_points)]
+        worlds[int(event)] = wc.WildcardWorldInputs(
+            worlds=1, player_ids=ids, minutes=minutes, core=core
+        )
+    return worlds
 
 
 def _legal_owned_ids(players) -> list[int]:
@@ -710,9 +734,21 @@ def test_P2_G_a_missing_binding_refuses_entirely():
 
 
 def test_P2_H_nonfinite_projections_fail_closed():
+    """A non-finite projection must never become a numeric candidate.
+
+    It fails closed either at construction (the world matrix rejects a non-finite
+    series) or as a token refusal -- both are fail-closed; what matters is that no
+    confident Wildcard output is produced.
+    """
+
     players = _with_row_override(_pool(), 7, 9, expected_points=float("nan"))
-    evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
-    assert wc.WC_PROJECTION_INVALID in evaluation.reason_codes
+    try:
+        evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
+    except wc.WildcardInputError as exc:
+        assert exc.reasons
+        return
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+    assert evaluation.reason_codes
 
 
 def test_P2_I_impossible_probabilities_fail_closed():
@@ -734,3 +770,212 @@ def test_P2_J_the_exclusion_audit_is_never_truncated():
     assert len(stats["excluded_ids"]) == 4          # full evidence, never truncated
     assert set(stats["excluded_reasons"]) == {5, 7, 9, 11}
     assert all(pid not in scores for pid in (5, 7, 9, 11))
+
+
+# ---------------------------------------------------------------------------
+# PHASE 1 — the Wildcard valuation must DELEGATE to the accepted engine
+# ---------------------------------------------------------------------------
+
+LINEUP_CLUBS = tuple(range(20, 30))
+
+
+def _lineup_squad():
+    """A legal 15 with distinct, easily-identifiable positions and clubs."""
+
+    players: dict[int, wc.WildcardPlayer] = {}
+    pid = 500
+    for position, count in (("GKP", 2), ("DEF", 5), ("MID", 5), ("FWD", 3)):
+        for _ in range(count):
+            club = LINEUP_CLUBS[pid % len(LINEUP_CLUBS)]
+            players[pid] = _player(pid, position, club, 50, 1.0)
+            pid += 1
+    return players
+
+
+def _worlds_for(players, event, *, blank=(), core_overrides=None, minutes_overrides=None):
+    """One deterministic world per requested scenario, all players always covered."""
+
+    core_overrides = core_overrides or {}
+    minutes_overrides = minutes_overrides or {}
+    ids = tuple(sorted(players))
+    minutes = {pid: [] for pid in ids}
+    core = {pid: [] for pid in ids}
+    for pid in ids:
+        blanked = pid in blank
+        minutes[pid].append(0.0 if blanked else minutes_overrides.get(pid, 90.0))
+        core[pid].append(0.0 if blanked else core_overrides.get(pid, 1.0))
+    return wc.WildcardWorldInputs(worlds=1, player_ids=ids, minutes=minutes, core=core)
+
+
+def _lineup_request(players, owned, worlds, *, planning_event=5):
+    return wc.WildcardRequest(
+        planning_event=planning_event,
+        horizon=wc.wildcard_horizon(planning_event, length=8),
+        players=players,
+        positions={pid: p.position for pid, p in players.items()},
+        owned_ids=tuple(sorted(owned)),
+        purchase_price_tenths={int(p): 50 for p in owned},
+        selling_price_tenths={int(p): 50 for p in owned},
+        bank_tenths=30,
+        rules=RULES,
+        horizon_binding=_binding(),
+        certification_identity=IDENTITY,
+        data_snapshot_sha256=SNAPSHOT,
+        event_start_free_transfers=2,
+        chip_availability=_chip_rows(5),
+        value_horizon_binding=_value_binding(5),
+        worlds_by_event=worlds,
+    )
+
+
+def _accepted_event_value(request, squad, event):
+    """The SAME value computed directly from the accepted helpers (the oracle)."""
+
+    policy = wc._event_policy(request, squad, event)
+    worlds = request.worlds_by_event[event]
+    positions = {pid: request.players[pid].position for pid in squad}
+    total = 0.0
+    for w in range(worlds.worlds):
+        minutes = {pid: float(worlds.minutes[pid][w]) for pid in squad}
+        core = {pid: float(worlds.core[pid][w]) for pid in squad}
+        outcome = manager_lineup.resolve_world(policy, positions, minutes, core,
+                                               require_player_ids=list(squad))
+        extra, _ = manager_lineup.captain_multiplier(policy, minutes, core)
+        total += sum(core[pid] for pid in outcome.counted_ids) + extra
+    return total / worlds.worlds
+
+
+def _worlds_every_event(players, *, blank=(), core_overrides=None):
+    return {event: _worlds_for(players, event, blank=blank, core_overrides=core_overrides)
+            for event in range(5, 13)}
+
+
+def test_worlds_A_the_wildcard_event_value_delegates_to_the_accepted_engine():
+    """Not a re-implementation: the value IS the accepted resolution."""
+
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    worlds = _worlds_every_event(players, core_overrides={500: 7.0})
+    request = _lineup_request(players, owned, worlds)
+    for event in (5, 8, 12):
+        assert wc._event_value(request, owned, event) == pytest.approx(
+            _accepted_event_value(request, owned, event)
+        )
+
+
+def test_worlds_B_captain_keeps_the_armband_when_he_appears():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    worlds = _worlds_every_event(players, core_overrides={500: 7.0})
+    request = _lineup_request(players, owned, worlds)
+    policy = wc._event_policy(request, owned, 5)
+    captain = policy.captain_id
+    minutes = {pid: float(worlds[5].minutes[pid][0]) for pid in owned}
+    core = {pid: float(worlds[5].core[pid][0]) for pid in owned}
+    assert minutes[captain] > 0.0
+    extra, source = manager_lineup.captain_multiplier(policy, minutes, core)
+    assert source == "CAPTAIN"
+    assert extra == pytest.approx(core[captain])
+
+
+def test_worlds_C_vice_takes_the_armband_when_the_captain_is_blank():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    probe = _lineup_request(players, owned, _worlds_every_event(players))
+    policy = wc._event_policy(probe, owned, 5)
+    captain, vice = policy.captain_id, policy.vice_captain_id
+
+    worlds = _worlds_every_event(players, blank={captain}, core_overrides={vice: 6.0})
+    request = _lineup_request(players, owned, worlds)
+    minutes = {pid: float(worlds[5].minutes[pid][0]) for pid in owned}
+    core = {pid: float(worlds[5].core[pid][0]) for pid in owned}
+    extra, source = manager_lineup.captain_multiplier(policy, minutes, core)
+    assert source == "VICE"
+    assert extra == pytest.approx(core[vice])
+
+
+def test_worlds_D_no_third_player_inherits_the_armband():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    probe = _lineup_request(players, owned, _worlds_every_event(players))
+    policy = wc._event_policy(probe, owned, 5)
+    blank = {policy.captain_id, policy.vice_captain_id}
+    worlds = _worlds_every_event(players, blank=blank)
+    request = _lineup_request(players, owned, worlds)
+    minutes = {pid: float(worlds[5].minutes[pid][0]) for pid in owned}
+    core = {pid: float(worlds[5].core[pid][0]) for pid in owned}
+    extra, source = manager_lineup.captain_multiplier(policy, minutes, core)
+    assert source == "NONE"
+    assert extra == 0.0
+
+
+def test_worlds_E_the_bench_admits_nobody_when_every_starter_appears():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    worlds = _worlds_every_event(players)
+    request = _lineup_request(players, owned, worlds)
+    policy = wc._event_policy(request, owned, 5)
+    outcome = manager_lineup.resolve_world(
+        policy,
+        {pid: request.players[pid].position for pid in owned},
+        {pid: float(worlds[5].minutes[pid][0]) for pid in owned},
+        {pid: float(worlds[5].core[pid][0]) for pid in owned},
+        require_player_ids=list(owned),
+    )
+    assert outcome.autosub_count == 0, "an all-appearing XI must admit no autosub"
+    assert outcome.entrants == () and outcome.gk_used is False
+
+
+def test_worlds_F_the_value_never_counts_the_whole_fifteen_bench_boost_is_not_active():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    worlds = _worlds_every_event(players)
+    request = _lineup_request(players, owned, worlds)
+    # every player scores 1.0, so counting all 15 would give 15 + captain extra
+    value = wc._event_value(request, owned, 5)
+    assert value < 13.0, "more than a legal XI's worth of points means Bench Boost leaked in"
+
+
+def test_worlds_G_only_the_bench_goalkeeper_may_replace_the_starting_goalkeeper():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    probe = _lineup_request(players, owned, _worlds_every_event(players))
+    policy = wc._event_policy(probe, owned, 5)
+    starter_gk = next(pid for pid in policy.starter_ids
+                      if probe.players[pid].position == "GKP")
+    bench_gk = int(policy.bench_gk_id)
+
+    worlds = _worlds_every_event(players, blank={starter_gk}, core_overrides={bench_gk: 8.0})
+    request = _lineup_request(players, owned, worlds)
+    outcome = manager_lineup.resolve_world(
+        policy,
+        {pid: request.players[pid].position for pid in owned},
+        {pid: float(worlds[5].minutes[pid][0]) for pid in owned},
+        {pid: float(worlds[5].core[pid][0]) for pid in owned},
+        require_player_ids=list(owned),
+    )
+    assert outcome.gk_used is True
+    assert bench_gk in outcome.counted_ids
+
+
+def test_worlds_H_missing_world_inputs_fail_closed():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    request = _lineup_request(players, owned, {})  # no worlds at all
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.WC_WORLD_INPUTS_MISSING in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_worlds_I_world_series_must_cover_every_supplied_player():
+    players = _lineup_squad()
+    owned = tuple(sorted(players))
+    partial = {event: wc.WildcardWorldInputs(
+        worlds=1,
+        player_ids=tuple(sorted(players))[:10],  # five players missing
+        minutes={pid: [90.0] for pid in tuple(sorted(players))[:10]},
+        core={pid: [1.0] for pid in tuple(sorted(players))[:10]},
+    ) for event in range(5, 13)}
+    request = _lineup_request(players, owned, partial)
+    problems = wc.validate_projections(request)
+    assert any("no world series" in p for p in problems)
