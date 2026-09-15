@@ -99,6 +99,8 @@ DIAG_CHIP_PLANNING_EVENT_MISMATCH = "CHIP_PLANNING_EVENT_MISMATCH"
 DIAG_CHIP_CERTIFICATION_HORIZON_MISMATCH = "CHIP_CERTIFICATION_HORIZON_MISMATCH"
 DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH = "CHIP_EVALUATION_CONTEXT_MISMATCH"
 DIAG_CHIP_EVALUATION_ACTION_MISMATCH = "CHIP_EVALUATION_ACTION_MISMATCH"
+DIAG_CHIP_NO_ACTIVE_WINDOW = "CHIP_NO_ACTIVE_WINDOW_FOR_ACTION"
+DIAG_CHIP_WINDOW_SELECTION_AMBIGUOUS = "CHIP_RESERVATION_WINDOW_SELECTION_AMBIGUOUS"
 
 
 class ChipDecisionError(ValueError):
@@ -593,6 +595,37 @@ def _eligible_from_rows(
     return eligible, details
 
 
+def _active_definition(
+    definitions: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any] | None, str | None]:
+    """The ONE definition row that establishes CURRENT eligibility for the action.
+
+    A chip type carries one definition row per seasonal window, and
+    ``planning.chips_state`` orders those rows by ``start_event``.  The first row
+    is therefore the EARLIEST window: taking it blindly hands a calibrated
+    reservation the ``stop_event`` of a window that has already closed.  For a
+    chip with windows GW2-GW19 and GW20-GW38 the action is correctly eligible at
+    GW20, but the reservation would be told it expires at 19 and see zero weeks
+    remaining instead of the real live horizon.
+
+    The active row is selected with the SAME per-row predicate the arbiter
+    already used to admit the action (``_eligible_from_rows``), so the
+    reservation can never disagree with the eligibility that admitted it.
+
+    Returns ``(row, None)`` when exactly one row is active.  When no row is
+    active, or several are, the state is not decidable: ``(None, token)``.  Two
+    simultaneously-active windows have no precedence in ``season_rules``, so
+    they fail closed rather than being resolved by row order.
+    """
+
+    active = [row for row in definitions if bool(row.get("eligible"))]
+    if len(active) == 1:
+        return active[0], None
+    if not active:
+        return None, DIAG_CHIP_NO_ACTIVE_WINDOW
+    return None, DIAG_CHIP_WINDOW_SELECTION_AMBIGUOUS
+
+
 def _availability_by_action(
     chip_availability: Sequence[Mapping[str, Any]], *, planning_event: int
 ) -> dict[str, dict[str, Any]]:
@@ -822,11 +855,22 @@ def decide_chip_action(
 
     chosen = sorted(eligible, key=rank)[0]
 
-    chosen_definitions = availability.get(chosen.action, {}).get("definitions") or [{}]
+    chosen_definitions = availability.get(chosen.action, {}).get("definitions") or []
+    active_definition, window_problem = _active_definition(chosen_definitions)
+    if window_problem is not None:
+        # The action was admitted by some row, yet no single row establishes a
+        # live window: the horizon the reservation would be valued against is
+        # unknown, so refuse rather than guess one.
+        n_active = sum(1 for row in chosen_definitions if row.get("eligible"))
+        return refuse(
+            window_problem,
+            f"{chosen.action} is eligible but its active window is not uniquely "
+            f"identifiable ({n_active} active definition rows of {len(chosen_definitions)})",
+        )
     estimate = (reservation or UncalibratedReservation()).estimate(
         action=chosen.action,
         planning_event=planning_event,
-        expiry_event=chosen_definitions[0].get("window_stop_event"),
+        expiry_event=active_definition.get("window_stop_event"),
         state={"squad_ids": list(squad_ids)},
     )
     uplift = chosen.mean_uplift

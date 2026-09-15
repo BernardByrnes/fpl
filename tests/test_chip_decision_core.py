@@ -1052,3 +1052,195 @@ def test_P2_3_I_expired_state_aggregates_per_definition_row():
     )
     assert both_expired["WC"]["eligible"] is False
     assert both_expired["WC"]["expired_all"] is True
+
+
+# ---------------------------------------------------------------------------
+# P2_4. RESERVATION EXPIRY MUST COME FROM THE ACTIVE WINDOW
+# ---------------------------------------------------------------------------
+
+
+class _RecordingReservation:
+    """Records the exact reservation input the arbiter supplies."""
+
+    calibration_status = cd.CALIBRATION_UNCALIBRATED
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def estimate(self, *, action, planning_event, expiry_event, state):
+        self.calls.append({"action": action, "planning_event": planning_event, "expiry_event": expiry_event})
+        return cd.ReservationEstimate(
+            value=None,
+            calibration_status=cd.CALIBRATION_UNCALIBRATED,
+            terminal_value=0.0,
+            weeks_to_expiry=None if expiry_event is None else max(0, int(expiry_event) - int(planning_event)),
+            reason_codes=(cd.DIAG_CHIP_RESERVATION_UNCALIBRATED,),
+            conditional_on=(),
+        )
+
+
+def _tc_evaluation_for(planning_event: int) -> tc.ChipEvaluation:
+    """A genuine TC evaluation carried by the certified binding for that event."""
+
+    events = cd.canonical_chip_horizon(planning_event)
+    worlds = cd.ChipWorldInputs(
+        worlds=4,
+        player_ids=SQUAD,
+        minutes={pid: tuple(90.0 for _ in events) for pid in SQUAD},
+        core=_flat({pid: 5.0 for pid in SQUAD} | {CAPTAIN: 9.0}, 4),
+        planning_event=planning_event,
+        horizon_events=events,
+        certification_identity="sha256:" + "c" * 64,
+        data_snapshot_sha256="sha256:" + "d" * 64,
+        world_seed=20260911,
+        world_identity="sha256:" + "e" * 64,
+    )
+    return tc.evaluate_triple_captain(
+        tc.TripleCaptainRequest(
+            worlds=worlds,
+            horizon_binding=_binding(planning_event=planning_event),
+            policy=_policy(),
+            positions=POSITIONS,
+        )
+    )
+
+
+def _multi_window_decision(
+    planning_event: int, rows, *, reservation=None
+) -> cd.ChipDecision:
+    return cd.decide_chip_action(
+        horizon_binding=_binding(planning_event=planning_event),
+        chip_availability=list(rows),
+        evaluations={cd.CHIP_ACTION_TC: _tc_evaluation_for(planning_event)},
+        reservation=reservation,
+        certification_valid=True,
+        manager_state={"squad_ids": list(SQUAD)},
+    )
+
+
+def test_P2_4_active_definition_selection_is_exactly_one_or_fail_closed():
+    """The selector mirrors the arbiter's own per-row eligibility predicate."""
+
+    expired = cd._eligible_from_rows([_row("3xc", available=False, expired=True, start=2, stop=19)], planning_event=20)[1]
+    live = cd._eligible_from_rows([_row("3xc", available=True, start=20, stop=38)], planning_event=20)[1]
+
+    # exactly one active row -> that row
+    row, problem = cd._active_definition(expired + live)
+    assert problem is None and row["window_stop_event"] == 38
+
+    # none active -> fail closed
+    row, problem = cd._active_definition(expired)
+    assert row is None and problem == cd.DIAG_CHIP_NO_ACTIVE_WINDOW
+
+    # more than one active -> fail closed, never resolved by row order
+    another = cd._eligible_from_rows([_row("3xc", available=True, start=20, stop=30)], planning_event=20)[1]
+    row, problem = cd._active_definition(live + another)
+    assert row is None and problem == cd.DIAG_CHIP_WINDOW_SELECTION_AMBIGUOUS
+
+
+def test_P2_4_A_a_live_second_window_supplies_the_reservation_expiry():
+    """GW20: GW2-19 has expired, GW20-38 is live -> the reservation sees 38."""
+
+    rows = [_row("3xc", available=False, expired=True, start=2, stop=19), _row("3xc", start=20, stop=38)]
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(20, rows, reservation=spy)
+
+    # the action IS eligible and selected, so this test really exercises the
+    # reservation path rather than an early refusal
+    assert decision.recommended_action == cd.CHIP_ACTION_TC
+    assert decision.status != cd.STATUS_INSUFFICIENT_EVIDENCE
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["action"] == cd.CHIP_ACTION_TC
+    assert spy.calls[0]["planning_event"] == 20
+    # the ACTIVE window, not the first row's already-closed GW2-19
+    assert spy.calls[0]["expiry_event"] == 38
+    assert decision.candidate_metrics["reservation_weeks_to_expiry"] == 18
+
+
+def test_P2_4_B_a_live_first_window_supplies_the_reservation_expiry():
+    """GW18: the first window is live, the second is still in the future -> 19."""
+
+    rows = [_row("3xc", start=2, stop=19), _row("3xc", available=False, start=20, stop=38)]
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(18, rows, reservation=spy)
+
+    assert decision.recommended_action == cd.CHIP_ACTION_TC
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["expiry_event"] == 19
+    assert decision.candidate_metrics["reservation_weeks_to_expiry"] == 1
+
+
+def test_P2_4_C_every_window_expired_makes_the_action_ineligible():
+    rows = [
+        _row("3xc", available=False, expired=True, start=2, stop=19),
+        _row("3xc", available=False, expired=True, start=20, stop=28),
+    ]
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(30, rows, reservation=spy)
+
+    assert decision.recommended_action == cd.CHIP_ACTION_NO_CHIP
+    assert cd.DIAG_CHIP_UNAVAILABLE + ":TC" in decision.reason_codes
+    # an ineligible action never reaches the reservation
+    assert spy.calls == []
+
+
+def test_P2_4_D_an_expired_window_plus_an_unavailable_one_is_ineligible():
+    rows = [
+        _row("3xc", available=False, expired=True, start=2, stop=19),
+        _row("3xc", available=False, used=True, start=20, stop=38),
+    ]
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(20, rows, reservation=spy)
+
+    assert decision.recommended_action == cd.CHIP_ACTION_NO_CHIP
+    assert cd.DIAG_CHIP_UNAVAILABLE + ":TC" in decision.reason_codes
+    assert spy.calls == []
+
+
+def test_P2_4_E_overlapping_active_windows_fail_closed():
+    """Two simultaneously-active windows have no season-rule precedence.
+
+    ``season_rules`` defines no way to order them, so the only safe answer is to
+    refuse.  Picking row 0 would value the chip against GW20-30 while the live
+    window may run to GW38 -- exactly the silent-guess failure this repair is
+    about.
+    """
+
+    rows = [_row("3xc", start=20, stop=30), _row("3xc", start=24, stop=38)]
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(25, rows, reservation=spy)
+
+    assert decision.recommended_action == cd.CHIP_ACTION_NO_CHIP
+    assert cd.DIAG_CHIP_WINDOW_SELECTION_AMBIGUOUS in decision.reason_codes
+    # the reservation is never consulted with a guessed horizon
+    assert spy.calls == []
+    # and row 0's stop_event is never presented as the answer: the refusal
+    # carries no reservation metric at all
+    assert decision.candidate_metrics.get("reservation_weeks_to_expiry") is None
+    assert "not uniquely identifiable" in decision.evidence.get("refusal_detail", "")
+
+    # deterministic: the same ambiguous state always refuses the same way
+    again = _multi_window_decision(25, list(reversed(rows)), reservation=_RecordingReservation())
+    assert again.recommended_action == decision.recommended_action
+    assert again.status == decision.status
+    assert again.reason_codes == decision.reason_codes
+
+
+def test_P2_4_F_a_single_definition_row_is_unchanged():
+    """The legacy one-row-per-chip shape still supplies its own stop_event."""
+
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(5, [_row("3xc", start=1, stop=19)], reservation=spy)
+    assert decision.recommended_action == cd.CHIP_ACTION_TC
+    assert spy.calls[0]["expiry_event"] == 19
+
+    # a row with no window bounds at all (the synthetic shape) reports None,
+    # exactly as before this repair
+    spy = _RecordingReservation()
+    decision = _multi_window_decision(
+        5, [{"name": "3xc", "available_for_event": True, "used": False, "expired": False, "window": "GW5-GW19"}],
+        reservation=spy,
+    )
+    assert spy.calls[0]["expiry_event"] is None
+    assert decision.candidate_metrics["reservation_weeks_to_expiry"] is None
