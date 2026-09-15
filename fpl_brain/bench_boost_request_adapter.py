@@ -54,6 +54,7 @@ from . import manager_lineup as ml
 from . import manager_worlds as mw
 from . import planning as planning_module
 from . import repositories as repo
+from . import transfer_state as ts
 
 BENCH_BOOST_ADAPTER_VERSION = "bench_boost_adapter_v1.0.0"
 
@@ -62,6 +63,15 @@ BB_LINEUP_NOT_CAPTURED = "BENCH_BOOST_ADMISSIBLE_LINEUP_NOT_CAPTURED"
 BB_LINEUP_SQUAD_MISMATCH = "BENCH_BOOST_CAPTURED_LINEUP_IS_NOT_THE_CANONICAL_SQUAD"
 BB_LINEUP_ILLEGAL = "BENCH_BOOST_CAPTURED_LINEUP_IS_NOT_LEGAL"
 BB_CALLER_STATE_DISAGREES = "BENCH_BOOST_CALLER_STATE_DISAGREES_WITH_CANONICAL"
+#: A production request must be built against canonical manager authority.  A
+#: caller holding only a hand-made state has no authority to assert positions,
+#: clubs or a lineup, so it must say so explicitly.
+BB_CANONICAL_AUTHORITY_REQUIRED = "BENCH_BOOST_CANONICAL_AUTHORITY_REQUIRED"
+#: The certified identity is mandatory for a production Bench Boost request.  The
+#: shared comparison is presence-gated, so an OMITTED snapshot would otherwise
+#: bypass coherence entirely; production refuses a missing, empty or differing
+#: identity rather than skipping the check.
+BB_DATA_SNAPSHOT_REQUIRED = "BENCH_BOOST_DATA_SNAPSHOT_REQUIRED"
 BB_HORIZON_MISMATCH = "BENCH_BOOST_CERTIFIED_HORIZON_MISMATCH"
 
 
@@ -76,13 +86,22 @@ class BenchBoostAdapterError(cd.ChipInputError):
 
 @dataclass(frozen=True)
 class BenchBoostManagerState:
-    """The manager facts the adapter needs, sourced canonically."""
+    """The manager facts the adapter needs, sourced canonically.
+
+    ``positions`` and ``clubs`` are CANONICAL: they come from the player
+    authority (``route_comparator.load_player_meta``), never from a caller's
+    label map.  A caller that relabels one canonical player's position while
+    keeping the same fifteen would change which autosubs are legal and therefore
+    the chip's value, so ``build_bench_boost_request`` re-derives both and
+    refuses on any disagreement.
+    """
 
     entry_id: int
     planning_event: int
     squad_ids: tuple[int, ...]
     policy: ml.ManagerPolicy
     positions: Mapping[int, str]
+    clubs: Mapping[int, int]
     chip_availability: tuple[Mapping[str, Any], ...]
     #: The event whose captured lineup supplied the XI/bench/armband.  Recorded
     #: so the report can show WHICH submitted lineup was evaluated.
@@ -93,10 +112,9 @@ class BenchBoostManagerState:
 
     def problems(self) -> list[str]:
         found: list[str] = []
-        if len(self.squad_ids) != ml.SQUAD_SIZE:
-            found.append(f"squad has {len(self.squad_ids)} players, expected {ml.SQUAD_SIZE}")
-        if len(set(int(pid) for pid in self.squad_ids)) != len(self.squad_ids):
-            found.append("squad contains duplicate players")
+        # The FULL fifteen, not merely a fieldable eleven: exact composition and
+        # the club limit are properties of the squad itself.
+        found.extend(ts.squad_composition_errors(self.squad_ids, self.positions, self.clubs))
         legality = ml.policy_legality_errors(self.policy, self.positions)
         if legality:
             found.append(f"lineup is not legal: {legality}")
@@ -105,6 +123,33 @@ class BenchBoostManagerState:
         if not self.chip_availability:
             found.append("no chip availability rows")
         return found
+
+
+def _canonical_positions_and_clubs(
+    conn: sqlite3.Connection, squad_ids: Sequence[int]
+) -> tuple[dict[int, str], dict[int, int]]:
+    """Canonical position and club per player, from the accepted player authority.
+
+    ``route_comparator.load_player_meta`` is the SAME reader the accepted route
+    layer uses (``scoring_rules.POSITION_IDS`` over ``players.element_type``),
+    and it is the only place the club is available at all -- the manager-world
+    resolver discards it.  A squad member the player table does not describe is
+    reported rather than defaulted, so an unknown label can never satisfy a
+    composition count.
+    """
+
+    from . import route_comparator as rc
+
+    meta = rc.load_player_meta(conn, squad_ids)
+    missing = sorted(int(pid) for pid in squad_ids if int(pid) not in meta)
+    if missing:
+        raise BenchBoostAdapterError(
+            f"{BB_MANAGER_STATE_MISSING}: the player authority does not describe squad player(s) {missing[:8]}",
+            reasons=(BB_MANAGER_STATE_MISSING,),
+        )
+    positions = {int(pid): str(meta[int(pid)].position) for pid in squad_ids}
+    clubs = {int(pid): int(meta[int(pid)].club_id) for pid in squad_ids}
+    return positions, clubs
 
 
 def _lineup_policy(
@@ -172,28 +217,45 @@ def bench_boost_manager_state(
 ) -> BenchBoostManagerState:
     """Source the manager facts from canonical accessors, read-only.
 
-    The fifteen and their positions come from ``manager_worlds.resolve_squad``
-    (the accepted manager-world authority).  The lineup comes from the manager's
-    captured ``squad_picks``: the planning event's own capture when it exists,
-    otherwise the most recent earlier capture.  Anything the canonical state does
-    not supply refuses -- the adapter never invents a squad, a lineup or a chip.
+    The fifteen come from ``manager_worlds.resolve_squad`` (the accepted
+    manager-world authority) and their POSITIONS AND CLUBS come from
+    ``route_comparator.load_player_meta`` (the accepted player authority the
+    route layer uses), so a position label and a club are canonical facts rather
+    than caller assertions.  The lineup comes from the manager's captured
+    ``squad_picks``: the planning event's own capture when it exists, otherwise
+    the most recent earlier capture.  Anything the canonical state does not
+    supply refuses -- the adapter never invents a squad, a lineup, a position,
+    a club or a chip.
     """
 
     context = planning_module.get_planning_context(conn, int(entry_id), int(planning_event), as_of)
     squad_info = mw.resolve_squad(context, conn)
     squad_ids = tuple(sorted(int(pid) for pid in squad_info["squad_ids"]))
-    positions = {
+    resolved_positions = {
         int(pid): str(position)
         for pid, position in (squad_info["positions"] or {}).items()
         if position
     }
     chips = tuple(dict(row) for row in planning_module.chips_state(conn, int(entry_id), int(planning_event)))
 
-    if len(squad_ids) != ml.SQUAD_SIZE or len(positions) != len(squad_ids):
+    if len(squad_ids) != ml.SQUAD_SIZE or len(resolved_positions) != len(squad_ids):
         raise BenchBoostAdapterError(
             f"{BB_MANAGER_STATE_MISSING}: the canonical planning state supplies {len(squad_ids)} "
-            f"players with {len(positions)} known positions, expected {ml.SQUAD_SIZE} of each "
+            f"players with {len(resolved_positions)} known positions, expected {ml.SQUAD_SIZE} of each "
             f"(squad_state={squad_info.get('squad_state')!r})",
+            reasons=(BB_MANAGER_STATE_MISSING,),
+        )
+
+    positions, clubs = _canonical_positions_and_clubs(conn, squad_ids)
+    # Two accepted accessors must agree about the same fifteen.  If they do not,
+    # the player layer is not coherent and neither reading may be used.
+    disagreements = sorted(
+        pid for pid in squad_ids if str(resolved_positions.get(pid)) != str(positions.get(pid))
+    )
+    if disagreements:
+        raise BenchBoostAdapterError(
+            f"{BB_MANAGER_STATE_MISSING}: the squad and player authorities disagree about the position of "
+            f"{disagreements[:8]}",
             reasons=(BB_MANAGER_STATE_MISSING,),
         )
 
@@ -227,6 +289,7 @@ def bench_boost_manager_state(
         squad_ids=squad_ids,
         policy=policy,
         positions=positions,
+        clubs=clubs,
         chip_availability=chips,
         lineup_source_event=int(lineup_event),
         lineup_is_exact_event=int(lineup_event) == int(planning_event),
@@ -272,6 +335,11 @@ def build_bench_boost_request(
     *,
     conn: sqlite3.Connection | None = None,
     as_of: str | None = None,
+    #: An explicit, loud opt-out for a caller that has NO database: a pure
+    #: simulation or a unit test.  Without it (or a ``conn``) the request is
+    #: refused, because positions, clubs and the lineup are canonical facts
+    #: and a hand-made state cannot assert them.
+    allow_unverified_manager_state: bool = False,
     calibration_status: str = cd.CALIBRATION_UNCALIBRATED,
     input_uncertainty_flags: Sequence[str] = (),
 ) -> bb.BenchBoostRequest:
@@ -288,6 +356,15 @@ def build_bench_boost_request(
         for this planning event, and the world inputs must declare the same
         window, planning event and certification identity.
     """
+
+    if conn is None and not allow_unverified_manager_state:
+        raise BenchBoostAdapterError(
+            f"{BB_CANONICAL_AUTHORITY_REQUIRED}: a request must be built against the canonical manager "
+            "state; pass the connection, or set allow_unverified_manager_state=True to declare that "
+            "this is a simulation with no database.  Caller-supplied positions, clubs and lineups are "
+            "never authority over the canonical ones",
+            reasons=(BB_CANONICAL_AUTHORITY_REQUIRED,),
+        )
 
     problems = manager.problems()
     if problems:
@@ -312,6 +389,25 @@ def build_bench_boost_request(
                 f"lineup source event {int(manager.lineup_source_event)} != canonical "
                 f"{int(canonical.lineup_source_event)}"
             )
+        # POSITIONAL and CLUB identity are part of the canonical squad, not a
+        # caller's label map.  Relabelling one player's position would change
+        # which autosubs are legal -- and therefore the chip's value -- while
+        # keeping the same fifteen ids, and a club map is what makes the
+        # three-per-club limit checkable at all.
+        relabelled = sorted(
+            pid
+            for pid in manager.squad_ids
+            if str(manager.positions.get(int(pid))) != str(canonical.positions.get(int(pid)))
+        )
+        if relabelled:
+            disagreements.append(f"position of {relabelled[:8]} is not the canonical one")
+        reclubbed = sorted(
+            pid
+            for pid in manager.squad_ids
+            if int(manager.clubs.get(int(pid)) or 0) != int(canonical.clubs.get(int(pid)) or 0)
+        )
+        if reclubbed:
+            disagreements.append(f"club of {reclubbed[:8]} is not the canonical one")
         if disagreements:
             raise BenchBoostAdapterError(
                 f"{BB_CALLER_STATE_DISAGREES}: the supplied manager state is not the canonical one: "
@@ -333,6 +429,34 @@ def build_bench_boost_request(
         # submitted lineup is the correct authority.  ``lineup_source_event``
         # carries that fact into the report; nothing is silently substituted.
         pass
+
+    # The certified identity must be PRESENT before anything numeric happens.
+    # The shared comparison is presence-gated (an object that declares no
+    # snapshot makes no claim), which is right for legacy synthetic flows but
+    # fail-open for a production request: dropping the field would bypass
+    # coherence entirely.  Production Bench Boost therefore requires an explicit
+    # non-empty snapshot on BOTH sides, and their exact equality, here -- before
+    # a Bench Boost value can be produced at all.
+    binding_snapshot = str(binding.data_snapshot_sha256 or "").strip()
+    world_snapshot = str(certified.worlds.data_snapshot_sha256 or "").strip()
+    if not binding_snapshot:
+        raise BenchBoostAdapterError(
+            f"{BB_DATA_SNAPSHOT_REQUIRED}: the certified horizon binding carries no data snapshot "
+            "identity; a Bench Boost decision cannot be bound to an unidentified capture",
+            reasons=(BB_DATA_SNAPSHOT_REQUIRED,),
+        )
+    if not world_snapshot:
+        raise BenchBoostAdapterError(
+            f"{BB_DATA_SNAPSHOT_REQUIRED}: the certified world inputs carry no data snapshot identity; "
+            "the identity is the artifact's own evidence and is never inferred from the binding",
+            reasons=(BB_DATA_SNAPSHOT_REQUIRED,),
+        )
+    if world_snapshot != binding_snapshot:
+        raise BenchBoostAdapterError(
+            f"{BB_DATA_SNAPSHOT_REQUIRED}: the world inputs were produced from a different capture than "
+            f"the certified binding authorises",
+            reasons=(BB_DATA_SNAPSHOT_REQUIRED,),
+        )
 
     request = bb.BenchBoostRequest(
         worlds=certified.worlds,

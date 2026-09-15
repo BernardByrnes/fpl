@@ -98,6 +98,9 @@ DIAG_CHIP_HORIZON_NOT_CANONICAL = "CHIP_HORIZON_NOT_CANONICAL"
 DIAG_CHIP_PLANNING_EVENT_MISMATCH = "CHIP_PLANNING_EVENT_MISMATCH"
 DIAG_CHIP_CERTIFICATION_HORIZON_MISMATCH = "CHIP_CERTIFICATION_HORIZON_MISMATCH"
 DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH = "CHIP_EVALUATION_CONTEXT_MISMATCH"
+#: Raised when the disagreement is specifically the DATA snapshot identity, so a
+#: cross-snapshot arbitration is distinguishable from a horizon mismatch.
+DIAG_CHIP_DATA_SNAPSHOT_MISMATCH = "CHIP_DATA_SNAPSHOT_MISMATCH"
 DIAG_CHIP_EVALUATION_ACTION_MISMATCH = "CHIP_EVALUATION_ACTION_MISMATCH"
 DIAG_CHIP_EVALUATOR_UNCALIBRATED = "CHIP_EVALUATOR_VALUE_MODEL_UNCALIBRATED"
 DIAG_CHIP_NO_ACTIVE_WINDOW = "CHIP_NO_ACTIVE_WINDOW_FOR_ACTION"
@@ -418,6 +421,18 @@ class ChipEvaluation:
     #: exact established semantics -- only an evaluator that knows its own value
     #: model is uncalibrated sets this False.
     execution_permitted: bool = True
+    #: Whether this evaluation is BOUND to a data snapshot identity.
+    #:
+    #: Defaults to False so every pre-existing evaluator keeps its exact
+    #: established semantics, including the shared presence-gated comparison (an
+    #: evaluation that declares no snapshot makes no claim to contradict).
+    #:
+    #: An evaluator whose number is computed from certified predictive worlds sets
+    #: this True, and its snapshot may then never be OMITTED, EMPTY or DIFFERENT:
+    #: the arbiter refuses instead of skipping the comparison.  Without it a
+    #: production request could bypass snapshot coherence simply by dropping the
+    #: field -- a fail-open bypass, not a legacy compatibility requirement.
+    data_snapshot_bound: bool = False
 
     @property
     def mean_uplift(self) -> float | None:
@@ -559,6 +574,14 @@ class ChipHorizonBinding:
             )
         if str(worlds.certification_identity) != str(self.certification_identity):
             problems.append("worlds certification identity is not the authorised one")
+        # The DATA snapshot is part of the certified context, not decoration: a
+        # world set built from snapshot A may not be evaluated against a binding
+        # authorised for snapshot D, even when the event window and the
+        # certification identity agree.  Compared whenever both sides declare one
+        # (a binding that carries no snapshot is not a claim about any snapshot).
+        if self.data_snapshot_sha256 and worlds.data_snapshot_sha256:
+            if str(worlds.data_snapshot_sha256) != str(self.data_snapshot_sha256):
+                problems.append("worlds data snapshot is not the certified one")
         return problems
 
 
@@ -778,17 +801,33 @@ def decide_chip_action(
             DIAG_CHIP_EVALUATION_ACTION_MISMATCH,
             f"evaluation mapping key disagrees with the evaluation's own action for {mismatched_keys}",
         )
+    # The two snapshot rules, in one place so the refusal and the reason code can
+    # never disagree about WHY an evaluation was rejected:
+    #   * presence-gated (legacy): an evaluation that declares no snapshot makes
+    #     no claim to contradict;
+    #   * presence-REQUIRED (snapshot-bound): a missing or empty snapshot is
+    #     itself a disagreement, so the check cannot be bypassed by omitting it.
+    def snapshot_disagrees(evaluation: ChipEvaluation) -> bool:
+        declared = evaluation.evidence.get("data_snapshot_sha256")
+        if bool(getattr(evaluation, "data_snapshot_bound", False)):
+            return not declared or str(declared) != str(data_snapshot_sha256)
+        return bool(declared) and str(declared) != str(data_snapshot_sha256)
+
     foreign = sorted(
         action
         for action, evaluation in supplied.items()
         if str(evaluation.evidence.get("certification_identity") or "") != str(certification_identity)
         or tuple(int(event) for event in (evaluation.evidence.get("horizon_events") or ())) != events
         or int(evaluation.evidence.get("planning_event") or -1) != planning_event
+        or snapshot_disagrees(evaluation)
     )
     if foreign:
+        snapshot_foreign = sorted(action for action in foreign if snapshot_disagrees(supplied[action]))
         return refuse(
             DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH,
-            f"evaluation(s) {foreign} were produced for a different horizon or certification identity",
+            f"evaluation(s) {foreign} were produced for a different horizon, certification identity "
+            f"or data snapshot",
+            extra=(DIAG_CHIP_DATA_SNAPSHOT_MISMATCH,) if snapshot_foreign else (),
         )
 
     # 6. one chip per Gameweek

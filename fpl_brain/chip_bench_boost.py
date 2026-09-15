@@ -76,6 +76,7 @@ from . import manager_lineup
 from .chip_decision import (
     CALIBRATION_UNCALIBRATED,
     CHIP_ACTION_BB,
+    DIAG_CHIP_CERTIFICATION_REQUIRED,
     DIAG_CHIP_HORIZON_NOT_CANONICAL,
     DIAG_CHIP_PLANNING_EVENT_MISMATCH,
     DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE,
@@ -254,13 +255,34 @@ def evaluate_bench_boost(request: BenchBoostRequest) -> ChipEvaluation:
     """PLAY_BB_NOW vs the SAVE policy -> the arbiter's ``ChipEvaluation`` shape.
 
     Raises ``ChipInputError`` when the request is not bound to the certified
-    context, when the manager's fifteen is not a legal FPL lineup, or when the
-    world inputs do not cover it.  A missing series is never read as zero.
+    context, when the manager's fifteen is not a legal FPL lineup, when the world
+    inputs do not cover it, or when the certified identity is incomplete.  A
+    missing series is never read as zero, and a missing snapshot identity is
+    never inferred.
     """
 
     worlds = request.worlds
     total_worlds = worlds.validate()
     binding = request.horizon_binding
+
+    # The certified identity must be COMPLETE, and it must come from the artifact
+    # itself.  An empty data snapshot is not "unknown but usable": it is the one
+    # field that says WHICH capture produced this number, so without it the
+    # evaluation could not be arbitrated coherently at all.  It is never inferred
+    # from the binding and never stamped onto the worlds from the request -- the
+    # world identity stays its own evidence.
+    if not str(worlds.data_snapshot_sha256 or "").strip():
+        raise ChipInputError(
+            f"{DIAG_CHIP_CERTIFICATION_REQUIRED}: the world inputs carry no data snapshot identity, "
+            "so a Bench Boost value could not be bound to the capture that produced it",
+            reasons=[DIAG_CHIP_CERTIFICATION_REQUIRED],
+        )
+    if not str(binding.data_snapshot_sha256 or "").strip():
+        raise ChipInputError(
+            f"{DIAG_CHIP_CERTIFICATION_REQUIRED}: the horizon binding carries no data snapshot identity, "
+            "so there is nothing for the world inputs to be coherent with",
+            reasons=[DIAG_CHIP_CERTIFICATION_REQUIRED],
+        )
 
     problems = binding.matches_worlds(worlds)
     if problems:
@@ -452,6 +474,10 @@ def evaluate_bench_boost(request: BenchBoostRequest) -> ChipEvaluation:
         # REVIEW-ONLY: no Bench Boost future-opportunity value model exists, so a
         # positive uplift may be reported but can never be executed on.
         execution_permitted=False,
+        # The value above is computed from certified predictive worlds, so the
+        # arbiter must require this evaluation's snapshot to be present and exact
+        # rather than skipping the comparison when the field is absent.
+        data_snapshot_bound=True,
     )
 
 
