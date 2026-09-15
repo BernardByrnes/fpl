@@ -75,6 +75,9 @@ class WildcardManagerState:
             found.append("no owned squad")
         if len(self.squad_ids) != ts.SQUAD_SIZE:
             found.append(f"squad has {len(self.squad_ids)} players, expected {ts.SQUAD_SIZE}")
+        for pid, price in self.market_price_tenths.items():
+            if not isinstance(price, int) or price <= 0:
+                found.append(f"player {pid} has a non-positive or non-integer price {price!r}")
         if int(self.bank_tenths) < 0:
             found.append("negative bank")
         if int(self.event_start_free_transfers) < 0:
@@ -91,7 +94,8 @@ class WildcardManagerState:
 
 
 def wildcard_manager_state(
-    conn: sqlite3.Connection, entry_id: int, planning_event: int, *, as_of: str | None = None
+    conn: sqlite3.Connection, entry_id: int, planning_event: int, *,
+    cutoff: str, eligible_ids: Sequence[int] | None = None, as_of: str | None = None
 ) -> WildcardManagerState:
     """Source the manager facts from canonical accessors, read-only.
 
@@ -128,7 +132,11 @@ def wildcard_manager_state(
         if effective is not None:
             cached[pid] = int(effective)
 
-    market = _canonical_market_prices(conn, squad, as_of)
+    # Canonicalize prices for the WHOLE eligible universe, not just the owned
+    # squad: an incoming Wildcard candidate's affordability must never rest on
+    # a caller-supplied price.
+    universe = tuple(int(p) for p in (eligible_ids if eligible_ids is not None else squad))
+    market = _canonical_market_prices(conn, tuple(sorted(set(universe) | set(squad))), cutoff)
     return WildcardManagerState(
         entry_id=int(entry_id),
         planning_event=int(planning_event),
@@ -143,24 +151,32 @@ def wildcard_manager_state(
 
 
 def _canonical_market_prices(
-    conn: sqlite3.Connection, player_ids: Sequence[int], as_of: str | None
+    conn: sqlite3.Connection, player_ids: Sequence[int], cutoff: str
 ) -> dict[int, int]:
-    """Current official price per player, from the canonical snapshot store."""
+    """Current official price per player AS OF the decision cutoff.
 
-    if not player_ids:
-        return {}
-    placeholders = ",".join("?" for _ in player_ids)
-    sql = (
-        "SELECT ps.player_id AS player_id, ps.now_cost AS now_cost "
-        "FROM player_snapshots ps "
-        "JOIN (SELECT player_id, MAX(captured_at) AS latest FROM player_snapshots "
-        f"      WHERE player_id IN ({placeholders}) GROUP BY player_id) m "
-        "  ON m.player_id = ps.player_id AND m.latest = ps.captured_at"
-    )
+    Uses the canonical point-in-time accessor ``analytics.snapshot_as_of`` --
+    "freshest official snapshot captured at or before the cutoff" -- rather than
+    MAX(captured_at), which would leak a post-cutoff price into a historical
+    replay.  A player with no snapshot at or before the cutoff has NO canonical
+    price and is reported as missing rather than being defaulted.
+    """
+
+    from . import analytics as analytics_module
+
     prices: dict[int, int] = {}
-    for row in conn.execute(sql, [int(p) for p in player_ids]):
-        if row["now_cost"] is not None:
-            prices[int(row["player_id"])] = int(row["now_cost"])
+    for pid in player_ids:
+        snapshot = analytics_module.snapshot_as_of(conn, int(pid), str(cutoff))
+        if snapshot is None:
+            continue
+        cost = snapshot.get("now_cost")
+        if cost is None:
+            continue
+        try:
+            value = int(cost)
+        except (TypeError, ValueError):
+            continue
+        prices[int(pid)] = value
     return prices
 
 
@@ -239,6 +255,38 @@ def build_wildcard_request(
             f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: {len(missing)} eligible players have no "
             f"projection row (e.g. {missing[:5]})",
             reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+        )
+
+    # --- canonical prices for EVERY candidate, cross-checked against the rows
+    #
+    # The screening universe is the eligible pool, so a row's price must be the
+    # authoritative point-in-time price.  A caller-supplied price that disagrees
+    # is a contradiction, not a hint: it refuses rather than being overwritten,
+    # because silently substituting would hide evidence that the caller's
+    # universe is not the certified one.
+    missing_price: list[int] = []
+    disagreeing: list[tuple[int, int, int]] = []
+    for pid in sorted(int(p) for p in certified.players):
+        canonical = manager.market_price_tenths.get(int(pid))
+        supplied = certified.players[int(pid)].market_price_tenths
+        if canonical is None:
+            missing_price.append(int(pid))
+            continue
+        if int(canonical) != int(supplied):
+            disagreeing.append((int(pid), int(supplied), int(canonical)))
+    if missing_price:
+        raise WildcardAdapterError(
+            f"{wc.WC_PRICING_UNAVAILABLE}: {len(missing_price)} candidate players have no "
+            f"canonical point-in-time price (e.g. {missing_price[:5]})",
+            reasons=(wc.WC_PRICING_UNAVAILABLE,),
+        )
+    if disagreeing:
+        pid, supplied, canonical = disagreeing[0]
+        raise WildcardAdapterError(
+            f"{wc.WC_PRICING_UNAVAILABLE}: player {pid} is priced {supplied} by the caller but "
+            f"{canonical} by the canonical point-in-time snapshot "
+            f"({len(disagreeing)} disagreement(s))",
+            reasons=(wc.WC_PRICING_UNAVAILABLE,),
         )
 
     # --- canonical selling values, recomputed and cross-checked
