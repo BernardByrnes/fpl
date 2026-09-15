@@ -431,3 +431,70 @@ def test_readiness_hard_fails_on_occupancy_and_minute_mass_violations():
     broken2["minute_mass_violations"] = 1
     failed2 = mc.readiness_summary({100: fixture}, broken2, config)
     assert any("TEAM_MINUTE_MASS_VIOLATION" in reason for reason in failed2["fail_reasons"])
+
+
+
+# ---------------------------------------------------------------------------
+# DEFCON calibration must be applied consistently by BOTH layers
+# ---------------------------------------------------------------------------
+
+
+def _defcon_calibration_run(calibration):
+    """Run one simulation and return (sampled hit rate, per-world exposures)."""
+
+    from fpl_brain import defcon_calibration as dc  # noqa: F401  (imported for clarity)
+
+    fixture = _fixture()
+    over = {"defcon_actions_per90": 9.0}
+    if calibration is not None:
+        over["defcon_calibration"] = calibration
+    targeted = _player(3, "DEF", p_start=1.0, p_cameo=0.0, p80=1.0, **over)
+    for side in fixture["sides"]:
+        for index, existing in enumerate(side["players"]):
+            if existing["player_id"] == 3:
+                side["players"][index] = targeted
+    finished = _finish(fixture)
+    config = mc.MonteCarloConfig(simulations=6000, seed=12345)
+    result = mc.simulate(
+        {finished["fixture_id"]: finished}, config, RULES, capture_player_ids=[3]
+    )
+    hit_rate = _by_player(result)[3]["p_defcon_hit"]
+    exposures = list(result["world_matrix"]["minutes"][3])
+    return hit_rate, exposures
+
+
+def test_calibrated_defcon_is_applied_by_the_sampled_layer_too():
+    """The two layers must not disagree about which calibration is in force.
+
+    The exposures vary (the substitution model samples them), so the analytic
+    reference is recomputed over the SIMULATION'S OWN per-world minutes: the
+    sampled hit frequency must equal the mean of the calibration applied to the
+    raw probability at each of those exposures.  If Monte Carlo still sampled
+    the raw count, the analytic row would report calibrated points while the
+    simulation reported raw ones -- exactly the split the promotion prevents.
+    """
+
+    from fpl_brain import defcon_calibration as dc
+    from fpl_brain import xpts
+
+    plain_hit, plain_exposures = _defcon_calibration_run(None)
+    platt_hit, platt_exposures = _defcon_calibration_run(dc.DEFCON_PLATT_V1.as_dict())
+
+    # the calibration changes only the probability map, never the worlds
+    assert plain_exposures == platt_exposures
+
+    threshold = RULES.defcon_threshold_for("DEF")
+    raw_expectation = sum(
+        xpts.poisson_tail_probability(9.0 * m / 90.0, threshold) for m in platt_exposures
+    ) / len(platt_exposures)
+    calibrated_expectation = sum(
+        dc.DEFCON_PLATT_V1.apply(xpts.poisson_tail_probability(9.0 * m / 90.0, threshold))
+        for m in platt_exposures
+    ) / len(platt_exposures)
+
+    # the two maps are clearly distinguishable at these exposures
+    assert abs(raw_expectation - calibrated_expectation) > 0.02
+
+    # ~6000 draws gives SE < 0.007, so 0.02 is about 3 sigma
+    assert plain_hit == pytest.approx(raw_expectation, abs=0.02)
+    assert platt_hit == pytest.approx(calibrated_expectation, abs=0.02)

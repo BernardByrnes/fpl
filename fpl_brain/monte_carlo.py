@@ -42,6 +42,8 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import analytics, joint_minutes
+from . import defcon_calibration as defcon_cal
+from . import xpts
 from .scoring_rules import DEFAULT_SCORING_RULES, POSITION_IDS, SCORING_RULES_VERSION, ScoringRules
 
 MONTE_CARLO_MODEL_VERSION = "mc_v1.3.0"
@@ -523,6 +525,14 @@ def load_fixture_inputs(
                 "payload": record["payload"],
                 "minutes": minutes_payload,
                 "has_primitives": not missing,
+                # Resolve each row's declared DEFCON calibration ONCE here, not
+                # per world: the sampled layer must apply the SAME calibration
+                # the analytic row recorded, or the two would disagree.  An
+                # unrecognised spec raises; an absent one means a pre-calibration
+                # run and resolves explicitly to the legacy identity mapping.
+                "defcon_calibration": defcon_cal.from_payload(
+                    (record["payload"] or {}).get("defcon_calibration")
+                ),
             }
         )
     for fixture in fixtures.values():
@@ -1474,9 +1484,23 @@ def _score_personal_events(entry, opponent, rules, accumulators, config, fixture
         threshold = rules.defcon_threshold_for(position)
         if position in rules.defcon_positions and threshold is not None and exposure > 0:
             actions_per90 = float(payload.get("defcon_actions_per90") or 0.0)
+            # The SAME calibrated hit probability the analytic row scored, at
+            # THIS world's sampled exposure.  Sampling the raw count and
+            # thresholding it would leave the sampled layer uncalibrated while
+            # the analytic layer was calibrated, which is exactly the
+            # raw-p-vs-calibrated-points split the two layers must not have.
+            # The PAYLOAD is the authority on which calibration applies, so a
+            # hand-built input that never passed through load_fixture_inputs
+            # still resolves correctly (and, with no declared spec, resolves to
+            # the explicit legacy identity mapping = the original semantics).
+            calibration = player.get("defcon_calibration")
+            if calibration is None:
+                calibration = defcon_cal.from_payload((payload or {}).get("defcon_calibration"))
+            p_hit = xpts.defcon_hit_probability(
+                position, actions_per90, exposure, rules, calibration=calibration
+            )
             rng = _stream(config.seed, fixture_id, simulation_index, "defcon", team_id, player_id)
-            actions = _poisson(rng, max(0.0, actions_per90) * exposure / 90.0)
-            if actions >= threshold:
+            if rng.random() < p_hit:
                 bucket["defcon"] += rules.defcon_points
                 bucket["defcon_flag"] = 1.0
 
