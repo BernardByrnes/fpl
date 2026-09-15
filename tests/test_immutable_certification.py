@@ -458,13 +458,21 @@ def test_i_valid_artifact_yields_exact_certified_run_ids(tmp_path):
 
 
 def test_i_artifact_missing_an_event_is_refused(tmp_path):
+    """An event the artifact does not certify can never be consumed.
+
+    The refusal now happens at the horizon gate, before any bundle lookup: the
+    consumed horizon must EQUAL the certified horizon, so requesting event 6 from a
+    five-only certification is refused outright rather than after discovery.
+    """
+
     conn = connect_database(tmp_path / "fpl.db")
     _base_world_for_bundles(conn)
     path = tmp_path / "art.json"
     path.write_text(json.dumps(_artifact()), encoding="utf-8")
     artifact = fg.load_certification_artifact(path)
-    with pytest.raises(fg.DecisionCertificationRequired, match="covers no bundle"):
+    with pytest.raises(fg.DecisionCertificationRequired) as caught:
         fg.event_support_from_certification(conn, artifact, events=[5, 6], cutoff="2026-09-12T19:00:00Z")
+    assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH in str(caught.value)
     conn.close()
 
 

@@ -437,6 +437,7 @@ DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING = "CERTIFIED_HISTORY_COMPLE
 DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING = "CERTIFICATION_WIRING_IDENTITY_MISSING"
 DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED = "LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED"
 DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH = "CERTIFICATION_BUNDLE_IDENTITY_MISMATCH"
+DIAG_CERTIFICATION_EVENT_SET_MISMATCH = "CERTIFICATION_EVENT_SET_MISMATCH"
 
 
 def certification_artifact_requires_history_completeness(schema: Any) -> bool:
@@ -669,6 +670,17 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def canonical_event_horizon(values: Iterable[Any] | None) -> tuple[int, ...]:
+    """Canonical (sorted, int) horizon for an exact-identity comparison.
+
+    Order is canonicalised, duplicates are NOT collapsed: a horizon that repeats
+    an event therefore fails an equality test deterministically instead of being
+    silently normalised into acceptance.
+    """
+
+    return tuple(sorted(int(event) for event in (values or ())))
+
+
 def event_support_from_certification(
     conn: sqlite3.Connection,
     certification: Mapping[str, Any],
@@ -676,7 +688,23 @@ def event_support_from_certification(
     events: Iterable[int],
     cutoff: str,
 ) -> dict[int, dict[str, Any]]:
-    """Support derived from a CERTIFICATION ARTIFACT's exact certified run ids."""
+    """Support derived from a CERTIFICATION ARTIFACT's exact certified run ids.
+
+    The horizon a decision CONSUMES must equal the horizon the artifact CERTIFIED.
+    A caller-supplied subset is not authorisation: a certification for five events
+    must never authorize a four-event consumer, nor the reverse.  The comparison is
+    canonical (sorted ints) and exact, so subsets, supersets, duplicates and
+    reorderings are all refused before any support is returned.
+    """
+
+    requested = canonical_event_horizon(events)
+    certified = canonical_event_horizon(certification.get("events"))
+    if requested != certified:
+        raise DecisionCertificationRequired(
+            f"{DIAG_CERTIFICATION_EVENT_SET_MISMATCH}: the decision horizon {list(requested)} must equal "
+            f"the certified horizon {list(certified)}; a certification authorises exactly its own events "
+            "(no subset, superset, duplicate or reordering)"
+        )
 
     bundles = certification.get("certified_bundles") or {}
     selected = {

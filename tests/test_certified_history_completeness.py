@@ -1287,3 +1287,168 @@ def test_F6_real_certifier_artifact_loads_through_the_real_loader(tmp_path):
     with pytest.raises(fg.DecisionCertificationRequired) as failure:
         fg.load_certification_artifact(path)
     assert fg.DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING in str(failure.value)
+
+
+# ---------------------------------------------------------------------------
+# Sol P2-2 — the events a decision CONSUMES must equal the events CERTIFIED.
+#
+# _assert_bundle_identities_bind ties the artifact's own events to its bundles, but
+# event_support_from_certification takes a caller-supplied horizon, so a five-event
+# certification could authorise a four-event consumer.  The comparison is now exact.
+# ---------------------------------------------------------------------------
+
+
+def _seed_event5_certified_world(conn):
+    """The runs and dependency edges the event-5 bundle fixture references.
+
+    event_support_from_certification validates the certified run ids against the
+    database, so an ACCEPTED horizon needs a real world; the refusal paths do not.
+    """
+
+    with conn:
+        conn.execute("INSERT INTO positions(id, singular_name_short, raw_json, updated_at)"
+                     " VALUES (2,'DEF','{}','2026-09-01T00:00:00Z')")
+        for team_id, name in ((1, "One"), (2, "Two")):
+            conn.execute("INSERT INTO teams(id, name, short_name, raw_json, updated_at)"
+                         " VALUES (?,?,?,'{}','2026-09-01T00:00:00Z')", (team_id, name, name.upper()))
+        conn.execute("INSERT INTO events(id, name, deadline_time, finished, raw_json, updated_at)"
+                     " VALUES (5,'GW5','2026-09-18T17:30:00Z',0,'{}','2026-09-01T00:00:00Z')")
+        conn.execute("INSERT INTO fixtures(id, event, team_h, team_a, kickoff_time, finished, started,"
+                     " raw_json, updated_at)"
+                     " VALUES (48,5,1,2,'2026-09-19T14:00:00Z',0,0,'{}','2026-09-01T00:00:00Z')")
+        for run_id, family, version in (
+            (1, "minutes_v1", "minutes_v1.6.0"),
+            (2, "team_strength_v1", "team_strength_v1.0.0"),
+            (3, "player_rates_v1", "player_rates_v1.0.0"),
+            (4, "xpts_v1", "xpts_v1.4.1"),
+            (5, "monte_carlo_v1", "mc_v1.3.0"),
+        ):
+            conn.execute(
+                "INSERT INTO projection_runs(id, model_family, model_version, generated_at, planning_event,"
+                " data_cutoff, status, source_snapshot_sha256, planning_context_hash)"
+                " VALUES (?,?,?,'2026-09-12T19:01:00Z',5,?,'complete','codehash','ctx')",
+                (run_id, family, version, CUTOFF),
+            )
+        conn.execute(
+            "INSERT INTO player_fixture_xpts_projections(projection_run_id, player_id, fixture_id, event,"
+            " team_id, opponent_id, position, minutes_run_id, team_run_id, rate_run_id, payload_json,"
+            " model_version, scoring_rules_version, generated_at)"
+            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}','xpts_v1.4.1','v1','2026-09-12T19:01:00Z')"
+        )
+        conn.execute(
+            "INSERT INTO monte_carlo_distributions(projection_run_id, player_id, fixture_id, event, team_id,"
+            " opponent_id, position, xpts_run_id, minutes_run_id, team_run_id, rate_run_id, payload_json,"
+            " model_version, generated_at)"
+            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}','mc_v1.3.0','2026-09-12T19:01:00Z')"
+        )
+
+
+def test_P2_2A_matching_horizons_are_accepted(tmp_path):
+    bundles, identities = _bound_bundles((5,))
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA, events=[5],
+                        certified_bundles=bundles, certified_bundle_identity=identities,
+                        history_completeness=_complete_audit())
+    artifact = fg.load_certification_artifact(_write(tmp_path, payload, name="match.json"))
+    conn = connect_database(tmp_path / "fpl.db")
+    try:
+        _seed_event5_certified_world(conn)
+        support = fg.event_support_from_certification(conn, artifact, events=[5], cutoff=CUTOFF)
+        assert set(support) == {5}
+    finally:
+        conn.close()
+
+
+def test_P2_2B_a_five_event_certification_cannot_authorise_four_events(tmp_path):
+    events = (5, 6, 7, 8, 9)
+    bundles, identities = _bound_bundles(events)
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA, events=list(events),
+                        certified_bundles=bundles, certified_bundle_identity=identities,
+                        history_completeness=_complete_audit())
+    artifact = fg.load_certification_artifact(_write(tmp_path, payload, name="five.json"))
+    conn = connect_database(tmp_path / "fpl.db")
+    try:
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.event_support_from_certification(conn, artifact, events=[5, 6, 7, 8], cutoff=CUTOFF)
+        assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH in str(failure.value)
+    finally:
+        conn.close()
+
+
+def test_P2_2C_a_four_event_certification_cannot_authorise_five_events(tmp_path):
+    events = (5, 6, 7, 8)
+    bundles, identities = _bound_bundles(events)
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA, events=list(events),
+                        certified_bundles=bundles, certified_bundle_identity=identities,
+                        history_completeness=_complete_audit())
+    artifact = fg.load_certification_artifact(_write(tmp_path, payload, name="four.json"))
+    conn = connect_database(tmp_path / "fpl.db")
+    try:
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.event_support_from_certification(conn, artifact, events=[5, 6, 7, 8, 9], cutoff=CUTOFF)
+        assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH in str(failure.value)
+    finally:
+        conn.close()
+
+
+def test_P2_2D_duplicates_and_reorderings_are_deterministic(tmp_path):
+    events = (5, 6, 7, 8)
+    bundles, identities = _bound_bundles(events)
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA, events=list(events),
+                        certified_bundles=bundles, certified_bundle_identity=identities,
+                        history_completeness=_complete_audit())
+    artifact = fg.load_certification_artifact(_write(tmp_path, payload, name="order.json"))
+    conn = connect_database(tmp_path / "fpl.db")
+    try:
+        # A reordering is the SAME horizon: the gate passes and the call progresses
+        # to the unrelated bundle validation (which fails only because this fixture
+        # declares run ids the empty database does not hold).
+        with pytest.raises(Exception) as reordered:
+            fg.event_support_from_certification(conn, artifact, events=[8, 6, 7, 5], cutoff=CUTOFF)
+        assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH not in str(reordered.value)
+        # A duplicate is a DIFFERENT horizon and is refused deterministically.
+        for bad in ([5, 5, 6, 7, 8], [5, 6, 7]):
+            with pytest.raises(fg.DecisionCertificationRequired) as failure:
+                fg.event_support_from_certification(conn, artifact, events=bad, cutoff=CUTOFF)
+            assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH in str(failure.value)
+        # Canonicalisation is order-insensitive and duplicate-preserving.
+        assert fg.canonical_event_horizon([8, 6, 7, 5]) == (5, 6, 7, 8)
+        assert fg.canonical_event_horizon([5, 5, 6]) == (5, 5, 6)
+    finally:
+        conn.close()
+
+
+def test_P2_2E_the_production_runner_seam_refuses_a_mismatched_horizon(tmp_path):
+    """The runner's exact gate: load the artifact, then request its own horizon."""
+
+    source = Path("scripts/run_four_gw_decision.py").read_text(encoding="utf-8")
+    assert "decision_events = fg.decision_events(" in source
+    assert "fg.event_support_from_certification(" in source
+    assert "conn, certification, events=decision_events, cutoff=cutoff" in source
+
+    events = (5, 6, 7, 8, 9)
+    bundles, identities = _bound_bundles(events)
+    payload = _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA, events=list(events),
+                        certified_bundles=bundles, certified_bundle_identity=identities,
+                        history_completeness=_complete_audit())
+    path = _write(tmp_path, payload, name="runner.json")
+    conn = connect_database(tmp_path / "fpl.db")
+    try:
+        # This is line-for-line what the runner does at its certification gate.
+        certification = fg.load_certification_artifact(path)
+        with pytest.raises(fg.DecisionCertificationRequired) as failure:
+            fg.event_support_from_certification(
+                conn, certification, events=[5, 6, 7, 8], cutoff=CUTOFF
+            )
+        assert fg.DIAG_CERTIFICATION_EVENT_SET_MISMATCH in str(failure.value)
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(not R5_ARTIFACT.exists(), reason="the accepted R5 artifact is not present in this checkout")
+def test_P2_2F_the_genuine_r5_four_event_certification_still_passes():
+    artifact = fg.load_certification_artifact(R5_ARTIFACT)
+    assert list(artifact["events"]) == [5, 6, 7, 8]
+    # The runner derives exactly this horizon for planning event 5, so the contract
+    # holds for the accepted artifact and can be verified without a database.
+    assert fg.canonical_event_horizon(artifact["events"]) == (5, 6, 7, 8)
+    assert fg.canonical_event_horizon(fg.decision_events(5, last_event=38)) == (5, 6, 7, 8)

@@ -8,9 +8,11 @@ older official payload (for example after a player's club context changed).
 
 from __future__ import annotations
 
+import copy
 import json
 
 from fpl_brain import repositories as repo
+from fpl_brain.config import DEFAULT_CONFIG
 from fpl_brain.database import connect_database
 from fpl_brain.models import (
     EventRecord,
@@ -304,7 +306,34 @@ KICKOFF = "2026-09-06T14:00:00Z"
 BEFORE_KICKOFF = "2026-09-05T12:00:00Z"
 
 
-def _seed_transfer_world(conn, *, club_at_kickoff=None):
+def _causal_capture(conn, *, club, captured_at, finished_at, accepted=1, player_id=10):
+    """One official capture with EXPLICIT causal provenance.
+
+    ``captured_at`` is the request-start stamp ``run_fetch`` writes BEFORE it issues
+    the HTTP request; ``finished_at`` is when the response actually completed.  Only
+    the latter can authorise anything destructive, and only for an ACCEPTED
+    bootstrap generation.
+    """
+
+    with conn:
+        run_id = conn.execute(
+            "INSERT INTO fetch_runs(started_at, finished_at, status, trigger) VALUES (?,?,?,?)",
+            (captured_at, finished_at, "success", "fetch_fpl"),
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO bootstrap_generations(fetch_run_id, captured_at, accepted, official_element_count,"
+            " parsed_count, persisted_count, element_ids_sha256, element_ids_json, acceptance_rule,"
+            " acceptance_rule_version, recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, captured_at, int(accepted), 1, 1, 1, "0" * 64, "[]", "test_rule", "v1", finished_at),
+        )
+        conn.execute(
+            "INSERT INTO player_snapshots(player_id, fetch_run_id, captured_at, raw_json) VALUES (?,?,?,?)",
+            (player_id, run_id, captured_at, json.dumps({"id": player_id, "team": club})),
+        )
+    return int(run_id)
+
+
+def _seed_transfer_world(conn, *, club_at_kickoff=None, club_finished_at=BEFORE_KICKOFF, accepted=1):
     with conn:
         repo.upsert_teams(
             conn,
@@ -324,13 +353,9 @@ def _seed_transfer_world(conn, *, club_at_kickoff=None):
             [FixtureRecord(id=103, event=2, team_h=1, team_a=2, kickoff_time=KICKOFF,
                            finished=1, started=1, raw_json={})],
         )
-        if club_at_kickoff is not None:
-            run_id = repo.create_fetch_run(conn, "test", None, BEFORE_KICKOFF)
-            conn.execute(
-                "INSERT INTO player_snapshots(player_id, fetch_run_id, captured_at, raw_json)"
-                " VALUES (10, ?, ?, ?)",
-                (run_id, BEFORE_KICKOFF, json.dumps({"id": 10, "team": club_at_kickoff})),
-            )
+    if club_at_kickoff is not None:
+        _causal_capture(conn, club=club_at_kickoff, captured_at=BEFORE_KICKOFF,
+                        finished_at=club_finished_at, accepted=accepted)
 
 
 def _placeholder(conn, event, fixture_id):
@@ -366,7 +391,7 @@ def test_F1B_point_in_time_evidence_of_an_earlier_move_allows_pruning(tmp_path):
     """B: official evidence proves he had already left BEFORE kickoff -> prune."""
 
     conn = connect_database(tmp_path / "fpl.db")
-    _seed_transfer_world(conn, club_at_kickoff=11)    # already at Club C before kickoff
+    _seed_transfer_world(conn, club_at_kickoff=11, club_finished_at=BEFORE_KICKOFF)
     _placeholder(conn, 2, 103)
     with conn:
         deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
@@ -416,4 +441,163 @@ def test_F1E_not_started_placeholder_prunes_normally(tmp_path):
         deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(4, 104)})
     assert deleted == 1
     assert _rows(conn, 104) == 0
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Sol P2-1 — club-at-kickoff evidence must be CAUSAL.
+#
+# run_fetch stamps captured_at BEFORE it issues the HTTP request (the accepted
+# snapshot shows windows of ~5-8 minutes), so a response received after a fixture
+# kicked off can still carry a pre-kickoff captured_at.  Authorising a destructive
+# prune therefore requires the response to have COMPLETED by kickoff AND to belong
+# to an ACCEPTED bootstrap generation; anything else fails safe.
+# ---------------------------------------------------------------------------
+
+AFTER_KICKOFF = "2026-09-06T15:00:00Z"
+
+
+def test_P2_1A_a_response_completing_after_kickoff_cannot_authorise_deletion(tmp_path):
+    """A: request before kickoff, response after -> NOT club-at-kickoff proof."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    # Club C is not in fixture 103 (1 v 2), so this evidence WOULD authorise a prune.
+    _seed_transfer_world(conn, club_at_kickoff=11, club_finished_at=AFTER_KICKOFF)
+    _placeholder(conn, 2, 103)
+    # The leak the old rule allowed: captured_at really is before the kickoff.
+    captured_at = conn.execute("SELECT captured_at FROM player_snapshots").fetchone()[0]
+    assert captured_at < KICKOFF
+    assert repo._official_club_at(conn, 10, KICKOFF) is None
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 0
+    assert _rows(conn, 103) == 1
+    conn.close()
+
+
+def test_P2_1B_a_response_completing_before_kickoff_may_authorise_deletion(tmp_path):
+    """B: request AND accepted response complete before kickoff -> usable."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=11, club_finished_at=BEFORE_KICKOFF)
+    _placeholder(conn, 2, 103)
+    assert repo._official_club_at(conn, 10, KICKOFF) == 11
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 1
+    assert _rows(conn, 103) == 0
+    conn.close()
+
+
+def test_P2_1C_rejected_generation_evidence_cannot_authorise_deletion(tmp_path):
+    """C: a pre-kickoff capture from a REJECTED generation is not authoritative."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=11, club_finished_at=BEFORE_KICKOFF, accepted=0)
+    _placeholder(conn, 2, 103)
+    assert repo._official_club_at(conn, 10, KICKOFF) is None
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 0
+    assert _rows(conn, 103) == 1
+    conn.close()
+
+
+def test_P2_1D_a_later_observation_does_not_retroactively_apply(tmp_path):
+    """D: the latest observation AVAILABLE at kickoff decides, not a later one."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=1, club_finished_at=BEFORE_KICKOFF)
+    # The transfer is only observed AFTER the fixture kicked off.
+    _causal_capture(conn, club=11, captured_at=AFTER_KICKOFF, finished_at=AFTER_KICKOFF)
+    _placeholder(conn, 2, 103)
+    assert repo._official_club_at(conn, 10, KICKOFF) == 1
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 0, "the later Club C observation must not rewrite kickoff membership"
+    assert _rows(conn, 103) == 1
+    conn.close()
+
+
+def test_P2_1E_an_accepted_pre_kickoff_move_may_establish_the_new_club(tmp_path):
+    """E: a genuinely earlier, accepted Club C observation is usable evidence."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=None)
+    _causal_capture(conn, club=11, captured_at=BEFORE_KICKOFF, finished_at=BEFORE_KICKOFF)
+    _placeholder(conn, 2, 103)
+    assert repo._official_club_at(conn, 10, KICKOFF) == 11
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 1
+    assert _rows(conn, 103) == 0
+    conn.close()
+
+
+def test_P2_1F_without_causal_evidence_the_placeholder_is_retained(tmp_path):
+    """F: neither condition proven (rejected generation AND late completion)."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _seed_transfer_world(conn, club_at_kickoff=11, club_finished_at=AFTER_KICKOFF, accepted=0)
+    _placeholder(conn, 2, 103)
+    assert repo._official_club_at(conn, 10, KICKOFF) is None
+    with conn:
+        deleted = repo.prune_stale_element_summary_placeholders(conn, 10, {(3, 999)})
+    assert deleted == 0
+    assert _rows(conn, 103) == 1
+    conn.close()
+
+
+def test_P2_1G_real_ingest_provenance_governs_the_club_evidence(monkeypatch, tmp_path, fixture_json):
+    """The REAL ingest path: request-start time is not availability.
+
+    Runs the canonical ``ingest.run_fetch`` (fake HTTP client is the only stub) so
+    the fetch_run, the accepted bootstrap generation and the snapshot are written by
+    production code, then checks which of the two timestamps the causal lookup may
+    trust.  The clock is controlled only to make the leak window deterministic.
+    """
+
+    from fpl_brain import ingest
+
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["paths"]["database"] = str(tmp_path / "fpl.db")
+    config["paths"]["raw_dir"] = str(tmp_path / "raw")
+    config["paths"]["exports_dir"] = str(tmp_path / "exports")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def get_bootstrap_static(self):
+            return fixture_json("bootstrap_static_sample.json")
+
+        def get_fixtures(self):
+            return []
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(ingest, "FplClient", FakeClient)
+    monkeypatch.setattr(ingest, "utc_now", lambda: BEFORE_KICKOFF)          # captured_at (pre-request)
+    monkeypatch.setattr(repo, "utc_now", lambda: AFTER_KICKOFF)            # started_at / finished_at
+    result = ingest.run_fetch(config)
+    assert result["status"] == "success", result.get("endpoints_failed")
+
+    conn = connect_database(config["paths"]["database"])
+    run = conn.execute("SELECT id, started_at, finished_at FROM fetch_runs ORDER BY id DESC LIMIT 1").fetchone()
+    generation = conn.execute(
+        "SELECT accepted FROM bootstrap_generations WHERE fetch_run_id=?", (run["id"],)
+    ).fetchone()
+    snapshot = conn.execute(
+        "SELECT player_id, captured_at, raw_json FROM player_snapshots WHERE fetch_run_id=? ORDER BY id LIMIT 1",
+        (run["id"],),
+    ).fetchone()
+    # The real path writes the accepted generation and links it to the run.
+    assert generation is not None and generation["accepted"] == 1
+    assert snapshot["captured_at"] == BEFORE_KICKOFF < run["finished_at"]
+    club = int(json.loads(snapshot["raw_json"])["team"])
+    # Request-start time is NOT availability...
+    assert repo._official_club_at(conn, snapshot["player_id"], snapshot["captured_at"]) is None
+    # ...response completion is.
+    assert repo._official_club_at(conn, snapshot["player_id"], run["finished_at"]) == club
     conn.close()

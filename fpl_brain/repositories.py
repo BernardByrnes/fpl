@@ -495,20 +495,39 @@ def upsert_player_gameweeks(
 
 
 def _official_club_at(conn: sqlite3.Connection, player_id: int, moment: str | None) -> int | None:
-    """The player's official club as of ``moment``, from point-in-time captures.
+    """The player's official club as of ``moment``, from CAUSALLY VALID captures.
 
-    Uses the latest official bootstrap capture at or before ``moment`` and reads
-    the element's ``team`` field, which is the only causally valid evidence about
-    which club the player belonged to *then*.  Returns ``None`` when no capture
-    establishes it; callers must FAIL SAFE on ``None``.  The player's CURRENT club
-    is deliberately not consulted: it says nothing about membership at kickoff.
+    Destruction of a started placeholder may only be authorised by evidence that
+    was genuinely available: an official observation qualifies only when
+
+    A. the response that carried it COMPLETED no later than ``moment`` -- the run's
+       ``finished_at``, never ``captured_at``.  ``run_fetch`` takes ``captured_at``
+       before the HTTP request is issued, so a response received after a fixture
+       kicked off can still carry a pre-kickoff ``captured_at`` (the accepted
+       snapshot shows windows of ~5-8 minutes), and request-start time is not
+       availability; and
+    B. it belongs to an ACCEPTED bootstrap generation -- the canonical official
+       state.  Snapshots from rejected generations are recorded for audit only and
+       are never authoritative.
+
+    Returns ``None`` whenever either condition cannot be proven, and the caller
+    MUST fail safe on ``None``.  The player's CURRENT club is never consulted: it
+    says nothing about membership at kickoff.
     """
 
     if moment is None:
         return None
     row = conn.execute(
-        "SELECT raw_json FROM player_snapshots WHERE player_id=? AND captured_at<=?"
-        " ORDER BY captured_at DESC, id DESC LIMIT 1",
+        """SELECT ps.raw_json
+             FROM player_snapshots ps
+             JOIN fetch_runs fr ON fr.id = ps.fetch_run_id
+             JOIN bootstrap_generations bg
+               ON bg.fetch_run_id = ps.fetch_run_id AND bg.accepted = 1
+            WHERE ps.player_id = ?
+              AND fr.finished_at IS NOT NULL
+              AND fr.finished_at <= ?
+            ORDER BY fr.finished_at DESC, ps.id DESC
+            LIMIT 1""",
         (int(player_id), str(moment)),
     ).fetchone()
     if row is None or not row["raw_json"]:
