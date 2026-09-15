@@ -874,11 +874,22 @@ def decide_chip_action(
             f"{chosen.action} is eligible but its active window is not uniquely "
             f"identifiable ({n_active} active definition rows of {len(chosen_definitions)})",
         )
+    # The reservation provider receives the squad plus, when the evaluator
+    # supplies one, its AUTHORITATIVE post-SAVE state (post-route squad, bank, FT,
+    # chip availability).  This is how a chip whose decision turns on a projected
+    # future state hands that state onward WITHOUT the evaluator ever calling the
+    # reservation itself -- the arbiter remains the single seam.  An evaluator
+    # that supplies no such state (notably Triple Captain) is unaffected: its
+    # payload is exactly what it always was.
+    reservation_state: dict[str, Any] = {"squad_ids": list(squad_ids)}
+    supplied_state = (chosen.evidence.get("save_policy") or {}).get("post_save_state_for_reservation")
+    if isinstance(supplied_state, Mapping):
+        reservation_state.update(supplied_state)
     estimate = (reservation or UncalibratedReservation()).estimate(
         action=chosen.action,
         planning_event=planning_event,
         expiry_event=active_definition.get("window_stop_event"),
-        state={"squad_ids": list(squad_ids)},
+        state=reservation_state,
     )
     uplift = chosen.mean_uplift
     net = None if (uplift is None or estimate.value is None) else float(uplift) - float(estimate.value)
