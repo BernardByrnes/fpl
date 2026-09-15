@@ -70,6 +70,10 @@ SOURCE_SNAPSHOT_FILES = (
     "fpl_brain/analytics.py",
     "fpl_brain/calibration.py",
     "fpl_brain/database.py",
+    # The DEFCON probability calibration is part of the certified source set:
+    # its versioned spec determines the DEFCON term in every xPts row, so a
+    # change to it must change the certified code identity.
+    "fpl_brain/defcon_calibration.py",
     "fpl_brain/history_completeness.py",
     "fpl_brain/joint_minutes.py",
     "fpl_brain/minutes_coherence.py",

@@ -41,6 +41,7 @@ from dataclasses import dataclass, fields
 from typing import Any, Iterable, Mapping
 
 from . import analytics, repositories as repo
+from . import defcon_calibration as defcon_cal
 from .scoring_rules import POSITION_IDS, SCORING_RULES_VERSION, ScoringRules, DEFAULT_SCORING_RULES
 from .utils import parse_utc, utc_now
 
@@ -115,9 +116,30 @@ class XPtsConfig:
     # Team-model sensitivity threshold on total xPts.
     team_model_sensitive_threshold: float = 0.5
 
+    # Versioned DEFCON probability calibration.  The version pin (not the
+    # parameters) is the tunable; the spec itself lives in ONE place,
+    # ``defcon_calibration``, so the constants are never scattered through
+    # prediction code.  Changing this version changes the run's config identity.
+    defcon_calibration_version: str = defcon_cal.DEFCON_CALIBRATION_VERSION
+
+    @property
+    def defcon_calibration(self) -> defcon_cal.DefconCalibration:
+        """The resolved calibration spec — fails closed on an unknown version."""
+
+        return defcon_cal.resolve(self.defcon_calibration_version)
+
     def config_hash(self) -> str:
         values = {item.name: getattr(self, item.name) for item in fields(self)}
-        return analytics.canonical_hash({"model": XPTS_MODEL_VERSION, **values})
+        # The FULL calibration spec is hashed, not just its version string, so a
+        # re-fitted parameter set can never inherit a previous run's identity.
+        values.pop("defcon_calibration_version", None)
+        return analytics.canonical_hash(
+            {
+                "model": XPTS_MODEL_VERSION,
+                **values,
+                "defcon_calibration": self.defcon_calibration.as_dict(),
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -381,14 +403,48 @@ def minute_state_mixture(minutes_payload: Mapping[str, Any]) -> list[tuple[float
     return mixture
 
 
+def defcon_hit_probability(
+    position: str,
+    actions_per90: float,
+    expected_minutes: float,
+    rules: ScoringRules,
+    *,
+    calibration: defcon_cal.DefconCalibration,
+) -> float:
+    """P(reaching the DefCon threshold) at a given exposure, CALIBRATED.
+
+    ONE definition, used by the analytic minute mixture here and by the Monte
+    Carlo kernel at a world's sampled minutes.  Keeping it single is what makes
+    the analytic and sampled layers reconcile: both evaluate the same calibrated
+    function at their own exposure, so the only difference between them is the
+    exposure distribution, exactly as before calibration.
+
+    ``calibration`` is REQUIRED.  The raw probability is not a legitimate return
+    value for a caller that has not stated which calibration it is producing.
+    """
+
+    raw = _defcon_p_hit(position, actions_per90, expected_minutes, rules)
+    return float(calibration.apply(raw))
+
+
 def defcon_xpts_with_mixture(
-    position: str, actions_per90: float, minutes_payload: Mapping[str, Any], rules: ScoringRules
+    position: str,
+    actions_per90: float,
+    minutes_payload: Mapping[str, Any],
+    rules: ScoringRules,
+    *,
+    calibration: defcon_cal.DefconCalibration = defcon_cal.DEFCON_CALIBRATION_LEGACY,
 ) -> tuple[float, float, bool]:
     """DefCon expected points and hit probability through the minute mixture.
 
     ``P(Poisson(lambda(m)) >= threshold)`` is NOT globally convex in ``m``, so
     evaluating it once at ``E[minutes]`` carries no universal signed bias.  The
     mixture integrates the frozen states directly instead.
+
+    Defaults to the LEGACY identity calibration so that a historical replay and
+    the primitive-level tests keep their original raw semantics.  Production
+    passes the active spec explicitly (see ``_build_row``), so the prediction
+    path never falls back to raw by omission.
     """
 
     threshold = rules.defcon_threshold_for(position)
@@ -397,15 +453,19 @@ def defcon_xpts_with_mixture(
     mixture = minute_state_mixture(minutes_payload)
     if mixture is None:
         minutes = float(minutes_payload.get("expected_minutes") or 0.0)
-        hit = _defcon_p_hit(position, actions_per90, minutes, rules)
+        hit = defcon_hit_probability(position, actions_per90, minutes, rules, calibration=calibration)
         return rules.defcon_points * hit, hit, False
     # A zero-probability state contributes zero weight, so its conditional mean
     # is irrelevant and must never be evaluated.
     hit = sum(
-        probability * poisson_tail_probability(max(0.0, actions_per90) * mean_minutes / 90.0, threshold)
+        probability * defcon_hit_probability(
+            position, actions_per90, mean_minutes, rules, calibration=calibration
+        )
         for probability, mean_minutes in mixture
         if probability > 0.0
     )
+    # defcon_xpts and defcon_p_hit come from the SAME calibrated probability, so
+    # the two can never disagree about which model produced them.
     return rules.defcon_points * hit, hit, True
 
 
@@ -634,6 +694,11 @@ def build_xpts_projections(
         "model_version": XPTS_MODEL_VERSION,
         "scoring_rules_version": SCORING_RULES_VERSION,
         "config_hash": config.config_hash(),
+        # The run-level record of the calibration that produced every
+        # defcon_p_hit below, with a canonical identity hash so a re-fitted
+        # parameter set cannot reuse this run's provenance.
+        "defcon_calibration": config.defcon_calibration.as_dict(),
+        "defcon_calibration_identity": config.defcon_calibration.identity(),
         "scoring_hash": rules.scoring_hash(),
         "generated_at": generated_at,
         "data_cutoff": cutoff,
@@ -747,7 +812,11 @@ def _build_row(
             flags.append("DEFCON_PRIOR_WEAK")
         flags.append("HISTORICAL_POSITION_UNKNOWN")
         defcon_xpts, p_defcon_hit, defcon_mixture_used = defcon_xpts_with_mixture(
-            position, actions_per90, minutes, rules
+            position, actions_per90, minutes, rules,
+            # Active calibration, resolved from the run config.  Resolving here
+            # (rather than defaulting) means an unknown or malformed calibration
+            # version aborts the projection instead of silently emitting raw.
+            calibration=config.defcon_calibration,
         )
         if not defcon_mixture_used:
             flags.append("DEFCON_MINUTE_MIXTURE_UNAVAILABLE")
@@ -887,6 +956,11 @@ def _build_row(
         "goals_conceded_xpts": round(goals_conceded_xpts, 6),
         "defcon_xpts": round(defcon_xpts, 6),
         "defcon_p_hit": round(p_defcon_hit, 6),
+        # Self-describing provenance: a frozen prediction records WHICH
+        # calibration produced its defcon_p_hit/defcon_xpts, so a future
+        # calibration version can never silently change a historical run's
+        # meaning.  Consumers read it back fail-closed.
+        "defcon_calibration": config.defcon_calibration.as_dict(),
         "defcon_actions_per90": round(actions_per90, 6) if actions_per90 is not None else None,
         "save_xpts": round(save_xpts, 6),
         "save_model": save_info,
