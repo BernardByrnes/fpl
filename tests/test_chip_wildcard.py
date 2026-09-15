@@ -40,7 +40,7 @@ def _player(pid, position, club, price, points, *, p_start=1.0, availability=1.0
             event: wc.WildcardPlayerEvent(
                 event=event, expected_points=points, expected_minutes=90.0 * p_start,
                 p_start=p_start, availability=availability, fixture_count=1,
-                cutoff=CUTOFF, generation=GENERATION,
+                identity=_identity(),
             )
             for event in events
         },
@@ -174,6 +174,15 @@ def _save_route(players, owned, *, bank_tenths=30, events=(5, 6, 7, 8),
     )
 
 
+def _identity(**over):
+    """The complete predictive identity every artifact in the fixture carries."""
+
+    base = dict(cutoff=CUTOFF, data_snapshot_sha256=SNAPSHOT, source_snapshot_sha256=SOURCE_SNAPSHOT,
+                generation=GENERATION, model_config_identity=CONFIG_ID)
+    base.update(over)
+    return wc.WildcardPredictiveIdentity(**base)
+
+
 def _pool_binding(players, *, generation="gen-2026-09-12T19:20:00Z"):
     """The accepted official-pool binding for this fixture's universe."""
 
@@ -206,7 +215,7 @@ def _default_worlds(players, *, events=range(5, 13)):
             minutes[pid] = [0.0 if entry is None else float(entry.expected_minutes)]
             core[pid] = [0.0 if entry is None else float(entry.expected_points)]
         worlds[int(event)] = wc.WildcardWorldInputs(
-            worlds=1, player_ids=ids, minutes=minutes, core=core
+            worlds=1, player_ids=ids, minutes=minutes, core=core, identity=_identity()
         )
     return worlds
 
@@ -556,7 +565,7 @@ def test_K_future_outcomes_outside_the_horizon_cannot_change_the_selection():
         for event in range(13, 20):
             extra[event] = wc.WildcardPlayerEvent(
                 event=event, expected_points=999.0, expected_minutes=90.0, p_start=1.0,
-                availability=1.0, fixture_count=1, cutoff=CUTOFF, generation=GENERATION,
+                availability=1.0, fixture_count=1, identity=_identity(),
             )
         mutated[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
                                          player.market_price_tenths, extra, player.web_name)
@@ -726,7 +735,7 @@ def _with_row_override(players, pid, event, **fields):
         event=entry.event, expected_points=fields.get("expected_points", entry.expected_points),
         expected_minutes=entry.expected_minutes, p_start=fields.get("p_start", entry.p_start),
         availability=entry.availability, fixture_count=entry.fixture_count,
-        cutoff=fields.get("cutoff", entry.cutoff), generation=fields.get("generation", entry.generation),
+        identity=fields.get("identity", entry.identity),
     )
     players[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
                                      player.market_price_tenths, events, player.web_name)
@@ -734,14 +743,14 @@ def _with_row_override(players, pid, event, **fields):
 
 
 def test_P2_A_a_projection_from_a_different_run_refuses():
-    players = _with_row_override(_pool(), 7, 9, generation="generation-OTHER")
+    players = _with_row_override(_pool(), 7, 9, identity=_identity(generation="generation-OTHER"))
     evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
     assert evaluation.candidate_metrics["mean_paired_uplift"] is None
     assert evaluation.reason_codes
 
 
 def test_P2_B_a_projection_from_a_different_cutoff_refuses():
-    players = _with_row_override(_pool(), 7, 9, cutoff="2026-09-13T00:00:00Z")
+    players = _with_row_override(_pool(), 7, 9, identity=_identity(cutoff="2026-09-13T00:00:00Z"))
     evaluation = wc.evaluate_wildcard(_request(players, _legal_owned_ids(players)))
     assert evaluation.candidate_metrics["mean_paired_uplift"] is None
 
@@ -755,11 +764,22 @@ def test_P2_C_a_different_data_snapshot_refuses():
     assert evaluation.candidate_metrics["mean_paired_uplift"] is None
 
 
-def test_P2_D_the_binding_is_individually_coherent():
+def test_P2_D_a_binding_from_another_model_config_refuses():
+    """CORRECTED.  This test previously changed the request's
+    ``model_config_identity`` and asserted that validation PASSED.  That codified
+    the defect: the supplied rows still carry the ORIGINAL config identity, so a
+    binding naming a different model/config describes a different predictive
+    world and must fail closed.
+    """
+
     players = _pool()
     request = _request(players, _legal_owned_ids(players),
                        value_horizon_binding=_value_binding(5, config_id="sha256:" + "8" * 64))
-    assert wc.validate_projections(request) == []
+    problems = wc.validate_projections(request)
+    assert problems, "a differing model/config identity must not validate"
+    assert any("model_config_identity" in p for p in problems), problems
+    evaluation = wc.evaluate_wildcard(request)
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
 
 
 def test_P2_E_a_non_contiguous_horizon_refuses():
@@ -863,7 +883,9 @@ def _worlds_for(players, event, *, blank=(), core_overrides=None, minutes_overri
         blanked = pid in blank
         minutes[pid].append(0.0 if blanked else minutes_overrides.get(pid, 90.0))
         core[pid].append(0.0 if blanked else core_overrides.get(pid, 1.0))
-    return wc.WildcardWorldInputs(worlds=1, player_ids=ids, minutes=minutes, core=core)
+    return wc.WildcardWorldInputs(
+        worlds=1, player_ids=ids, minutes=minutes, core=core, identity=_identity()
+    )
 
 
 def _lineup_request(players, owned, worlds, *, planning_event=5):
@@ -1036,6 +1058,7 @@ def test_worlds_I_world_series_must_cover_every_supplied_player():
         player_ids=tuple(sorted(players))[:10],  # five players missing
         minutes={pid: [90.0] for pid in tuple(sorted(players))[:10]},
         core={pid: [1.0] for pid in tuple(sorted(players))[:10]},
+        identity=_identity(),
     ) for event in range(5, 13)}
     request = _lineup_request(players, owned, partial)
     problems = wc.validate_projections(request)
@@ -1422,3 +1445,173 @@ def test_reservation_B_a_full_decision_calls_the_reservation_exactly_once():
     assert state["bank_tenths"] == 77
     assert state["free_transfers"] == 3
     assert state["retains_wildcard_option"] is True
+
+
+# ---------------------------------------------------------------------------
+# FINDING B — full predictive provenance on ROWS and WORLDS
+# ---------------------------------------------------------------------------
+
+
+def _problems_for_row(**over):
+    players = _with_row_override(_pool(), 7, 9, identity=_identity(**over))
+    request = _request(players, _legal_owned_ids(players))
+    return wc.validate_projections(request)
+
+
+def _problems_for_world(**over):
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    worlds = dict(_default_worlds(players))
+    target = 9
+    entry = worlds[target]
+    worlds[target] = wc.WildcardWorldInputs(
+        worlds=entry.worlds, player_ids=entry.player_ids,
+        minutes=entry.minutes, core=entry.core, identity=_identity(**over),
+    )
+    return wc.validate_projections(_request(players, owned, worlds_by_event=worlds))
+
+
+def test_B_row_A_a_differing_row_cutoff_refuses():
+    problems = _problems_for_row(cutoff="2026-09-13T00:00:00Z")
+    assert any("cutoff" in p for p in problems), problems
+
+
+def test_B_row_B_a_differing_row_data_snapshot_refuses():
+    problems = _problems_for_row(data_snapshot_sha256="sha256:" + "9" * 64)
+    assert any("data_snapshot_sha256" in p for p in problems), problems
+
+
+def test_B_row_C_a_differing_row_source_snapshot_refuses():
+    problems = _problems_for_row(source_snapshot_sha256="sha256:" + "6" * 64)
+    assert any("source_snapshot_sha256" in p for p in problems), problems
+
+
+def test_B_row_D_a_differing_row_generation_refuses():
+    problems = _problems_for_row(generation="generation-OTHER")
+    assert any("generation" in p for p in problems), problems
+
+
+def test_B_row_E_a_differing_row_model_config_refuses():
+    problems = _problems_for_row(model_config_identity="sha256:" + "8" * 64)
+    assert any("model_config_identity" in p for p in problems), problems
+
+
+def test_B_row_F_a_fully_coherent_row_validates():
+    assert _problems_for_row() == []
+
+
+def test_B_row_G_a_row_with_no_identity_refuses():
+    players = _pool()
+    player = players[7]
+    events = dict(player.events)
+    entry = events[9]
+    events[9] = wc.WildcardPlayerEvent(
+        event=9, expected_points=entry.expected_points, expected_minutes=entry.expected_minutes,
+        p_start=entry.p_start, availability=entry.availability, fixture_count=1, identity=None,
+    )
+    players[7] = wc.WildcardPlayer(7, player.position, player.club_id,
+                                   player.market_price_tenths, events, player.web_name)
+    problems = wc.validate_projections(_request(players, _legal_owned_ids(players)))
+    assert any("no predictive identity on the row" in p for p in problems), problems
+
+
+def test_B_world_A_a_differing_world_cutoff_refuses():
+    problems = _problems_for_world(cutoff="2026-09-13T00:00:00Z")
+    assert any("cutoff" in p for p in problems), problems
+
+
+def test_B_world_B_a_differing_world_data_snapshot_refuses():
+    problems = _problems_for_world(data_snapshot_sha256="sha256:" + "9" * 64)
+    assert any("data_snapshot_sha256" in p for p in problems), problems
+
+
+def test_B_world_C_a_differing_world_source_snapshot_refuses():
+    problems = _problems_for_world(source_snapshot_sha256="sha256:" + "6" * 64)
+    assert any("source_snapshot_sha256" in p for p in problems), problems
+
+
+def test_B_world_D_a_differing_world_generation_refuses():
+    problems = _problems_for_world(generation="generation-OTHER")
+    assert any("generation" in p for p in problems), problems
+
+
+def test_B_world_E_a_differing_world_model_config_refuses():
+    problems = _problems_for_world(model_config_identity="sha256:" + "8" * 64)
+    assert any("model_config_identity" in p for p in problems), problems
+
+
+def test_B_world_F_a_fully_coherent_world_matrix_validates():
+    assert _problems_for_world() == []
+    assert wc.validate_projections(_request(_pool(), _legal_owned_ids(_pool()))) == []
+
+
+def test_B_world_G_a_world_matrix_with_no_identity_refuses():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    worlds = dict(_default_worlds(players))
+    entry = worlds[9]
+    worlds[9] = wc.WildcardWorldInputs(
+        worlds=entry.worlds, player_ids=entry.player_ids,
+        minutes=entry.minutes, core=entry.core, identity=None,
+    )
+    problems = wc.validate_projections(_request(players, owned, worlds_by_event=worlds))
+    assert any("no predictive identity on the world matrix" in p for p in problems), problems
+
+
+# ---------------------------------------------------------------------------
+# §11 — the decisive tests: a VALID binding with ONE bad artifact
+# ---------------------------------------------------------------------------
+
+
+def test_B_decisive_a_valid_binding_with_one_row_from_another_snapshot_refuses():
+    """The binding is perfect; exactly one ROW belongs to another data snapshot."""
+
+    players = _with_row_override(_pool(), 7, 9, identity=_identity(data_snapshot_sha256="sha256:" + "9" * 64))
+    request = _request(players, _legal_owned_ids(players))
+    # the binding itself is internally valid
+    assert request.value_horizon_binding.problems() == []
+    evaluation = wc.evaluate_wildcard(request)
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+    assert any("data_snapshot_sha256" in p for p in wc.validate_projections(request))
+
+
+def test_B_decisive_a_valid_binding_with_one_world_from_another_config_refuses():
+    """The binding is perfect; exactly one WORLD matrix belongs to another config."""
+
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    worlds = dict(_default_worlds(players))
+    entry = worlds[11]
+    worlds[11] = wc.WildcardWorldInputs(
+        worlds=entry.worlds, player_ids=entry.player_ids, minutes=entry.minutes, core=entry.core,
+        identity=_identity(model_config_identity="sha256:" + "8" * 64),
+    )
+    request = _request(players, owned, worlds_by_event=worlds)
+    assert request.value_horizon_binding.problems() == []
+    evaluation = wc.evaluate_wildcard(request)
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+    assert any("model_config_identity" in p for p in wc.validate_projections(request))
+
+
+def test_B_identity_is_compared_not_stamped():
+    """The adapter must never copy the binding's identity onto the evidence."""
+
+    import inspect
+
+    from fpl_brain import wildcard_request_adapter as adapter_module
+
+    source = inspect.getsource(adapter_module)
+    assert "predictive_identity(" not in source.replace("binding.predictive_identity()", ""), (
+        "the adapter must not stamp an identity onto evidence from the binding"
+    )
+    # The comparison is evidence -> binding, performed where the evidence is
+    # validated (the row's and the world's own problems()), never by writing the
+    # binding's identity into the evidence.
+    from fpl_brain import chip_wildcard as wc_module
+
+    assert "disagreements_with(binding.predictive_identity())" in inspect.getsource(
+        wc_module.WildcardPlayerEvent.problems
+    )
+    assert "disagreements_with(binding.predictive_identity())" in inspect.getsource(
+        wc_module.WildcardWorldInputs.problems
+    )

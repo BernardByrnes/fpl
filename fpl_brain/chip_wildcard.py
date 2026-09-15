@@ -168,6 +168,57 @@ class WildcardHorizonSpec:
 
 
 @dataclass(frozen=True)
+class WildcardPredictiveIdentity:
+    """The complete identity of ONE predictive world, carried by every artifact.
+
+    ``WildcardValueHorizonBinding`` names the world a Wildcard decision is
+    authorised against; a projection ROW or a world MATRIX is usable only if it
+    came from that same world.  Binding rows by cutoff and a generation label
+    alone is not enough -- a row from another data snapshot, another source
+    snapshot, or another model/config can match both strings and still come from a
+    different predictive world, including a current/latest one leaking into a
+    historical replay.
+
+    The identity is therefore CARRIED by the evidence and COMPARED against the
+    binding.  It is never stamped onto a row from the binding, which would make
+    the check circular.
+    """
+
+    cutoff: str
+    data_snapshot_sha256: str
+    source_snapshot_sha256: str
+    generation: str
+    model_config_identity: str
+
+    def problems(self) -> list[str]:
+        found: list[str] = []
+        for name in ("cutoff", "data_snapshot_sha256", "source_snapshot_sha256",
+                     "generation", "model_config_identity"):
+            if not str(getattr(self, name) or "").strip():
+                found.append(f"{name} is empty")
+        return found
+
+    def disagreements_with(self, other: "WildcardPredictiveIdentity") -> list[str]:
+        """Every dimension on which this identity differs from ``other``."""
+
+        found: list[str] = []
+        for name in ("cutoff", "data_snapshot_sha256", "source_snapshot_sha256",
+                     "generation", "model_config_identity"):
+            if str(getattr(self, name)) != str(getattr(other, name)):
+                found.append(name)
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cutoff": str(self.cutoff),
+            "data_snapshot_sha256": str(self.data_snapshot_sha256),
+            "source_snapshot_sha256": str(self.source_snapshot_sha256),
+            "generation": str(self.generation),
+            "model_config_identity": str(self.model_config_identity),
+        }
+
+
+@dataclass(frozen=True)
 class WildcardValueHorizonBinding:
     """The certified identity of the LONGER Wildcard valuation horizon.
 
@@ -225,6 +276,17 @@ class WildcardValueHorizonBinding:
             "model_config_identity": str(self.model_config_identity),
             "horizon_version": str(self.horizon_version),
         }
+
+    def predictive_identity(self) -> WildcardPredictiveIdentity:
+        """The complete predictive world this horizon is authorised against."""
+
+        return WildcardPredictiveIdentity(
+            cutoff=str(self.decision_cutoff),
+            data_snapshot_sha256=str(self.data_snapshot_sha256),
+            source_snapshot_sha256=str(self.source_snapshot_sha256),
+            generation=str(self.prediction_generation),
+            model_config_identity=str(self.model_config_identity),
+        )
 
     def identity(self) -> str:
         from .analytics import canonical_hash
@@ -383,10 +445,11 @@ def wildcard_horizon(
 class WildcardPlayerEvent:
     """One player's projection for one event, from certified inputs only.
 
-    ``cutoff`` and ``generation`` are this ROW's own provenance.  They are
-    checked against the value-horizon binding individually, because a binding
-    that only covers the request cannot stop an arbitrary row being inserted
-    under a matching label.
+    ``identity`` is this ROW's own complete predictive provenance, and it is
+    checked against the value-horizon binding individually.  A binding that only
+    covers the request cannot stop an arbitrary row being inserted under a
+    matching label, and two matching strings (cutoff + generation) cannot stop a
+    row from a different data snapshot, source snapshot or model/config.
     """
 
     event: int
@@ -395,8 +458,7 @@ class WildcardPlayerEvent:
     p_start: float
     availability: float
     fixture_count: int = 1
-    cutoff: str = ""
-    generation: str = ""
+    identity: "WildcardPredictiveIdentity | None" = None
 
     def problems(self, binding: "WildcardValueHorizonBinding | None" = None) -> list[str]:
         found: list[str] = []
@@ -413,10 +475,14 @@ class WildcardPlayerEvent:
         if int(self.fixture_count) < 0:
             found.append("fixture_count is negative")
         if binding is not None:
-            if str(self.cutoff) != str(binding.decision_cutoff):
-                found.append(f"cutoff {self.cutoff!r} != bound {binding.decision_cutoff!r}")
-            if str(self.generation) != str(binding.prediction_generation):
-                found.append(f"generation {self.generation!r} != bound {binding.prediction_generation!r}")
+            if self.identity is None:
+                found.append("no predictive identity on the row")
+            else:
+                found.extend(self.identity.problems())
+                for dimension in self.identity.disagreements_with(binding.predictive_identity()):
+                    found.append(
+                        f"row identity disagrees with the bound value horizon on {dimension}"
+                    )
         return found
 
 
@@ -451,6 +517,9 @@ class WildcardWorldInputs:
     player_ids: tuple[int, ...]
     minutes: Mapping[int, Sequence[float]]
     core: Mapping[int, Sequence[float]]
+    #: World matrices are PREDICTIVE EVIDENCE, not provenance-free simulation
+    #: inputs: a complete-looking matrix from another predictive run must refuse.
+    identity: "WildcardPredictiveIdentity | None" = None
 
     def __post_init__(self) -> None:
         problems = self.problems()
@@ -460,8 +529,17 @@ class WildcardWorldInputs:
                 reasons=(WC_WORLD_INPUTS_MALFORMED,),
             )
 
-    def problems(self) -> list[str]:
+    def problems(self, binding: "WildcardValueHorizonBinding | None" = None) -> list[str]:
         found: list[str] = []
+        if binding is not None:
+            if self.identity is None:
+                found.append("no predictive identity on the world matrix")
+            else:
+                found.extend(self.identity.problems())
+                for dimension in self.identity.disagreements_with(binding.predictive_identity()):
+                    found.append(
+                        f"world identity disagrees with the bound value horizon on {dimension}"
+                    )
         if int(self.worlds) <= 0:
             found.append(f"worlds={self.worlds} must be positive")
             return found
@@ -756,6 +834,13 @@ def validate_projections(request: WildcardRequest) -> list[str]:
             if world_inputs is None:
                 problems.append(f"{WC_WORLD_INPUTS_MISSING}: no world inputs for event {event}")
                 continue
+            # Worlds are predictive evidence: their provenance must match the
+            # bound value horizon on EVERY dimension, not merely look complete.
+            # The matrix is keyed by event, so a mismatched key cannot hide here.
+            for detail in world_inputs.problems(binding):
+                if ("disagrees with the bound value horizon" in detail
+                        or "no predictive identity" in detail):
+                    problems.append(f"event {event}: {detail}")
             covered = {int(pid) for pid in world_inputs.player_ids}
             uncovered = sorted(supplied - covered)
             if uncovered:
