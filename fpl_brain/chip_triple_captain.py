@@ -4,38 +4,45 @@ WHAT THE CHIP DOES
 ------------------
 Normal captaincy adds ONE extra copy of the armband holder's score; Triple
 Captain adds TWO.  The armband holder is world-dependent: the captain when he
-appears, otherwise the vice when he appears, otherwise nobody.  So the whole
-chip is one extra copy of
+appears, otherwise the vice when he appears, otherwise nobody.  So the chip is
+one extra copy of
 
     arm_w = core[captain][w] if captain appeared in w
             else core[vice][w] if vice appeared in w
             else 0
 
-and this module computes it per world from the certified minute/score series.
-There is no ``captain_xpts * 3`` shortcut anywhere: captain, vice, appearance
-fallback and the armband-source probabilities all come out of the same worlds.
+computed per world from the certified minute/score series.  There is no
+``captain_xpts * 3`` shortcut anywhere.
+
+PLAY vs SAVE — BOTH ARMS OPTIMISE
+---------------------------------
+The comparison is between two LEGAL POLICIES, not between an optimised arm and
+whatever pair happened to be handed in:
+
+    PLAY_TC = best legal (captain, vice) pair under Triple Captain
+    SAVE    = best legal (captain, vice) pair WITHOUT the chip
+
+Each arm independently takes the argmax over the SAME candidate universe (every
+ordered pair of distinct starting players), on the SELECTION worlds only.  Using
+the request's own pair for SAVE would understate the counterfactual and inflate
+the reported uplift.
 
 INSIDE THE FOUR-GW POLICY
 -------------------------
 TC's direct scoring effect is H1 only, and it does not touch the squad, transfers,
-free-transfer state or bank.  Therefore the H2–H4 consequence of a TC policy is
-*identical* to the SAVE policy's by construction, and the four-GW comparison is
-
-    play TC  =  H1 armband uplift  +  H2-H4 route consequence  -  future opportunity
-    save     =  0                  +  H2-H4 route consequence
-
-The two route terms cancel, which is why the evaluator requires the exact
-four-event horizon and carries an explicit ``route_consequence_delta`` field
-(zero by construction, and available for a caller that has measured something
-else) rather than silently assuming it away.  The remaining term — what saving
-the chip is worth — is the reservation abstraction in ``chip_decision``.  No
-final numeric reservation threshold is invented here.
+free-transfer state or bank, so the H2-H4 consequence of the two arms is
+identical *for the transfers and lineup*.  A caller that has measured a real
+non-zero H2-H4 consequence may pass it as ``route_consequence_delta``; that scalar
+is added to the paired per-world difference EXACTLY ONCE and therefore moves
+``mean_paired_uplift`` (a constant shift leaves the SE and the dispersion
+unchanged — it is never displayed-and-ignored).  The remaining term — what saving
+the chip is worth — is the reservation abstraction in ``chip_decision``.
 
 SELECTION vs VALUATION
 ----------------------
-The (captain, vice) pair is CHOSEN on the deterministic selection worlds and its
-value is REPORTED on the disjoint valuation worlds, so the reported uplift is not
-the maximum of the same sample that produced it.
+Both pairs are CHOSEN on the deterministic selection worlds and VALUED on the
+disjoint valuation worlds, so the reported uplift is not the maximum of the same
+sample that produced it.  No candidate is re-selected on the valuation worlds.
 """
 
 from __future__ import annotations
@@ -48,32 +55,38 @@ from . import manager_lineup
 from .chip_decision import (
     CALIBRATION_UNCALIBRATED,
     CHIP_ACTION_TC,
-    DIAG_CHIP_HORIZON_INCOMPLETE,
+    DIAG_CHIP_HORIZON_NOT_CANONICAL,
+    DIAG_CHIP_PLANNING_EVENT_MISMATCH,
     DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE,
     ChipEvaluation,
+    ChipHorizonBinding,
     ChipInputError,
     ChipWorldInputs,
     partition_worlds,
 )
 
-TRIPLE_CAPTAIN_EVALUATOR_VERSION = "chip_tc_v1.0.0"
+TRIPLE_CAPTAIN_EVALUATOR_VERSION = "chip_tc_v1.1.0"
 
 #: Armband BONUS copies.  Normal captaincy adds one copy (the armband holder
-#: counts twice); Triple Captain adds two (he counts three times).  The chip is
-#: therefore worth exactly one copy of the holder's score, which is what the
-#: paired difference reports.
+#: counts twice); Triple Captain adds two (he counts three times), so the chip is
+#: worth exactly one extra copy of the holder's score.
 NORMAL_CAPTAIN_BONUS_COPIES = 1
 TRIPLE_CAPTAIN_BONUS_COPIES = 2
 
 #: Interval half-width constant, matching the engine's near-tie convention.
 PAIRED_INTERVAL_K = 1.96
 
+#: The contract this evaluator implements for a supplied route consequence.
+ROUTE_DELTA_CONTRACT = "ADDED_ONCE_TO_THE_PAIRED_DIFFERENCE"
+
 DIAG_TC_EVALUATED = "CHIP_TC_EVALUATED"
-DIAG_TC_CAPTAIN_CHANGED = "CHIP_TC_CAPTAIN_UNCHANGED_BY_CHIP"
+DIAG_TC_PLAY_ARM_DIFFERS_FROM_REQUEST = "CHIP_TC_PLAY_ARM_DIFFERS_FROM_REQUEST"
+DIAG_TC_SAVE_ARM_DIFFERS_FROM_REQUEST = "CHIP_TC_SAVE_ARM_DIFFERS_FROM_REQUEST"
 DIAG_TC_CAPTAIN_APPEARANCE_UNCERTAIN = "CHIP_TC_CAPTAIN_APPEARANCE_UNCERTAIN"
 DIAG_TC_VICE_FALLBACK_MATERIAL = "CHIP_TC_VICE_FALLBACK_MATERIAL"
-DIAG_TC_NO_ARMband_POSSIBLE = "CHIP_TC_NO_ARMband_POSSIBLE"
+DIAG_TC_NO_ARMBAND_POSSIBLE = "CHIP_TC_NO_ARMBAND_POSSIBLE"
 DIAG_TC_INPUT_UNCERTAINTY = "CHIP_TC_INPUT_UNCERTAINTY_PROPAGATED"
+DIAG_TC_ROUTE_DELTA_APPLIED = "CHIP_TC_ROUTE_CONSEQUENCE_DELTA_APPLIED"
 
 
 @dataclass(frozen=True)
@@ -81,18 +94,26 @@ class TripleCaptainRequest:
     """Everything the evaluator may consume — nothing from the football model."""
 
     worlds: ChipWorldInputs
+    horizon_binding: ChipHorizonBinding
     policy: manager_lineup.ManagerPolicy
     positions: Mapping[int, str]
-    planning_event: int
     chip_available: bool = True
     calibration_status: str = CALIBRATION_UNCALIBRATED
-    #: Optional measured H2-H4 consequence difference between the two arms.  Left
-    #: at 0.0 because TC provably does not change any H2-H4 input; a caller that
-    #: has measured otherwise may pass it.
+    #: Optional measured H2-H4 consequence difference between the two arms, in the
+    #: same units as the H1 uplift.  Added to the paired per-world difference
+    #: exactly once (see ``ROUTE_DELTA_CONTRACT``); 0.0 by construction because TC
+    #: does not change any H2-H4 input.
     route_consequence_delta: float = 0.0
     #: Upstream uncertainty flags to propagate verbatim (role, minutes, staleness).
     input_uncertainty_flags: Sequence[str] = field(default_factory=tuple)
-    required_horizon_length: int = 4
+
+    @property
+    def planning_event(self) -> int:
+        return int(self.horizon_binding.planning_event)
+
+    @property
+    def horizon_events(self) -> tuple[int, ...]:
+        return tuple(int(event) for event in self.horizon_binding.horizon_events)
 
 
 def _quantile(sorted_values: Sequence[float], q: float) -> float:
@@ -117,7 +138,6 @@ def _std(values: Sequence[float]) -> float:
 
 def _armband_series(
     *,
-    worlds: int,
     core: Mapping[int, Sequence[float]],
     appeared: Mapping[int, Sequence[bool]],
     captain: int,
@@ -127,7 +147,7 @@ def _armband_series(
     """Per-world armband extra for one (captain, vice) pair, on ``indices`` only.
 
     Mirrors ``manager_lineup.captain_multiplier`` exactly (captain, then vice,
-    then none) — the certified engine is the oracle for that rule, and the
+    then nobody) — the certified engine is the oracle for that rule and the
     equivalence is pinned by test.
     """
 
@@ -166,30 +186,69 @@ def _armband_source_counts(
     return counts
 
 
-def captaincy_candidates(policy: manager_lineup.ManagerPolicy, positions: Mapping[int, str]) -> tuple[tuple[int, int], ...]:
+def captaincy_candidates(
+    policy: manager_lineup.ManagerPolicy, positions: Mapping[int, str]
+) -> tuple[tuple[int, int], ...]:
     """Every legal (captain, vice) pair: both in the XI, distinct.
 
     FPL requires the armband to be on a starting player, and the vice to be a
-    different starting player, so the candidate set is the XI's ordered pairs.
+    different starting player, so the candidate universe is the XI's ordered
+    pairs.  BOTH arms search exactly this universe.
     """
 
     starters = tuple(sorted(int(pid) for pid in policy.starter_ids))
     return tuple((captain, vice) for captain in starters for vice in starters if captain != vice)
 
 
+def _best_pair(
+    *,
+    core: Mapping[int, Sequence[float]],
+    appeared: Mapping[int, Sequence[bool]],
+    candidates: Sequence[tuple[int, int]],
+    indices: Sequence[int],
+) -> tuple[tuple[int, int], float]:
+    """Deterministic argmax of the armband over the candidate universe.
+
+    One implementation, called independently for each arm, so a future change to
+    either arm's objective cannot silently reuse the other arm's choice.  Ties
+    break on (captain, vice) ascending.
+    """
+
+    ranked: list[tuple[float, int, int]] = []
+    for candidate_captain, candidate_vice in candidates:
+        series = _armband_series(
+            core=core, appeared=appeared,
+            captain=candidate_captain, vice=candidate_vice, indices=indices,
+        )
+        ranked.append((-_mean(series), candidate_captain, candidate_vice))
+    ranked.sort(key=lambda row: (row[0], row[1], row[2]))
+    best_mean, best_captain, best_vice = ranked[0]
+    return (int(best_captain), int(best_vice)), -best_mean
+
+
 def evaluate_triple_captain(request: TripleCaptainRequest) -> ChipEvaluation:
-    """Evaluate TC against the SAVE policy on one certified world set."""
+    """Evaluate PLAY_TC against an equally-optimised SAVE arm on one world set."""
 
     worlds = request.worlds
     total_worlds = worlds.validate()
+    binding = request.horizon_binding
 
-    # The exact four-GW horizon is required: no fifth event, no shortened horizon.
-    events = tuple(int(event) for event in worlds.horizon_events)
-    if len(events) != int(request.required_horizon_length):
+    # The evaluation is bound to the exact certified horizon, planning event and
+    # certification identity.
+    problems = binding.matches_worlds(worlds)
+    if int(request.policy.captain_id) == int(request.policy.vice_captain_id):
+        problems.append("captain and vice are the same player")
+    if problems:
         raise ChipInputError(
-            f"{DIAG_CHIP_HORIZON_INCOMPLETE}: Triple Captain needs the exact "
-            f"{int(request.required_horizon_length)}-event horizon, got {list(events)}",
-            reasons=[DIAG_CHIP_HORIZON_INCOMPLETE],
+            f"{DIAG_CHIP_PLANNING_EVENT_MISMATCH}: the request is not bound to the certified context: "
+            + "; ".join(problems),
+            reasons=[DIAG_CHIP_PLANNING_EVENT_MISMATCH],
+        )
+    events = request.horizon_events
+    if events != binding.validate().horizon_events:
+        raise ChipInputError(
+            f"{DIAG_CHIP_HORIZON_NOT_CANONICAL}: horizon {list(events)} is not the bound certified horizon",
+            reasons=[DIAG_CHIP_HORIZON_NOT_CANONICAL],
         )
 
     policy = request.policy
@@ -200,13 +259,8 @@ def evaluate_triple_captain(request: TripleCaptainRequest) -> ChipEvaluation:
             f"{DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE}: the H1 policy is not legal: {legality}",
             reasons=[DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE],
         )
-    captain = int(policy.captain_id)
-    vice = int(policy.vice_captain_id)
-    if captain == vice:
-        raise ChipInputError(
-            f"{DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE}: captain and vice are the same player {captain}",
-            reasons=[DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE],
-        )
+    requested_captain = int(policy.captain_id)
+    requested_vice = int(policy.vice_captain_id)
     policy_players = set(int(pid) for pid in policy.starter_ids) | {int(policy.bench_gk_id)} | set(
         int(pid) for pid in policy.bench_outfield_order
     )
@@ -228,53 +282,56 @@ def evaluate_triple_captain(request: TripleCaptainRequest) -> ChipEvaluation:
             reasons=[DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE],
         )
 
-    # --- SELECTION: choose the armband pair on the selection worlds only -------
-    ranked: list[tuple[float, int, int, list[float]]] = []
-    for candidate_captain, candidate_vice in candidates:
-        series = _armband_series(
-            worlds=total_worlds, core=worlds.core, appeared=appeared,
-            captain=candidate_captain, vice=candidate_vice, indices=partition.selection,
-        )
-        ranked.append((-_mean(series), candidate_captain, candidate_vice, series))
-    ranked.sort(key=lambda row: (row[0], row[1], row[2]))
-    best_mean_selection, best_captain, best_vice, _ = ranked[0]
+    # --- SELECTION: each arm optimises INDEPENDENTLY on the selection worlds ----
+    tc_pair, tc_selection_arm = _best_pair(
+        core=worlds.core, appeared=appeared, candidates=candidates, indices=partition.selection
+    )
+    save_pair, save_selection_arm = _best_pair(
+        core=worlds.core, appeared=appeared, candidates=candidates, indices=partition.selection
+    )
 
-    # --- VALUATION: report the chosen pair on the disjoint worlds --------------
+    # --- VALUATION: value the two selected policies on the disjoint worlds ------
     arm_tc = _armband_series(
-        worlds=total_worlds, core=worlds.core, appeared=appeared,
-        captain=best_captain, vice=best_vice, indices=partition.valuation,
+        core=worlds.core, appeared=appeared,
+        captain=tc_pair[0], vice=tc_pair[1], indices=partition.valuation,
     )
     arm_save = _armband_series(
-        worlds=total_worlds, core=worlds.core, appeared=appeared,
-        captain=captain, vice=vice, indices=partition.valuation,
+        core=worlds.core, appeared=appeared,
+        captain=save_pair[0], vice=save_pair[1], indices=partition.valuation,
     )
+    route_delta = float(request.route_consequence_delta)
     paired = [
         float(TRIPLE_CAPTAIN_BONUS_COPIES) * arm_tc[index]
         - float(NORMAL_CAPTAIN_BONUS_COPIES) * arm_save[index]
+        + route_delta
         for index in range(len(partition.valuation))
     ]
     mean_uplift = _mean(paired)
     paired_se = _std(paired) / math.sqrt(len(paired)) if paired else float("nan")
     ordered = sorted(paired)
 
-    sources = _armband_source_counts(
-        appeared=appeared, captain=best_captain, vice=best_vice, indices=partition.valuation
+    sources_tc = _armband_source_counts(
+        appeared=appeared, captain=tc_pair[0], vice=tc_pair[1], indices=partition.valuation
+    )
+    sources_save = _armband_source_counts(
+        appeared=appeared, captain=save_pair[0], vice=save_pair[1], indices=partition.valuation
     )
     valuation_worlds = max(1, partition.valuation_worlds)
-    p_captain_appears = _mean([1.0 if appeared[best_captain][index] else 0.0 for index in partition.valuation])
-    p_captain_chosen = sources["CAPTAIN"] / valuation_worlds
-    p_vice_armband = sources["VICE"] / valuation_worlds
-    p_no_armband = sources["NONE"] / valuation_worlds
+    p_captain_appears = _mean([1.0 if appeared[tc_pair[0]][index] else 0.0 for index in partition.valuation])
 
     flags: list[str] = [DIAG_TC_EVALUATED]
-    if int(best_captain) != captain:
-        flags.append(DIAG_TC_CAPTAIN_CHANGED)
+    if tc_pair != (requested_captain, requested_vice):
+        flags.append(DIAG_TC_PLAY_ARM_DIFFERS_FROM_REQUEST)
+    if save_pair != (requested_captain, requested_vice):
+        flags.append(DIAG_TC_SAVE_ARM_DIFFERS_FROM_REQUEST)
     if 0.0 < p_captain_appears < 1.0:
         flags.append(DIAG_TC_CAPTAIN_APPEARANCE_UNCERTAIN)
-    if p_vice_armband > 0.05:
+    if sources_tc["VICE"] / valuation_worlds > 0.05:
         flags.append(DIAG_TC_VICE_FALLBACK_MATERIAL)
-    if p_no_armband > 0.0:
-        flags.append(DIAG_TC_NO_ARMband_POSSIBLE)
+    if sources_tc["NONE"] > 0:
+        flags.append(DIAG_TC_NO_ARMBAND_POSSIBLE)
+    if route_delta != 0.0:
+        flags.append(DIAG_TC_ROUTE_DELTA_APPLIED)
     propagated = tuple(str(flag) for flag in request.input_uncertainty_flags)
     if propagated:
         flags.append(DIAG_TC_INPUT_UNCERTAINTY)
@@ -285,30 +342,34 @@ def evaluate_triple_captain(request: TripleCaptainRequest) -> ChipEvaluation:
         candidate_metrics={
             "mean_paired_uplift": round(mean_uplift, 6),
             "mean_tc_armband_bonus_selection": round(
-                -best_mean_selection * float(TRIPLE_CAPTAIN_BONUS_COPIES), 6
+                tc_selection_arm * float(TRIPLE_CAPTAIN_BONUS_COPIES), 6
             ),
-            "mean_tc_armband_bonus_valuation": round(
-                _mean(arm_tc) * float(TRIPLE_CAPTAIN_BONUS_COPIES), 6
+            "mean_save_armband_bonus_selection": round(
+                save_selection_arm * float(NORMAL_CAPTAIN_BONUS_COPIES), 6
             ),
-            "mean_save_armband_bonus_valuation": round(
-                _mean(arm_save) * float(NORMAL_CAPTAIN_BONUS_COPIES), 6
-            ),
+            "mean_tc_armband_bonus_valuation": round(_mean(arm_tc) * TRIPLE_CAPTAIN_BONUS_COPIES, 6),
+            "mean_save_armband_bonus_valuation": round(_mean(arm_save) * NORMAL_CAPTAIN_BONUS_COPIES, 6),
             "paired_se": round(paired_se, 6),
             "armband_bonus_copies": {
                 "normal": float(NORMAL_CAPTAIN_BONUS_COPIES),
                 "triple_captain": float(TRIPLE_CAPTAIN_BONUS_COPIES),
             },
-            "route_consequence_delta": float(request.route_consequence_delta),
+            "route_consequence_delta": route_delta,
+            "route_consequence_contract": ROUTE_DELTA_CONTRACT,
             "four_gw_basis": (
                 "TC alters only the H1 armband and the chip ledger, so the H2-H4 policy consequence is "
-                "identical across arms; the horizon is required to be exactly four events"
+                "identical across arms and the horizon must be the exact canonical four events"
             ),
             "horizon_events": list(events),
-            "captain_id": int(best_captain),
-            "vice_captain_id": int(best_vice),
-            "save_captain_id": captain,
-            "save_vice_captain_id": vice,
-            "selected_candidate": f"{int(best_captain)}/{int(best_vice)}",
+            "captain_id": int(tc_pair[0]),
+            "vice_captain_id": int(tc_pair[1]),
+            "save_captain_id": int(save_pair[0]),
+            "save_vice_captain_id": int(save_pair[1]),
+            "save_arm_optimised": True,
+            "requested_captain_id": requested_captain,
+            "requested_vice_captain_id": requested_vice,
+            "selected_candidate": f"{int(tc_pair[0])}/{int(tc_pair[1])}",
+            "selected_save_candidate": f"{int(save_pair[0])}/{int(save_pair[1])}",
             "candidate_pairs_evaluated": len(candidates),
             "selection_worlds": partition.selection_worlds,
             "valuation_worlds": partition.valuation_worlds,
@@ -317,10 +378,11 @@ def evaluate_triple_captain(request: TripleCaptainRequest) -> ChipEvaluation:
         },
         uncertainty={
             "p_captain_appears": round(p_captain_appears, 6),
-            "p_armband_captain": round(p_captain_chosen, 6),
-            "p_armband_vice": round(p_vice_armband, 6),
-            "p_armband_none": round(p_no_armband, 6),
-            "armband_source_counts": dict(sources),
+            "p_armband_captain": round(sources_tc["CAPTAIN"] / valuation_worlds, 6),
+            "p_armband_vice": round(sources_tc["VICE"] / valuation_worlds, 6),
+            "p_armband_none": round(sources_tc["NONE"] / valuation_worlds, 6),
+            "armband_source_counts": dict(sources_tc),
+            "save_armband_source_counts": dict(sources_save),
             "paired_interval_low": round(mean_uplift - PAIRED_INTERVAL_K * paired_se, 6),
             "paired_interval_high": round(mean_uplift + PAIRED_INTERVAL_K * paired_se, 6),
             "paired_quantile_05": round(_quantile(ordered, 0.05), 6),

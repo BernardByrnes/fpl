@@ -94,6 +94,11 @@ DIAG_CHIP_RESERVATION_UNCALIBRATED = "CHIP_RESERVATION_VALUE_UNCALIBRATED"
 DIAG_CHIP_UPLIFT_NON_POSITIVE = "CHIP_UPLIFT_NON_POSITIVE"
 DIAG_CHIP_UPLIFT_NOT_MATERIAL = "CHIP_UPLIFT_NOT_MATERIAL"
 DIAG_CHIP_UPLIFT_POSITIVE = "CHIP_UPLIFT_POSITIVE"
+DIAG_CHIP_HORIZON_NOT_CANONICAL = "CHIP_HORIZON_NOT_CANONICAL"
+DIAG_CHIP_PLANNING_EVENT_MISMATCH = "CHIP_PLANNING_EVENT_MISMATCH"
+DIAG_CHIP_CERTIFICATION_HORIZON_MISMATCH = "CHIP_CERTIFICATION_HORIZON_MISMATCH"
+DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH = "CHIP_EVALUATION_CONTEXT_MISMATCH"
+DIAG_CHIP_EVALUATION_ACTION_MISMATCH = "CHIP_EVALUATION_ACTION_MISMATCH"
 
 
 class ChipDecisionError(ValueError):
@@ -453,15 +458,153 @@ class ChipDecision:
 # --- the arbiter -----------------------------------------------------------
 
 
-def _availability_by_action(chip_availability: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
-    """Map canonical chip availability rows onto the action space.
+#: Chip decisions are bound to the canonical FOUR-Gameweek decision window.
+CHIP_HORIZON_LENGTH = 4
 
-    ``planning.chips_state`` reports availability per official chip definition
-    (a chip with two windows yields two rows); an action is available when ANY
-    of its definition rows is available for the event.
+
+def canonical_chip_horizon(planning_event: int, *, last_event: int | None = None) -> tuple[int, ...]:
+    """The canonical certified decision horizon for a planning event.
+
+    Delegates to the ONE definition of the rolling four-Gameweek window used by
+    the decision engine rather than restating it, so the chip layer cannot drift
+    from the certified horizon.  Imported lazily because the decision engine is a
+    consumer of this action space, not a dependency of the data model.
     """
 
-    merged: dict[str, dict[str, Any]] = {}
+    from . import four_gw_decision as fg
+
+    if last_event is None:
+        return tuple(fg.decision_events(int(planning_event), length=CHIP_HORIZON_LENGTH))
+    return tuple(
+        fg.decision_events(int(planning_event), length=CHIP_HORIZON_LENGTH, last_event=int(last_event))
+    )
+
+
+@dataclass(frozen=True)
+class ChipHorizonBinding:
+    """The exact certified four-event identity a chip decision is authorised for.
+
+    Four arbitrary (or duplicated) integers are NOT a certified horizon: the
+    events must be the canonical rolling window for the planning event, the world
+    inputs must declare the same window and planning event, and the certification
+    identity must be the one authorised for that window.
+    """
+
+    planning_event: int
+    horizon_events: tuple[int, ...]
+    certification_identity: str
+    data_snapshot_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> "ChipHorizonBinding":
+        events = tuple(int(event) for event in self.horizon_events)
+        expected = canonical_chip_horizon(int(self.planning_event))
+        if len(events) != CHIP_HORIZON_LENGTH or len(set(events)) != CHIP_HORIZON_LENGTH:
+            raise ChipInputError(
+                f"{DIAG_CHIP_HORIZON_NOT_CANONICAL}: a chip decision needs {CHIP_HORIZON_LENGTH} DISTINCT "
+                f"events, got {list(events)}",
+                reasons=[DIAG_CHIP_HORIZON_NOT_CANONICAL],
+            )
+        if events != expected:
+            raise ChipInputError(
+                f"{DIAG_CHIP_HORIZON_NOT_CANONICAL}: {list(events)} is not the canonical certified horizon "
+                f"{list(expected)} for planning event {int(self.planning_event)}",
+                reasons=[DIAG_CHIP_HORIZON_NOT_CANONICAL],
+            )
+        if not self.certification_identity:
+            raise ChipInputError(
+                f"{DIAG_CHIP_CERTIFICATION_REQUIRED}: the horizon binding carries no certification identity",
+                reasons=[DIAG_CHIP_CERTIFICATION_REQUIRED],
+            )
+        return self
+
+    @classmethod
+    def from_certification(
+        cls, artifact: Mapping[str, Any], *, planning_event: int | None = None
+    ) -> "ChipHorizonBinding":
+        """Build the binding from a certification artifact's own fields."""
+
+        events = tuple(int(event) for event in (artifact.get("events") or ()))
+        event = int(planning_event) if planning_event is not None else (events[0] if events else 0)
+        identity = artifact.get("four_gw_certification_identity") or artifact.get("certification_identity")
+        return cls(
+            planning_event=event,
+            horizon_events=events,
+            certification_identity=str(identity or ""),
+            data_snapshot_sha256=artifact.get("data_snapshot_sha256"),
+        )
+
+    def matches_worlds(self, worlds: "ChipWorldInputs") -> list[str]:
+        """Every way the supplied world inputs disagree with this binding."""
+
+        problems: list[str] = []
+        if tuple(int(event) for event in worlds.horizon_events) != tuple(int(e) for e in self.horizon_events):
+            problems.append(
+                f"worlds horizon {list(worlds.horizon_events)} != certified {list(self.horizon_events)}"
+            )
+        if int(worlds.planning_event) != int(self.planning_event):
+            problems.append(
+                f"worlds planning_event {int(worlds.planning_event)} != certified {int(self.planning_event)}"
+            )
+        if str(worlds.certification_identity) != str(self.certification_identity):
+            problems.append("worlds certification identity is not the authorised one")
+        return problems
+
+
+def _eligible_from_rows(
+    rows: Sequence[Mapping[str, Any]], *, planning_event: int
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Derive eligibility from the canonical chip state, per definition row.
+
+    A chip type carries one definition row per half-season window, so the action
+    is playable when ANY row is genuinely eligible.  Eligibility is computed from
+    the canonical fields -- in window for THIS event, not already used, not
+    expired -- rather than trusting an ``available_for_event`` flag on its own,
+    and it is never derived by collapsing rows with one guessed AND/OR.
+    """
+
+    details: list[dict[str, Any]] = []
+    eligible = False
+    for row in rows:
+        start = row.get("window_start_event")
+        stop = row.get("window_stop_event")
+        if start is not None and stop is not None:
+            in_window = int(start) <= int(planning_event) <= int(stop)
+        else:
+            in_window = bool(row.get("available_for_event"))
+        used = bool(row.get("used"))
+        expired = bool(row.get("expired"))
+        row_eligible = bool(row.get("available_for_event")) and in_window and not used and not expired
+        eligible = eligible or row_eligible
+        details.append(
+            {
+                "window": row.get("window"),
+                "window_start_event": start,
+                "window_stop_event": stop,
+                "available_for_event": bool(row.get("available_for_event")),
+                "in_window_for_event": bool(in_window),
+                "used": used,
+                "expired": expired,
+                "eligible": row_eligible,
+            }
+        )
+    return eligible, details
+
+
+def _availability_by_action(
+    chip_availability: Sequence[Mapping[str, Any]], *, planning_event: int
+) -> dict[str, dict[str, Any]]:
+    """Map canonical chip availability rows onto the action space.
+
+    ``planning.chips_state`` reports availability per official chip DEFINITION (a
+    chip with two windows yields two rows).  Each action's eligibility is the OR
+    of its rows' own eligibility; ``used``/``expired`` are reported as separate
+    any/all flags so a stale flag can never mask the canonical state.
+    """
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
     for row in chip_availability:
         name = normalise_chip_name(str(row.get("name") or ""))
         action = next(
@@ -470,31 +613,30 @@ def _availability_by_action(chip_availability: Sequence[Mapping[str, Any]]) -> d
         )
         if action is None:
             continue
-        entry = merged.setdefault(
-            action,
-            {"name": name, "available_for_event": False, "used": False, "expired": False, "windows": []},
-        )
-        entry["available_for_event"] = bool(entry["available_for_event"] or row.get("available_for_event"))
-        entry["used"] = bool(entry["used"] or row.get("used"))
-        entry["expired"] = bool(entry["expired"] and row.get("expired"))
-        if row.get("window") is not None:
-            entry["windows"].append(row.get("window"))
-    for action, entry in merged.items():
-        entry["windows"] = sorted(entry["windows"])
-        entry["action"] = action
+        grouped.setdefault(action, []).append(row)
+
+    merged: dict[str, dict[str, Any]] = {}
+    for action, rows in grouped.items():
+        eligible, details = _eligible_from_rows(rows, planning_event=int(planning_event))
+        merged[action] = {
+            "action": action,
+            "name": normalise_chip_name(str(rows[0].get("name") or "")),
+            "eligible": eligible,
+            "definitions": details,
+            "windows": sorted(str(row.get("window")) for row in rows if row.get("window") is not None),
+            "used_any": any(bool(row.get("used")) for row in rows),
+            "expired_any": any(bool(row.get("expired")) for row in rows),
+            "expired_all": all(bool(row.get("expired")) for row in rows),
+        }
     return {action: merged[action] for action in merged}
 
 
 def decide_chip_action(
     *,
-    planning_event: int,
+    horizon_binding: ChipHorizonBinding,
     chip_availability: Sequence[Mapping[str, Any]],
     evaluations: Mapping[str, ChipEvaluation] | None = None,
     reservation: ReservationValue | None = None,
-    horizon_events: Sequence[int] | None = None,
-    required_horizon_length: int = 4,
-    certification_identity: str | None = None,
-    data_snapshot_sha256: str | None = None,
     certification_valid: bool = False,
     manager_state: Mapping[str, Any] | None = None,
     chips_already_played_for_event: Sequence[str] = (),
@@ -502,40 +644,59 @@ def decide_chip_action(
 ) -> ChipDecision:
     """Choose exactly ONE chip action, or refuse.
 
+    The decision is BOUND to one certified four-event identity: the horizon
+    binding fixes the planning event, the canonical event window and the
+    authorised certification identity, and nothing may be decided outside it.
+
     Fail-closed order (each returns ``INSUFFICIENT_EVIDENCE``):
 
     1. certification missing/invalid;
-    2. the decision horizon is not the exact required length;
+    2. the horizon is not the exact canonical certified window (duplicated or
+       arbitrary four-event lists are refused);
     3. manager state incomplete;
-    4. the input claims more than one chip played in this Gameweek (the canonical
-       one-chip-per-Gameweek rule).
+    4. an evaluation's mapping key disagrees with its own action;
+    5. an evaluation was produced for a different horizon/certification;
+    6. the input claims more than one chip played in this Gameweek.
 
     A Gameweek whose single chip slot is already used returns ``NO_CHIP``: no
-    further chip may be played in it.  A chip that is unavailable for the event
-    can never be recommended.  With an uncalibrated reservation value a positive
-    mean uplift yields ``CHIP_CANDIDATE_RECHECK_REQUIRED`` (or
-    ``CHIP_REVIEW_REQUIRED`` when the interval still straddles zero) — never
+    further chip may be played in it.  An action is eligible only when the
+    canonical chip state says so (in window for this event, not used, not
+    expired); an ineligible action can never be recommended, and no action may
+    borrow another action's availability.  With an uncalibrated reservation value
+    a positive mean uplift yields ``CHIP_CANDIDATE_RECHECK_REQUIRED`` (or
+    ``CHIP_REVIEW_REQUIRED`` when the interval still straddles zero) -- never
     ``PLAY_CHIP``, which needs a reservation that declares itself CALIBRATED.
     """
 
+    binding = horizon_binding
+    planning_event = int(binding.planning_event)
+    events = tuple(int(event) for event in binding.horizon_events)
+    certification_identity = binding.certification_identity
+    data_snapshot_sha256 = binding.data_snapshot_sha256
     availability_rows = tuple(dict(row) for row in chip_availability)
-    availability = _availability_by_action(availability_rows)
+    availability = _availability_by_action(availability_rows, planning_event=planning_event)
     reasons: list[str] = []
 
-    def refuse(token: str, detail: str, *, status: str = STATUS_INSUFFICIENT_EVIDENCE) -> ChipDecision:
+    def refuse(
+        token: str,
+        detail: str,
+        *,
+        status: str = STATUS_INSUFFICIENT_EVIDENCE,
+        extra: Sequence[str] = (),
+    ) -> ChipDecision:
         return ChipDecision(
             recommended_action=CHIP_ACTION_NO_CHIP,
             status=status,
-            planning_event=int(planning_event),
+            planning_event=planning_event,
             chip_availability=availability_rows,
             calibration_status=CALIBRATION_UNCALIBRATED,
             evidence={
                 "certification_identity": certification_identity,
                 "data_snapshot_sha256": data_snapshot_sha256,
-                "horizon_events": list(horizon_events or ()),
+                "horizon_events": list(events),
                 "refusal_detail": detail,
             },
-            reason_codes=tuple(sorted({token, *reasons})),
+            reason_codes=tuple(sorted({token, *reasons, *extra})),
             uncertainty={},
             candidate_metrics={},
             evaluations_considered=(),
@@ -543,17 +704,24 @@ def decide_chip_action(
 
     # 1. certification
     if not certification_valid or not certification_identity:
-        return refuse(DIAG_CHIP_CERTIFICATION_REQUIRED,
-                      "a valid certification artifact is required to decide a chip")
+        return refuse(
+            DIAG_CHIP_CERTIFICATION_REQUIRED,
+            "a valid certification artifact is required to decide a chip",
+        )
     if not data_snapshot_sha256:
         return refuse(DIAG_CHIP_CERTIFICATION_REQUIRED, "the certification carries no data snapshot identity")
 
-    # 2. horizon: exact length, no approximation and no fifth event
-    events = tuple(int(event) for event in (horizon_events or ()))
-    if len(events) != int(required_horizon_length):
+    # 2. horizon: the exact canonical certified window, not merely four integers
+    if len(events) != CHIP_HORIZON_LENGTH or len(set(events)) != CHIP_HORIZON_LENGTH:
         return refuse(
-            DIAG_CHIP_HORIZON_INCOMPLETE,
-            f"the chip decision needs the exact {int(required_horizon_length)}-event horizon, got {list(events)}",
+            DIAG_CHIP_HORIZON_NOT_CANONICAL,
+            f"a chip decision needs {CHIP_HORIZON_LENGTH} distinct events, got {list(events)}",
+        )
+    if events != canonical_chip_horizon(planning_event):
+        return refuse(
+            DIAG_CHIP_HORIZON_NOT_CANONICAL,
+            f"{list(events)} is not the canonical certified horizon "
+            f"{list(canonical_chip_horizon(planning_event))} for planning event {planning_event}",
         )
 
     # 3. manager state
@@ -561,7 +729,29 @@ def decide_chip_action(
     if manager_state is None or not squad_ids:
         return refuse(DIAG_CHIP_MANAGER_STATE_INCOMPLETE, "manager squad state is required to decide a chip")
 
-    # 4. one chip per Gameweek
+    # 4/5. every evaluation must match its key, its action AND this certified context
+    supplied = dict(evaluations or {})
+    considered = tuple(sorted(supplied))
+    mismatched_keys = sorted(key for key, evaluation in supplied.items() if str(key) != str(evaluation.action))
+    if mismatched_keys:
+        return refuse(
+            DIAG_CHIP_EVALUATION_ACTION_MISMATCH,
+            f"evaluation mapping key disagrees with the evaluation's own action for {mismatched_keys}",
+        )
+    foreign = sorted(
+        action
+        for action, evaluation in supplied.items()
+        if str(evaluation.evidence.get("certification_identity") or "") != str(certification_identity)
+        or tuple(int(event) for event in (evaluation.evidence.get("horizon_events") or ())) != events
+        or int(evaluation.evidence.get("planning_event") or -1) != planning_event
+    )
+    if foreign:
+        return refuse(
+            DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH,
+            f"evaluation(s) {foreign} were produced for a different horizon or certification identity",
+        )
+
+    # 6. one chip per Gameweek
     played = tuple(str(chip) for chip in chips_already_played_for_event)
     if len(set(played)) > 1:
         return refuse(
@@ -573,7 +763,7 @@ def decide_chip_action(
         return ChipDecision(
             recommended_action=CHIP_ACTION_NO_CHIP,
             status=STATUS_NO_CHIP,
-            planning_event=int(planning_event),
+            planning_event=planning_event,
             chip_availability=availability_rows,
             calibration_status=CALIBRATION_UNCALIBRATED,
             evidence={
@@ -588,37 +778,35 @@ def decide_chip_action(
             evaluations_considered=(),
         )
 
-    supplied = dict(evaluations or {})
-    considered = tuple(sorted(supplied))
-    # Always report which chips have no evaluator: an unimplemented chip is
-    # never silently treated as evaluated-and-bad.
+    # Always report which chips have no evaluator: an unimplemented chip is never
+    # silently treated as evaluated-and-bad.
     unimplemented = [action for action in PLAYABLE_CHIP_ACTIONS if action not in supplied]
     if unimplemented:
         reasons.append(f"{DIAG_CHIP_EVALUATOR_NOT_IMPLEMENTED}:{','.join(unimplemented)}")
-    # A chip that is not available for this event can never be recommended.
+
+    # Eligibility comes from the canonical chip state for the SAME action that may
+    # be returned: no action can borrow another action's availability.
     eligible: list[ChipEvaluation] = []
-    for action in CHIP_ACTIONS:
-        if action not in supplied:
-            continue
+    for action, evaluation in sorted(supplied.items()):
         row = availability.get(action)
-        if row is None or not row.get("available_for_event"):
+        if evaluation.action not in CHIP_ACTIONS or row is None or not row.get("eligible"):
             reasons.append(f"{DIAG_CHIP_UNAVAILABLE}:{action}")
             continue
-        eligible.append(supplied[action])
+        eligible.append(evaluation)
 
     if not eligible:
-        available_any = any(bool(row.get("available_for_event")) for row in availability.values())
+        available_any = any(bool(row.get("eligible")) for row in availability.values())
         return ChipDecision(
             recommended_action=CHIP_ACTION_NO_CHIP,
             status=STATUS_NO_CHIP if not available_any else STATUS_CHIP_REVIEW_REQUIRED,
-            planning_event=int(planning_event),
+            planning_event=planning_event,
             chip_availability=availability_rows,
             calibration_status=CALIBRATION_UNCALIBRATED,
             evidence={
                 "certification_identity": certification_identity,
                 "data_snapshot_sha256": data_snapshot_sha256,
                 "horizon_events": list(events),
-                "available_actions": sorted(a for a, row in availability.items() if row.get("available_for_event")),
+                "available_actions": sorted(a for a, row in availability.items() if row.get("eligible")),
             },
             reason_codes=tuple(sorted(set(reasons))),
             uncertainty={},
@@ -634,10 +822,11 @@ def decide_chip_action(
 
     chosen = sorted(eligible, key=rank)[0]
 
+    chosen_definitions = availability.get(chosen.action, {}).get("definitions") or [{}]
     estimate = (reservation or UncalibratedReservation()).estimate(
         action=chosen.action,
-        planning_event=int(planning_event),
-        expiry_event=availability.get(chosen.action, {}).get("window_stop_event"),
+        planning_event=planning_event,
+        expiry_event=chosen_definitions[0].get("window_stop_event"),
         state={"squad_ids": list(squad_ids)},
     )
     uplift = chosen.mean_uplift
@@ -674,7 +863,7 @@ def decide_chip_action(
             CHIP_ACTION_NO_CHIP if status in {STATUS_NO_CHIP, STATUS_INSUFFICIENT_EVIDENCE} else chosen.action
         ),
         status=status,
-        planning_event=int(planning_event),
+        planning_event=planning_event,
         chip_availability=availability_rows,
         calibration_status=estimate.calibration_status,
         evidence={
