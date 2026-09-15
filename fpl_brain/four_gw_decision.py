@@ -136,6 +136,11 @@ def sanitize_wildcard_screen(wildcard: Mapping[str, Any]) -> dict[str, Any]:
 #: caller-supplied mapping can never stand in for a real evaluator.
 WILDCARD_QUANTITATIVE_CAPABILITY = "NOT_SUPPORTED"
 SUPPORTED_WILDCARD_EVALUATION_SCHEMA = "fpl_brain.wildcard_squad_evaluation.v1"
+
+#: The Wildcard play rule is NOT calibrated, so the screen never emits an
+#: executable recommendation: a verified evaluation is reported as a signal and
+#: the chip stays review-only until a point-in-time calibration exists.
+WILDCARD_CALIBRATION_STATUS = "UNCALIBRATED_PROVISIONAL"
 WILDCARD_INJECTION_REJECTED = "WILDCARD_UNVERIFIED_EVALUATION_REJECTED"
 
 
@@ -1617,13 +1622,19 @@ def wildcard_trigger_screen(
     if int(availability_problems) > 0:
         signals.append(f"AVAILABILITY_PROBLEMS:{int(availability_problems)}")
 
+    verified_evaluation_signal = None
     if supported:
         status = WILDCARD_EVALUATION_SUPPORTED
         try:
             net_gain = float(supported_evaluation.get("four_gw_net_core", supported_evaluation.get("net_gain", 0.0)))
         except (TypeError, ValueError):
             net_gain = 0.0
-        recommendation = "PLAY_WILDCARD" if (math.isfinite(net_gain) and net_gain > 0) else "DO_NOT_PLAY_WILDCARD"
+        # The verified evaluation IS evidence, but the play rule on top of it is
+        # uncalibrated, so it is surfaced as a non-executable signal.  Nothing
+        # here may become an executable recommendation until a calibrated
+        # four-GW Wildcard evaluator exists.
+        verified_evaluation_signal = "POSITIVE" if (math.isfinite(net_gain) and net_gain > 0) else "NEGATIVE"
+        recommendation = "NONE"
     elif signals:
         status = WILDCARD_REVIEW_REQUIRED
         recommendation = "NONE"
@@ -1635,7 +1646,8 @@ def wildcard_trigger_screen(
         "status": status,
         "recommendation": recommendation,
         "recommendation_basis": (
-            "a VERIFIED separate four-GW Wildcard squad evaluation was supplied"
+            "a VERIFIED separate four-GW Wildcard squad evaluation was supplied, so its sign is reported "
+            "as a non-executable signal; the play rule is UNCALIBRATED, so the chip remains review-only"
             if supported else
             (
                 f"{WILDCARD_INJECTION_REJECTED}: the supplied evaluation is not verifiable "
@@ -1670,6 +1682,8 @@ def wildcard_trigger_screen(
         # is reported here rather than being surfaced as a recommendation.
         "wildcard_quantitative_capability": WILDCARD_QUANTITATIVE_CAPABILITY,
         "overstatement_prevented": bool(supported_evaluation is not None and not supported),
+        "calibration_status": WILDCARD_CALIBRATION_STATUS,
+        "verified_evaluation_signal": verified_evaluation_signal,
         "provisional_points_estimate": None,
         "hit_rule": WILDCARD_HIT_RULE_TEXT,
         "same_gameweek_hit_rule": hit_rule,
@@ -1682,7 +1696,10 @@ def wildcard_trigger_screen(
         "flags": [WILDCARD_NOT_MODELLED_FLAG, WILDCARD_HIT_INTERACTION_FLAG,
                   WILDCARD_REQUIRES_SEPARATE_EVALUATION],
         "hit_interaction_verified": True,
-        "actionable": status == WILDCARD_EVALUATION_SUPPORTED,
+        # Actions are impossible while the play rule is uncalibrated: even a
+        # verified evaluation stays non-executable.
+        "actionable": False,
+        "executable": False,
         "no_recommendation": True,
     }
 

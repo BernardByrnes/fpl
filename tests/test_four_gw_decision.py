@@ -508,7 +508,10 @@ def test_wildcard_screen_never_fabricates_points():
     assert injected["wildcard_quantitative_capability"] == fg.WILDCARD_QUANTITATIVE_CAPABILITY
     assert "PLAY_WILDCARD" not in json.dumps(injected)
 
-    # Only a VERIFIED separate four-GW evaluation can be actionable.
+    # A VERIFIED separate four-GW evaluation is real evidence, but the play rule on
+    # top of it is UNCALIBRATED, so it is surfaced as a non-executable signal and
+    # the chip stays review-only.  Nothing here may be executable until a
+    # calibrated four-GW Wildcard evaluator exists.
     verified = fg.wildcard_trigger_screen(
         weak_slot_count=5,
         supported_evaluation={
@@ -521,8 +524,13 @@ def test_wildcard_screen_never_fabricates_points():
         },
     )
     assert verified["status"] == fg.WILDCARD_EVALUATION_SUPPORTED
-    assert verified["actionable"] is True
-    assert verified["recommendation"] == "PLAY_WILDCARD"
+    assert verified["evaluation_verified"] is True
+    assert verified["actionable"] is False
+    assert verified["executable"] is False
+    assert verified["recommendation"] == "NONE"
+    assert verified["verified_evaluation_signal"] == "POSITIVE"
+    assert verified["calibration_status"] == fg.WILDCARD_CALIBRATION_STATUS
+    assert "PLAY_WILDCARD" not in json.dumps(verified)
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Iterable, Mapping
 
-from .season_rules import ChipFreeTransferError
+from .season_rules import ChipFreeTransferError, FT_PRESERVING_CHIPS, NON_TRANSFER_CHIPS
 
 TRANSFER_RULES_VERSION = "fpl_transfer_rules_2026_27_v1"
 
@@ -252,10 +252,12 @@ def next_event_free_transfers(ft_before: int, transfer_count: int) -> int:
 
 
 #: Chips that make a whole Gameweek's transfers free and retain the saved FT
-#: state (Wildcard / Free Hit).  The canonical rule lives in
-#: ``fpl_brain.season_rules.free_transfers_after_chip``.
-CHIP_FT_PRESERVING = ("wildcard", "freehit")
-CHIP_BOOSTING = ("bboost", "3xc")  # team chips; normal weekly FT accrual applies
+#: state (Wildcard / Free Hit), and the team chips that leave normal weekly
+#: accrual in place.  Both are the CANONICAL tuples from ``season_rules`` -- one
+#: definition, so the state layer cannot drift from the rule layer.  The rule
+#: itself lives in ``fpl_brain.season_rules.free_transfers_after_chip``.
+CHIP_FT_PRESERVING = FT_PRESERVING_CHIPS
+CHIP_BOOSTING = NON_TRANSFER_CHIPS
 
 #: Raised when a chip FT transition lacks the explicitly recorded event-start bank.
 ChipFTTransitionError = ChipFreeTransferError

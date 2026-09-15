@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import manager_lineup, monte_carlo, transfer_state as ts
+from .season_rules import CHIP_NAME_KEYWORDS
 
 PHASE7B_VERSION = "route_comparator_v7b_1.0.0"
 
@@ -30,8 +31,8 @@ CROSS_GW_FLAG = "CROSS_GW_AVAILABILITY_PERSISTENCE_UNMODELLED"
 FLAT_PRICE_ASSUMPTION = "SCENARIO_ASSUMPTION_NOT_PRICE_FORECAST"
 NEAR_TIE_K = 1.96
 CHIP_ROUTE_FLAG = "CHIP_ROUTE_NOT_MODELLED"
-CHIP_KEYWORDS = ("wildcard", "freehit", "free_hit", "triplecaptain", "triple_captain",
-                 "benchboost", "bench_boost")
+#: Recognised chip spellings, from the canonical list in ``season_rules``.
+CHIP_KEYWORDS = CHIP_NAME_KEYWORDS
 
 
 # ---------------------------------------------------------------------------
