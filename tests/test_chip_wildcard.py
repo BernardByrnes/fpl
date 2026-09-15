@@ -133,9 +133,45 @@ def _request(players, owned_ids, **overrides):
         value_horizon_binding=_value_binding(5),
         worlds_by_event=_default_worlds(players),
         pool_binding=_pool_binding(players),
+        save_route=_save_route(players, owned_ids),
     )
     base.update(overrides)
     return wc.WildcardRequest(**base)
+
+
+def _save_route(players, owned, *, bank_tenths=30, events=(5, 6, 7, 8),
+                mean_net_core=40.0, terminal_bank_tenths=None, terminal_free_transfers=1,
+                shifts=None, **overrides):
+    """A deterministic accepted-normal-route fixture.
+
+    ``shifts`` maps event -> (squad_ids, bank_tenths, mean_net_core) so a test can
+    change the route's squad, bank or net value per event.  ``mean_net_core``
+    ALREADY nets that event's hits, which is the whole point of the contract.
+    """
+
+    shifts = dict(shifts or {})
+    entries = []
+    for event in events:
+        squad, bank, core = shifts.get(event, (tuple(sorted(owned)), bank_tenths, mean_net_core))
+        entries.append(wc.WildcardSaveRouteEvent(
+            event=int(event),
+            squad_ids=tuple(int(p) for p in squad),
+            bank_tenths=int(bank),
+            purchase_price_tenths={int(p): players[int(p)].market_price_tenths for p in squad},
+            free_transfers=1,
+            mean_net_core=float(core),
+            hit_points=0,
+        ))
+    last = entries[-1]
+    return wc.WildcardSaveRoute(
+        events=tuple(entries),
+        terminal_squad_ids=tuple(last.squad_ids),
+        terminal_bank_tenths=int(last.bank_tenths if terminal_bank_tenths is None else terminal_bank_tenths),
+        terminal_purchase_price_tenths=dict(last.purchase_price_tenths),
+        terminal_free_transfers=int(terminal_free_transfers),
+        cumulative_hits=int(overrides.pop("cumulative_hits", 0)),
+        wildcard_available=bool(overrides.pop("wildcard_available", True)),
+    )
 
 
 def _pool_binding(players, *, generation="gen-2026-09-12T19:20:00Z"):
@@ -263,11 +299,19 @@ def test_B_a_healthy_squad_shows_a_much_smaller_uplift_than_a_bad_one():
     beside a broken squad's, which is what drives the SAVE decision.
     """
 
+    # A healthy squad's normal route is itself strong, which is what makes the
+    # Wildcard small; a broken squad's route is weak.  SAVE now comes from the
+    # route, so the route values must express that difference.
     healthy_pool = _pool(strong=set(range(40, 80)))
-    healthy = wc.evaluate_wildcard(_request(healthy_pool, _legal_owned_ids(healthy_pool)))
+    healthy_owned = _legal_owned_ids(healthy_pool)
+    healthy = wc.evaluate_wildcard(_request(
+        healthy_pool, healthy_owned,
+        save_route=_save_route(healthy_pool, healthy_owned, mean_net_core=95.0)))
 
     bad_pool = _pool(weak=set(range(1, 16)))
-    bad = wc.evaluate_wildcard(_request(bad_pool, list(range(1, 16))))
+    bad_owned = list(range(1, 16))
+    bad = wc.evaluate_wildcard(_request(
+        bad_pool, bad_owned, save_route=_save_route(bad_pool, bad_owned, mean_net_core=5.0)))
 
     healthy_uplift = healthy.candidate_metrics["mean_paired_uplift"]
     bad_uplift = bad.candidate_metrics["mean_paired_uplift"]
@@ -280,9 +324,9 @@ def test_B_a_healthy_squad_shows_a_much_smaller_uplift_than_a_bad_one():
 def test_B2_a_better_save_route_reduces_the_uplift():
     players = _pool(weak=set(range(1, 16)))
     bad = list(range(1, 16))
-    plain = wc.evaluate_wildcard(_request(players, bad))
-    better_save = wc.evaluate_wildcard(_request(players, bad, save_route_value=plain.candidate_metrics["save_objective"] + 25.0))
-    assert better_save.candidate_metrics["mean_paired_uplift"] < plain.candidate_metrics["mean_paired_uplift"]
+    plain = wc.evaluate_wildcard(_request(players, bad, save_route=_save_route(players, bad, mean_net_core=5.0)))
+    better = wc.evaluate_wildcard(_request(players, bad, save_route=_save_route(players, bad, mean_net_core=45.0)))
+    assert better.candidate_metrics["mean_paired_uplift"] < plain.candidate_metrics["mean_paired_uplift"]
 
 
 # ---------------------------------------------------------------------------
@@ -478,21 +522,21 @@ def test_I2_an_ambiguous_window_is_not_resolved_by_row_order():
 
 def test_J_save_retains_the_wildcard_option_and_can_use_normal_transfers():
     players = _pool(weak=set(range(1, 16)))
-    request = _request(players, list(range(1, 16)), save_route_value=100.0, save_route_expected_hits=1)
-    evaluation = wc.evaluate_wildcard(request)
+    owned = list(range(1, 16))
+    route = _save_route(players, owned, mean_net_core=60.0, terminal_bank_tenths=88)
+    evaluation = wc.evaluate_wildcard(_request(players, owned, save_route=route))
     save = evaluation.evidence["save_policy"]
     assert save["retains_wildcard_option"] is True
-    assert save["expected_hits"] == 1
-    # the normal route's hits are charged against the save arm, not ignored
-    base = wc.evaluate_wildcard(_request(players, list(range(1, 16)), save_route_value=100.0, save_route_expected_hits=0))
-    assert evaluation.candidate_metrics["save_objective"] < base.candidate_metrics["save_objective"]
+    assert save["route_value_evidence"]["cumulative_hits"] == 0
     # The reservation belongs to the ARBITER, so this evaluator must not have
-    # called it: it reports the raw play-vs-save difference and the post-SAVE
-    # state the arbiter's provider needs, and nothing else.
+    # called it: it reports the raw play-vs-save difference and the authoritative
+    # post-SAVE state the arbiter's provider needs, and nothing else.
     assert evaluation.candidate_metrics["net_of_reservation"] is None
     assert "reservation_value" not in save
-    assert save["post_save_state_for_reservation"]["squad_ids"] == list(range(1, 16))
-    assert save["post_save_state_for_reservation"]["retains_wildcard_option"] is True
+    state = save["post_save_state_for_reservation"]
+    assert state["squad_ids"] == list(owned)
+    assert state["bank_tenths"] == 88
+    assert state["retains_wildcard_option"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +885,7 @@ def _lineup_request(players, owned, worlds, *, planning_event=5):
         value_horizon_binding=_value_binding(5),
         worlds_by_event=worlds,
         pool_binding=_pool_binding(players),
+        save_route=_save_route(players, owned),
     )
 
 
@@ -1117,3 +1162,263 @@ def test_pool_E_the_exclusion_audit_is_never_truncated():
     assert len(accounting["excluded_ids"]) == 6          # full evidence
     assert len(accounting["excluded_reasons"]) == 6
     assert len(accounting["excluded_sample"]) <= 20      # a display sample only
+
+
+# ---------------------------------------------------------------------------
+# PHASE 4 — the SAVE arm consumes the accepted normal route
+# ---------------------------------------------------------------------------
+
+
+def _route_request(players, owned, **overrides):
+    return _request(players, owned, **overrides)
+
+
+def test_route_A_save_uses_the_routes_own_net_value_not_a_scalar():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    cheap = _request(players, owned, save_route=_save_route(players, owned, mean_net_core=10.0))
+    rich = _request(players, owned, save_route=_save_route(players, owned, mean_net_core=100.0))
+    low_eval = wc.evaluate_wildcard(cheap)
+    high_eval = wc.evaluate_wildcard(rich)
+    low = low_eval.candidate_metrics["save_objective"]
+    high = high_eval.candidate_metrics["save_objective"]
+    assert high > low, "SAVE must follow the route's per-event net value"
+    # The H1-H4 component is exactly the weighted sum of the route's OWN per-event
+    # net values; H5+ adds the carried terminal state on top.
+    weights = cheap.horizon.weights[:4]
+    h1_h4 = sum(low_eval.evidence["save_policy"]["route_value_evidence"]["per_event"][e]["weighted"]
+                for e in (5, 6, 7, 8))
+    assert h1_h4 == pytest.approx(sum(w * 10.0 for w in weights))
+    # the two routes differ ONLY on H1-H4, since both carry the same terminal squad
+    assert high - low == pytest.approx(sum(w * 90.0 for w in weights))
+
+
+def test_route_B_one_minus_four_hit_moves_save_by_exactly_four_points():
+    """THE decisive regression: one hit authority, no double counting.
+
+    Both routes have the SAME football value.  Route B's engine output already
+    nets one paid transfer, so ``mean_net_core`` is 4 lower on one event.  The
+    Wildcard SAVE value must differ by exactly the weighted 4 -- not 0 (hit
+    ignored) and not 8 (hit subtracted twice).
+    """
+
+    players = _pool()
+    owned = _legal_owned_ids(players)
+
+    # Route A: no hit.  gross 100, net 100 on every event.
+    route_a = _save_route(players, owned, mean_net_core=100.0)
+    # Route B: the SAME football value, but one event carries a paid transfer,
+    # so the engine reports net 96 for that event (gross stays 100).
+    route_b = _save_route(players, owned, mean_net_core=100.0,
+                          shifts={6: (tuple(sorted(owned)), 30, 96.0)})
+
+    value_a = wc.evaluate_wildcard(_route_request(players, owned, save_route=route_a)).candidate_metrics["save_objective"]
+    value_b = wc.evaluate_wildcard(_route_request(players, owned, save_route=route_b)).candidate_metrics["save_objective"]
+
+    horizon = wc.wildcard_horizon(5, length=8)
+    weight = horizon.weight_for(6)
+    assert value_a - value_b == pytest.approx(4.0 * weight), "hit must count exactly once"
+    # explicitly reject the two failure modes the brief names
+    assert value_a - value_b != pytest.approx(0.0, abs=1e-9)
+    assert value_a - value_b != pytest.approx(8.0 * weight, abs=1e-9)
+
+
+def test_route_C_the_evaluator_never_subtracts_route_hit_points():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    route = _save_route(players, owned, mean_net_core=100.0)
+    # even if the route REPORTS hits, they must not be subtracted again
+    noisy = wc.WildcardSaveRoute(
+        events=tuple(wc.WildcardSaveRouteEvent(
+            event=e.event, squad_ids=e.squad_ids, bank_tenths=e.bank_tenths,
+            purchase_price_tenths=e.purchase_price_tenths, free_transfers=e.free_transfers,
+            mean_net_core=e.mean_net_core, hit_points=4,
+        ) for e in route.events),
+        terminal_squad_ids=route.terminal_squad_ids,
+        terminal_bank_tenths=route.terminal_bank_tenths,
+        terminal_purchase_price_tenths=route.terminal_purchase_price_tenths,
+        terminal_free_transfers=route.terminal_free_transfers,
+        cumulative_hits=4,
+    )
+    with_hits = wc.evaluate_wildcard(_route_request(players, owned, save_route=noisy)).candidate_metrics["save_objective"]
+    without = wc.evaluate_wildcard(_route_request(players, owned, save_route=route)).candidate_metrics["save_objective"]
+    assert with_hits == pytest.approx(without), "reported hit_points must never be subtracted again"
+    evidence = wc.evaluate_wildcard(_route_request(players, owned, save_route=noisy)).evidence["save_policy"]["route_value_evidence"]
+    assert evidence["manual_hit_subtraction"] is False
+    assert evidence["hit_authority"] == "ROUTE_MEAN_NET_CORE_ALREADY_NETS_HITS"
+
+
+def test_route_D_per_event_evidence_consumes_the_matching_route_event():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    route = _save_route(players, owned, mean_net_core=55.0)
+    evaluation = wc.evaluate_wildcard(_route_request(players, owned, save_route=route))
+    per_event = evaluation.evidence["save_policy"]["route_value_evidence"]["per_event"]
+    for event in (5, 6, 7, 8):
+        assert per_event[event]["source"] == "ROUTE_MEAN_NET_CORE"
+        assert per_event[event]["event"] == event
+    for event in (9, 10, 11, 12):
+        assert per_event[event]["source"] == "CARRIED_TERMINAL_STATE"
+
+
+def test_route_E_post_h4_carries_the_terminal_squad_without_inventing_transfers():
+    """H5+ values the route's TERMINAL state; no transfers, no future information."""
+
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    # a route that ends with a materially different squad
+    outside = [pid for pid in sorted(players) if pid not in set(owned)]
+    terminal = list(owned[:-1]) + [outside[0]]
+    route = _save_route(players, owned, mean_net_core=40.0,
+                        shifts={8: (tuple(terminal), 30, 40.0)})
+    request = _route_request(players, owned, save_route=route)
+    evaluation = wc.evaluate_wildcard(request)
+    terminal_value = wc._event_value(request, tuple(sorted(terminal)), 9)
+    carried = evaluation.evidence["save_policy"]["route_value_evidence"]["per_event"][9]
+    assert carried["mean_net_core"] == pytest.approx(terminal_value)
+    assert carried["source"] == "CARRIED_TERMINAL_STATE"
+
+
+def test_route_F_bank_basis_and_ft_come_from_the_route_terminal_state():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    route = _save_route(players, owned, mean_net_core=40.0,
+                        terminal_bank_tenths=123, terminal_free_transfers=4)
+    request = _route_request(players, owned, bank_tenths=999, save_route=route)
+    evaluation = wc.evaluate_wildcard(request)
+    state = evaluation.evidence["save_policy"]["post_save_state_for_reservation"]
+    assert state["bank_tenths"] == 123, "must use the ROUTE terminal bank, not the original"
+    assert state["free_transfers"] == 4
+    assert state["retains_wildcard_option"] is True
+    assert state["planning_event"] == 5
+    assert state["certification_identity"] == IDENTITY
+    # basis is the route's own, per player
+    assert state["purchase_price_tenths"]
+
+
+def test_route_G_save_must_leave_the_wildcard_available():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    route = _save_route(players, owned, wildcard_available=False)
+    evaluation = wc.evaluate_wildcard(_route_request(players, owned, save_route=route))
+    assert wc.WC_SAVE_ROUTE_INVALID in evaluation.reason_codes
+
+
+def test_route_H_a_missing_route_refuses_rather_than_falling_back_to_a_scalar():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    evaluation = wc.evaluate_wildcard(_route_request(players, owned, save_route=None))
+    assert wc.WC_SAVE_ROUTE_MISSING in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_route_I_a_route_with_the_wrong_event_count_refuses():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    route = _save_route(players, owned, events=(5, 6, 7))
+    evaluation = wc.evaluate_wildcard(_route_request(players, owned, save_route=route))
+    assert wc.WC_SAVE_ROUTE_INVALID in evaluation.reason_codes
+
+
+def test_route_J_a_route_missing_an_event_refuses():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    route = _save_route(players, owned, events=(5, 6, 7, 9))
+    evaluation = wc.evaluate_wildcard(_route_request(players, owned, save_route=route))
+    assert wc.WC_SAVE_ROUTE_INVALID in evaluation.reason_codes
+
+
+def test_route_K_missing_basis_or_bank_or_ft_refuses():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    good = _save_route(players, owned)
+
+    no_basis = wc.WildcardSaveRoute(
+        events=tuple(wc.WildcardSaveRouteEvent(
+            event=e.event, squad_ids=e.squad_ids, bank_tenths=e.bank_tenths,
+            purchase_price_tenths={},  # nothing carries a basis
+            free_transfers=e.free_transfers, mean_net_core=e.mean_net_core,
+        ) for e in good.events),
+        terminal_squad_ids=good.terminal_squad_ids, terminal_bank_tenths=good.terminal_bank_tenths,
+        terminal_purchase_price_tenths={}, terminal_free_transfers=good.terminal_free_transfers,
+    )
+    assert no_basis.problems()
+
+    no_squad = wc.WildcardSaveRoute(
+        events=good.events, terminal_squad_ids=(), terminal_bank_tenths=10,
+        terminal_purchase_price_tenths={}, terminal_free_transfers=1,
+    )
+    assert any("terminal squad" in p for p in no_squad.problems())
+
+    bad_ft = wc.WildcardSaveRoute(
+        events=good.events, terminal_squad_ids=good.terminal_squad_ids,
+        terminal_bank_tenths=good.terminal_bank_tenths,
+        terminal_purchase_price_tenths=good.terminal_purchase_price_tenths,
+        terminal_free_transfers=-1,
+    )
+    assert any("free transfers" in p for p in bad_ft.problems())
+
+
+# ---------------------------------------------------------------------------
+# PHASE 5 — the reservation receives the authoritative post-SAVE state, once
+# ---------------------------------------------------------------------------
+
+
+def test_reservation_A_the_evaluator_never_calls_the_reservation():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+
+    class Spy:
+        calls = 0
+
+        def estimate(self, *, action, planning_event, expiry_event, state):
+            Spy.calls += 1
+            return cd.ReservationEstimate(
+                value=None, calibration_status=cd.CALIBRATION_UNCALIBRATED,
+                terminal_value=0.0, weeks_to_expiry=None, reason_codes=(), conditional_on=(),
+            )
+
+    spy = Spy()
+    wc.evaluate_wildcard(_route_request(players, owned, reservation=spy))
+    assert Spy.calls == 0, "the reservation is the arbiter's seam, not the evaluator's"
+
+
+def test_reservation_B_a_full_decision_calls_the_reservation_exactly_once():
+    players = _pool(weak=set(range(1, 16)))
+    owned = list(range(1, 16))
+
+    class Spy:
+        calls = 0
+        payload = None
+
+        def estimate(self, *, action, planning_event, expiry_event, state):
+            Spy.calls += 1
+            Spy.payload = dict(state)
+            return cd.ReservationEstimate(
+                value=1.0, calibration_status=cd.CALIBRATION_CALIBRATED,
+                terminal_value=0.0, weeks_to_expiry=10, reason_codes=(),
+                conditional_on=("weeks_remaining",),
+            )
+
+    route = _save_route(players, owned, terminal_bank_tenths=77, terminal_free_transfers=3)
+    request = _route_request(players, owned, save_route=route)
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.evaluate_wildcard.__module__  # evaluator ran
+
+    decision = cd.decide_chip_action(
+        horizon_binding=_binding(),
+        chip_availability=_chip_rows(5),
+        evaluations={cd.CHIP_ACTION_WC: evaluation},
+        reservation=Spy(),
+        certification_valid=True,
+        manager_state={"squad_ids": list(owned)},
+    )
+    assert Spy.calls == 1, "the arbiter applies the reservation exactly once"
+    # and even a CALIBRATED reservation cannot unlock PLAY_CHIP for Wildcard V1
+    assert decision.status != cd.STATUS_PLAY_CHIP
+    assert decision.status in (cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED, cd.STATUS_CHIP_REVIEW_REQUIRED)
+    # the evaluator's own evidence still carries the authoritative post-SAVE state
+    state = evaluation.evidence["save_policy"]["post_save_state_for_reservation"]
+    assert state["bank_tenths"] == 77
+    assert state["free_transfers"] == 3
+    assert state["retains_wildcard_option"] is True

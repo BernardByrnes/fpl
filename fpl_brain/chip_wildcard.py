@@ -89,6 +89,11 @@ WC_REASON_NOT_COMPETITIVE = "WILDCARD_NOT_COMPETITIVE"
 WC_REASON_PLAY_DESCRIPTION = "WILDCARD_PLAY_NOW_SQUAD_DESCRIPTION"
 WC_REASON_REVIEW_ONLY = "WILDCARD_REVIEW_ONLY_UNCALIBRATED"
 
+#: The SAVE arm consumes the accepted normal route.  These refuse when that
+#: route is absent or does not expose the authoritative per-event state.
+WC_SAVE_ROUTE_MISSING = "WILDCARD_SAVE_ROUTE_MISSING"
+WC_SAVE_ROUTE_INVALID = "WILDCARD_SAVE_ROUTE_INVALID"
+
 
 #: Alias kept simple: any iterable of ints is accepted for the explicit set.
 FrozenSetCapable = Any
@@ -485,6 +490,113 @@ class WildcardWorldInputs:
 
 
 @dataclass(frozen=True)
+class WildcardSaveRouteEvent:
+    """One event of the accepted normal four-GW route, as the SAVE arm sees it.
+
+    ``mean_net_core`` is the route engine's OWN per-event value and ALREADY nets
+    that event's hit deduction (``route_optimizer.exact_evaluate`` returns
+    ``mean_gross_core`` and ``mean_net_core`` side by side, with
+    ``net_core = gross_core - cumulative_hits``).  ``hit_points`` is carried for
+    EVIDENCE ONLY and must never be subtracted from ``mean_net_core`` -- doing so
+    would double-count, turning a single -4 hit into an 8-point swing.  That is
+    the one authority this contract exists to protect.
+    """
+
+    event: int
+    squad_ids: tuple[int, ...]
+    bank_tenths: int
+    purchase_price_tenths: Mapping[int, int]
+    free_transfers: int
+    mean_net_core: float
+    hit_points: int = 0
+    actions: tuple = ()
+
+    def problems(self) -> list[str]:
+        found: list[str] = []
+        if not math.isfinite(float(self.mean_net_core)):
+            found.append(f"event {self.event}: mean_net_core is not finite")
+        if not self.squad_ids:
+            found.append(f"event {self.event}: no resulting squad")
+        if int(self.bank_tenths) < 0:
+            found.append(f"event {self.event}: negative bank")
+        if int(self.free_transfers) < 0:
+            found.append(f"event {self.event}: negative free transfers")
+        missing = [pid for pid in self.squad_ids if int(pid) not in self.purchase_price_tenths]
+        if missing:
+            found.append(f"event {self.event}: {len(missing)} squad players have no acquisition basis")
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "event": int(self.event),
+            "squad_ids": [int(p) for p in self.squad_ids],
+            "bank_tenths": int(self.bank_tenths),
+            "free_transfers": int(self.free_transfers),
+            "mean_net_core": round(float(self.mean_net_core), 6),
+            "hit_points": int(self.hit_points),
+        }
+
+
+@dataclass(frozen=True)
+class WildcardSaveRoute:
+    """The accepted normal route, terminal state included.
+
+    The SAVE_WC policy is: do not wildcard, play this route, and KEEP the chip.
+    The terminal state is the route's final permanent state, carried unchanged
+    through the remaining Wildcard horizon -- no H5+ transfers are invented.
+    """
+
+    events: tuple[WildcardSaveRouteEvent, ...]
+    terminal_squad_ids: tuple[int, ...]
+    terminal_bank_tenths: int
+    terminal_purchase_price_tenths: Mapping[int, int]
+    terminal_free_transfers: int
+    cumulative_hits: int = 0
+    wildcard_available: bool = True
+
+    def problems(self) -> list[str]:
+        found: list[str] = []
+        if len(self.events) != 4:
+            found.append(f"a normal route must have exactly 4 events, got {len(self.events)}")
+        for entry in self.events:
+            found.extend(entry.problems())
+        if not self.terminal_squad_ids:
+            found.append("no terminal squad")
+        if int(self.terminal_bank_tenths) < 0:
+            found.append("negative terminal bank")
+        missing = [pid for pid in self.terminal_squad_ids if int(pid) not in self.terminal_purchase_price_tenths]
+        if missing:
+            found.append(f"{len(missing)} terminal squad players have no acquisition basis")
+        if int(self.terminal_free_transfers) < 0:
+            found.append("negative terminal free transfers")
+        if not self.wildcard_available:
+            found.append("SAVE_WC must leave the Wildcard available")
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "events": [e.as_dict() for e in self.events],
+            "terminal_squad_ids": [int(p) for p in self.terminal_squad_ids],
+            "terminal_bank_tenths": int(self.terminal_bank_tenths),
+            "terminal_free_transfers": int(self.terminal_free_transfers),
+            "cumulative_hits": int(self.cumulative_hits),
+            "wildcard_available": bool(self.wildcard_available),
+        }
+
+    def post_save_state(self) -> dict[str, Any]:
+        """The authoritative post-SAVE state handed to the arbiter's reservation."""
+
+        return {
+            "squad_ids": [int(p) for p in self.terminal_squad_ids],
+            "bank_tenths": int(self.terminal_bank_tenths),
+            "purchase_price_tenths": {int(k): int(v) for k, v in sorted(self.terminal_purchase_price_tenths.items())},
+            "free_transfers": int(self.terminal_free_transfers),
+            "retains_wildcard_option": bool(self.wildcard_available),
+            "cumulative_hits": int(self.cumulative_hits),
+        }
+
+
+@dataclass(frozen=True)
 class WildcardRequest:
     """Everything the evaluator consumes.  Nothing here is a football model."""
 
@@ -501,8 +613,11 @@ class WildcardRequest:
     certification_identity: str
     data_snapshot_sha256: str | None = None
     event_start_free_transfers: int | None = None
-    save_route_value: float | None = None
-    save_route_expected_hits: int = 0
+    #: The ACTUAL accepted normal four-GW route.  This is the ONLY authoritative
+    #: SAVE input: the scalar ``save_route_value`` / ``save_route_expected_hits``
+    #: fields it replaces could be invented by a caller, which is what the SAVE
+    #: wiring exists to prevent.
+    save_route: WildcardSaveRoute | None = None
     reservation: Any | None = None
     #: planning.chips_state rows — the canonical window evidence, so the
     #: Wildcard expiry resolves through the same selector the arbiter uses.
@@ -1060,6 +1175,56 @@ def _event_value(request: WildcardRequest, squad: Sequence[int], event: int) -> 
     return total / worlds.worlds
 
 
+def save_route_value(request: WildcardRequest, route: WildcardSaveRoute) -> tuple[float, dict[str, Any]]:
+    """SAVE_WC value from the ACCEPTED normal route plus the carried terminal state.
+
+    H1-H4 use the route engine's OWN per-event ``mean_net_core``, which already
+    nets that route's transfer hits, so NO hit term is subtracted here.  H5+ value
+    the route's TERMINAL permanent state (squad/basis/bank/FT) carried forward
+    unchanged -- no further transfers are invented and no future information is
+    used, because V1 does not construct a route beyond H4.
+    """
+
+    horizon = request.horizon
+    first_four = tuple(int(e) for e in horizon.events[:4])
+    route_events = {int(entry.event): entry for entry in route.events}
+
+    total = 0.0
+    per_event: dict[int, dict[str, Any]] = {}
+    for event in first_four:
+        entry = route_events.get(int(event))
+        if entry is None:
+            raise WildcardInputError(
+                f"{WC_SAVE_ROUTE_INVALID}: the route has no state for horizon event {event}",
+                reasons=(WC_SAVE_ROUTE_INVALID,),
+            )
+        # mean_net_core ALREADY includes this event's hit.  Subtracting
+        # entry.hit_points here would be the double-count the contract forbids.
+        weighted = horizon.weight_for(event) * float(entry.mean_net_core)
+        total += weighted
+        per_event[int(event)] = {**entry.as_dict(), "weighted": weighted, "source": "ROUTE_MEAN_NET_CORE"}
+
+    # H5+ : the route's terminal permanent state, valued with the accepted
+    # Wildcard event/world valuation.  No transfers, no new hits.
+    carried = tuple(int(p) for p in route.terminal_squad_ids)
+    for event in [int(e) for e in horizon.events][4:]:
+        value = _event_value(request, carried, event)
+        weighted = horizon.weight_for(event) * value
+        total += weighted
+        per_event[int(event)] = {"event": int(event), "weighted": weighted,
+                                 "source": "CARRIED_TERMINAL_STATE", "mean_net_core": value}
+
+    evidence = {
+        "per_event": per_event,
+        "terminal_bank_tenths": int(route.terminal_bank_tenths),
+        "terminal_free_transfers": int(route.terminal_free_transfers),
+        "cumulative_hits": int(route.cumulative_hits),
+        "hit_authority": "ROUTE_MEAN_NET_CORE_ALREADY_NETS_HITS",
+        "manual_hit_subtraction": False,
+    }
+    return total, evidence
+
+
 def _minutes_security(request: WildcardRequest, squad: Sequence[int]) -> float:
     """Mean start probability across the squad over the horizon."""
 
@@ -1444,28 +1609,44 @@ def evaluate_wildcard(request: WildcardRequest):
     try:
         ranked = sorted((evaluate_squad(request, c.squad) for c in candidates),
                         key=lambda v: (-v.objective, v.squad))
-        # --- SAVE arm: keep the squad, play the legal normal route, KEEP the chip.
-        save_current = evaluate_squad(request, request.owned_ids)
     except WildcardInputError as exc:
         token = (exc.reasons[0] if exc.reasons else WC_WORLD_INPUTS_MISSING)
         return _refuse(request, token, str(exc), reasons=tuple(exc.reasons))
     play = ranked[0]
-    save_total = float(request.save_route_value) if request.save_route_value is not None else save_current.objective
-    if request.save_route_expected_hits:
-        save_total -= request.rules.transfer_hit_cost * int(request.save_route_expected_hits)
+
+    # --- SAVE arm: do not wildcard, play the ACCEPTED normal route, KEEP the chip.
+    route = request.save_route
+    if route is None:
+        return _refuse(request, WC_SAVE_ROUTE_MISSING,
+                       "SAVE requires the accepted normal four-GW route; scalar SAVE "
+                       "inputs are not authoritative",
+                       reasons=(WC_SAVE_ROUTE_MISSING,))
+    route_problems = route.problems()
+    if route_problems:
+        return _refuse(request, WC_SAVE_ROUTE_INVALID,
+                       "; ".join(route_problems[:6]), reasons=(WC_SAVE_ROUTE_INVALID,))
+    if tuple(int(e.event) for e in route.events) != tuple(int(e) for e in request.horizon.events[:4]):
+        return _refuse(request, WC_SAVE_ROUTE_INVALID,
+                       "the route's events are not the first four horizon events",
+                       reasons=(WC_SAVE_ROUTE_INVALID,))
+    try:
+        save_total, save_evidence = save_route_value(request, route)
+    except WildcardInputError as exc:
+        return _refuse(request, WC_SAVE_ROUTE_INVALID, str(exc), reasons=tuple(exc.reasons))
 
     # The reservation is applied EXACTLY ONCE, by the chip arbiter — the same
     # seam every other chip uses.  This evaluator therefore reports the RAW
     # play-vs-save difference plus the post-SAVE state the arbiter's reservation
     # provider needs, and never calls the reservation itself.
     uplift = float(play.objective) - float(save_total)
+    carried = evaluate_squad(request, route.terminal_squad_ids)
     save_state = {
-        "squad_ids": list(request.owned_ids),
-        "bank_tenths": int(request.bank_tenths),
-        "minutes_security": save_current.minutes_security,
-        "expected_forced_moves": save_current.repairability["expected_forced_moves"],
+        **route.post_save_state(),
         "wildcard_expiry_event": expiry_event,
-        "retains_wildcard_option": True,
+        "minutes_security": carried.minutes_security,
+        "expected_forced_moves": carried.repairability["expected_forced_moves"],
+        "planning_event": int(request.planning_event),
+        "certification_identity": request.certification_identity,
     }
     reasons = {WC_REASON_PLAY_DESCRIPTION, WC_REASON_REVIEW_ONLY}
     reasons.add(WC_REASON_POSITIVE if uplift > 0.0 else WC_REASON_NOT_COMPETITIVE)
@@ -1543,10 +1724,10 @@ def evaluate_wildcard(request: WildcardRequest):
             "ft_preserved_by_chip": sr.chip_preserves_saved_free_transfers("wildcard"),
             "play_now": play.as_dict(),
             "save_policy": {
-                "squad": list(request.owned_ids),
-                "objective": save_current.objective,
-                "retains_wildcard_option": True,
-                "expected_hits": int(request.save_route_expected_hits),
+                "objective": save_total,
+                "route": route.as_dict(),
+                "route_value_evidence": save_evidence,
+                "retains_wildcard_option": bool(route.wildcard_available),
                 "post_save_state_for_reservation": save_state,
             },
             "executable": False,
