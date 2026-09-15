@@ -425,4 +425,9 @@ def test_wildcard_is_never_recommended_without_a_separate_evaluation():
             "wildcard_squad_player_ids": [1, 2, 3],
         },
     )
-    assert verified_negative["recommendation"] == "DO_NOT_PLAY_WILDCARD"
+    # The verified negative sign is reported as a signal, never as an executable
+    # recommendation: the Wildcard play rule is uncalibrated.
+    assert verified_negative["recommendation"] == "NONE"
+    assert verified_negative["verified_evaluation_signal"] == "NEGATIVE"
+    assert verified_negative["executable"] is False
+    assert verified_negative["calibration_status"] == fg.WILDCARD_CALIBRATION_STATUS

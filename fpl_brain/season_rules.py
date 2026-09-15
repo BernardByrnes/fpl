@@ -162,6 +162,26 @@ FT_PRESERVING_CHIPS = ("wildcard", "freehit")
 #: Team chips that do not change the transfer process (normal rollover applies).
 NON_TRANSFER_CHIPS = ("bboost", "3xc")
 
+#: Every official chip name the season can present, in canonical spelling.  One
+#: list, so the state layer, the route layer and the chip decision layer cannot
+#: drift apart.
+CANONICAL_CHIP_NAMES = ("wildcard", "freehit", "bboost", "3xc")
+
+#: Spellings under which a chip may be requested in a payload or a route.  The
+#: normaliser strips case, underscores, hyphens and spaces, so these are simply
+#: the spellings that must resolve to the same four chips.
+CHIP_NAME_KEYWORDS = (
+    "wildcard",
+    "freehit",
+    "free_hit",
+    "bboost",
+    "benchboost",
+    "bench_boost",
+    "3xc",
+    "triplecaptain",
+    "triple_captain",
+)
+
 
 class ChipFreeTransferError(ValueError):
     """The event-start free-transfer bank is required but was not recorded."""
