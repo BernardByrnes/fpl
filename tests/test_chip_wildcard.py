@@ -165,7 +165,9 @@ def test_A_an_obviously_bad_squad_produces_a_positive_but_suppressed_candidate()
     assert decision.status == cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
     assert decision.status != cd.STATUS_PLAY_CHIP
 
-    # a CALIBRATED reservation is the only route to an executable play
+    # A CALIBRATED RESERVATION IS NOT ENOUGH.  The Wildcard value model is
+    # itself uncalibrated, so the execution gate must keep PLAY_WC blocked even
+    # when the reservation declares itself calibrated.
     class Calibrated:
         def estimate(self, *, action, planning_event, expiry_event, state):
             return cd.ReservationEstimate(
@@ -173,7 +175,7 @@ def test_A_an_obviously_bad_squad_produces_a_positive_but_suppressed_candidate()
                 terminal_value=0.0, weeks_to_expiry=10, reason_codes=(), conditional_on=("weeks_remaining",),
             )
 
-    played = cd.decide_chip_action(
+    still_blocked = cd.decide_chip_action(
         horizon_binding=_binding(),
         chip_availability=_chip_rows(5),
         evaluations={cd.CHIP_ACTION_WC: evaluation},
@@ -181,7 +183,10 @@ def test_A_an_obviously_bad_squad_produces_a_positive_but_suppressed_candidate()
         certification_valid=True,
         manager_state={"squad_ids": list(bad)},
     )
-    assert played.status == cd.STATUS_PLAY_CHIP
+    assert still_blocked.status != cd.STATUS_PLAY_CHIP
+    assert still_blocked.status in (cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED, cd.STATUS_CHIP_REVIEW_REQUIRED)
+    assert cd.DIAG_CHIP_EVALUATOR_UNCALIBRATED in still_blocked.reason_codes
+    assert evaluation.execution_permitted is False
 
 
 # ---------------------------------------------------------------------------
@@ -230,13 +235,29 @@ def test_C_the_budget_uses_real_selling_value_not_market_price():
     players = _pool()
     owned = _legal_owned_ids(players)
     # every owned player has risen in price, so selling value < market price
+    # market price has RISEN 20 tenths above the purchase basis, so the
+    # canonical selling value is between the two
     purchase = {pid: players[pid].market_price_tenths for pid in owned}
     selling = {pid: ts.selling_price_tenths(purchase[pid], purchase[pid] + 20) for pid in owned}
+    for pid in owned:
+        players[pid] = T_player_with_market(players[pid], players[pid].market_price_tenths + 20)
     request = _request(players, owned, purchase_price_tenths=purchase, selling_price_tenths=selling, bank_tenths=0)
 
-    available, _, _ = wc._budget_and_cost(request, ())
-    assert available == sum(selling.values()), "budget must be bank + SELLING value"
-    assert available < sum(purchase[pid] + 20 for pid in owned), "must not use market price"
+    # retaining the whole squad sells nobody, so cash is just the bank -- the
+    # capital locked in 15 retained players is NOT spendable
+    available, _, _ = wc._budget_and_cost(request, owned)
+    assert available == 0, "retained capital is NOT cash"
+    plan = wc.plan_transaction(request, owned)
+    assert plan.sold_ids == () and plan.bought_ids == ()
+    assert plan.retained_ids == tuple(sorted(owned))
+
+    # selling exactly one player realises exactly that player's canonical value
+    keep = list(owned[:-1])
+    sold_id = owned[-1]
+    available_one, _, _ = wc._budget_and_cost(request, keep)
+    canonical = ts.selling_price_tenths(purchase[sold_id], players[sold_id].market_price_tenths)
+    assert available_one == canonical, "one sale contributes exactly its canonical selling value"
+    assert available_one < purchase[sold_id] + 20, "must not use market price"
 
 
 def test_D_retained_players_keep_their_acquisition_basis_and_cost_nothing_new():
@@ -266,6 +287,28 @@ def test_E_sold_then_rebought_players_use_the_new_market_basis():
     # the purchase basis for a newly bought player is the price paid now
     assert request.purchase_price_tenths.get(outside[0]) is None
     assert players[outside[0]].market_price_tenths > 0
+
+
+def T_player_with_market(player, market_price_tenths):
+    """Same player, re-priced (used to model a market move)."""
+
+    return wc.WildcardPlayer(
+        player_id=player.player_id, position=player.position, club_id=player.club_id,
+        market_price_tenths=market_price_tenths, events=dict(player.events),
+        web_name=player.web_name,
+    )
+
+
+def test_C2_a_supplied_selling_value_that_disagrees_with_the_canonical_rule_fails_closed():
+    """Caller-supplied selling values are validated, never trusted."""
+
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    bad = {pid: players[pid].market_price_tenths + 15 for pid in owned}
+    request = _request(players, owned, selling_price_tenths=bad)
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.WC_PRICING_UNAVAILABLE in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +424,13 @@ def test_J_save_retains_the_wildcard_option_and_can_use_normal_transfers():
     # the normal route's hits are charged against the save arm, not ignored
     base = wc.evaluate_wildcard(_request(players, list(range(1, 16)), save_route_value=100.0, save_route_expected_hits=0))
     assert evaluation.candidate_metrics["save_objective"] < base.candidate_metrics["save_objective"]
-    # and the reservation is consulted, not bypassed
-    assert save["reservation_value"] is None  # uncalibrated
+    # The reservation belongs to the ARBITER, so this evaluator must not have
+    # called it: it reports the raw play-vs-save difference and the post-SAVE
+    # state the arbiter's provider needs, and nothing else.
     assert evaluation.candidate_metrics["net_of_reservation"] is None
+    assert "reservation_value" not in save
+    assert save["post_save_state_for_reservation"]["squad_ids"] == list(range(1, 16))
+    assert save["post_save_state_for_reservation"]["retains_wildcard_option"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +500,11 @@ def test_M_bench_value_is_part_of_the_valuation_not_an_afterthought():
     players = _pool()
     owned = _legal_owned_ids(players)
     value = wc.evaluate_squad(_request(players, owned), owned)
-    # the objective is strictly more than the XI alone: bench and terminal terms
-    # each contribute
-    assert value.terminal_value > 0.0
-    assert value.objective > value.horizon_points - 1e-9
+    # Bench value is inside the horizon points (it is real expected FPL points),
+    # while the structural terms are REPORTED and deliberately not scored.
+    assert value.terminal_value == 0.0
+    assert value.flexibility_value == 0.0
+    assert value.objective == value.horizon_points
     # a squad whose bench is genuinely valuable scores above one whose bench is dead
     weak = _pool()
     for pid in range(40, 52):  # back-fill deep pool ids
@@ -481,12 +529,15 @@ def test_N_the_wildcard_transition_uses_canonical_free_transfer_semantics():
     assert evaluation.evidence["ft_preserved_by_chip"] == sr.chip_preserves_saved_free_transfers("wildcard")
 
 
-def test_N2_an_unknown_event_start_bank_is_not_invented():
+def test_N2_an_unknown_event_start_bank_fails_closed():
+    """No numeric uplift may be emitted alongside an FT warning."""
+
     players = _pool()
     owned = _legal_owned_ids(players)
     evaluation = wc.evaluate_wildcard(_request(players, owned, event_start_free_transfers=None))
-    assert evaluation.evidence["free_transfers_after_wildcard"] is None
     assert wc.WC_MANAGER_STATE_INCOHERENT in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+    assert "free_transfers_after_wildcard" not in evaluation.evidence
 
 
 # ---------------------------------------------------------------------------

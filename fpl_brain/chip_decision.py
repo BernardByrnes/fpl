@@ -99,6 +99,7 @@ DIAG_CHIP_PLANNING_EVENT_MISMATCH = "CHIP_PLANNING_EVENT_MISMATCH"
 DIAG_CHIP_CERTIFICATION_HORIZON_MISMATCH = "CHIP_CERTIFICATION_HORIZON_MISMATCH"
 DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH = "CHIP_EVALUATION_CONTEXT_MISMATCH"
 DIAG_CHIP_EVALUATION_ACTION_MISMATCH = "CHIP_EVALUATION_ACTION_MISMATCH"
+DIAG_CHIP_EVALUATOR_UNCALIBRATED = "CHIP_EVALUATOR_VALUE_MODEL_UNCALIBRATED"
 DIAG_CHIP_NO_ACTIVE_WINDOW = "CHIP_NO_ACTIVE_WINDOW_FOR_ACTION"
 DIAG_CHIP_WINDOW_SELECTION_AMBIGUOUS = "CHIP_RESERVATION_WINDOW_SELECTION_AMBIGUOUS"
 
@@ -411,6 +412,12 @@ class ChipEvaluation:
     reason_codes: tuple[str, ...] = ()
     calibration_status: str = CALIBRATION_UNCALIBRATED
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    #: Whether THIS evaluation's own value model is sound enough to execute on.
+    #: Independent of the reservation: an executable play needs BOTH.  Defaults
+    #: to True so every pre-existing evaluator (notably Triple Captain) keeps its
+    #: exact established semantics -- only an evaluator that knows its own value
+    #: model is uncalibrated sets this False.
+    execution_permitted: bool = True
 
     @property
     def mean_uplift(self) -> float | None:
@@ -895,6 +902,19 @@ def decide_chip_action(
             else STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
         )
         verdicts = [DIAG_CHIP_UPLIFT_POSITIVE, DIAG_CHIP_RESERVATION_UNCALIBRATED]
+    elif not chosen.execution_permitted:
+        # The evaluation's OWN value model is not fit to execute on, so a
+        # calibrated reservation is NOT sufficient: the system still must not
+        # endorse.  A positive interval asks for a recheck; a straddling one for
+        # review.  Keying on this dedicated field (default True) rather than on
+        # ``calibration_status`` is what leaves every pre-existing evaluator --
+        # notably Triple Captain -- with its exact established semantics.
+        status = (
+            STATUS_CHIP_REVIEW_REQUIRED
+            if (lower is None or float(lower) <= 0.0)
+            else STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
+        )
+        verdicts = [DIAG_CHIP_UPLIFT_POSITIVE, DIAG_CHIP_EVALUATOR_UNCALIBRATED]
     elif material:
         status = STATUS_PLAY_CHIP
         verdicts = [DIAG_CHIP_UPLIFT_POSITIVE]

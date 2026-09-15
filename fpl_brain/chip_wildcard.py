@@ -46,7 +46,7 @@ from . import season_rules as sr
 from . import transfer_state as ts
 
 WILDCARD_EVALUATOR_VERSION = "chip_wc_v1.0.0"
-WILDCARD_HORIZON_VERSION = "wildcard_horizon_v1.0.0"
+WILDCARD_HORIZON_VERSION = "wildcard_horizon_v1.1.0"
 
 WILDCARD_HORIZON_MIN_EVENTS = 6
 WILDCARD_HORIZON_MAX_EVENTS = 10
@@ -55,9 +55,9 @@ WILDCARD_HORIZON_DEFAULT_EVENTS = 8
 #: immediately after GW4, while the tail still informs squad structure.
 WILDCARD_HORIZON_DECAY = 0.82
 #: Weight on the terminal squad-quality term relative to one horizon gameweek.
-WILDCARD_TERMINAL_WEIGHT = 0.55
-#: Weight on the flexibility / repairability term.
-WILDCARD_FLEXIBILITY_WEIGHT = 0.35
+#: Terminal and flexibility terms are REPORTED structurally, not scored.
+WILDCARD_TERMINAL_WEIGHT = 0.0
+WILDCARD_FLEXIBILITY_WEIGHT = 0.0
 #: Bank (in tenths) that counts as fully flexible for scoring purposes.
 WILDCARD_FLEXIBILITY_BANK_UNIT_TENTHS = 20
 
@@ -79,6 +79,10 @@ WC_REASON_POSITIVE = "WILDCARD_UPLIFT_POSITIVE"
 WC_REASON_NOT_COMPETITIVE = "WILDCARD_NOT_COMPETITIVE"
 WC_REASON_PLAY_DESCRIPTION = "WILDCARD_PLAY_NOW_SQUAD_DESCRIPTION"
 WC_REASON_REVIEW_ONLY = "WILDCARD_REVIEW_ONLY_UNCALIBRATED"
+
+
+#: Alias kept simple: any iterable of ints is accepted for the explicit set.
+FrozenSetCapable = Any
 
 
 class WildcardError(ValueError):
@@ -225,6 +229,10 @@ class WildcardRequest:
     #: planning.chips_state rows — the canonical window evidence, so the
     #: Wildcard expiry resolves through the same selector the arbiter uses.
     chip_availability: Sequence[Mapping[str, Any]] = ()
+    #: Owned players the caller intends to SELL AND BUY BACK in the same
+    #: Wildcard.  Never inferred from final squad membership — a player owned
+    #: before and after with no explicit entry here is simply RETAINED.
+    explicit_sell_rebuy: FrozenSetCapable = ()
     position_frontier_size: int = 6
     improvement_passes: int = 3
 
@@ -307,25 +315,105 @@ def position_frontiers(
 # ---------------------------------------------------------------------------
 
 
-def _budget_and_cost(
-    request: WildcardRequest, squad: Sequence[int]
-) -> tuple[int, int, int]:
-    """(available_tenths, cost_of_new_players, bank_after).
+@dataclass(frozen=True)
+class WildcardTransactionPlan:
+    """The explicit sell/buy accounting behind one candidate squad.
 
-    The manager's REAL budget: bank plus the canonical selling value of every
-    owned player.  Players RETAINED from the current squad cost nothing new, so
-    their acquisition basis is preserved exactly as §7 requires; only genuinely
-    new players are bought at market price.
+    RETAINED players are neither sold nor bought: their selling value is NOT
+    cash and they are NOT charged, and their acquisition basis is preserved.
+    SOLD players realise their canonical selling value.  BOUGHT players are
+    charged the current market price and take it as their NEW basis.
     """
 
-    owned = set(int(p) for p in request.owned_ids)
-    available = int(request.bank_tenths) + sum(
-        int(request.selling_price_tenths.get(pid, 0)) for pid in owned
+    retained_ids: tuple[int, ...]
+    sold_ids: tuple[int, ...]
+    bought_ids: tuple[int, ...]
+    rebought_ids: tuple[int, ...]
+    cash_available_tenths: int
+    purchase_cost_tenths: int
+    remaining_bank_tenths: int
+    new_basis: Mapping[int, int]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "retained_ids": list(self.retained_ids),
+            "sold_ids": list(self.sold_ids),
+            "bought_ids": list(self.bought_ids),
+            "rebought_ids": list(self.rebought_ids),
+            "cash_available_tenths": self.cash_available_tenths,
+            "purchase_cost_tenths": self.purchase_cost_tenths,
+            "remaining_bank_tenths": self.remaining_bank_tenths,
+            "new_basis": {int(k): int(v) for k, v in sorted(self.new_basis.items())},
+        }
+
+
+def canonical_selling_value(request: WildcardRequest, player_id: int) -> int:
+    """The canonical FPL selling value, validated against any supplied figure.
+
+    The rule is owned by ``transfer_state.selling_price_tenths``; this function
+    never invents one.  A caller-supplied selling value that DISAGREES with the
+    canonical calculation is a hard error rather than being trusted (§1/§14).
+    """
+
+    pid = int(player_id)
+    purchase = request.purchase_price_tenths.get(pid)
+    if purchase is None:
+        raise WildcardInputError(
+            f"{WC_PRICING_UNAVAILABLE}: no acquisition basis for owned player {pid}",
+            reasons=(WC_PRICING_UNAVAILABLE,),
+        )
+    market = int(request.players[pid].market_price_tenths)
+    computed = ts.selling_price_tenths(int(purchase), market)
+    supplied = request.selling_price_tenths.get(pid)
+    if supplied is not None and int(supplied) != int(computed):
+        raise WildcardInputError(
+            f"{WC_PRICING_UNAVAILABLE}: selling value for {pid} is {int(supplied)} but the "
+            f"canonical rule gives {computed} from purchase {int(purchase)} / market {market}",
+            reasons=(WC_PRICING_UNAVAILABLE,),
+        )
+    return int(computed)
+
+
+def plan_transaction(request: WildcardRequest, squad: Sequence[int]) -> WildcardTransactionPlan:
+    """Explicit transaction accounting.  No retained capital becomes cash.
+
+    ``cash_available = bank + SUM(canonical selling value of players ACTUALLY SOLD)``
+    and ``purchase_cost = SUM(market price of players ACTUALLY BOUGHT)``.  A
+    retained player contributes to neither side, which is the whole point: a
+    squad that keeps expensive players cannot spend their locked capital.
+    """
+
+    target = {int(p) for p in squad}
+    owned = {int(p) for p in request.owned_ids}
+    forced = {int(p) for p in request.explicit_sell_rebuy}
+
+    retained = tuple(sorted((owned & target) - forced))
+    sold = tuple(sorted(owned - target))
+    # A retained player explicitly marked sell+rebuy is sold and bought back at
+    # the same time; it is never inferred merely from final membership (§2).
+    rebought = tuple(sorted(forced & target))
+    bought = tuple(sorted((target - owned) | set(rebought)))
+
+    cash = int(request.bank_tenths) + sum(canonical_selling_value(request, pid) for pid in sold + rebought)
+    cost = sum(int(request.players[pid].market_price_tenths) for pid in bought)
+    basis = {pid: int(request.players[pid].market_price_tenths) for pid in bought}
+    return WildcardTransactionPlan(
+        retained_ids=retained,
+        sold_ids=sold,
+        bought_ids=bought,
+        rebought_ids=rebought,
+        cash_available_tenths=cash,
+        purchase_cost_tenths=cost,
+        remaining_bank_tenths=cash - cost,
+        new_basis=basis,
     )
-    cost = sum(
-        int(request.players[pid].market_price_tenths) for pid in squad if int(pid) not in owned
-    )
-    return available, cost, available - cost
+
+
+def _budget_and_cost(request: WildcardRequest, squad: Sequence[int]) -> tuple[int, int, int]:
+    """(cash_available, purchase_cost, remaining_bank) from the transaction plan."""
+
+    plan = plan_transaction(request, squad)
+    return plan.cash_available_tenths, plan.purchase_cost_tenths, plan.remaining_bank_tenths
 
 
 def is_legal_squad(request: WildcardRequest, squad: Sequence[int]) -> tuple[bool, list[str]]:
@@ -369,7 +457,7 @@ def _greedy_squad(
     owned = set(int(p) for p in request.owned_ids)
 
     for position, required in ts.POSITION_COMPOSITION.items():
-        candidates = list(frontier.get(position, []))
+        candidates = [pid for pid in frontier.get(position, []) if pid in scores]
         if key == "value":
             candidates.sort(key=lambda pid: (-(scores[pid] / max(1, request.players[pid].market_price_tenths)), pid))
         else:
@@ -394,7 +482,8 @@ def _greedy_squad(
 
 
 def _improve(
-    request: WildcardRequest, squad: list[int], value_of, *, passes: int
+    request: WildcardRequest, squad: list[int], value_of, *, passes: int,
+    universe: Sequence[int] | None = None,
 ) -> list[int]:
     """Bounded local improvement: only strictly-improving, still-legal swaps."""
 
@@ -404,7 +493,9 @@ def _improve(
         best_gain = 0.0
         best_swap: tuple[int, int] | None = None
         for index in range(len(current)):
-            for candidate in sorted(request.players):
+            # ONLY the screened universe: a missing-projection player can
+            # never be re-introduced by the local search.
+            for candidate in sorted(universe if universe is not None else scores):
                 if candidate in current:
                     continue
                 trial = list(current)
@@ -618,11 +709,15 @@ def evaluate_squad(request: WildcardRequest, squad: Sequence[int]) -> WildcardSq
             medium += weighted
     security = _minutes_security(request, squad)
     repair = _repairability(request, squad, bank_after)
-    terminal = horizon.terminal_weight * security * (horizon_points / max(1, len(horizon.events)))
-    flexibility = WILDCARD_FLEXIBILITY_WEIGHT * (
-        repair["bank_flexibility"] + 0.1 * repair["price_bands"] - 0.25 * repair["expected_forced_moves"]
-    )
-    objective = horizon_points + terminal + flexibility
+    # The PRIMARY numeric value is the versioned tapered expected FPL points
+    # over the Wildcard horizon, and NOTHING ELSE.  Structural measures (bank,
+    # minutes security, forced-move risk, price-band coverage, repairability)
+    # are reported separately and used only for Pareto retention and tie-breaks;
+    # they are never converted into fake points with judgement weights, and no
+    # terminal reward is derived from points already counted.
+    terminal = 0.0
+    flexibility = 0.0
+    objective = horizon_points
     return WildcardSquadValue(
         squad=tuple(sorted(int(p) for p in squad)),
         horizon_points=horizon_points,
@@ -647,6 +742,9 @@ def evaluate_squad(request: WildcardRequest, squad: Sequence[int]) -> WildcardSq
 def build_wildcard_candidates(
     request: WildcardRequest, scores: Mapping[int, float]
 ) -> tuple[list[WildcardSquadValue], dict[str, Any]]:
+    # ``scores`` IS the screened universe: a player without horizon support is
+    # absent from it and must never re-enter through a cheap-filler, bank,
+    # security or local-search path.  Every search below is bounded by it.
     """Build a bounded, legal candidate set and retain a Pareto frontier.
 
     This never claims to enumerate every legal squad.  It seeds from several
@@ -689,7 +787,8 @@ def build_wildcard_candidates(
     value_of(baseline_seed)
     improved: list[list[int]] = []
     for seed in seeds:
-        candidate = _improve(request, seed, value_of, passes=request.improvement_passes)
+        candidate = _improve(request, seed, value_of, passes=request.improvement_passes,
+                             universe=sorted(scores))
         improved.append(candidate)
         value_of(candidate)
 
@@ -799,7 +898,9 @@ def resolve_wildcard_expiry(request: WildcardRequest) -> int | None:
 
     rows = [row for row in (request.chip_availability or ()) if str(row.get("name") or "") == "wildcard"]
     if not rows:
-        return None
+        # No Wildcard definition at all is NOT "no expiry": the chip's window is
+        # unknown, so the caller must fail closed rather than continue numerically.
+        return EXPIRY_UNRESOLVED
     mapped = cd._availability_by_action(rows, planning_event=int(request.planning_event))
     entry = mapped.get(cd.CHIP_ACTION_WC) or {}
     if not entry.get("eligible"):
@@ -854,7 +955,15 @@ def evaluate_wildcard(request: WildcardRequest):
         # a zero-point player.
         screen_stats["missing_projection_policy"] = "EXCLUDED_WITH_REASON"
 
-    candidates, frontier_stats = build_wildcard_candidates(request, scores)
+    try:
+        candidates, frontier_stats = build_wildcard_candidates(request, scores)
+    except WildcardInputError as exc:
+        # A pricing/substance violation discovered mid-build (e.g. a supplied
+        # selling value disagreeing with the canonical rule) is a REFUSAL with a
+        # token, never an exception escaping to the caller and never a confident
+        # candidate built on unvalidated evidence.
+        token = (exc.reasons[0] if exc.reasons else WC_PRICING_UNAVAILABLE)
+        return _refuse(request, token, str(exc), reasons=tuple(exc.reasons))
     if not candidates:
         return _refuse(request, WC_FRONTIER_EMPTY,
                        "no legal Wildcard squad could be constructed under the canonical constraints")
@@ -870,22 +979,19 @@ def evaluate_wildcard(request: WildcardRequest):
     if request.save_route_expected_hits:
         save_total -= request.rules.transfer_hit_cost * int(request.save_route_expected_hits)
 
-    # --- non-anticipative reservation for the RETAINED wildcard option.
-    reservation = request.reservation or cd.UncalibratedReservation()
-    estimate = reservation.estimate(
-        action=cd.CHIP_ACTION_WC,
-        planning_event=int(request.planning_event),
-        expiry_event=expiry_event,
-        state={
-            "squad_ids": list(request.owned_ids),
-            "bank_tenths": int(request.bank_tenths),
-            "minutes_security": save_current.minutes_security,
-            "expected_forced_moves": save_current.repairability["expected_forced_moves"],
-        },
-    )
-
+    # The reservation is applied EXACTLY ONCE, by the chip arbiter — the same
+    # seam every other chip uses.  This evaluator therefore reports the RAW
+    # play-vs-save difference plus the post-SAVE state the arbiter's reservation
+    # provider needs, and never calls the reservation itself.
     uplift = float(play.objective) - float(save_total)
-    net = None if estimate.value is None else uplift - float(estimate.value)
+    save_state = {
+        "squad_ids": list(request.owned_ids),
+        "bank_tenths": int(request.bank_tenths),
+        "minutes_security": save_current.minutes_security,
+        "expected_forced_moves": save_current.repairability["expected_forced_moves"],
+        "wildcard_expiry_event": expiry_event,
+        "retains_wildcard_option": True,
+    }
     reasons = {WC_REASON_PLAY_DESCRIPTION, WC_REASON_REVIEW_ONLY}
     reasons.add(WC_REASON_POSITIVE if uplift > 0.0 else WC_REASON_NOT_COMPETITIVE)
 
@@ -900,7 +1006,10 @@ def evaluate_wildcard(request: WildcardRequest):
             event_start_free_transfers=int(request.event_start_free_transfers),
         )
     else:
-        reasons.add(WC_MANAGER_STATE_INCOHERENT)
+        return _refuse(request, WC_MANAGER_STATE_INCOHERENT,
+                       "event-start free-transfer state is unavailable; refusing rather than "
+                       "emitting a numeric uplift with a warning",
+                       reasons=(WC_MANAGER_STATE_INCOHERENT,))
 
     buy = sorted(set(play.squad) - set(request.owned_ids))
     sell = sorted(set(request.owned_ids) - set(play.squad))
@@ -911,7 +1020,7 @@ def evaluate_wildcard(request: WildcardRequest):
             "mean_paired_uplift": uplift,
             "play_now_objective": play.objective,
             "save_objective": save_total,
-            "net_of_reservation": net,
+            "net_of_reservation": None,
             "wildcard_squad": list(play.squad),
             "players_bought": buy,
             "players_sold": sell,
@@ -938,7 +1047,10 @@ def evaluate_wildcard(request: WildcardRequest):
             "deterministic_uplift_note": "no sampling error; model uncertainty is NOT represented here",
         },
         reason_codes=tuple(sorted(reasons)),
-        calibration_status=estimate.calibration_status,
+        # The VALUE MODEL itself is uncalibrated in V1, and the execution gate
+        # is what keeps a calibrated reservation from making PLAY_WC reachable.
+        calibration_status=cd.CALIBRATION_UNCALIBRATED,
+        execution_permitted=False,
         evidence={
             "certification_identity": request.certification_identity,
             "data_snapshot_sha256": request.data_snapshot_sha256,
@@ -955,10 +1067,9 @@ def evaluate_wildcard(request: WildcardRequest):
             "save_policy": {
                 "squad": list(request.owned_ids),
                 "objective": save_current.objective,
-                "reservation_value": estimate.value,
-                "reservation_weeks_to_expiry": estimate.weeks_to_expiry,
                 "retains_wildcard_option": True,
                 "expected_hits": int(request.save_route_expected_hits),
+                "post_save_state_for_reservation": save_state,
             },
             "executable": False,
             "actionable": False,
