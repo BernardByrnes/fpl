@@ -31,6 +31,15 @@ PLANNING_EVENT = 5
 CLUBS = tuple(range(1, 21))
 
 
+def _identity(**over):
+    """The complete predictive identity every artifact in this fixture carries."""
+
+    base = dict(cutoff=CUTOFF, data_snapshot_sha256=SNAPSHOT, source_snapshot_sha256=SOURCE,
+                generation=GENERATION, model_config_identity=CONFIG_ID)
+    base.update(over)
+    return wc.WildcardPredictiveIdentity(**base)
+
+
 def _pool(n_gkp=4, n_def=12, n_mid=14, n_fwd=10, points=3.0, price=50):
     """A production-shaped universe with per-row certified identity."""
 
@@ -43,7 +52,7 @@ def _pool(n_gkp=4, n_def=12, n_mid=14, n_fwd=10, points=3.0, price=50):
                 events[event] = wc.WildcardPlayerEvent(
                     event=event, expected_points=points + 0.3 * (index % 3),
                     expected_minutes=90.0, p_start=0.8, availability=1.0,
-                    fixture_count=1, cutoff=CUTOFF, generation=GENERATION,
+                    fixture_count=1, identity=_identity(),
                 )
             players[pid] = wc.WildcardPlayer(
                 player_id=pid, position=position, club_id=CLUBS[pid % len(CLUBS)],
@@ -63,7 +72,7 @@ def _worlds(players, *, events=range(PLANNING_EVENT, PLANNING_EVENT + 8)):
             minutes[pid] = [0.0 if entry is None else float(entry.expected_minutes)]
             core[pid] = [0.0 if entry is None else float(entry.expected_points)]
         worlds[int(event)] = wc.WildcardWorldInputs(
-            worlds=1, player_ids=ids, minutes=minutes, core=core
+            worlds=1, player_ids=ids, minutes=minutes, core=core, identity=_identity()
         )
     return worlds
 
