@@ -121,7 +121,7 @@ def test_A_chip_modules_never_import_the_predictive_stack():
         "xpts", "player_rates", "monte_carlo", "team_model", "minutes_model",
         "minutes_coherence", "joint_minutes", "substitution_model", "player_rates",
     )
-    for name in ("chip_decision", "chip_triple_captain"):
+    for name in ("chip_decision", "chip_triple_captain", "chip_bench_boost"):
         source = Path(f"fpl_brain/{name}.py").read_text(encoding="utf-8")
         offenders = [
             line.strip()
