@@ -90,24 +90,62 @@ def _check_squad_legal(
     return problems
 
 
+def _matrix_for(matrix: Any) -> Any:
+    """Normalise a world matrix to the shape ``route_optimizer`` expects.
+
+    ``WildcardWorldInputs`` and the route engine's matrices carry the same four
+    fields (``worlds`` / ``player_ids`` / ``core`` / ``minutes``); only the
+    container differs.  Nothing is inferred from a dictionary key here.
+    """
+
+    if isinstance(matrix, Mapping):
+        return matrix
+    return {
+        "worlds": int(matrix.worlds),
+        "player_ids": list(matrix.player_ids),
+        "core": {int(pid): list(series) for pid, series in matrix.core.items()},
+        "minutes": {int(pid): list(series) for pid, series in matrix.minutes.items()},
+    }
+
+
 def wildcard_save_route_from_canonical_route(
     partial: Any,
-    evaluation: Mapping[str, Any],
     *,
     planning_event: int,
     horizon: wc.WildcardHorizonSpec,
     rules: sr.SeasonRules,
     expected_horizon: Sequence[int] | None = None,
     club_of: Mapping[int, int] | None = None,
+    worlds_by_event: Mapping[int, Any] | None = None,
+    positions_of: Any | None = None,
+    config: Any | None = None,
+    events: Sequence[int] | None = None,
+    cache: Mapping[Any, Any] | None = None,
+    world_identity: Mapping[int, Any] | None = None,
 ) -> wc.WildcardSaveRoute:
     """Convert ONE canonical route result into the Wildcard SAVE input, or refuse.
 
-    ``partial`` is the canonical ``PartialRoute`` produced by the accepted route
-    engine and ``evaluation`` is its ``exact_evaluate`` result (the source of
-    ``mean_net_core``).  Both are required: a route without its own evaluation
-    cannot supply a value, and a value without a route cannot supply a state.
+    There is deliberately NO ``evaluation`` parameter.  ``mean_net_core`` is
+    produced by the canonical ``route_optimizer.exact_evaluate`` invoked HERE,
+    from the canonical route plus the authoritative evaluation inputs (the same
+    world matrices the route engine used).  A caller therefore has no channel
+    through which to supply a numeric SAVE value, so an arbitrary finite
+    ``mean_net_core`` cannot reach ``WildcardSaveRoute``.
+
+    Three passes, in this order on purpose:
+
+      PASS 1  validate the ROUTE (structure, legality, continuity, terminal, FT)
+      PASS 2  evaluate it canonically (``exact_evaluate``)
+      PASS 3  build the DTO from the canonical values
+
+    A malformed or fabricated route is refused in PASS 1 with a Wildcard
+    route-validation reason.  It is never handed to the canonical evaluator to
+    explode inside.
     """
 
+    # ------------------------------------------------------------------
+    # PASS 1 — structural and authority validation
+    # ------------------------------------------------------------------
     problems: list[str] = []
     actions = tuple(getattr(partial, "actions", ()) or ())
     expected_events = tuple(int(e) for e in (expected_horizon or horizon.events[:NORMAL_ROUTE_LENGTH]))
@@ -120,7 +158,6 @@ def wildcard_save_route_from_canonical_route(
     if events and events != expected_events:
         problems.append(f"route events {list(events)} != the normal horizon {list(expected_events)}")
 
-    per_event = {int(row["event"]): row for row in (evaluation.get("per_event") or ())}
     terminal = getattr(partial, "state", None)
     if terminal is None:
         problems.append("the route has no canonical terminal state")
@@ -130,7 +167,8 @@ def wildcard_save_route_from_canonical_route(
             reasons=(wc.WC_SAVE_ROUTE_INVALID,),
         )
 
-    entries: list[wc.WildcardSaveRouteEvent] = []
+    # Each event's validated facts: (event, squad, bank, basis, ft, hits, kind)
+    validated: list[tuple] = []
     previous_state = None
     for action in actions:
         event = int(action["event"])
@@ -148,10 +186,7 @@ def wildcard_save_route_from_canonical_route(
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
 
-        # --- CONTINUITY is proven from the CANONICAL TRANSITIONS, not by
-        # inspecting whether each squad merely "looks legal":
-        #   previous RouteState + canonical transition == next_event_state
-        # and squad_after must agree with the resulting state.
+        # --- squad_after must agree with the resulting state
         if _squad_of(squad_after) != _squad_of(next_state):
             raise WildcardSaveRouteError(
                 f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} squad_after disagrees with "
@@ -165,6 +200,8 @@ def wildcard_save_route_from_canonical_route(
                 "next_event_state on bank or acquisition basis",
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
+
+        # --- CONTINUITY: previous RouteState + canonical transition == next state
         before = getattr(transition, "before_state", None)
         if previous_state is not None and before is not None:
             if (_squad_of(before) != _squad_of(previous_state)
@@ -177,6 +214,7 @@ def wildcard_save_route_from_canonical_route(
                 )
         previous_state = next_state
 
+        # --- squad legality
         squad = _squad_of(next_state)
         positions = _positions_of(next_state)
         squad_problems = _check_squad_legal(squad, positions, rules, label=f"event {event}")
@@ -185,8 +223,8 @@ def wildcard_save_route_from_canonical_route(
                 f"{wc.WC_SAVE_ROUTE_INVALID}: {'; '.join(squad_problems[:4])}",
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
-        # The club ids come from the canonical state itself (RoutePlayer.club_id),
-        # so an optional caller map can only ADD evidence, never replace it.
+        # club ids come from the canonical state itself (RoutePlayer.club_id); an
+        # optional caller map can only ADD evidence, never replace it
         clubs: dict[int, int] = {}
         for player in next_state.players:
             clubs[int(player.club_id)] = clubs.get(int(player.club_id), 0) + 1
@@ -202,7 +240,7 @@ def wildcard_save_route_from_canonical_route(
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
 
-        # FT bounds from the canonical season rule, not a guessed maximum.
+        # --- FT bounds from the canonical season rule, not a guessed maximum
         ft_after = int(next_state.free_transfers)
         if ft_after < 0 or ft_after > int(rules.max_free_transfers):
             raise WildcardSaveRouteError(
@@ -211,38 +249,12 @@ def wildcard_save_route_from_canonical_route(
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
 
-        # --- mean_net_core: the route engine's OWN value for this event, which
-        # already nets the hit.  A route event with no evaluated value refuses
-        # rather than being given a number.
-        row = per_event.get(event)
-        if row is None or row.get("mean_net_core") is None:
-            raise WildcardSaveRouteError(
-                f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} has no canonical exact-evaluation value",
-                reasons=(wc.WC_SAVE_ROUTE_INVALID,),
-            )
-        net = float(row["mean_net_core"])
-        if not math.isfinite(net):
-            raise WildcardSaveRouteError(
-                f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} mean_net_core is not finite",
-                reasons=(wc.WC_SAVE_ROUTE_INVALID,),
-            )
+        validated.append((event, squad, int(next_state.bank_tenths),
+                          _basis_of(next_state), ft_after,
+                          int(action.get("hit_points") or 0),
+                          str(action.get("kind") or "")))
 
-        entries.append(wc.WildcardSaveRouteEvent(
-            event=event,
-            squad_ids=squad,
-            bank_tenths=int(next_state.bank_tenths),
-            purchase_price_tenths=_basis_of(next_state),
-            free_transfers=ft_after,
-            mean_net_core=net,
-            hit_points=int(action.get("hit_points") or 0),
-            actions=(str(action.get("kind") or ""),)
-        ))
-
-    # --- TERMINAL EQUALITY: the SAVE terminal state IS the canonical final state,
-    # never a separately supplied lookalike.
-    # The comparison includes the per-player ACQUISITION BASIS: a terminal state
-    # that matches on squad/bank/FT but carries different purchase prices is a
-    # different state, and a tampered basis must not survive.
+    # --- TERMINAL EQUALITY against the canonical final state, INCLUDING the basis
     if (_squad_of(terminal) != _squad_of(previous_state)
             or int(terminal.bank_tenths) != int(previous_state.bank_tenths)
             or int(terminal.free_transfers) != int(previous_state.free_transfers)
@@ -252,7 +264,6 @@ def wildcard_save_route_from_canonical_route(
             "(squad, bank, free transfers and acquisition basis must all match)",
             reasons=(wc.WC_SAVE_ROUTE_INVALID,),
         )
-
     terminal_ft = int(terminal.free_transfers)
     if terminal_ft < 0 or terminal_ft > int(rules.max_free_transfers):
         raise WildcardSaveRouteError(
@@ -260,6 +271,60 @@ def wildcard_save_route_from_canonical_route(
             f"canonical range 0..{int(rules.max_free_transfers)}",
             reasons=(wc.WC_SAVE_ROUTE_INVALID,),
         )
+
+    # ------------------------------------------------------------------
+    # PASS 2 — canonical exact evaluation of THIS route
+    # ------------------------------------------------------------------
+    if worlds_by_event is None or positions_of is None:
+        raise WildcardSaveRouteError(
+            f"{wc.WC_SAVE_ROUTE_INVALID}: the canonical exact-evaluation inputs (worlds and "
+            "positions) are required; mean_net_core is not accepted from the caller",
+            reasons=(wc.WC_SAVE_ROUTE_INVALID,),
+        )
+    from . import route_optimizer as _ro
+
+    evaluation = _ro.exact_evaluate(
+        partial,
+        worlds_by_event={int(e): _matrix_for(m) for e, m in worlds_by_event.items()},
+        positions_of=positions_of,
+        cache=dict(cache) if cache is not None else {},
+        config=config if config is not None else _ro.OptimizerConfig(),
+        events=tuple(int(e) for e in (events or expected_events)),
+        world_identity=world_identity,
+    )
+    per_event = {
+        int(row["event"]): float(row["mean_net_core"])
+        for row in (evaluation.get("per_event") or ())
+    }
+    for event in expected_events:
+        if int(event) not in per_event:
+            raise WildcardSaveRouteError(
+                f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} has no canonical exact-evaluation value",
+                reasons=(wc.WC_SAVE_ROUTE_INVALID,),
+            )
+        if not math.isfinite(per_event[int(event)]):
+            raise WildcardSaveRouteError(
+                f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} canonical mean_net_core is not finite",
+                reasons=(wc.WC_SAVE_ROUTE_INVALID,),
+            )
+
+    # ------------------------------------------------------------------
+    # PASS 3 — build the DTO from the canonical values
+    # ------------------------------------------------------------------
+    entries = [
+        wc.WildcardSaveRouteEvent(
+            event=event,
+            squad_ids=squad,
+            bank_tenths=bank,
+            purchase_price_tenths=basis,
+            free_transfers=ft,
+            # mean_net_core ALREADY includes this event's hit; nothing is subtracted
+            mean_net_core=per_event[int(event)],
+            hit_points=hits,
+            actions=(kind,),
+        )
+        for event, squad, bank, basis, ft, hits, kind in validated
+    ]
 
     route = wc.WildcardSaveRoute(
         events=tuple(entries),
@@ -270,10 +335,10 @@ def wildcard_save_route_from_canonical_route(
         cumulative_hits=int(getattr(partial, "hits", 0) or 0),
         wildcard_available=True,
     )
-    problems = route.problems()
-    if problems:
+    route_problems = route.problems()
+    if route_problems:
         raise WildcardSaveRouteError(
-            f"{wc.WC_SAVE_ROUTE_INVALID}: {'; '.join(problems[:6])}",
+            f"{wc.WC_SAVE_ROUTE_INVALID}: {'; '.join(route_problems[:6])}",
             reasons=(wc.WC_SAVE_ROUTE_INVALID,),
         )
     return route

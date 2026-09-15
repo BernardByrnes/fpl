@@ -12,6 +12,7 @@ import pytest
 
 from fpl_brain import chip_wildcard as wc
 from fpl_brain import season_rules as sr
+from fpl_brain import route_optimizer as ro
 from fpl_brain import transfer_state as ts
 from fpl_brain import wildcard_save_route as wsr
 
@@ -29,6 +30,9 @@ def _Meta(player_id: int, position: str, club_id: int, price: int = PRICE):
     return ts.PlayerMeta(player_id=int(player_id), position=position, club_id=int(club_id))
 
 
+_META: list = [None]
+
+
 def _squad_meta():
     """A legal 15: 2 GKP / 5 DEF / 5 MID / 3 FWD, <=3 per club."""
 
@@ -39,6 +43,7 @@ def _squad_meta():
         for _ in range(count):
             meta[pid] = _Meta(pid, position, clubs[pid % len(clubs)])
             pid += 1
+    _META[0] = meta
     return meta
 
 
@@ -95,11 +100,43 @@ def _horizon():
     return wc.wildcard_horizon(PLANNING_EVENT, length=8)
 
 
-def _convert(partial, evaluation, **over):
+def _positions_of(squad_ids):
+    """The canonical positions the route evaluator needs, from the fixture meta."""
+
+    meta = _META[0] or {}
+    return {int(p): meta[int(p)].position for p in squad_ids if int(p) in meta}
+
+
+def _worlds_for(partial):
+    """One deterministic world per route event, covering that event's squad."""
+
+    worlds = {}
+    for event, squad in ro.route_event_squads(partial):
+        ids = tuple(sorted(int(p) for p in squad))
+        worlds[int(event)] = {
+            "worlds": 1, "player_ids": list(ids),
+            "core": {pid: [1.0] for pid in ids},
+            "minutes": {pid: [90.0] for pid in ids},
+        }
+    return worlds
+
+
+def _convert(partial, evaluation=None, **over):
+    """Convert using the AUTHORITATIVE evaluation INPUTS.
+
+    ``evaluation`` is accepted only so existing call sites read naturally and is
+    deliberately NOT forwarded: the converter computes the canonical exact
+    evaluation itself and there is no parameter to inject numbers through.
+    """
+
     kwargs = dict(planning_event=PLANNING_EVENT, horizon=_horizon(), rules=RULES,
                   expected_horizon=EVENTS)
+    kwargs.setdefault("worlds_by_event", _worlds_for(partial))
+    kwargs.setdefault("positions_of", _positions_of)
+    kwargs.setdefault("events", EVENTS)
+    kwargs.setdefault("config", ro.OptimizerConfig())
     kwargs.update(over)
-    return wsr.wildcard_save_route_from_canonical_route(partial, evaluation, **kwargs)
+    return wsr.wildcard_save_route_from_canonical_route(partial, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +150,14 @@ def test_D_A_a_valid_canonical_route_converts():
     assert len(route.events) == 4
     assert tuple(e.event for e in route.events) == EVENTS
     assert route.problems() == []
-    # the values came from the evaluation, not from the caller
-    assert all(e.mean_net_core == 100.0 for e in route.events)
+    # The values are the CANONICAL recomputation, not anything a caller said.
+    canonical = ro.exact_evaluate(_canonical_route(meta),
+                                  worlds_by_event=_worlds_for(_canonical_route(meta)),
+                                  positions_of=_positions_of, cache={},
+                                  config=ro.OptimizerConfig(), events=EVENTS)
+    expected = {int(r["event"]): float(r["mean_net_core"]) for r in canonical["per_event"]}
+    assert [e.mean_net_core for e in route.events] == [expected[e.event] for e in route.events]
+    assert all(e.mean_net_core != 100.0 for e in route.events), "a caller value must not survive"
     # the terminal state is the canonical final state
     canonical = _canonical_route(meta)
     assert route.terminal_squad_ids == tuple(sorted(int(p.player_id) for p in canonical.state.players))
@@ -135,22 +178,56 @@ def test_D_A2_the_converted_route_feeds_a_wildcard_request():
 # ---------------------------------------------------------------------------
 
 
-def test_D_L_a_route_without_its_exact_evaluation_refuses():
+def test_D_L_the_converter_requires_the_canonical_evaluation_INPUTS():
+    """mean_net_core is not accepted from the caller: without the authoritative
+    evaluation inputs the converter refuses rather than inventing a value."""
+
     meta = _squad_meta()
     with pytest.raises(wsr.WildcardSaveRouteError) as exc:
-        _convert(_canonical_route(meta), {"per_event": []})
-    assert "exact-evaluation value" in str(exc.value)
+        wsr.wildcard_save_route_from_canonical_route(
+            _canonical_route(meta), planning_event=PLANNING_EVENT, horizon=_horizon(),
+            rules=RULES, expected_horizon=EVENTS,
+        )
+    assert "exact-evaluation inputs" in str(exc.value)
 
 
-def test_D_L2_a_nonfinite_evaluation_value_refuses():
+def test_D_L2_the_one_million_attack_is_IMPOSSIBLE():
+    """THE decisive P2-D attack.
+
+    A caller tries to supply a modified evaluation whose per-event mean_net_core
+    is 1_000_000 while leaving event numbers and route structure valid.  There is
+    no parameter through which that mapping can be passed -- the converter invokes
+    the canonical exact evaluation itself -- so 1_000_000 can never reach
+    WildcardSaveRoute.
+    """
+
+    import inspect
+
     meta = _squad_meta()
-    with pytest.raises(wsr.WildcardSaveRouteError):
-        _convert(_canonical_route(meta), _evaluation(over={6: float("nan")}))
+    partial = _canonical_route(meta)
 
+    # 1. the production API has no evaluation-result parameter at all
+    parameters = inspect.signature(wsr.wildcard_save_route_from_canonical_route).parameters
+    assert "evaluation" not in parameters, "caller authority over the value must not exist"
 
-# ---------------------------------------------------------------------------
-# C/D/E/F — squad legality
-# ---------------------------------------------------------------------------
+    # 2. the canonical value is what lands in the DTO
+    route = _convert(partial)
+    assert all(e.mean_net_core != 1_000_000.0 for e in route.events)
+    canonical = ro.exact_evaluate(partial, worlds_by_event=_worlds_for(partial),
+                                  positions_of=_positions_of, cache={},
+                                  config=ro.OptimizerConfig(), events=EVENTS)
+    expected = {int(r["event"]): float(r["mean_net_core"]) for r in canonical["per_event"]}
+    assert [e.mean_net_core for e in route.events] == [expected[e.event] for e in route.events]
+
+    # 3. an attempt to pass a tampered mapping positionally is rejected outright
+    with pytest.raises(TypeError):
+        wsr.wildcard_save_route_from_canonical_route(
+            partial,
+            {"per_event": [{"event": e, "mean_net_core": 1_000_000.0} for e in EVENTS]},
+            planning_event=PLANNING_EVENT, horizon=_horizon(), rules=RULES,
+            expected_horizon=EVENTS, worlds_by_event=_worlds_for(partial),
+            positions_of=_positions_of, events=EVENTS, config=ro.OptimizerConfig(),
+        )
 
 
 def _tamper_event_squad(partial, event, players):
@@ -450,7 +527,7 @@ def test_D_fabricated_route_attack_refuses():
     fake_actions = tuple(
         # one-player squads, matching event numbers, arbitrary finite value
         {"event": e, "kind": "ROLL", "transition": FakeTransition(fake_state([ids[0]])),
-         "hit_points": 0, "squad_after": (), "bank_after": 999}
+         "hit_points": 0, "squad_ids": (ids[0],), "squad_after": (), "bank_after": 999}
         for e in EVENTS
     )
     fake_route = _Partial(actions=fake_actions, state=fake_state([ids[0]]), hits=0)
