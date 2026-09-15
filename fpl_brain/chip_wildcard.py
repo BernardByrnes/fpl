@@ -44,6 +44,9 @@ from typing import Any, Mapping, Sequence
 from . import manager_lineup
 from . import season_rules as sr
 from . import transfer_state as ts
+# The canonical token for an incomplete official player pool is owned by the
+# candidate-universe contract; Wildcard reuses it rather than inventing a synonym.
+from .candidate_universe import OFFICIAL_PLAYER_POOL_INCOMPLETE
 
 WILDCARD_EVALUATOR_VERSION = "chip_wc_v1.0.0"
 WILDCARD_HORIZON_VERSION = "wildcard_horizon_v1.1.0"
@@ -268,6 +271,83 @@ def value_horizon_binding(
     )
 
 
+@dataclass(frozen=True)
+class WildcardPoolBinding:
+    """The official eligible-player pool this Wildcard evaluation is exhaustive over.
+
+    The canonical authority is the ACCEPTED official bootstrap generation
+    (``ingest_provenance``): this wrapper only carries its identity alongside the
+    eligible id set, and validates by IDENTITY — the generation's
+    ``element_id_sha256`` must equal the digest of the eligible ids.  A count
+    match with a different id set is a failure, because counts alone cannot prove
+    identity.  Without this a caller could hand over a short list and the
+    "exhaustive discovery" claim would be unfalsifiable.
+    """
+
+    generation_identity: str
+    generation_id_sha256: str
+    official_count: int
+    eligible_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        problems = self.problems()
+        if problems:
+            raise WildcardInputError(
+                f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: {'; '.join(problems[:6])}",
+                reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+            )
+
+    def problems(self) -> list[str]:
+        from .ingest_provenance import element_id_sha256
+
+        found: list[str] = []
+        if not str(self.generation_identity or "").strip():
+            found.append("no official pool generation identity")
+        ids = tuple(int(p) for p in self.eligible_ids)
+        if len(set(ids)) != len(ids):
+            found.append("duplicate ids in the eligible pool")
+        if int(self.official_count) != len(ids):
+            found.append(f"official_count {int(self.official_count)} != {len(ids)} eligible ids")
+        if not str(self.generation_id_sha256 or "").strip():
+            found.append("no official generation id digest")
+        elif ids and str(self.generation_id_sha256) != element_id_sha256(sorted(ids)):
+            found.append("the eligible ids do not match the official generation identity digest")
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "generation_identity": str(self.generation_identity),
+            "generation_id_sha256": str(self.generation_id_sha256),
+            "official_count": int(self.official_count),
+            "eligible_count": len(self.eligible_ids),
+        }
+
+
+def pool_binding_from_generation(generation: Mapping[str, Any]) -> WildcardPoolBinding:
+    """Build the binding from an ACCEPTED official bootstrap generation row.
+
+    Reuses the canonical generation record (``ingest_provenance``) rather than a
+    Wildcard-specific completeness truth.
+    """
+
+    if not generation:
+        raise WildcardInputError(
+            f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: no accepted official generation supplied",
+            reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+        )
+    if not generation.get("accepted", generation.get("accepted") is None):
+        raise WildcardInputError(
+            f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: the supplied official generation was not accepted",
+            reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+        )
+    return WildcardPoolBinding(
+        generation_identity=str(generation.get("captured_at") or generation.get("id") or ""),
+        generation_id_sha256=str(generation.get("element_id_sha256") or ""),
+        official_count=int(generation.get("official_element_count") or len(generation.get("element_ids") or ())),
+        eligible_ids=tuple(sorted(int(p) for p in (generation.get("eligible_ids") or generation.get("element_ids") or ()))),
+    )
+
+
 def wildcard_horizon(
     planning_event: int,
     *,
@@ -441,6 +521,10 @@ class WildcardRequest:
     #: event with no world inputs is a hard failure: the event value is never
     #: approximated from start probabilities.
     worlds_by_event: Mapping[int, WildcardWorldInputs] = field(default_factory=dict)
+    #: The accepted official eligible-player pool.  Absent means the discovery
+    #: claim cannot be checked, so the evaluator refuses rather than assuming
+    #: the supplied universe is exhaustive.
+    pool_binding: WildcardPoolBinding | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +536,69 @@ def _available(player: WildcardPlayer, horizon: WildcardHorizonSpec) -> bool:
     """A player is screenable only if EVERY horizon event has a projection."""
 
     return all(player.at(event) is not None for event in horizon.events)
+
+
+def pool_accounting(request: WildcardRequest) -> dict[str, Any]:
+    """Account for EVERY eligible official player as SUPPORTED or EXCLUDED.
+
+    The invariant is ``supported_count + excluded_count == eligible_count`` and
+    ``screened_ids == supported_ids``.  A player who is neither supported nor
+    excluded is reported in ``unaccounted_ids``, which is a hard failure: no
+    eligible player may simply disappear from the universe.  The audit is
+    machine-readable and never truncated.
+    """
+
+    binding = request.pool_binding
+    if binding is None:
+        return {
+            "official_count": None, "eligible_count": None, "supported_count": None,
+            "excluded_count": None, "screened_count": None,
+            "generation_identity": None, "generation_id_sha256": None,
+            "supported_ids": [], "excluded_ids": [], "excluded_reasons": {},
+            "unaccounted_ids": [], "complete": False,
+            "reason": "no official pool binding supplied",
+        }
+
+    horizon = request.horizon
+    eligible = tuple(int(p) for p in binding.eligible_ids)
+    supported: list[int] = []
+    excluded: list[int] = []
+    absent: list[int] = []
+    for pid in eligible:
+        player = request.players.get(pid)
+        if player is None:
+            # ABSENT from the universe entirely is NOT an exclusion with a
+            # reason -- it is the silent disappearance this contract exists to
+            # catch, and it must fail rather than be filed as "excluded".
+            absent.append(pid)
+        elif _available(player, horizon):
+            supported.append(pid)
+        else:
+            # PRESENT but without complete horizon support: a legitimate,
+            # auditable exclusion.
+            excluded.append(pid)
+
+    unaccounted = sorted(absent)
+    complete = (
+        not unaccounted
+        and len(supported) + len(excluded) == len(eligible)
+    )
+    return {
+        "official_count": len(eligible),
+        "eligible_count": len(eligible),
+        "supported_count": len(supported),
+        "excluded_count": len(excluded),
+        "screened_count": len(supported),
+        "generation_identity": str(binding.generation_identity),
+        "generation_id_sha256": str(binding.generation_id_sha256),
+        "supported_ids": sorted(supported),
+        "excluded_ids": sorted(excluded),
+        "excluded_reasons": {pid: WC_MISSING_PROJECTION for pid in sorted(excluded)},
+        "excluded_sample": sorted(excluded)[:20],
+        "unaccounted_ids": unaccounted,
+        "complete": complete,
+        "reason": None if complete else f"{len(unaccounted)} eligible players are unaccounted for",
+    }
 
 
 def validate_projections(request: WildcardRequest) -> list[str]:
@@ -1168,6 +1315,7 @@ def _refuse(request: WildcardRequest, token: str, detail: str, *, reasons: Seque
             "wildcard_horizon": request.horizon.as_dict(),
             "wildcard_value_horizon": (request.value_horizon_binding.as_dict()
                                         if request.value_horizon_binding else None),
+            "official_player_pool": pool_accounting(request),
             "wildcard_evaluator_version": WILDCARD_EVALUATOR_VERSION,
             "wildcard_quantitative_capability": "SUPPORTED_REVIEW_ONLY",
             "executable": False,
@@ -1238,6 +1386,12 @@ def evaluate_wildcard(request: WildcardRequest):
         return _refuse(request, WC_WINDOW_AMBIGUOUS,
                        "more than one Wildcard window is active for this event; refusing rather than guessing",
                        reasons=(WC_WINDOW_AMBIGUOUS,))
+
+    accounting = pool_accounting(request)
+    if not accounting["complete"]:
+        return _refuse(request, OFFICIAL_PLAYER_POOL_INCOMPLETE,
+                       str(accounting["reason"] or "the official player pool is not fully accounted for"),
+                       reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,))
 
     projection_problems = validate_projections(request)
     if projection_problems:
@@ -1380,6 +1534,7 @@ def evaluate_wildcard(request: WildcardRequest):
             "wildcard_horizon": request.horizon.as_dict(),
             "wildcard_value_horizon": request.value_horizon_binding.as_dict(),
             "wildcard_value_horizon_identity": request.value_horizon_binding.identity(),
+            "official_player_pool": pool_accounting(request),
             "wildcard_evaluator_version": WILDCARD_EVALUATOR_VERSION,
             "wildcard_quantitative_capability": "SUPPORTED_REVIEW_ONLY",
             "no_global_optimum_claim": True,

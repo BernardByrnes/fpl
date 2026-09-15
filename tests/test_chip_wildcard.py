@@ -132,9 +132,24 @@ def _request(players, owned_ids, **overrides):
         chip_availability=_chip_rows(5),
         value_horizon_binding=_value_binding(5),
         worlds_by_event=_default_worlds(players),
+        pool_binding=_pool_binding(players),
     )
     base.update(overrides)
     return wc.WildcardRequest(**base)
+
+
+def _pool_binding(players, *, generation="gen-2026-09-12T19:20:00Z"):
+    """The accepted official-pool binding for this fixture's universe."""
+
+    from fpl_brain.ingest_provenance import element_id_sha256
+
+    ids = tuple(sorted(players))
+    return wc.WildcardPoolBinding(
+        generation_identity=generation,
+        generation_id_sha256=element_id_sha256(sorted(ids)),
+        official_count=len(ids),
+        eligible_ids=ids,
+    )
 
 
 def _default_worlds(players, *, events=range(5, 13)):
@@ -825,6 +840,7 @@ def _lineup_request(players, owned, worlds, *, planning_event=5):
         chip_availability=_chip_rows(5),
         value_horizon_binding=_value_binding(5),
         worlds_by_event=worlds,
+        pool_binding=_pool_binding(players),
     )
 
 
@@ -979,3 +995,125 @@ def test_worlds_I_world_series_must_cover_every_supplied_player():
     request = _lineup_request(players, owned, partial)
     problems = wc.validate_projections(request)
     assert any("no world series" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 2 — official player-pool completeness
+# ---------------------------------------------------------------------------
+
+
+def test_pool_A_an_incomplete_generation_identity_refuses():
+    """No pool binding means the discovery claim cannot be checked."""
+
+    players = _pool()
+    request = _request(players, _legal_owned_ids(players), pool_binding=None)
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.OFFICIAL_PLAYER_POOL_INCOMPLETE in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_pool_B_a_tampered_generation_digest_refuses():
+    """Identity, not counts: a matching count with a different id set fails."""
+
+    players = _pool()
+    ids = tuple(sorted(players))
+    # a WRONG digest must be rejected even though the COUNT is right
+    with pytest.raises(wc.WildcardInputError) as exc:
+        wc.WildcardPoolBinding(
+            generation_identity="gen-x", generation_id_sha256="sha256:" + "0" * 64,
+            official_count=len(ids), eligible_ids=ids,
+        )
+    assert wc.OFFICIAL_PLAYER_POOL_INCOMPLETE in str(exc.value)
+    # and a wrong count is rejected too
+    with pytest.raises(wc.WildcardInputError):
+        wc.WildcardPoolBinding(
+            generation_identity="gen-x", generation_id_sha256="sha256:" + "0" * 64,
+            official_count=len(ids) - 1, eligible_ids=ids,
+        )
+
+
+def test_pool_C_an_eligible_player_absent_from_the_universe_refuses():
+    """The disappearance this contract exists to prevent."""
+
+    players = _pool()
+    owned = _legal_owned_ids(players)          # computed on the FULL universe
+    # drop an UNOWNED player, so the universe is genuinely short of an eligible id
+    dropped = min(pid for pid in players if pid not in set(owned))
+    binding = _pool_binding(players)           # bound to the FULL official pool
+    reduced = {pid: p for pid, p in players.items() if pid != dropped}
+    request = _request(reduced, owned, pool_binding=binding)
+    evaluation = wc.evaluate_wildcard(request)
+    assert wc.OFFICIAL_PLAYER_POOL_INCOMPLETE in evaluation.reason_codes
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_pool_D_the_659_player_discovery_path_accounts_for_everyone():
+    """Production-scale: every official player is SUPPORTED or EXCLUDED.
+
+    This exercises the WHOLE path (screen -> frontier -> improvement -> final
+    squad), not just screen_players: no excluded player may re-enter anywhere.
+    """
+
+    CLUBS = tuple(range(1, 21))
+    players = {}
+    pid = 1
+    for position, count in (("GKP", 60), ("DEF", 200), ("MID", 240), ("FWD", 159)):
+        for index in range(count):
+            players[pid] = _player(pid, position, CLUBS[pid % len(CLUBS)],
+                                   40 + (pid % 40), 2.0 + (pid % 11) * 0.7,
+                                   p_start=0.2 + (pid % 8) * 0.1)
+            pid += 1
+    assert len(players) == 659
+
+    # N players lack complete horizon support
+    unsupported = sorted(players)[:37]
+    for pid in unsupported:
+        player = players[pid]
+        short = {e: v for e, v in player.events.items() if e < 10}
+        players[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
+                                         player.market_price_tenths, short, player.web_name)
+    N = len(unsupported)
+    binding = _pool_binding(players)
+    request = _request(players, _legal_owned_ids(players), pool_binding=binding, bank_tenths=200)
+
+    accounting = wc.pool_accounting(request)
+    assert accounting["official_count"] == 659
+    assert accounting["eligible_count"] == 659
+    assert accounting["supported_count"] == 659 - N
+    assert accounting["excluded_count"] == N
+    assert accounting["screened_count"] == 659 - N
+    assert accounting["supported_count"] + accounting["excluded_count"] == accounting["eligible_count"]
+    assert accounting["complete"] is True
+
+    # every excluded player carries an explicit machine-readable reason
+    assert set(accounting["excluded_ids"]) == set(unsupported)
+    assert all(accounting["excluded_reasons"][pid] for pid in unsupported)
+
+    scores, stats = wc.screen_players(request)
+    assert stats["screened"] == 659 - N
+    assert sorted(scores) == accounting["supported_ids"], "optimizer universe == supported ids"
+
+    evaluation = wc.evaluate_wildcard(request)
+    squad = evaluation.candidate_metrics["wildcard_squad"]
+    assert not (set(squad) & set(unsupported)), "an excluded player reached the selected squad"
+
+    frontier: set[int] = set()
+    for ids in evaluation.candidate_metrics["frontier_by_position"].values():
+        assert isinstance(ids, int)
+    _, frontier_stats = wc.build_wildcard_candidates(request, scores)
+    assert frontier_stats["legal_squads_considered"] > 0
+    assert not (frontier & set(unsupported))
+
+
+def test_pool_E_the_exclusion_audit_is_never_truncated():
+    players = _pool()
+    for pid in (5, 7, 9, 11, 13, 15):
+        player = players[pid]
+        short = {e: v for e, v in player.events.items() if e < 10}
+        players[pid] = wc.WildcardPlayer(pid, player.position, player.club_id,
+                                         player.market_price_tenths, short, player.web_name)
+    accounting = wc.pool_accounting(_request(players, _legal_owned_ids(players)))
+    assert accounting["excluded_count"] == 6
+    assert len(accounting["excluded_ids"]) == 6          # full evidence
+    assert len(accounting["excluded_reasons"]) == 6
+    assert len(accounting["excluded_sample"]) <= 20      # a display sample only
