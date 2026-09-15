@@ -217,6 +217,8 @@ def build_wildcard_request(
     rules: sr.SeasonRules,
     data_snapshot_sha256: str,
     reservation: Any | None = None,
+    conn: sqlite3.Connection | None = None,
+    pool_binding: wc.WildcardPoolBinding | None = None,
 ) -> wc.WildcardRequest:
     """Assemble an authoritative ``WildcardRequest``, or refuse.
 
@@ -235,8 +237,28 @@ def build_wildcard_request(
             reasons=(WC_MANAGER_STATE_MISSING,),
         )
 
-    # --- pool identity: the generation is the authority, not the caller's list
-    pool_binding = wc.pool_binding_from_generation(certified.generation)
+    # --- pool identity: the STORE is the authority, not the caller's list
+    #
+    # In production a connection is supplied and the binding is RESOLVED from
+    # the canonical accepted-generation store
+    # (repositories.latest_accepted_bootstrap_generation), so a caller cannot
+    # choose the eligible ids, the count, the digest or the acceptance flag.
+    # A supplied binding is at most evidence: if it disagrees with the store
+    # that is a contradiction and it refuses.
+    supplied_binding = pool_binding
+    if conn is not None:
+        resolved_binding = wc.pool_binding_from_store(conn)
+        if supplied_binding is not None and supplied_binding.as_dict() != resolved_binding.as_dict():
+            raise WildcardAdapterError(
+                f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: the supplied pool binding disagrees with "
+                "the accepted official generation recorded in the store",
+                reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+            )
+        pool_binding = resolved_binding
+    else:
+        # Synthetic/evaluator-level construction.  Still requires an EXPLICIT
+        # accepted generation -- absence is never acceptance.
+        pool_binding = supplied_binding or wc.pool_binding_from_generation(certified.generation)
 
     # --- certified evidence must be internally coherent
     value_binding = certified.value_horizon_binding

@@ -331,8 +331,10 @@ class WildcardPoolBinding:
 def pool_binding_from_generation(generation: Mapping[str, Any]) -> WildcardPoolBinding:
     """Build the binding from an ACCEPTED official bootstrap generation row.
 
-    Reuses the canonical generation record (``ingest_provenance``) rather than a
-    Wildcard-specific completeness truth.
+    Requires an EXPLICIT accepted flag.  A missing or falsy ``accepted`` is NOT
+    accepted: without a recorded acceptance there is nothing to certify the pool
+    against, and treating absence as acceptance is precisely how a caller would
+    self-certify a universe.
     """
 
     if not generation:
@@ -340,17 +342,48 @@ def pool_binding_from_generation(generation: Mapping[str, Any]) -> WildcardPoolB
             f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: no accepted official generation supplied",
             reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
         )
-    if not generation.get("accepted", generation.get("accepted") is None):
+    if generation.get("accepted") is None:
         raise WildcardInputError(
-            f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: the supplied official generation was not accepted",
+            f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: the official generation carries no explicit "
+            "accepted status",
+            reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+        )
+    if not generation.get("accepted"):
+        raise WildcardInputError(
+            f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: the supplied official generation is not accepted "
+            f"({generation.get('rejection_reasons') or 'rejected'})",
             reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
         )
     return WildcardPoolBinding(
         generation_identity=str(generation.get("captured_at") or generation.get("id") or ""),
-        generation_id_sha256=str(generation.get("element_id_sha256") or ""),
+        # The in-memory record uses ``element_id_sha256``; the persisted
+        # ``bootstrap_generations`` column is ``element_ids_sha256``.  Accept
+        # both, or a store row would look like it had no digest at all.
+        generation_id_sha256=str(
+            generation.get("element_id_sha256") or generation.get("element_ids_sha256") or ""
+        ),
         official_count=int(generation.get("official_element_count") or len(generation.get("element_ids") or ())),
         eligible_ids=tuple(sorted(int(p) for p in (generation.get("eligible_ids") or generation.get("element_ids") or ()))),
     )
+
+
+def pool_binding_from_store(conn: Any) -> WildcardPoolBinding:
+    """Resolve the binding from the CANONICAL accepted-generation store.
+
+    The production authority is ``repositories.latest_accepted_bootstrap_generation``
+    -- the newest row recorded with ``accepted=1``.  A caller cannot choose these
+    ids, the count, the digest or the acceptance flag: they come from the store.
+    """
+
+    from . import repositories as repo
+
+    generation = repo.latest_accepted_bootstrap_generation(conn)
+    if not generation:
+        raise WildcardInputError(
+            f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: no accepted official generation is recorded",
+            reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
+        )
+    return pool_binding_from_generation(dict(generation))
 
 
 def wildcard_horizon(
@@ -694,8 +727,15 @@ def pool_accounting(request: WildcardRequest) -> dict[str, Any]:
             excluded.append(pid)
 
     unaccounted = sorted(absent)
+    # A player present in the SUPPLIED universe but absent from the canonical
+    # eligible pool is contradictory evidence: the caller's universe is not the
+    # certified one.  It is refused rather than silently ignored, because
+    # ignoring it is exactly how a nonofficial player reaches the optimizer.
+    supplied = {int(pid) for pid in request.players}
+    extra = sorted(supplied - set(eligible))
     complete = (
         not unaccounted
+        and not extra
         and len(supported) + len(excluded) == len(eligible)
     )
     return {
@@ -711,8 +751,14 @@ def pool_accounting(request: WildcardRequest) -> dict[str, Any]:
         "excluded_reasons": {pid: WC_MISSING_PROJECTION for pid in sorted(excluded)},
         "excluded_sample": sorted(excluded)[:20],
         "unaccounted_ids": unaccounted,
+        "extra_ids": extra,
+        "extra_sample": extra[:20],
         "complete": complete,
-        "reason": None if complete else f"{len(unaccounted)} eligible players are unaccounted for",
+        "reason": (
+            None if complete
+            else (f"{len(extra)} supplied players are not in the canonical eligible pool "
+                  f"(e.g. {extra[:5]})" if extra else f"{len(unaccounted)} eligible players are unaccounted for")
+        ),
     }
 
 
@@ -783,10 +829,20 @@ def screen_players(request: WildcardRequest) -> tuple[dict[int, float], dict[str
     """
 
     horizon = request.horizon
+    # The screening universe is the CANONICAL eligible pool, never an arbitrary
+    # request.players.  Without this a caller could add a player outside the
+    # certified pool (the "999" counterexample) and have him screened and
+    # optimised while the pool accounting still looked complete.
+    canonical = (
+        tuple(int(p) for p in request.pool_binding.eligible_ids)
+        if request.pool_binding is not None
+        else tuple(sorted(int(p) for p in request.players))
+    )
     scores: dict[int, float] = {}
     missing: list[int] = []
-    for player_id, player in sorted(request.players.items()):
-        if not _available(player, horizon):
+    for player_id in canonical:
+        player = request.players.get(int(player_id))
+        if player is None or not _available(player, horizon):
             missing.append(int(player_id))
             continue
         total = 0.0
