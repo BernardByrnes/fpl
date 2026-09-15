@@ -72,6 +72,7 @@ def _worlds(players, *, events=range(PLANNING_EVENT, PLANNING_EVENT + 8)):
             minutes[pid] = [0.0 if entry is None else float(entry.expected_minutes)]
             core[pid] = [0.0 if entry is None else float(entry.expected_points)]
         worlds[int(event)] = wc.WildcardWorldInputs(
+            event=int(event),
             worlds=1, player_ids=ids, minutes=minutes, core=core, identity=_identity()
         )
     return worlds

@@ -215,6 +215,7 @@ def _default_worlds(players, *, events=range(5, 13)):
             minutes[pid] = [0.0 if entry is None else float(entry.expected_minutes)]
             core[pid] = [0.0 if entry is None else float(entry.expected_points)]
         worlds[int(event)] = wc.WildcardWorldInputs(
+            event=int(event),
             worlds=1, player_ids=ids, minutes=minutes, core=core, identity=_identity()
         )
     return worlds
@@ -884,6 +885,7 @@ def _worlds_for(players, event, *, blank=(), core_overrides=None, minutes_overri
         minutes[pid].append(0.0 if blanked else minutes_overrides.get(pid, 90.0))
         core[pid].append(0.0 if blanked else core_overrides.get(pid, 1.0))
     return wc.WildcardWorldInputs(
+        event=int(event),
         worlds=1, player_ids=ids, minutes=minutes, core=core, identity=_identity()
     )
 
@@ -1054,6 +1056,7 @@ def test_worlds_I_world_series_must_cover_every_supplied_player():
     players = _lineup_squad()
     owned = tuple(sorted(players))
     partial = {event: wc.WildcardWorldInputs(
+        event=int(event),
         worlds=1,
         player_ids=tuple(sorted(players))[:10],  # five players missing
         minutes={pid: [90.0] for pid in tuple(sorted(players))[:10]},
@@ -1465,6 +1468,7 @@ def _problems_for_world(**over):
     target = 9
     entry = worlds[target]
     worlds[target] = wc.WildcardWorldInputs(
+        event=int(target),
         worlds=entry.worlds, player_ids=entry.player_ids,
         minutes=entry.minutes, core=entry.core, identity=_identity(**over),
     )
@@ -1551,6 +1555,7 @@ def test_B_world_G_a_world_matrix_with_no_identity_refuses():
     worlds = dict(_default_worlds(players))
     entry = worlds[9]
     worlds[9] = wc.WildcardWorldInputs(
+        event=int(9),
         worlds=entry.worlds, player_ids=entry.player_ids,
         minutes=entry.minutes, core=entry.core, identity=None,
     )
@@ -1583,6 +1588,7 @@ def test_B_decisive_a_valid_binding_with_one_world_from_another_config_refuses()
     worlds = dict(_default_worlds(players))
     entry = worlds[11]
     worlds[11] = wc.WildcardWorldInputs(
+        event=int(11),
         worlds=entry.worlds, player_ids=entry.player_ids, minutes=entry.minutes, core=entry.core,
         identity=_identity(model_config_identity="sha256:" + "8" * 64),
     )
@@ -1615,3 +1621,64 @@ def test_B_identity_is_compared_not_stamped():
     assert "disagreements_with(binding.predictive_identity())" in inspect.getsource(
         wc_module.WildcardWorldInputs.problems
     )
+
+
+# ---------------------------------------------------------------------------
+# P2-B — a world matrix carries its OWN event identity
+# ---------------------------------------------------------------------------
+
+
+def test_P2B_a_world_matrix_carries_its_own_event():
+    players = _pool()
+    worlds = _default_worlds(players)
+    for event, matrix in worlds.items():
+        assert int(matrix.event) == int(event), "each matrix must name its own event"
+
+
+def test_P2B_the_H1_H2_swap_is_refused():
+    """THE decisive counterexample.
+
+    Two coherent matrices with identical five-dimensional predictive identities,
+    swapped between their dictionary keys.  The key is not evidence, so without an
+    intrinsic event identity this would route event-X worlds into event-Y
+    valuation and validate cleanly.
+    """
+
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    worlds = dict(_default_worlds(players))
+    h1, h2 = 5, 6
+
+    # swap: the H2 matrix is stored under the H1 key and vice versa
+    swapped = dict(worlds)
+    swapped[h1] = worlds[h2]
+    swapped[h2] = worlds[h1]
+
+    problems = wc.validate_projections(_request(players, owned, worlds_by_event=swapped))
+    assert any("intrinsic event" in p for p in problems), problems
+    assert any(f"event {h1}" in p for p in problems)
+
+    evaluation = wc.evaluate_wildcard(_request(players, owned, worlds_by_event=swapped))
+    assert evaluation.candidate_metrics["mean_paired_uplift"] is None
+
+
+def test_P2B_a_matrix_under_the_wrong_key_refuses():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    worlds = dict(_default_worlds(players))
+    worlds[7] = worlds[6]          # the H6 matrix stored under the H7 key
+    problems = wc.validate_projections(_request(players, owned, worlds_by_event=worlds))
+    assert any("intrinsic event" in p for p in problems), problems
+
+
+def test_P2B_the_correct_placement_still_validates():
+    players = _pool()
+    owned = _legal_owned_ids(players)
+    assert wc.validate_projections(_request(players, owned)) == []
+    # and the five-dimensional identity checks are untouched by the event repair
+    for over, dimension in (({"cutoff": "2026-09-13T00:00:00Z"}, "cutoff"),
+                            ({"data_snapshot_sha256": "sha256:" + "9" * 64}, "data_snapshot_sha256"),
+                            ({"source_snapshot_sha256": "sha256:" + "6" * 64}, "source_snapshot_sha256"),
+                            ({"generation": "generation-OTHER"}, "generation"),
+                            ({"model_config_identity": "sha256:" + "8" * 64}, "model_config_identity")):
+        assert dimension in "".join(_problems_for_world(**over)), (dimension, over)

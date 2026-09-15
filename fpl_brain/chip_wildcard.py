@@ -546,6 +546,11 @@ class WildcardWorldInputs:
     all resolved by ``manager_lineup`` rather than approximated here.
     """
 
+    #: The EVENT this matrix is FOR, carried by the artifact itself.  The
+    #: ``worlds_by_event`` key is NOT evidence: two valid matrices from different
+    #: events, with otherwise identical predictive identities, could be swapped
+    #: between keys and route event-X worlds into event-Y valuation.
+    event: int
     worlds: int
     player_ids: tuple[int, ...]
     minutes: Mapping[int, Sequence[float]]
@@ -880,9 +885,16 @@ def validate_projections(request: WildcardRequest) -> list[str]:
             if world_inputs is None:
                 problems.append(f"{WC_WORLD_INPUTS_MISSING}: no world inputs for event {event}")
                 continue
+            # The artifact's OWN event must match the key it is stored under:
+            # the key is not evidence, so a swapped pair of otherwise-valid
+            # matrices would otherwise route event-X worlds into event-Y.
+            if int(world_inputs.event) != int(event):
+                problems.append(
+                    f"event {event}: the world matrix carries intrinsic event "
+                    f"{int(world_inputs.event)}"
+                )
             # Worlds are predictive evidence: their provenance must match the
             # bound value horizon on EVERY dimension, not merely look complete.
-            # The matrix is keyed by event, so a mismatched key cannot hide here.
             for detail in world_inputs.problems(binding):
                 if ("disagrees with the bound value horizon" in detail
                         or "no predictive identity" in detail):
