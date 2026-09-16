@@ -83,6 +83,10 @@ from . import manager_lineup as ml
 from . import season_rules as sr
 from . import transfer_state as ts
 from .candidate_universe import OFFICIAL_PLAYER_POOL_INCOMPLETE
+from .free_hit_route import (
+    ARM_PLAY, ARM_SAVE, FH_ROUTE_BASIS_MISMATCH, FH_ROUTE_START_STATE_MISMATCH,
+    FreeHitRoute, free_hit_route_from_canonical_route, state_fingerprint,
+)
 from .chip_wildcard import (
     WildcardPoolBinding,
     WildcardPredictiveIdentity,
@@ -162,6 +166,9 @@ class FreeHitPermanentState:
     owned_ids: tuple[int, ...]
     purchase_price_tenths: Mapping[int, int]
     bank_tenths: int
+    #: FT AVAILABLE entering H1 (the normal route's starting state) and the bank
+    #: held at the START of H1 (what a played Free Hit preserves).  Different jobs.
+    free_transfers: int
     event_start_free_transfers: int
     positions: Mapping[int, str]
     clubs: Mapping[int, int]
@@ -176,6 +183,8 @@ class FreeHitPermanentState:
             found.append(f"negative bank {self.bank_tenths}")
         if int(self.event_start_free_transfers) < 0:
             found.append(f"negative event-start free transfers {self.event_start_free_transfers}")
+        if int(self.free_transfers) < 0:
+            found.append(f"negative free transfers {self.free_transfers}")
         return found
 
 
@@ -315,8 +324,12 @@ class FreeHitRequest:
     #: engine.  Both are REQUIRED: an H1-only comparison cannot be an exact
     #: four-GW chip decision, because a played Free Hit and an ordinary Gameweek
     #: enter H2 with different free-transfer banks.
-    play_tail: FreeHitTailRoute | None = None
-    save_tail: FreeHitTailRoute | None = None
+    #: PLAY: the canonical H2-H4 route from the RESTORED permanent state.
+    #: SAVE: the canonical H1-H4 normal route from the CURRENT permanent state.
+    #: Both come from ``free_hit_route.free_hit_route_from_canonical_route`` and
+    #: carry values computed by ``route_optimizer.exact_evaluate``.
+    play_route: FreeHitRoute | None = None
+    save_route: FreeHitRoute | None = None
     #: The CANONICAL certified decision context every predictive dimension is
     #: anchored to.  Comparing two request-owned identities against each other
     #: proves nothing, so the authority -- not a second supplied object -- is
@@ -950,35 +963,43 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
                 f"player(s): {extra[:8]}"
             )
 
-    play_tail = request.play_tail
-    save_tail = request.save_tail
-    if play_tail is None or save_tail is None:
+    play_route = request.play_route
+    save_route = request.save_route
+    if play_route is None or save_route is None:
         problems.append(
-            f"{FH_TAIL_ROUTE_MISSING}: both arms need their canonical H2-H4 route; an H1-only "
-            "comparison is not an exact four-GW chip decision"
+            f"{FH_TAIL_ROUTE_MISSING}: both arms need their canonical route; an H1-only comparison "
+            "is not an exact four-GW chip decision"
         )
     else:
-        tail_events = list(events)[1:]
-        restored = restore_permanent_state(
-            request.permanent, rules=request.rules, restored_event=int(binding.planning_event) + 1
-        )
-        save_state = save_arm_h2_state(request)
-        problems.extend(
-            f"{FH_TAIL_ROUTE_INVALID}: {problem}"
-            for problem in play_tail.problems(
-                expected_arm=FreeHitTailRoute.FREE_HIT_ARM_PLAY, expected_events=tail_events,
-                expected_squad=request.permanent.owned_ids, expected_bank=restored.bank_tenths,
-                expected_free_transfers=restored.free_transfers,
+        tail_events = tuple(events)[1:]
+        if str(play_route.arm) != ARM_PLAY:
+            problems.append(f"{FH_TAIL_ROUTE_INVALID}: the PLAY route is labelled {play_route.arm!r}")
+        if str(save_route.arm) != ARM_SAVE:
+            problems.append(f"{FH_TAIL_ROUTE_INVALID}: the SAVE route is labelled {save_route.arm!r}")
+        play_events = tuple(int(entry.event) for entry in play_route.events)
+        if play_events != tail_events:
+            problems.append(
+                f"{FH_TAIL_ROUTE_INVALID}: PLAY route events {list(play_events)} != {list(tail_events)}"
             )
-        )
-        problems.extend(
-            f"{FH_TAIL_ROUTE_INVALID}: {problem}"
-            for problem in save_tail.problems(
-                expected_arm=FreeHitTailRoute.FREE_HIT_ARM_SAVE, expected_events=tail_events,
-                expected_squad=save_state.owned_ids, expected_bank=save_state.bank_tenths,
-                expected_free_transfers=save_state.free_transfers,
+        save_events = tuple(int(entry.event) for entry in save_route.events)
+        if save_events != tuple(events):
+            problems.append(
+                f"{FH_TAIL_ROUTE_INVALID}: SAVE route events {list(save_events)} != {list(events)}"
             )
-        )
+        # PLAY starts H2 from the RESTORED permanent state; SAVE starts H1 from the
+        # CURRENT permanent state.  Both comparisons include the acquisition basis.
+        for label, route, expected_state in (
+            ("PLAY route start", play_route, play_h2_start_state(request)),
+            ("SAVE route start", save_route, save_h1_start_state(request)),
+        ):
+            start_problems = _route_start_problems(route, expected_state, label=label)
+            if start_problems:
+                token = (
+                    FH_ROUTE_BASIS_MISMATCH
+                    if any("basis" in problem for problem in start_problems)
+                    else FH_ROUTE_START_STATE_MISMATCH
+                )
+                problems.extend(f"{token}: {problem}" for problem in start_problems)
 
     if int(request.permanent.event) != int(binding.planning_event):
         problems.append(
@@ -1066,10 +1087,8 @@ def evaluate_free_hit(request: FreeHitRequest) -> cd.ChipEvaluation:
     # from the restored permanent state, the SAVE arm from ordinary progression --
     # so the free-transfer divergence between them enters the decision instead of
     # being assumed away.
-    arms = four_gw_arm_values(
-        request, h1_temporary_value=float(temporary.expected_h1_core), h1_permanent_value=float(baseline_value)
-    )
-    mean_uplift = float(h1_uplift) + float(arms["tail_delta"])
+    arms = four_gw_arm_values(request, h1_temporary_value=float(temporary.expected_h1_core))
+    mean_uplift = float(arms["four_gw_play_value"]) - float(arms["four_gw_save_value"])
     paired_se = _std(paired) / math.sqrt(len(paired)) if len(paired) > 1 else 0.0
     ordered = sorted(paired)
 
@@ -1103,10 +1122,8 @@ def evaluate_free_hit(request: FreeHitRequest) -> cd.ChipEvaluation:
             # The four-GW decomposition: H1 temporary vs permanent, then the two
             # ACTUAL H2-H4 tails, then the totals the chip is decided on.
             **{key: round(value, 6) for key, value in arms.items()},
-            "play_tail_events": (request.play_tail.event_values() if request.play_tail else []),
-            "save_tail_events": (request.save_tail.event_values() if request.save_tail else []),
-            "play_h2_state": (request.play_tail.h2_state() if request.play_tail else {}),
-            "save_h2_state": (request.save_tail.h2_state() if request.save_tail else {}),
+            "play_route": (request.play_route.as_dict() if request.play_route else {}),
+            "save_route": (request.save_route.as_dict() if request.save_route else {}),
             "paired_se": round(paired_se, 6),
             "value_basis": "CORE_POINTS",
             "temporary_squad": list(temporary.squad_ids),
@@ -1188,143 +1205,93 @@ def _quantile(sorted_values: Sequence[float], q: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class FreeHitTailRoute:
-    """One ARM's H2-H4 route, evaluated by the canonical route engine.
+def play_h2_start_state(request: "FreeHitRequest") -> dict[str, Any]:
+    """The canonical state the PLAY arm enters H2 with: the RESTORED permanent state.
 
-    Free Hit's effect is not confined to H1.  A played Free Hit PRESERVES the
-    saved free-transfer bank while an ordinary Gameweek ACCRUES one, so the two
-    arms enter H2 with genuinely different states even when neither squad
-    changes -- and that difference propagates through H2-H4 route value.  An
-    H1-only comparison that asserts "H2-H4 are identical across arms" is
-    therefore wrong, and this type is how the real difference is carried.
-
-    ``events`` are the route engine's OWN per-event results.  Each
-    ``mean_net_core`` ALREADY nets that event's hit deduction, so no hit term is
-    subtracted again anywhere in this module -- double-counting a -4 hit as an
-    8-point swing is the one authority this contract exists to protect.
-
-    ``h2_*`` is the state this arm actually starts H2 from, and it is VALIDATED
-    against the arm it claims to be: the restored permanent squad with the
-    canonical post-Free-Hit free-transfer count for PLAY, and the permanent squad
-    with ordinary progression for SAVE.  A route that describes some other state
-    is refused rather than silently valued.
+    Derived from the permanent world and the season rules -- never from the SAVE
+    route and never from the temporary Free Hit squad.
     """
 
-    arm: str
-    events: tuple[Any, ...]
-    h2_squad_ids: tuple[int, ...]
-    h2_bank_tenths: int
-    h2_purchase_price_tenths: Mapping[int, int]
-    h2_free_transfers: int
-
-    FREE_HIT_ARM_PLAY = "PLAY"
-    FREE_HIT_ARM_SAVE = "SAVE"
-
-    def value(self) -> float:
-        """The arm's H2-H4 core: the sum of the route engine's per-event net core."""
-
-        return float(sum(float(getattr(entry, "mean_net_core")) for entry in self.events))
-
-    def event_values(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "event": int(getattr(entry, "event")),
-                "mean_net_core": round(float(getattr(entry, "mean_net_core")), 6),
-                "hit_points": int(getattr(entry, "hit_points", 0)),
-                "free_transfers": int(getattr(entry, "free_transfers", 0)),
-            }
-            for entry in self.events
-        ]
-
-    def h2_state(self) -> dict[str, Any]:
-        return {
-            "arm": str(self.arm),
-            "squad_ids": [int(p) for p in self.h2_squad_ids],
-            "bank_tenths": int(self.h2_bank_tenths),
-            "purchase_price_tenths": {int(k): int(v) for k, v in sorted(self.h2_purchase_price_tenths.items())},
-            "free_transfers": int(self.h2_free_transfers),
-        }
-
-    def problems(
-        self,
-        *,
-        expected_arm: str,
-        expected_events: Sequence[int],
-        expected_squad: Sequence[int],
-        expected_bank: int,
-        expected_free_transfers: int,
-    ) -> list[str]:
-        found: list[str] = []
-        if str(self.arm) != str(expected_arm):
-            found.append(f"the route is labelled {self.arm!r}, expected {expected_arm!r}")
-        events = tuple(int(getattr(entry, "event", -1)) for entry in self.events)
-        if len(events) != len(expected_events):
-            found.append(f"{expected_arm} tail has {len(events)} events, expected {len(expected_events)}")
-        if events and events != tuple(int(e) for e in expected_events):
-            found.append(f"{expected_arm} tail events {list(events)} != {list(expected_events)}")
-        if tuple(int(p) for p in self.h2_squad_ids) != tuple(int(p) for p in expected_squad):
-            # The arm must start H2 from the RESTORED permanent squad: a Free Hit
-            # temporary squad leaking into H2-H4 would be exactly the failure this
-            # check exists to catch.
-            found.append(f"{expected_arm} tail does not start H2 from the expected permanent squad")
-        if int(self.h2_bank_tenths) != int(expected_bank):
-            found.append(f"{expected_arm} tail H2 bank != the expected permanent bank")
-        if int(self.h2_free_transfers) != int(expected_free_transfers):
-            found.append(
-                f"{expected_arm} tail H2 free transfers {int(self.h2_free_transfers)} != the "
-                f"canonical {int(expected_free_transfers)}"
+    permanent = request.permanent
+    return {
+        "event": int(request.planning_event) + 1,
+        "squad_ids": [int(p) for p in permanent.owned_ids],
+        "bank_tenths": int(permanent.bank_tenths),
+        "free_transfers": int(
+            post_free_hit_ft_state(
+                request.rules, event_start_free_transfers=permanent.event_start_free_transfers
             )
-        for entry in self.events:
-            for problem in (getattr(entry, "problems", lambda: [])() or []):
-                found.append(f"{expected_arm}: {problem}")
-        return found
+        ),
+        "purchase_price_tenths": {
+            int(k): int(v) for k, v in sorted(permanent.purchase_price_tenths.items())
+        },
+    }
 
 
-def save_arm_h2_state(request: "FreeHitRequest") -> RestoredPermanentState:
-    """The state the SAVE arm enters H2 with: ordinary Gameweek progression."""
+def save_h1_start_state(request: "FreeHitRequest") -> dict[str, Any]:
+    """The canonical state the SAVE route begins H1 from: the CURRENT permanent state."""
 
     permanent = request.permanent
-    normal_ft = int(
-        sr.free_transfers_after_gameweek(request.rules, int(permanent.event_start_free_transfers), 0)
-    )
-    return RestoredPermanentState(
-        event=int(request.planning_event) + 1,
-        owned_ids=tuple(int(p) for p in permanent.owned_ids),
-        purchase_price_tenths={int(k): int(v) for k, v in permanent.purchase_price_tenths.items()},
-        bank_tenths=int(permanent.bank_tenths),
-        free_transfers=normal_ft,
-        free_transfers_rule="ordinary_gameweek_progression",
-    )
+    return {
+        "event": int(request.planning_event),
+        "squad_ids": [int(p) for p in permanent.owned_ids],
+        "bank_tenths": int(permanent.bank_tenths),
+        "free_transfers": int(permanent.free_transfers),
+        "purchase_price_tenths": {
+            int(k): int(v) for k, v in sorted(permanent.purchase_price_tenths.items())
+        },
+    }
+
+
+def _route_start_problems(
+    route: FreeHitRoute | None, expected: Mapping[str, Any], *, label: str
+) -> list[str]:
+    """Every way a route's START STATE differs from the arm's canonical state."""
+
+    if route is None:
+        return [f"{label}: no route"]
+    actual = route.start_state or {}
+    found: list[str] = []
+    if [int(p) for p in actual.get("squad_ids") or ()] != [int(p) for p in expected["squad_ids"]]:
+        found.append(f"{label}: squad")
+    if int(actual.get("bank_tenths", -(10**9))) != int(expected["bank_tenths"]):
+        found.append(f"{label}: bank")
+    if int(actual.get("free_transfers", -(10**9))) != int(expected["free_transfers"]):
+        found.append(f"{label}: free transfers")
+    actual_basis = {int(k): int(v) for k, v in (actual.get("purchase_price_tenths") or {}).items()}
+    if actual_basis != {int(k): int(v) for k, v in expected["purchase_price_tenths"].items()}:
+        found.append(f"{label}: acquisition basis")
+    return found
 
 
 def four_gw_arm_values(
-    request: "FreeHitRequest",
-    *,
-    h1_temporary_value: float,
-    h1_permanent_value: float,
+    request: "FreeHitRequest", *, h1_temporary_value: float
 ) -> dict[str, Any]:
-    """The TRUE four-GW values of both arms, from their ACTUAL H2 states.
+    """The TRUE four-GW values of both arms.
 
-    PLAY : H1 temporary Free Hit value, then the restored state's H2-H4 route
-    SAVE : H1 permanent value, then the ordinarily-progressed state's H2-H4 route
+    PLAY : the exact Free Hit H1 value, then the canonical H2-H4 route from the
+           RESTORED permanent state
+    SAVE : the canonical normal H1-H4 route from the CURRENT permanent state
 
-    Nothing here assumes the tails are equal, and nothing invents a future
-    transfer: both tails come from the canonical route engine.
+    SAVE is NOT "do nothing in H1": the normal route may make a beneficial H1
+    transfer, which is exactly why its H1 value and its H2 state both come from
+    the SAME evaluated route rather than from a synthesised state.
     """
 
-    play_tail = request.play_tail
-    save_tail = request.save_tail
-    play_tail_value = play_tail.value() if play_tail is not None else float("nan")
-    save_tail_value = save_tail.value() if save_tail is not None else float("nan")
+    play = request.play_route
+    save = request.save_route
+    play_tail_value = float(play.value()) if play is not None else float("nan")
+    save_value = float(save.value()) if save is not None else float("nan")
+    save_h1_entry = save.event_for(int(request.planning_event)) if save is not None else None
+    save_h1_value = float(save_h1_entry.mean_net_core) if save_h1_entry is not None else float("nan")
     return {
         "h1_temporary_value": float(h1_temporary_value),
-        "h1_permanent_value": float(h1_permanent_value),
+        "save_h1_route_value": float(save_h1_value),
         "play_tail_value": float(play_tail_value),
-        "save_tail_value": float(save_tail_value),
+        "save_route_value": float(save_value),
         "four_gw_play_value": float(h1_temporary_value) + float(play_tail_value),
-        "four_gw_save_value": float(h1_permanent_value) + float(save_tail_value),
-        "tail_delta": float(play_tail_value) - float(save_tail_value),
+        "four_gw_save_value": float(save_value),
+        "h1_value_delta": float(h1_temporary_value) - float(save_h1_value),
     }
 
 # ---------------------------------------------------------------------------

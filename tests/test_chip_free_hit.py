@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fpl_brain import chip_decision as cd  # noqa: E402
 from fpl_brain import chip_free_hit as fh  # noqa: E402
@@ -125,7 +126,7 @@ def _permanent(owned: tuple[int, ...], *, bank: int = 20, ft: int = 2,
     return fh.FreeHitPermanentState(
         event=EVENT, owned_ids=tuple(sorted(owned)),
         purchase_price_tenths=basis if basis is not None else {pid: 50 for pid in owned},
-        bank_tenths=int(bank), event_start_free_transfers=int(ft),
+        bank_tenths=int(bank), free_transfers=int(ft), event_start_free_transfers=int(ft),
         positions=POSITION, clubs=CLUB,
     )
 
@@ -141,19 +142,74 @@ def _market(prices: dict[int, int] | None = None) -> dict[int, int]:
 TAIL_EVENTS = (EVENT + 1, EVENT + 2, EVENT + 3)
 
 
-def _tail_events(values, *, owned, bank, basis, free_transfers):
-    """Build the accepted route-event DTOs the route engine produces."""
+def _canonical_route(
+    *,
+    arm,
+    events,
+    permanent,
+    bank_tenths,
+    free_transfers,
+    values,
+    transfers=None,
+    universe=None,
+):
+    """Build ONE arm's route through the fixture builder and the converter.
 
-    from fpl_brain import chip_wildcard as _wc
+    ``values`` sets the per-event WORLD score, not a route value: a uniform score
+    ``s`` over the eleven starters plus the armband yields ``12 * s`` per event,
+    so a test controls the world and the ENGINE produces the number.
+    """
 
-    return tuple(
-        _wc.WildcardSaveRouteEvent(
-            event=int(event), squad_ids=tuple(sorted(int(p) for p in owned)),
-            bank_tenths=int(bank), purchase_price_tenths={int(k): int(v) for k, v in basis.items()},
-            free_transfers=int(free_transfers), mean_net_core=float(value),
-        )
-        for event, value in zip(TAIL_EVENTS, values)
+    import free_hit_route_fixtures as fx
+    from fpl_brain import free_hit_route as fr
+
+    universe = tuple(int(p) for p in (universe if universe is not None else UNIVERSE))
+    ids = tuple(sorted(int(p) for p in permanent.owned_ids))
+    start = ts.RouteState(
+        event=int(events[0]),
+        players=tuple(
+            ts.RoutePlayer(int(pid), POSITION[int(pid)], CLUB[int(pid)],
+                           int(permanent.purchase_price_tenths.get(int(pid), 50)))
+            for pid in ids
+        ),
+        bank_tenths=int(bank_tenths),
+        free_transfers=int(free_transfers),
     )
+    meta = {pid: ts.PlayerMeta(pid, POSITION[pid], CLUB[pid]) for pid in universe}
+    partial, _terminal = fx.build_canonical_route(
+        start=start, events=tuple(events), transfers=transfers or {}, meta=meta,
+        universe=universe, price_default=50,
+    )
+    worlds = {
+        int(event): _world_matrix(event=int(event), uniform=(float(value) / 12.0), universe=universe)
+        for event, value in zip(events, values)
+    }
+    expected_start = {
+        "event": int(events[0]),
+        "squad_ids": list(ids),
+        "bank_tenths": int(bank_tenths),
+        "free_transfers": int(free_transfers),
+        "purchase_price_tenths": {
+            int(pid): int(permanent.purchase_price_tenths.get(int(pid), 50)) for pid in ids
+        },
+    }
+    return fr.free_hit_route_from_canonical_route(
+        partial, arm=arm, expected_events=tuple(events), rules=RULES,
+        expected_start_state=expected_start, worlds_by_event=worlds,
+        positions_of=lambda squad: {int(p): POSITION[int(p)] for p in squad},
+        route_config=fx.route_config(),
+    )
+
+
+def _world_matrix(*, event, uniform, universe):
+    """A canonical world matrix with a UNIFORM score for every player."""
+
+    return {
+        "worlds": 24,
+        "player_ids": list(universe),
+        "minutes": {pid: tuple(90.0 for _ in range(24)) for pid in universe},
+        "core": {pid: tuple(float(uniform) for _ in range(24)) for pid in universe},
+    }
 
 
 def _tails(
@@ -163,40 +219,32 @@ def _tails(
     play_values=(10.0, 10.0, 10.0),
     save_values=(10.0, 10.0, 10.0),
 ):
-    """Both arms' H2-H4 routes, each anchored to its OWN canonical H2 state.
+    """Both arms' routes, each anchored to its OWN canonical starting state.
 
-    PLAY starts H2 with the RESTORED permanent state (post-Free-Hit FT); SAVE
-    starts H2 after ordinary Gameweek progression.  Those free-transfer counts
+    PLAY starts H2 from the RESTORED permanent state (post-Free-Hit FT); SAVE
+    starts H1 from the CURRENT permanent state.  Those free-transfer counts
     genuinely differ, which is exactly what the four-GW comparison must reflect.
     """
 
     from fpl_brain import chip_free_hit as _fh
-    from fpl_brain import season_rules as _sr
+    from fpl_brain import free_hit_route as fr
 
-    rules = rules if rules is not None else _sr.SeasonRules(season="2026/27")
-    restored = _fh.restore_permanent_state(permanent, rules=rules, restored_event=TAIL_EVENTS[0])
-    request = _fh.FreeHitRequest(
-        permanent=permanent, horizon_binding=_binding(), h1_worlds=None, world_identity=None,
-        positions={}, clubs={}, market_price_tenths={}, pool_binding=None, rules=rules,
+    rules = rules if rules is not None else RULES
+    universe = tuple(int(p) for p in UNIVERSE)
+    save_ft = int(permanent.free_transfers)
+    play_ft = int(_fh.post_free_hit_ft_state(
+        rules, event_start_free_transfers=permanent.event_start_free_transfers))
+    play = _canonical_route(
+        arm=fr.ARM_PLAY, events=TAIL_EVENTS, permanent=permanent,
+        bank_tenths=int(permanent.bank_tenths), free_transfers=play_ft,
+        values=play_values, universe=universe,
     )
-    save_state = _fh.save_arm_h2_state(request)
-    play = _fh.FreeHitTailRoute(
-        arm=_fh.FreeHitTailRoute.FREE_HIT_ARM_PLAY,
-        events=_tail_events(play_values, owned=permanent.owned_ids, bank=restored.bank_tenths,
-                            basis=permanent.purchase_price_tenths,
-                            free_transfers=restored.free_transfers),
-        h2_squad_ids=tuple(sorted(permanent.owned_ids)), h2_bank_tenths=int(restored.bank_tenths),
-        h2_purchase_price_tenths=dict(permanent.purchase_price_tenths),
-        h2_free_transfers=int(restored.free_transfers),
-    )
-    save = _fh.FreeHitTailRoute(
-        arm=_fh.FreeHitTailRoute.FREE_HIT_ARM_SAVE,
-        events=_tail_events(save_values, owned=save_state.owned_ids, bank=save_state.bank_tenths,
-                            basis=save_state.purchase_price_tenths,
-                            free_transfers=save_state.free_transfers),
-        h2_squad_ids=tuple(sorted(save_state.owned_ids)), h2_bank_tenths=int(save_state.bank_tenths),
-        h2_purchase_price_tenths=dict(save_state.purchase_price_tenths),
-        h2_free_transfers=int(save_state.free_transfers),
+    # SAVE spans H1-H4.  Its H1 uses the SAME uniform world score as the permanent
+    # H1 baseline (12.0 on this fifteen), so the two arms remain commensurate.
+    save = _canonical_route(
+        arm=fr.ARM_SAVE, events=(EVENT, *TAIL_EVENTS), permanent=permanent,
+        bank_tenths=int(permanent.bank_tenths), free_transfers=save_ft,
+        values=(12.0, *tuple(save_values)), universe=universe,
     )
     return play, save
 
@@ -216,8 +264,8 @@ def _request(
     )
     base = dict(
         permanent=permanent,
-        play_tail=play_tail,
-        save_tail=save_tail,
+        play_route=play_tail,
+        save_route=save_tail,
         decision_authority=_authority() if authority is None else authority,
         horizon_binding=_binding(event, snapshot),
         h1_worlds=h1,
@@ -468,7 +516,8 @@ def test_four_from_one_club_refuses():
         permanent=fh.FreeHitPermanentState(
             event=EVENT, owned_ids=_legal_owned(),
             purchase_price_tenths={pid: 50 for pid in _legal_owned()},
-            bank_tenths=20, event_start_free_transfers=2, positions=POSITION, clubs=crowded,
+            bank_tenths=20, free_transfers=2, event_start_free_transfers=2,
+            positions=POSITION, clubs=crowded,
         ),
         horizon_binding=request.horizon_binding, h1_worlds=request.h1_worlds,
         world_identity=request.world_identity, positions=POSITION, clubs=crowded,

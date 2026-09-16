@@ -90,6 +90,8 @@ class FreeHitManagerState:
     owned_ids: tuple[int, ...]
     purchase_price_tenths: Mapping[int, int]
     bank_tenths: int
+    #: FT AVAILABLE entering H1 (the normal route's starting state).
+    free_transfers: int
     event_start_free_transfers: int
     positions: Mapping[int, str]
     clubs: Mapping[int, int]
@@ -109,6 +111,7 @@ class FreeHitManagerState:
             owned_ids=tuple(sorted(int(p) for p in self.owned_ids)),
             purchase_price_tenths={int(k): int(v) for k, v in self.purchase_price_tenths.items()},
             bank_tenths=int(self.bank_tenths),
+            free_transfers=int(self.free_transfers),
             event_start_free_transfers=int(self.event_start_free_transfers),
             positions={int(k): str(v) for k, v in self.positions.items()},
             clubs={int(k): int(v) for k, v in self.clubs.items()},
@@ -165,10 +168,12 @@ def free_hit_manager_state(
 
     bank = state.get("bank")
     event_start_ft = state.get("event_start_free_transfers")
-    if bank is None or event_start_ft is None:
+    available_ft = state.get("free_transfers")
+    if bank is None or event_start_ft is None or available_ft is None:
         raise FreeHitAdapterError(
             f"{FH_MANAGER_STATE_MISSING}: bank or event-start free transfers unavailable from "
-            f"canonical manager state (bank={bank!r}, ft={event_start_ft!r})",
+            f"canonical manager state (bank={bank!r}, ft={available_ft!r}, "
+            f"event_start_ft={event_start_ft!r})",
             reasons=(FH_MANAGER_STATE_MISSING,),
         )
 
@@ -218,6 +223,7 @@ def free_hit_manager_state(
         owned_ids=squad,
         purchase_price_tenths=basis,
         bank_tenths=int(bank),
+        free_transfers=int(available_ft),
         event_start_free_transfers=int(event_start_ft),
         positions=positions,
         clubs=clubs,
@@ -272,12 +278,11 @@ class FreeHitCertifiedInputs:
     h1_worlds: WildcardWorldInputs
     world_identity: WildcardPredictiveIdentity
     pool_binding: WildcardPoolBinding
-    #: The two arms' H2-H4 routes from the canonical route engine.  Both are
-    #: required: a played Free Hit and an ordinary Gameweek enter H2 with
-    #: different free-transfer banks, so an H1-only comparison is not an exact
-    #: four-GW chip decision.
-    play_tail: fh.FreeHitTailRoute
-    save_tail: fh.FreeHitTailRoute
+    #: The two arms' canonical routes.  Both are required: a played Free Hit and
+    #: an ordinary Gameweek enter H2 with different free-transfer banks, so an
+    #: H1-only comparison is not an exact four-GW chip decision.
+    play_route: fh.FreeHitRoute
+    save_route: fh.FreeHitRoute
     #: The canonical certified decision context, built from the certification
     #: artifact.  Every predictive dimension is anchored to it.
     decision_authority: fh.FreeHitDecisionAuthority
@@ -397,8 +402,8 @@ def build_free_hit_request(
         clubs=dict(manager.clubs),
         market_price_tenths=dict(manager.market_price_tenths),
         pool_binding=certified.pool_binding,
-        play_tail=certified.play_tail,
-        save_tail=certified.save_tail,
+        play_route=certified.play_route,
+        save_route=certified.save_route,
         decision_authority=certified.decision_authority,
         chip_available=bool(chip_available),
         rules=rules if rules is not None else sr.SeasonRules(season="2026/27"),

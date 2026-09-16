@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fpl_brain import chip_decision as cd  # noqa: E402
 from fpl_brain import chip_free_hit as fh  # noqa: E402
@@ -192,34 +193,52 @@ def _pool() -> WildcardPoolBinding:
     )
 
 
-def _tails(*, play_values=(10.0, 10.0, 10.0), save_values=(10.0, 10.0, 10.0)):
-    from fpl_brain import chip_wildcard as _wc
+def _arms(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
+    """Both arms as canonical routes from the fixture builder and the converter."""
+
+    import free_hit_route_fixtures as fx
+    from fpl_brain import free_hit_route as fr
+    from fpl_brain import transfer_state as ts
 
     permanent = _permanent()
-    events = (EVENT + 1, EVENT + 2, EVENT + 3)
+    universe = tuple(int(pid) for pid in UNIVERSE)
+    meta = {pid: ts.PlayerMeta(pid, POSITION[pid], CLUB[pid]) for pid in universe}
+    ids = tuple(sorted(OWNED))
+    basis = {pid: 50 for pid in ids}
     restored_ft = fh.post_free_hit_ft_state(RULES, event_start_free_transfers=2)
-    save_ft = int(sr.free_transfers_after_gameweek(RULES, 2, 0))
-    basis = permanent.purchase_price_tenths
 
-    def _build(arm, values, free_transfers):
-        return fh.FreeHitTailRoute(
-            arm=arm,
-            events=tuple(
-                _wc.WildcardSaveRouteEvent(
-                    event=int(event), squad_ids=tuple(sorted(OWNED)), bank_tenths=20,
-                    purchase_price_tenths={int(k): int(v) for k, v in basis.items()},
-                    free_transfers=int(free_transfers), mean_net_core=float(value),
-                )
-                for event, value in zip(events, values)
-            ),
-            h2_squad_ids=tuple(sorted(OWNED)), h2_bank_tenths=20,
-            h2_purchase_price_tenths={int(k): int(v) for k, v in basis.items()},
-            h2_free_transfers=int(free_transfers),
+    def _build(arm, events, scores, free_transfers):
+        state = ts.RouteState(
+            event=int(events[0]),
+            players=tuple(ts.RoutePlayer(pid, POSITION[pid], CLUB[pid], basis[pid]) for pid in ids),
+            bank_tenths=20, free_transfers=int(free_transfers),
+        )
+        partial, _terminal = fx.build_canonical_route(
+            start=state, events=tuple(events), meta=meta, universe=universe, price_default=50,
+        )
+        worlds = {
+            int(event): {
+                "worlds": 24, "player_ids": list(universe),
+                "minutes": {pid: tuple(90.0 for _ in range(24)) for pid in universe},
+                "core": {pid: tuple(float(score) for _ in range(24)) for pid in universe},
+            }
+            for event, score in zip(events, scores)
+        }
+        return fr.free_hit_route_from_canonical_route(
+            partial, arm=arm, expected_events=tuple(events), rules=RULES,
+            expected_start_state={
+                "event": int(events[0]), "squad_ids": list(ids), "bank_tenths": 20,
+                "free_transfers": int(free_transfers), "purchase_price_tenths": basis,
+            },
+            worlds_by_event=worlds,
+            positions_of=lambda squad: {int(p): POSITION[int(p)] for p in squad},
+            route_config=fx.route_config(),
         )
 
     return (
-        _build(fh.FreeHitTailRoute.FREE_HIT_ARM_PLAY, play_values, restored_ft),
-        _build(fh.FreeHitTailRoute.FREE_HIT_ARM_SAVE, save_values, save_ft),
+        _build(fr.ARM_PLAY, (EVENT + 1, EVENT + 2, EVENT + 3), play_scores, restored_ft),
+        _build(fr.ARM_SAVE, (EVENT, EVENT + 1, EVENT + 2, EVENT + 3),
+               (1.0, *tuple(save_scores)), 2),
     )
 
 
@@ -227,14 +246,14 @@ def _permanent() -> fh.FreeHitPermanentState:
     return fh.FreeHitPermanentState(
         event=EVENT, owned_ids=tuple(sorted(OWNED)),
         purchase_price_tenths={pid: 50 for pid in OWNED}, bank_tenths=20,
-        event_start_free_transfers=2, positions=POSITION, clubs=CLUB,
+        free_transfers=2, event_start_free_transfers=2, positions=POSITION, clubs=CLUB,
     )
 
 
 def _certified(**overrides) -> ad.FreeHitCertifiedInputs:
-    play_tail, save_tail = _tails()
+    play_tail, save_tail = _arms()
     base = dict(horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool(), play_tail=play_tail, save_tail=save_tail,
+                pool_binding=_pool(), play_route=play_tail, save_route=save_tail,
                 decision_authority=_authority())
     base.update(overrides)
     return ad.FreeHitCertifiedInputs(**base)

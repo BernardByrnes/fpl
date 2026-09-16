@@ -36,165 +36,12 @@ def _improving(**overrides):
 
 # ---------------------------------------------------------------------------
 # P1 — THE FOUR-GW COMPARISON
+#
+# The decisive four-GW route tests live in ``test_free_hit_route_authority.py``,
+# built on REAL canonical routes.  They replaced the tests that stood here: those
+# were written against a Free Hit tail DTO whose numeric fields were supplied by
+# the caller, which is precisely the authority this repair removed.
 # ---------------------------------------------------------------------------
-
-
-def test_P1_the_arms_enter_H2_with_genuinely_different_states():
-    """The counterexample: a played chip preserves the bank; an ordinary week accrues."""
-
-    permanent = _permanent(LEGAL_OWNED, bank=200, ft=2)
-    request = fh.FreeHitRequest(
-        permanent=permanent, horizon_binding=_request().horizon_binding,
-        h1_worlds=_worlds(), world_identity=_identity(),
-        positions={}, clubs={}, market_price_tenths={}, pool_binding=_pool(), rules=RULES,
-    )
-    restored = fh.restore_permanent_state(permanent, rules=RULES, restored_event=EVENT + 1)
-    save_state = fh.save_arm_h2_state(request)
-    assert restored.free_transfers == 2            # preserved by the chip
-    assert save_state.free_transfers == 3          # ordinary progression
-    assert restored.free_transfers != save_state.free_transfers
-    # Squad, bank and basis are identical: ONLY the free-transfer count diverges.
-    assert restored.owned_ids == save_state.owned_ids
-    assert restored.bank_tenths == save_state.bank_tenths
-    assert restored.equals_permanent(permanent) == []
-
-
-def test_P1_the_four_gw_value_is_the_h1_difference_PLUS_the_tail_difference():
-    """The uplift is a real four-GW number, not an H1-only one wearing a wrapper."""
-
-    permanent = _permanent(LEGAL_OWNED, bank=200, ft=2)
-    play_tail, save_tail = _tails(permanent, play_values=(9.0, 9.0, 9.0), save_values=(6.0, 6.0, 6.0))
-    request = _improving(play_tail=play_tail, save_tail=save_tail)
-    evaluation = fh.evaluate_free_hit(request)
-    metrics = evaluation.candidate_metrics
-
-    assert metrics["h1_paired_uplift"] != 0.0
-    assert metrics["play_tail_value"] == pytest.approx(27.0)
-    assert metrics["save_tail_value"] == pytest.approx(18.0)
-    assert metrics["tail_delta"] == pytest.approx(9.0)
-    assert metrics["mean_paired_uplift"] == pytest.approx(
-        metrics["h1_paired_uplift"] + metrics["tail_delta"], abs=1e-5
-    )
-    assert metrics["four_gw_play_value"] == pytest.approx(
-        metrics["temporary_h1_value"] + metrics["play_tail_value"], abs=1e-5
-    )
-    assert metrics["four_gw_save_value"] == pytest.approx(
-        metrics["permanent_h1_baseline"] + metrics["save_tail_value"], abs=1e-5
-    )
-    assert metrics["mean_paired_uplift"] == pytest.approx(
-        metrics["four_gw_play_value"] - metrics["four_gw_save_value"], abs=1e-5
-    )
-    assert evaluation.evidence["planning_event"] == EVENT
-    assert metrics["arms_valued_separately"] is True
-
-
-def test_P1_the_same_H1_uplift_with_a_different_downstream_route_decides_differently():
-    """Sol's decisive case: identical H1 gain, different H2-H4 consequence."""
-
-    permanent = _permanent(LEGAL_OWNED, bank=200, ft=2)
-    flat_play, flat_save = _tails(permanent, play_values=(5.0,) * 3, save_values=(5.0,) * 3)
-    better_play, better_save = _tails(permanent, play_values=(20.0,) * 3, save_values=(5.0,) * 3)
-    worse_play, worse_save = _tails(permanent, play_values=(1.0,) * 3, save_values=(5.0,) * 3)
-
-    baseline = fh.evaluate_free_hit(_improving(play_tail=flat_play, save_tail=flat_save))
-    better = fh.evaluate_free_hit(_improving(play_tail=better_play, save_tail=better_save))
-    worse = fh.evaluate_free_hit(_improving(play_tail=worse_play, save_tail=worse_save))
-
-    # The H1 component is IDENTICAL across all three: only the tail differs.
-    assert better.candidate_metrics["h1_paired_uplift"] == pytest.approx(
-        baseline.candidate_metrics["h1_paired_uplift"]
-    )
-    assert worse.candidate_metrics["h1_paired_uplift"] == pytest.approx(
-        baseline.candidate_metrics["h1_paired_uplift"]
-    )
-    # And the DECISION value moves with it.
-    assert better.mean_uplift == pytest.approx(baseline.mean_uplift + 45.0, abs=1e-5)
-    assert worse.mean_uplift == pytest.approx(baseline.mean_uplift - 12.0, abs=1e-5)
-    assert worse.mean_uplift < baseline.mean_uplift < better.mean_uplift
-
-
-def test_P1_the_play_tail_must_start_from_the_restored_permanent_squad():
-    """A temporary Free Hit squad leaking into H2-H4 is refused, not valued."""
-
-    permanent = _permanent(LEGAL_OWNED)
-    play_tail, save_tail = _tails(permanent)
-    temporary_squad = tuple(sorted(set(UNIVERSE) - set(LEGAL_OWNED)))[:15]
-    leaked = fh.FreeHitTailRoute(
-        arm=play_tail.arm, events=play_tail.events, h2_squad_ids=temporary_squad,
-        h2_bank_tenths=play_tail.h2_bank_tenths,
-        h2_purchase_price_tenths=play_tail.h2_purchase_price_tenths,
-        h2_free_transfers=play_tail.h2_free_transfers,
-    )
-    request = _improving(play_tail=leaked, save_tail=save_tail)
-    problems = fh.contract_problems(request)
-    assert any(fh.FH_TAIL_ROUTE_INVALID in problem for problem in problems), problems
-    assert any("does not start H2 from the expected permanent squad" in problem for problem in problems)
-    assert fh.evaluate_free_hit(request).mean_uplift is None
-
-
-@pytest.mark.parametrize("mutation,needle", [
-    ("ft", "free transfers"),
-    ("bank", "bank"),
-    ("label", "labelled"),
-])
-def test_P1_a_tail_that_describes_the_wrong_arm_state_refuses(mutation, needle):
-    permanent = _permanent(LEGAL_OWNED, bank=200, ft=2)
-    play_tail, save_tail = _tails(permanent)
-    if mutation == "ft":
-        forged = fh.FreeHitTailRoute(
-            arm=play_tail.arm, events=play_tail.events, h2_squad_ids=play_tail.h2_squad_ids,
-            h2_bank_tenths=play_tail.h2_bank_tenths,
-            h2_purchase_price_tenths=play_tail.h2_purchase_price_tenths, h2_free_transfers=3,
-        )
-        request = _improving(play_tail=forged, save_tail=save_tail)
-    elif mutation == "bank":
-        forged = fh.FreeHitTailRoute(
-            arm=play_tail.arm, events=play_tail.events, h2_squad_ids=play_tail.h2_squad_ids,
-            h2_bank_tenths=999, h2_purchase_price_tenths=play_tail.h2_purchase_price_tenths,
-            h2_free_transfers=play_tail.h2_free_transfers,
-        )
-        request = _improving(play_tail=forged, save_tail=save_tail)
-    else:
-        forged = fh.FreeHitTailRoute(
-            arm=fh.FreeHitTailRoute.FREE_HIT_ARM_SAVE, events=play_tail.events,
-            h2_squad_ids=play_tail.h2_squad_ids, h2_bank_tenths=play_tail.h2_bank_tenths,
-            h2_purchase_price_tenths=play_tail.h2_purchase_price_tenths,
-            h2_free_transfers=play_tail.h2_free_transfers,
-        )
-        request = _improving(play_tail=forged, save_tail=save_tail)
-    problems = fh.contract_problems(request)
-    assert any(fh.FH_TAIL_ROUTE_INVALID in problem for problem in problems), (mutation, problems)
-    assert any(needle in problem for problem in problems), (mutation, problems)
-
-
-def test_P1_a_missing_tail_refuses():
-    """A request without both arms' routes is not an exact four-GW decision."""
-
-    coherent = _improving()
-    bare = fh.FreeHitRequest(
-        permanent=coherent.permanent, horizon_binding=coherent.horizon_binding,
-        h1_worlds=coherent.h1_worlds, world_identity=coherent.world_identity,
-        positions=coherent.positions, clubs=coherent.clubs,
-        market_price_tenths=coherent.market_price_tenths, pool_binding=coherent.pool_binding,
-        decision_authority=coherent.decision_authority, rules=RULES,
-    )
-    problems = fh.contract_problems(bare)
-    assert any(fh.FH_TAIL_ROUTE_MISSING in problem for problem in problems), problems
-    assert fh.evaluate_free_hit(bare).mean_uplift is None
-
-
-def test_P1_the_save_arm_is_not_a_clairvoyant_future_chip():
-    """SAVE is ordinary progression; no best-future-Free-Hit is searched for."""
-
-    source = Path(fh.__file__).read_text(encoding="utf-8")
-    assert "clairvoyant" not in source.lower()
-    permanent = _permanent(LEGAL_OWNED, bank=200, ft=2)
-    _play, save_tail = _tails(permanent)
-    # The SAVE state's free transfers are the CANONICAL progression, not a chip.
-    assert save_tail.h2_free_transfers == sr.free_transfers_after_gameweek(RULES, 2, 0)
-    assert save_tail.h2_free_transfers != fh.post_free_hit_ft_state(
-        RULES, event_start_free_transfers=2
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +133,7 @@ def test_P2c_a_missing_authority_refuses():
         h1_worlds=request.h1_worlds, world_identity=request.world_identity,
         positions=request.positions, clubs=request.clubs,
         market_price_tenths=request.market_price_tenths, pool_binding=request.pool_binding,
-        play_tail=request.play_tail, save_tail=request.save_tail, rules=RULES,
+        play_route=request.play_route, save_route=request.save_route, rules=RULES,
     )
     problems = fh.contract_problems(bare)
     assert any(fh.FH_DECISION_AUTHORITY_REQUIRED in problem for problem in problems), problems
