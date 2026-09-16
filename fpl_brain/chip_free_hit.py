@@ -83,6 +83,16 @@ from . import manager_lineup as ml
 from . import season_rules as sr
 from . import transfer_state as ts
 from .candidate_universe import OFFICIAL_PLAYER_POOL_INCOMPLETE
+from .free_hit_decision_authority import (
+    FH_CERTIFIED_CUTOFF_MISMATCH,
+    FH_CERTIFIED_EVENTS_MISMATCH,
+    FH_CERTIFIED_SNAPSHOT_MISMATCH,
+    FH_DECISION_AUTHORITY_MISMATCH,
+    FH_DECISION_AUTHORITY_REQUIRED,
+    FreeHitAuthorityError,
+    FreeHitDecisionAuthority,
+    load_decision_authority,
+)
 from .free_hit_route import (
     ARM_PLAY, ARM_SAVE, FH_ROUTE_BASIS_MISMATCH, FH_ROUTE_START_STATE_MISMATCH,
     FreeHitRoute, free_hit_route_from_canonical_route, state_fingerprint,
@@ -130,8 +140,6 @@ FH_HORIZON_NOT_CANONICAL = "FREE_HIT_HORIZON_NOT_CANONICAL"
 #: The four-GW comparison needs BOTH arms' H2-H4 routes.
 FH_TAIL_ROUTE_MISSING = "FREE_HIT_FOUR_GW_TAIL_ROUTE_MISSING"
 FH_TAIL_ROUTE_INVALID = "FREE_HIT_FOUR_GW_TAIL_ROUTE_INVALID"
-FH_DECISION_AUTHORITY_REQUIRED = "FREE_HIT_CANONICAL_DECISION_AUTHORITY_REQUIRED"
-FH_DECISION_AUTHORITY_MISMATCH = "FREE_HIT_PREDICTIVE_EVIDENCE_NOT_THE_CERTIFIED_ONE"
 #: The world matrix keyset must BE the authoritative eligible universe.
 FH_WORLD_KEYSET_MISMATCH = "FREE_HIT_WORLD_KEYSET_IS_NOT_THE_OFFICIAL_POOL"
 
@@ -876,6 +884,17 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
     else:
         for problem in authority.problems():
             problems.append(f"{FH_DECISION_AUTHORITY_REQUIRED}: {problem}")
+        # The horizon must BE the certified event set, not merely the same SHAPE:
+        # GW6-GW9 is a perfectly legal four-event window and is still the WRONG one.
+        problems.extend(authority.certified_events_problems(events))
+        # The planning event IS the first certified event; a manager context for
+        # another H1 must not be decided under this certificate.
+        if authority.certified_events and int(request.planning_event) != int(authority.certified_events[0]):
+            problems.append(
+                f"{FH_CERTIFIED_CUTOFF_MISMATCH}: the manager planning event "
+                f"GW{int(request.planning_event)} is not the first certified event "
+                f"GW{int(authority.certified_events[0])}"
+            )
         # BOTH the bound identity and the world's identity must be the CERTIFIED
         # one.  Requiring only that they agree with each other is exactly the
         # self-certification this closes.
@@ -1297,135 +1316,3 @@ def four_gw_arm_values(
 # ---------------------------------------------------------------------------
 # THE CANONICAL DECISION AUTHORITY
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class FreeHitDecisionAuthority:
-    """The CANONICAL certified decision context a Free Hit request is anchored to.
-
-    Comparing the request's world identity against ANOTHER request-owned identity
-    proves nothing: a caller can alter both together on the cutoff, the source
-    snapshot, the prediction run or the model/config while leaving the data
-    snapshot intact, and the two artifacts will happily agree with each other.
-    Agreement between two caller objects is not authority.
-
-    This type is built from the CERTIFICATION ARTIFACT -- the accepted canonical
-    object -- and its identity is RECOMPUTED from that artifact's own fields by
-    ``four_gw_decision.certification_identity_of``, so a copied identity on a
-    different artifact fails.  Every predictive dimension is then anchored here
-    rather than to another supplied object.
-    """
-
-    planning_cutoff: str
-    data_snapshot_sha256: str
-    certification_identity: str
-    certified_bundle_identity: Mapping[str, Any] = field(default_factory=dict)
-    source_snapshot_sha256: str = ""
-    prediction_generation: str = ""
-    model_config_identity: str = ""
-
-    def problems(self) -> list[str]:
-        found: list[str] = []
-        for name in ("planning_cutoff", "data_snapshot_sha256", "certification_identity",
-                     "source_snapshot_sha256", "prediction_generation", "model_config_identity"):
-            if not str(getattr(self, name) or "").strip():
-                found.append(f"the certified decision authority carries no {name}")
-        return found
-
-    def disagreements_with(
-        self, identity: WildcardPredictiveIdentity | None, *, event: int | None = None,
-        label: str = "identity",
-    ) -> list[str]:
-        """Every predictive dimension on which ``identity`` is not the certified one."""
-
-        found: list[str] = []
-        if identity is None:
-            return [f"{label} carries no predictive identity"]
-        if event is not None and int(event) != int(event):
-            found.append(f"{label} event")
-        pairs = (
-            ("cutoff", str(identity.cutoff), str(self.planning_cutoff)),
-            ("data_snapshot_sha256", str(identity.data_snapshot_sha256), str(self.data_snapshot_sha256)),
-            ("source_snapshot_sha256", str(identity.source_snapshot_sha256), str(self.source_snapshot_sha256)),
-            ("generation", str(identity.generation), str(self.prediction_generation)),
-            ("model_config_identity", str(identity.model_config_identity), str(self.model_config_identity)),
-        )
-        for name, supplied, certified in pairs:
-            if supplied != certified:
-                found.append(f"{label} {name}")
-        return found
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "planning_cutoff": str(self.planning_cutoff),
-            "data_snapshot_sha256": str(self.data_snapshot_sha256),
-            "certification_identity": str(self.certification_identity),
-            "source_snapshot_sha256": str(self.source_snapshot_sha256),
-            "prediction_generation": str(self.prediction_generation),
-            "model_config_identity": str(self.model_config_identity),
-        }
-
-    @classmethod
-    def from_certification(cls, artifact: Mapping[str, Any]) -> "FreeHitDecisionAuthority":
-        """Build the authority from a certification artifact, or refuse.
-
-        The artifact's own ``four_gw_certification_identity`` must equal the value
-        RECOMPUTED from its cutoff, bundle identities and data snapshot, so a
-        recognised identity copied onto a different artifact is refused.  Any
-        dimension the artifact does not carry refuses: this object is the anchor,
-        and an anchor with a missing dimension would silently stop anchoring it.
-        """
-
-        from . import four_gw_decision as fg
-
-        if not artifact:
-            raise FreeHitInputError(
-                f"{FH_DECISION_AUTHORITY_REQUIRED}: no certification artifact supplied",
-                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
-            )
-        declared = str(
-            artifact.get("four_gw_certification_identity") or artifact.get("certification_identity") or ""
-        )
-        recomputed = fg.certification_identity_of(artifact)
-        if not declared:
-            raise FreeHitInputError(
-                f"{FH_DECISION_AUTHORITY_REQUIRED}: the certification artifact declares no identity",
-                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
-            )
-        if str(declared) != str(recomputed):
-            raise FreeHitInputError(
-                f"{FH_DECISION_AUTHORITY_REQUIRED}: the certification artifact's declared identity is not "
-                "the one its own fields produce",
-                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
-            )
-        bundles = artifact.get("certified_bundle_identity") or {}
-        authority = cls(
-            planning_cutoff=str(artifact.get("planning_cutoff") or ""),
-            data_snapshot_sha256=str(artifact.get("data_snapshot_sha256") or ""),
-            certification_identity=str(declared),
-            certified_bundle_identity=dict(bundles) if isinstance(bundles, Mapping) else {},
-            source_snapshot_sha256=str(
-                artifact.get("source_snapshot_sha256")
-                or (bundles.get("source_snapshot_sha256") if isinstance(bundles, Mapping) else "")
-                or ""
-            ),
-            prediction_generation=str(
-                artifact.get("prediction_generation")
-                or artifact.get("projection_run_identity")
-                or (bundles.get("generation") if isinstance(bundles, Mapping) else "")
-                or ""
-            ),
-            model_config_identity=str(
-                artifact.get("model_config_identity")
-                or artifact.get("config_hash")
-                or (bundles.get("model_config_identity") if isinstance(bundles, Mapping) else "")
-                or ""
-            ),
-        )
-        problems = authority.problems()
-        if problems:
-            raise FreeHitInputError(
-                f"{FH_DECISION_AUTHORITY_REQUIRED}: " + "; ".join(problems[:6]),
-                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
-            )
-        return authority

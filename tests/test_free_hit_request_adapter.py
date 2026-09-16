@@ -8,8 +8,10 @@ hand-made object.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
+import tempfile
 import sys
 from pathlib import Path
 
@@ -21,11 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fpl_brain import chip_decision as cd  # noqa: E402
 from fpl_brain import chip_free_hit as fh  # noqa: E402
 from fpl_brain import free_hit_request_adapter as ad  # noqa: E402
+from fpl_brain import four_gw_decision as fg  # noqa: E402
 from fpl_brain import repositories as repo  # noqa: E402
 from fpl_brain import season_rules as sr  # noqa: E402
 from fpl_brain.chip_wildcard import WildcardPoolBinding, WildcardPredictiveIdentity  # noqa: E402
 from fpl_brain.database import connect_database  # noqa: E402
 from fpl_brain.ingest_provenance import element_id_sha256  # noqa: E402
+import free_hit_certification_fixtures as cf  # noqa: E402
 from fpl_brain.models import (  # noqa: E402
     EventRecord, PickRecord, PlayerRecord, PlayerSnapshotRecord, PositionRecord, TeamRecord,
 )
@@ -33,12 +37,20 @@ from fpl_brain.models import (  # noqa: E402
 ENTRY = 241392
 EVENT = 5
 WORLDS = 6
-CUTOFF = "2026-09-16T11:00:00Z"
 CAPTURED_AT = "2026-09-16T08:00:00Z"
-DATA = "sha256:" + "d" * 64
-SOURCE = "sha256:" + "s" * 64
-CERT = "sha256:" + "c" * 64
-CONFIG = "sha256:" + "f" * 64
+#: Derived from the certification fixture: the authority anchors each predictive
+#: dimension to the CERTIFIED BUNDLE, not to another request-owned object.
+CUTOFF = cf.CUTOFF
+DATA = cf.DATA_SNAPSHOT
+SOURCE = cf.CODE_SNAPSHOT
+CONFIG = cf.model_label(cf.MODEL_VERSIONS)
+CERT = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3))[
+    "four_gw_certification_identity"
+]
+#: The ONE production source of decision authority.
+CERT_PATH = cf.write_artifact(
+    Path(tempfile.mkdtemp()), cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3))
+)
 RULES = sr.SeasonRules(season="2026/27")
 
 UNIVERSE = tuple(range(1, 31))
@@ -159,23 +171,14 @@ def _h1_worlds(values: dict[int, float] | None = None, *, identity=None, event: 
 
 
 def _authority(**overrides) -> fh.FreeHitDecisionAuthority:
-    """The canonical certified decision context, from a self-consistent artifact."""
+    """The certified decision context, derived from a REAL-schema artifact."""
 
-    from fpl_brain import four_gw_decision as fg
-
-    base = dict(cutoff=CUTOFF, data=DATA, source=SOURCE, generation=CAPTURED_AT, config=CONFIG)
-    base.update(overrides)
-    artifact = {
-        "planning_cutoff": base["cutoff"],
-        "data_snapshot_sha256": base["data"],
-        "certified_bundle_identity": {
-            "source_snapshot_sha256": base["source"],
-            "generation": base["generation"],
-            "model_config_identity": base["config"],
-        },
-    }
-    artifact["four_gw_certification_identity"] = fg.certification_identity_of(artifact)
-    return fh.FreeHitDecisionAuthority.from_certification(artifact)
+    return fh.FreeHitDecisionAuthority.from_certification(
+        cf.certification_artifact(
+            events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), **overrides
+        ),
+        loaded_from="<test certificate>",
+    )
 
 
 def _binding(*, event: int = EVENT, snapshot: str = DATA, identity=None):
@@ -253,8 +256,7 @@ def _permanent() -> fh.FreeHitPermanentState:
 def _certified(**overrides) -> ad.FreeHitCertifiedInputs:
     play_tail, save_tail = _arms()
     base = dict(horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool(), play_route=play_tail, save_route=save_tail,
-                decision_authority=_authority())
+                pool_binding=_pool(), play_route=play_tail, save_route=save_tail)
     base.update(overrides)
     return ad.FreeHitCertifiedInputs(**base)
 
@@ -281,7 +283,7 @@ def test_the_canonical_manager_state_is_sourced_and_accepted(conn):
     assert state.market_price_tenths[1] == 50
     assert state.market_price_basis.startswith("analytics.snapshot_as_of@")
 
-    request = ad.build_free_hit_request(state, _certified(), conn=conn)
+    request = ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=CERT_PATH)
     evaluation = fh.evaluate_free_hit(request)
     assert evaluation.action == cd.CHIP_ACTION_FH
     assert evaluation.candidate_metrics["mean_paired_uplift"] is not None
@@ -339,7 +341,7 @@ def test_building_without_canonical_authority_refuses_by_default(conn):
     _seed(conn)
     state = _state(conn)
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(state, _certified())
+        ad.build_free_hit_request(state, _certified(), certification_path=CERT_PATH)
     assert caught.value.reasons[0] == ad.FH_CANONICAL_AUTHORITY_REQUIRED
 
 
@@ -376,7 +378,7 @@ def test_a_forged_permanent_component_refuses(conn, overrides, needle):
     forged = _forged(conn, **overrides)
     assert forged.problems() == [], "the forgery must pass every LOCAL rule"
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn)
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
     assert needle in str(caught.value), str(caught.value)
 
@@ -388,7 +390,7 @@ def test_a_forged_position_map_cannot_change_the_budget(conn):
     forged = _forged(conn, positions={**POSITION, 6: "MID", 16: "DEF"})
     assert forged.problems() == []          # locally it still looks like 2/5/5/3
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn)
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
 
 
@@ -404,7 +406,7 @@ def test_a_certified_input_that_is_not_the_bound_world_refuses(conn):
         ad.build_free_hit_request(
             state,
             _certified(h1_worlds=_h1_worlds(identity=_identity(cutoff="2026-09-16T12:00:00Z"))),
-            conn=conn,
+            conn=conn, certification_path=CERT_PATH,
         )
     # The world no longer matches the CERTIFIED authority, not merely the
     # request's own companion object.
@@ -417,19 +419,29 @@ def test_an_empty_snapshot_refuses_before_any_numeric_work(conn):
 
     _seed(conn)
     state = _state(conn)
+    # A mutated CERTIFICATE is how authority is attacked now; an empty snapshot
+    # on the request side is caught by the contract.
     cases = (
         ("binding snapshot empty", _certified(horizon_binding=_binding(snapshot=""))),
         ("world snapshot empty",
          _certified(h1_worlds=_h1_worlds(identity=_identity(data_snapshot_sha256="")))),
     )
-    # An authority that carries no data snapshot cannot even be built: the anchor
-    # is refused rather than becoming a hole in the anchoring.
-    with pytest.raises(fh.FreeHitInputError) as anchor:
-        _authority(data="")
+    # A certificate that carries no data snapshot cannot produce an authority at
+    # all: the anchor is refused rather than becoming a hole in the anchoring.
+    with pytest.raises(fh.FreeHitAuthorityError) as anchor:
+        _authority(snapshot="")
     assert anchor.value.reasons[0] == fh.FH_DECISION_AUTHORITY_REQUIRED
+    # And a certificate whose data snapshot is empty cannot be loaded at all.
+    empty_cert = cf.write_artifact(
+        Path(tempfile.mkdtemp()), cf.certification_artifact(
+            events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), snapshot=""), name="empty.json",
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as loader:
+        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=empty_cert)
+    assert loader.value.reasons[0] == ad.FH_CERTIFICATION_REQUIRED
     for label, certified in cases:
         with pytest.raises(ad.FreeHitAdapterError) as caught:
-            ad.build_free_hit_request(state, certified, conn=conn)
+            ad.build_free_hit_request(state, certified, conn=conn, certification_path=CERT_PATH)
         reasons = set(caught.value.reasons)
         assert reasons & {fh.FH_DATA_SNAPSHOT_REQUIRED, fh.FH_DECISION_AUTHORITY_REQUIRED,
                           fh.FH_DECISION_AUTHORITY_MISMATCH}, (label, reasons)
@@ -442,7 +454,7 @@ def test_a_horizon_bound_to_another_event_refuses(conn):
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
             state, _certified(horizon_binding=_binding(event=EVENT + 1)),
-            conn=conn,
+            conn=conn, certification_path=CERT_PATH,
         )
     assert caught.value.reasons[0] == fh.FH_HORIZON_NOT_CANONICAL
 
@@ -456,7 +468,7 @@ def test_the_certified_path_reaches_the_evaluator_end_to_end(conn):
     for pid in (20, 21, 22, 23, 24, 28, 29, 30):
         values[pid] = 6.0
     request = ad.build_free_hit_request(
-        state, _certified(h1_worlds=_h1_worlds(values)), conn=conn,
+        state, _certified(h1_worlds=_h1_worlds(values)), conn=conn, certification_path=CERT_PATH,
     )
     evaluation = fh.evaluate_free_hit(request)
     assert evaluation.mean_uplift is not None and evaluation.mean_uplift > 0
@@ -473,3 +485,144 @@ def test_the_certified_path_reaches_the_evaluator_end_to_end(conn):
     )
     assert decision.recommended_action == cd.CHIP_ACTION_FH
     assert decision.status == cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
+
+
+# ---------------------------------------------------------------------------
+# PRODUCTION CERTIFICATION AUTHORITY — exercised through the REAL loader
+# ---------------------------------------------------------------------------
+
+
+def _cert_file(payload=None, name="c.json"):
+    return cf.write_artifact(Path(tempfile.mkdtemp()), payload, name=name)
+
+
+def test_prod_A_a_genuine_certificate_authorises_the_decision(conn):
+    """The full production chain: real artifact -> loader -> adapter -> request."""
+
+    _seed(conn)
+    state = _state(conn)
+    request = ad.build_free_hit_request(
+        state, _certified(), conn=conn, certification_path=CERT_PATH,
+    )
+    assert request.decision_authority is not None
+    assert request.decision_authority.loaded_from.endswith("c.json") or \
+        request.decision_authority.loaded_from.endswith("cert.json")
+    assert request.decision_authority.certified_events == (EVENT, EVENT + 1, EVENT + 2, EVENT + 3)
+    assert request.decision_authority.planning_cutoff == CUTOFF
+
+
+def test_prod_B_a_different_four_event_window_refuses(conn):
+    """A certificate for GW6-GW9 cannot authorise a GW5-GW8 decision."""
+
+    _seed(conn)
+    state = _state(conn)
+    moved = _cert_file(cf.certification_artifact(events=(EVENT + 1, EVENT + 2, EVENT + 3, EVENT + 4)))
+    with pytest.raises(ad.FreeHitAdapterError):
+        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=moved)
+
+
+def test_prod_C_a_later_caller_cutoff_refuses_and_pit_still_uses_the_certified_one(conn):
+    """The caller cannot move the PIT replay instant."""
+
+    _seed(conn)
+    # A price captured AFTER the certified cutoff must stay invisible.
+    with conn:
+        run = repo.create_fetch_run(conn, "fetch_fpl", started_at="2026-09-17T08:00:00Z")
+        repo.insert_snapshots(conn, [
+            PlayerSnapshotRecord(player_id=1, captured_at="2026-09-17T08:00:00Z", now_cost=999, raw_json={})
+        ], run)
+        repo.finish_fetch_run(conn, run, "success", current_event=EVENT)
+
+    state = ad.free_hit_manager_state(conn, ENTRY, EVENT, decision_cutoff=CUTOFF)
+    assert state.market_price_tenths[1] == 50, "a post-cutoff price leaked into the decision"
+
+    later = cf.write_artifact(
+        Path(tempfile.mkdtemp()),
+        cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3),
+                                  cutoff="2026-09-16T14:00:00Z"),
+        name="later.json",
+    )
+    moved_cutoff = ad.free_hit_manager_state(
+        conn, ENTRY, EVENT, decision_cutoff="2026-09-16T14:00:00Z",
+    )
+    forged = dataclasses.replace(_state(conn), cutoff=CUTOFF)
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            dataclasses.replace(forged, cutoff="2026-09-16T14:00:00Z"),
+            _certified(), conn=conn, certification_path=later,
+        )
+    assert caught.value.reasons[0] == ad.FH_CUTOFF_MISMATCH
+    assert moved_cutoff.market_price_tenths[1] == 50
+
+
+def test_prod_J_a_caller_certificate_matching_itself_cannot_replace_the_persisted_one(conn):
+    """Sol's decisive attack: all caller objects agree with each other.
+
+    A caller builds a certificate B, a world identity B and a binding identity B
+    that are mutually consistent, and points the adapter at B.  That is not
+    authority over the PERSISTED certificate A: the loader validates B as an
+    artifact, but B is a different certified context and the manager state for A's
+    decision does not authorise it.
+    """
+
+    _seed(conn)
+    state = _state(conn)
+    world_b = _h1_worlds(identity=_identity(cutoff="2026-09-16T13:00:00Z"))
+    binding_b = _binding(snapshot=DATA)
+    cert_b = _cert_file(
+        cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3),
+                                  cutoff="2026-09-16T13:00:00Z"),
+        name="b.json",
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            state,
+            ad.FreeHitCertifiedInputs(
+                horizon_binding=binding_b, h1_worlds=world_b, world_identity=_identity(
+                    cutoff="2026-09-16T13:00:00Z"),
+                pool_binding=_pool(), play_route=_arms()[0], save_route=_arms()[1],
+            ),
+            conn=conn, certification_path=cert_b,
+        )
+    # The manager state is for the persisted decision, so B's cutoff does not fit.
+    assert caught.value.reasons[0] in {ad.FH_CUTOFF_MISMATCH, fh.FH_DECISION_AUTHORITY_MISMATCH}
+
+
+@pytest.mark.parametrize("mutation,needle", [
+    ("mutated bundle", lambda: _mutated("certified_bundles")),
+    ("copied digest", lambda: _copied_digest()),
+    ("missing completeness audit", lambda: _without("history_completeness")),
+    ("not permitted to decide", lambda: _permitted_false()),
+])
+def test_prod_E_an_invalid_certificate_is_refused_by_the_loader(conn, mutation, needle):
+    _seed(conn)
+    state = _state(conn)
+    path = _cert_file(needle(), name=f"{mutation.replace(' ', '-')}.json")
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=path)
+    assert caught.value.reasons[0] == ad.FH_CERTIFICATION_REQUIRED
+
+
+def _mutated(key):
+    payload = json.loads(json.dumps(cf.certification_artifact()))
+    payload[key][str(EVENT + 1)]["runs"] = {"xpts": 999}
+    return payload
+
+
+def _copied_digest():
+    payload = json.loads(json.dumps(cf.certification_artifact()))
+    payload["planning_cutoff"] = "2026-09-16T12:30:00Z"     # component altered, digest kept
+    return payload
+
+
+def _without(key):
+    payload = json.loads(json.dumps(cf.certification_artifact()))
+    payload.pop(key)
+    payload["four_gw_certification_identity"] = fg.certification_identity_of(payload)
+    return payload
+
+
+def _permitted_false():
+    payload = json.loads(json.dumps(cf.certification_artifact()))
+    payload["decision_search_permitted"] = False
+    return payload

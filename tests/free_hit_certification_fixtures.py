@@ -18,6 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import certified_bundle as cb  # noqa: E402
 from fpl_brain import four_gw_decision as fg  # noqa: E402
+from fpl_brain.free_hit_decision_authority import (  # noqa: E402
+    model_label,
+    runs_label,
+)
 
 DATA_SNAPSHOT = "sha256:" + "d" * 64
 CUTOFF = "2026-09-16T11:00:00Z"

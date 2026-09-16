@@ -46,97 +46,14 @@ def _improving(**overrides):
 
 # ---------------------------------------------------------------------------
 # P2c — PREDICTIVE AUTHORITY
+#
+# The decisive predictive-authority tests live in
+# ``test_free_hit_certification_authority.py``, which exercises the REAL
+# certification loader, the REAL v2 artifact schema and identity recomputation.
+# They replaced the tests that stood here: those compared two REQUEST-OWNED
+# identities against each other, which is exactly the self-certification the
+# loaded authority removes -- caller agreement is no longer authority at all.
 # ---------------------------------------------------------------------------
-
-
-def test_P2c_the_self_certification_attack_refuses():
-    """Both caller identities mutated TOGETHER still cannot be authoritative.
-
-    This is Sol's decisive case: the world matrix and the request's companion
-    identity agree with each other on cutoff, source snapshot, generation and
-    model/config, while the data snapshot still matches the binding.  Agreement
-    between two caller objects is not authority.
-    """
-
-    coherent = _improving()
-    certified = _authority()
-    mutations = {
-        "cutoff": {"cutoff": "2026-09-16T12:00:00Z"},
-        "source_snapshot_sha256": {"source_snapshot_sha256": "sha256:" + "8" * 64},
-        "generation": {"generation": "2026-09-16T09:00:00Z"},
-        "model_config_identity": {"model_config_identity": "sha256:" + "7" * 64},
-    }
-    for dimension, mutation in mutations.items():
-        forged_identity = _identity(**mutation)
-        request = _improving(
-            identity=forged_identity,
-            worlds=_worlds(identity=forged_identity),   # BOTH mutated together
-            authority=certified,
-        )
-        assert request.world_identity.disagreements_with(
-            request.h1_worlds.identity
-        ) == [], f"{dimension}: the two caller objects must agree for this attack to be real"
-        problems = fh.contract_problems(request)
-        assert any(
-            fh.FH_DECISION_AUTHORITY_MISMATCH in problem and dimension in problem
-            for problem in problems
-        ), (dimension, problems)
-        # And a coherent control passes.
-    assert not any(
-        fh.FH_DECISION_AUTHORITY_MISMATCH in problem
-        for problem in fh.contract_problems(coherent)
-    )
-
-
-@pytest.mark.parametrize("dimension", ["cutoff", "data_snapshot_sha256", "source_snapshot_sha256",
-                                       "generation", "model_config_identity"])
-def test_P2c_the_bound_identity_is_anchored_to_the_authority(dimension):
-    """Mutating ONLY the bound identity (the matrix staying certified) also refuses."""
-
-    coherent = _improving()
-    field = {"cutoff": "cutoff", "data_snapshot_sha256": "data_snapshot_sha256",
-             "source_snapshot_sha256": "source_snapshot_sha256", "generation": "generation",
-             "model_config_identity": "model_config_identity"}[dimension]
-    forged = _identity(**{field: "sha256:" + "9" * 64 if field != "cutoff" else "2026-09-16T23:00:00Z"})
-    request = _improving(identity=forged)
-    problems = fh.contract_problems(request)
-    assert any(dimension in problem for problem in problems), (dimension, problems)
-    assert not any(
-        fh.FH_DECISION_AUTHORITY_MISMATCH in problem for problem in fh.contract_problems(coherent)
-    )
-
-
-def test_P2c_an_authority_whose_identity_does_not_recompute_refuses():
-    """A copied certification identity on a different artifact fails rather than certifying."""
-
-    from fpl_brain import four_gw_decision as fg
-
-    other = _authority()
-    artifact = {
-        "planning_cutoff": "2026-09-16T12:00:00Z",       # different cutoff
-        "data_snapshot_sha256": DATA,
-        "certified_bundle_identity": {"source_snapshot_sha256": SOURCE, "generation": GENERATION,
-                                      "model_config_identity": CONFIG},
-        "four_gw_certification_identity": other.certification_identity,   # the COPIED identity
-    }
-    assert fg.certification_identity_of(artifact) != other.certification_identity
-    with pytest.raises(fh.FreeHitInputError) as caught:
-        fh.FreeHitDecisionAuthority.from_certification(artifact)
-    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_REQUIRED
-
-
-def test_P2c_a_missing_authority_refuses():
-    request = _improving(authority=_authority())     # coherent control
-    assert not any(fh.FH_DECISION_AUTHORITY_REQUIRED in p for p in fh.contract_problems(request))
-    bare = fh.FreeHitRequest(
-        permanent=request.permanent, horizon_binding=request.horizon_binding,
-        h1_worlds=request.h1_worlds, world_identity=request.world_identity,
-        positions=request.positions, clubs=request.clubs,
-        market_price_tenths=request.market_price_tenths, pool_binding=request.pool_binding,
-        play_route=request.play_route, save_route=request.save_route, rules=RULES,
-    )
-    problems = fh.contract_problems(bare)
-    assert any(fh.FH_DECISION_AUTHORITY_REQUIRED in problem for problem in problems), problems
 
 
 # ---------------------------------------------------------------------------

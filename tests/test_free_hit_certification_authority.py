@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import free_hit_certification_fixtures as cf  # noqa: E402
 from fpl_brain import certified_bundle as cb  # noqa: E402
 from fpl_brain import four_gw_decision as fg  # noqa: E402
+from fpl_brain import chip_free_hit as fh  # noqa: E402
 from fpl_brain import free_hit_decision_authority as fa  # noqa: E402
 
 
@@ -259,3 +260,44 @@ def test_the_bundle_identity_algorithm_is_the_canonical_one(tmp_path):
     payload = cf.certification_artifact()
     for event, row in payload["certified_bundles"].items():
         assert payload["certified_bundle_identity"][event] == cb.canonical_bundle_identity(row)
+
+
+# ---------------------------------------------------------------------------
+# ARCHITECTURAL GUARD — no silently shadowed FH production definitions
+# ---------------------------------------------------------------------------
+
+
+def test_no_duplicate_top_level_definitions_in_the_free_hit_modules():
+    """A duplicated definition silently shadows the first one.
+
+    That happened once on this branch (a bad slice produced two copies of
+    ``contract_problems`` / ``evaluate_free_hit`` / ``play_h2_start_state`` /
+    ``four_gw_arm_values``), and the second copy won.  This guard makes the
+    failure loud instead of invisible.
+    """
+
+    import ast
+    import collections
+    from pathlib import Path as _Path
+
+    root = _Path(fa.__file__).resolve().parent
+    for name in ("chip_free_hit.py", "free_hit_route.py", "free_hit_request_adapter.py",
+                 "free_hit_decision_authority.py"):
+        tree = ast.parse((root / name).read_text(encoding="utf-8"))
+        defs = [node.name for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
+        duplicates = [key for key, count in collections.Counter(defs).items() if count > 1]
+        assert duplicates == [], f"{name}: duplicate top-level definitions {duplicates}"
+
+
+def test_the_free_hit_authority_symbol_is_the_loader_derived_one():
+    """``chip_free_hit`` must not define its own authority class again."""
+
+    import ast
+    from pathlib import Path as _Path
+
+    root = _Path(fa.__file__).resolve().parent
+    tree = ast.parse((root / "chip_free_hit.py").read_text(encoding="utf-8"))
+    classes = [node.name for node in tree.body if isinstance(node, ast.ClassDef)]
+    assert "FreeHitDecisionAuthority" not in classes
+    assert fh.FreeHitDecisionAuthority is fa.FreeHitDecisionAuthority

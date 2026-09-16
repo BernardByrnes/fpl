@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import chip_decision as cd
@@ -69,6 +70,9 @@ FH_CUTOFF_MISMATCH = "FREE_HIT_PRICE_PREDICTION_CUTOFF_MISMATCH"
 FH_KEYSET_MISMATCH = "FREE_HIT_CALLER_KEYSET_IS_NOT_THE_CANONICAL_UNIVERSE"
 FH_POOL_MISMATCH = "FREE_HIT_POOL_IS_NOT_THE_ACCEPTED_GENERATION"
 FH_UNIVERSE_INCOMPLETE = "FREE_HIT_CANONICAL_UNIVERSE_INCOMPLETE"
+#: Production Free Hit must LOAD the canonical certification.  There is no
+#: caller-supplied authority, and no fallback to request-owned values.
+FH_CERTIFICATION_REQUIRED = "FREE_HIT_PRODUCTION_CERTIFICATION_REQUIRED"
 
 
 class FreeHitAdapterError(fh.FreeHitInputError):
@@ -283,9 +287,6 @@ class FreeHitCertifiedInputs:
     #: H1-only comparison is not an exact four-GW chip decision.
     play_route: fh.FreeHitRoute
     save_route: fh.FreeHitRoute
-    #: The canonical certified decision context, built from the certification
-    #: artifact.  Every predictive dimension is anchored to it.
-    decision_authority: fh.FreeHitDecisionAuthority
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +299,9 @@ def build_free_hit_request(
     certified: FreeHitCertifiedInputs,
     *,
     conn: sqlite3.Connection | None = None,
+    #: The canonical certification artifact the decision is authorised by.  This
+    #: is the ONE production source of decision authority.
+    certification_path: str | Path | None = None,
     as_of: str | None = None,
     allow_unverified_manager_state: bool = False,
     rules: sr.SeasonRules | None = None,
@@ -334,11 +338,26 @@ def build_free_hit_request(
             reasons=(FH_MANAGER_STATE_MISSING,),
         )
 
-    # ── the canonical decision cutoff comes from the CERTIFIED context ────────
-    # The predictive identity owns the cutoff; a caller-supplied cutoff must agree
-    # with it or refuse.  Price retrieval below uses the CERTIFIED cutoff, so a
-    # later caller cutoff can never pull post-cutoff prices into this decision.
-    authority = certified.decision_authority
+    # ── the canonical decision context is LOADED, never supplied ──────────────
+    # `certification_path` is the ONE production source of authority: the accepted
+    # loader validates the real v2 artifact and `FreeHitDecisionAuthority`
+    # recomputes the certification identity from it.  A caller cannot pass an
+    # authority object at all, so "B agrees with B, therefore B is trusted" has no
+    # production path.  Price retrieval below uses the CERTIFIED cutoff, so a later
+    # caller cutoff can never pull post-cutoff prices into this decision.
+    if not str(certification_path or "").strip():
+        raise FreeHitAdapterError(
+            f"{FH_CERTIFICATION_REQUIRED}: production Free Hit must load the canonical certification "
+            "artifact; no caller-supplied decision authority is accepted",
+            reasons=(FH_CERTIFICATION_REQUIRED,),
+        )
+    try:
+        authority = fh.load_decision_authority(certification_path)
+    except fh.FreeHitAuthorityError as exc:
+        raise FreeHitAdapterError(
+            f"{FH_CERTIFICATION_REQUIRED}: the canonical certification could not be loaded: {exc}",
+            reasons=(FH_CERTIFICATION_REQUIRED,),
+        ) from exc
     certified_cutoff = str(authority.planning_cutoff or "").strip()
     if not certified_cutoff:
         raise FreeHitAdapterError(
@@ -404,7 +423,9 @@ def build_free_hit_request(
         pool_binding=certified.pool_binding,
         play_route=certified.play_route,
         save_route=certified.save_route,
-        decision_authority=certified.decision_authority,
+        # The LOADED authority: derived here from the canonical certification
+        # artifact, never accepted from the caller.
+        decision_authority=authority,
         chip_available=bool(chip_available),
         rules=rules if rules is not None else sr.SeasonRules(season="2026/27"),
         calibration_status=str(calibration_status),

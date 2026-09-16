@@ -27,15 +27,21 @@ from fpl_brain.chip_wildcard import (  # noqa: E402
     WildcardPoolBinding, WildcardPredictiveIdentity, WildcardWorldInputs,
 )
 from fpl_brain.ingest_provenance import element_id_sha256  # noqa: E402
+import free_hit_certification_fixtures as cf  # noqa: E402
 
 EVENT = 5
 WORLDS = 8
-CUTOFF = "2026-09-16T11:00:00Z"
-DATA = "sha256:" + "d" * 64
-SOURCE = "sha256:" + "s" * 64
-CERT = "sha256:" + "c" * 64
-GENERATION = "2026-09-16T08:00:00Z"
-CONFIG = "sha256:" + "f" * 64
+#: Every predictive constant is derived from the CERTIFICATION FIXTURE, because
+#: the authority now anchors each dimension to the certified bundle rather than to
+#: another request-owned object.
+CUTOFF = cf.CUTOFF
+DATA = cf.DATA_SNAPSHOT
+SOURCE = cf.CODE_SNAPSHOT
+GENERATION = cf.runs_label(cf.RUNS)
+CONFIG = cf.model_label(cf.MODEL_VERSIONS)
+CERT = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3))[
+    "four_gw_certification_identity"
+]
 RULES = sr.SeasonRules(season="2026/27")
 
 #: A small but complete universe: 4 GKP / 10 DEF / 10 MID / 6 FWD, so a legal
@@ -76,23 +82,19 @@ def _binding(event: int = EVENT, snapshot: str = DATA, events=None, identity=Non
 
 
 def _authority(**overrides):
-    """The canonical certified decision context, from a self-consistent artifact."""
+    """The certified decision context, derived from a REAL-schema artifact.
 
-    from fpl_brain import four_gw_decision as fg
+    ``overrides`` name the CERTIFIED BUNDLE dimensions (``cutoff``, ``snapshot``,
+    ``code``, ``context``, ``runs``, ``models``); a test that wants to attack one
+    dimension mutates the certificate rather than a request-owned object.
+    """
 
-    base = dict(cutoff=CUTOFF, data=DATA, source=SOURCE, generation=GENERATION, config=CONFIG)
-    base.update(overrides)
-    artifact = {
-        "planning_cutoff": base["cutoff"],
-        "data_snapshot_sha256": base["data"],
-        "certified_bundle_identity": {
-            "source_snapshot_sha256": base["source"],
-            "generation": base["generation"],
-            "model_config_identity": base["config"],
-        },
-    }
-    artifact["four_gw_certification_identity"] = fg.certification_identity_of(artifact)
-    return fh.FreeHitDecisionAuthority.from_certification(artifact)
+    return fh.FreeHitDecisionAuthority.from_certification(
+        cf.certification_artifact(
+            events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), **overrides
+        ),
+        loaded_from="<test certificate>",
+    )
 
 
 def _pool(ids: tuple[int, ...] = UNIVERSE) -> WildcardPoolBinding:
