@@ -55,6 +55,7 @@ from . import planning as planning_module
 from . import repositories as repo
 from . import season_rules as sr
 from .chip_wildcard import (
+    WildcardWorldInputs,
     WildcardPoolBinding,
     WildcardPredictiveIdentity,
     WildcardWorldInputs,
@@ -272,22 +273,24 @@ def _canonical_market_prices(
 class FreeHitArmRoute:
     """ONE arm's canonical route ingredients, before conversion.
 
-    These are the same inputs the accepted converter takes: the canonical
-    ``PartialRoute`` the route engine produced, the authoritative evaluation
-    worlds and position resolver and the route configuration.  Deliberately NOT a
-    ``FreeHitRoute``: accepting a converted DTO would bypass structural
-    validation, acquisition-basis validation, inter-event continuity, terminal-state
-    validation, ``exact_evaluate`` and route evaluation provenance all at once.
+    Deliberately NOT a ``FreeHitRoute``: accepting a converted DTO would bypass
+    structural validation, acquisition-basis validation, inter-event continuity,
+    terminal-state validation and ``exact_evaluate`` all at once.
+
+    ``certified_worlds_by_event`` holds the ACCEPTED provenance-carrying world
+    artifact -- ``chip_wildcard.WildcardWorldInputs`` -- which carries its OWN
+    intrinsic event, its OWN predictive identity AND the numeric matrix as ONE
+    indivisible object.  There is deliberately no separate matrix map and no
+    separate identity map: two parallel containers can be made to disagree, and
+    validating one while evaluating the other is exactly the defect this closes.
     """
 
     partial: Any
-    worlds_by_event: Mapping[int, Any]
+    #: event -> the certified world artifact for that event.  REQUIRED and
+    #: exactly keyed; there is no empty or optional form.
+    certified_worlds_by_event: Mapping[int, "WildcardWorldInputs"]
     positions_of: Any
     route_config: Any
-    #: The predictive identity of each event's evaluation worlds, keyed BY the
-    #: event.  The key is not evidence -- it is compared against the certified
-    #: bundle for the event it names, so swapping two events' worlds cannot pass.
-    world_identities: Mapping[int, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -436,21 +439,19 @@ def build_free_hit_request(
             reasons=(fh.FH_HORIZON_NOT_CANONICAL,),
         )
 
-    # ── B2: bind each arm's route-evaluation worlds to the certified bundle ──
-    # Per EVENT, before any exact evaluation, so a run or model-version swap on a
-    # single H2-H4 event refuses before its value could enter the decision.
-    play_worlds = {int(e): ident for e, ident in (certified.play.world_identities or {}).items()}
-    save_worlds = {int(e): ident for e, ident in (certified.save.world_identities or {}).items()}
-    for arm_label, identities in (("PLAY", play_worlds), ("SAVE", save_worlds)):
-        for event, supplied in sorted(identities.items()):
-            mismatches = authority.disagreements_with(
-                supplied, event=int(event), label=f"{arm_label} route event {int(event)} world identity"
-            )
-            if mismatches:
-                raise FreeHitAdapterError(
-                    f"{fh.FH_DECISION_AUTHORITY_MISMATCH}: " + "; ".join(mismatches),
-                    reasons=(fh.FH_DECISION_AUTHORITY_MISMATCH,),
-                )
+    # ── bind each arm's route worlds to the certified bundle, PER EVENT ───────
+    # Validation and matrix extraction happen together, so the matrices handed to
+    # exact_evaluate are the ones carried by the artifacts that were just proved
+    # to be the certified event bundles.
+    horizon = tuple(int(e) for e in binding.horizon_events)
+    save_worlds = certified_route_worlds(
+        certified.save, arm="SAVE", expected_events=horizon, authority=authority,
+        eligible_ids=manager.eligible_ids,
+    )
+    play_worlds = certified_route_worlds(
+        certified.play, arm="PLAY", expected_events=horizon[1:], authority=authority,
+        eligible_ids=manager.eligible_ids,
+    )
 
     # ── A2: derive the expected start states, then CONVERT both arms HERE ─────
     # Conversion happens in the adapter, on the canonical routes, so the only
@@ -469,16 +470,16 @@ def build_free_hit_request(
     try:
         save_route = fh.free_hit_route_from_canonical_route(
             certified.save.partial, arm=fh.ARM_SAVE,
-            expected_events=tuple(int(e) for e in binding.horizon_events),
+            expected_events=horizon,
             rules=probe.rules, expected_start_state=save_expected,
-            worlds_by_event=dict(certified.save.worlds_by_event),
+            worlds_by_event=save_worlds,
             positions_of=certified.save.positions_of, route_config=certified.save.route_config,
         )
         play_route = fh.free_hit_route_from_canonical_route(
             certified.play.partial, arm=fh.ARM_PLAY,
-            expected_events=tuple(int(e) for e in binding.horizon_events)[1:],
+            expected_events=horizon[1:],
             rules=probe.rules, expected_start_state=play_expected,
-            worlds_by_event=dict(certified.play.worlds_by_event),
+            worlds_by_event=play_worlds,
             positions_of=certified.play.positions_of, route_config=certified.play.route_config,
         )
     except FreeHitRouteError as exc:
@@ -498,7 +499,10 @@ def build_free_hit_request(
         pool_binding=certified.pool_binding,
         play_route=play_route,
         save_route=save_route,
-        route_world_identities={**play_worlds, **save_worlds},
+        route_world_identities={
+            **{int(e): w.identity for e, w in certified.play.certified_worlds_by_event.items()},
+            **{int(e): w.identity for e, w in certified.save.certified_worlds_by_event.items()},
+        },
         # The LOADED authority: derived here from the canonical certification
         # artifact, never accepted from the caller.
         decision_authority=authority,
@@ -528,6 +532,80 @@ def build_free_hit_request(
             reasons=(token,),
         )
     return request
+
+
+def certified_route_worlds(
+    arm_route: "FreeHitArmRoute",
+    *,
+    arm: str,
+    expected_events: Sequence[int],
+    authority: Any,
+    eligible_ids: Sequence[int] | None = None,
+) -> dict[int, dict[str, Any]]:
+    """Validate ONE arm's certified route worlds, then extract their matrices.
+
+    The invariant: the raw matrix handed to ``exact_evaluate`` is extracted from
+    the SAME artifact whose identity and intrinsic event were validated.  There is
+    no second map from which a matrix could come.
+
+    For every event this requires THREE-WAY equality --
+    ``world.event == mapping key == route event`` -- and then binds the world's
+    identity to the certified bundle for ``world.event``.  A missing key, an extra
+    key, a relabelled world or a world from another run/model refuses HERE, before
+    any exact evaluation.
+    """
+
+    worlds = {int(k): w for k, w in (arm_route.certified_worlds_by_event or {}).items()}
+    expected = {int(e) for e in expected_events}
+    problems: list[str] = []
+    missing = sorted(expected - set(worlds))
+    extra = sorted(set(worlds) - expected)
+    if missing:
+        problems.append(f"{arm} route is missing certified world(s) for event(s) {missing}")
+    if extra:
+        problems.append(f"{arm} route carries certified world(s) for non-route event(s) {extra}")
+    for key, world in sorted(worlds.items()):
+        intrinsic = int(getattr(world, "event", -1))
+        if intrinsic != int(key):
+            problems.append(
+                f"{arm} route: the world stored under event {key} carries intrinsic event "
+                f"{intrinsic}; the container key is not evidence"
+            )
+        if not isinstance(world, WildcardWorldInputs):
+            problems.append(f"{arm} route event {key}: not a canonical certified world artifact")
+            continue
+        for problem in world.problems():
+            problems.append(f"{arm} route event {key}: {problem}")
+        # The matrix's PLAYER SET is bound too: a world from an unrelated universe
+        # cannot stand in for a route event's certified worlds.
+        if eligible_ids is not None:
+            expected_ids = {int(p) for p in eligible_ids}
+            actual_ids = {int(p) for p in world.player_ids}
+            if actual_ids != expected_ids:
+                problems.append(
+                    f"{arm} route event {key}: the world matrix covers "
+                    f"{len(actual_ids)} players, not the authoritative {len(expected_ids)}"
+                )
+        for dimension in authority.disagreements_with(
+            world.identity, event=intrinsic, label=f"{arm} route event {intrinsic} world identity"
+        ):
+            problems.append(f"{arm} route event {intrinsic}: {dimension}")
+    if problems:
+        raise FreeHitAdapterError(
+            f"{fh.FH_DECISION_AUTHORITY_MISMATCH}: "
+            + "; ".join(problems[:6]),
+            reasons=(fh.FH_DECISION_AUTHORITY_MISMATCH,),
+        )
+    # ONLY NOW are the matrices extracted -- from the artifacts just validated.
+    return {
+        int(key): {
+            "worlds": int(world.worlds),
+            "player_ids": tuple(world.player_ids),
+            "minutes": world.minutes,
+            "core": world.core,
+        }
+        for key, world in worlds.items()
+    }
 
 
 def _pool_disagreements(canonical: WildcardPoolBinding, supplied: WildcardPoolBinding) -> list[str]:

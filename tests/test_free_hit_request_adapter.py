@@ -27,7 +27,9 @@ from fpl_brain import four_gw_decision as fg  # noqa: E402
 from fpl_brain import free_hit_route as fr  # noqa: E402
 from fpl_brain import repositories as repo  # noqa: E402
 from fpl_brain import season_rules as sr  # noqa: E402
-from fpl_brain.chip_wildcard import WildcardPoolBinding, WildcardPredictiveIdentity  # noqa: E402
+from fpl_brain.chip_wildcard import (  # noqa: E402
+    WildcardPoolBinding, WildcardPredictiveIdentity, WildcardWorldInputs,
+)
 from fpl_brain.database import connect_database  # noqa: E402
 from fpl_brain.ingest_provenance import element_id_sha256  # noqa: E402
 import free_hit_certification_fixtures as cf  # noqa: E402
@@ -267,19 +269,21 @@ def _arm_inputs(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
         partial, _terminal = fx.build_canonical_route(
             start=state, events=tuple(events), meta=meta, universe=universe, price_default=50,
         )
-        worlds = {
-            int(event): {
-                "worlds": 24, "player_ids": list(universe),
-                "minutes": {pid: tuple(90.0 for _ in range(24)) for pid in universe},
-                "core": {pid: tuple(float(score) for _ in range(24)) for pid in universe},
-            }
+        # ONE provenance-carrying artifact per event: intrinsic event, identity
+        # and matrix together.  There is no parallel matrix or identity map.
+        certified = {
+            int(event): WildcardWorldInputs(
+                event=int(event), worlds=24, player_ids=tuple(universe),
+                minutes={pid: tuple(90.0 for _ in range(24)) for pid in universe},
+                core={pid: tuple(float(score) for _ in range(24)) for pid in universe},
+                identity=_identity(),
+            )
             for event, score in zip(events, scores)
         }
         return ad.FreeHitArmRoute(
-            partial=partial, worlds_by_event=worlds,
+            partial=partial, certified_worlds_by_event=certified,
             positions_of=lambda squad: {int(p): POSITION[int(p)] for p in squad},
             route_config=fx.route_config(),
-            world_identities={int(event): _identity() for event in events},
         )
 
     return (
@@ -712,9 +716,12 @@ def test_A1_the_production_api_has_no_converted_route_parameter():
     assert "play_route" not in fields and "save_route" not in fields
     for name in ("play", "save"):
         arm = set(ad.FreeHitArmRoute.__dataclass_fields__)
-        assert arm == {"partial", "worlds_by_event", "positions_of", "route_config", "world_identities"}
+        # ONE certified world artifact per event: no parallel matrix map and no
+        # parallel identity map, so the two cannot be made to disagree.
+        assert arm == {"partial", "certified_worlds_by_event", "positions_of", "route_config"}
+        assert not arm & {"world_identities", "worlds_by_event", "mean_net_core", "value"}
         # No route VALUE can be supplied: the arm carries ingredients, not results.
-        assert not arm & {"mean_net_core", "events", "value", "route_value", "evaluation"}
+        assert not arm & {"mean_net_core", "events", "route_value", "evaluation"}
 
 
 def test_A2_a_canonical_partial_route_is_converted_internally(conn):
@@ -761,9 +768,8 @@ def test_A5_a_route_with_the_wrong_start_state_refuses(conn):
     # A SAVE route whose H1 state is the RESTORED (post-chip) state is the wrong arm.
     post_chip = start_state_for_save_arm(post_free_hit=True)
     broken = ad.FreeHitArmRoute(
-        partial=post_chip.partial, worlds_by_event=save.worlds_by_event,
+        partial=post_chip.partial, certified_worlds_by_event=save.certified_worlds_by_event,
         positions_of=save.positions_of, route_config=save.route_config,
-        world_identities=save.world_identities,
     )
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
@@ -806,12 +812,15 @@ def test_B2_a_route_event_world_from_another_run_refuses(conn):
 
     _seed(conn)
     play, save = _arm_inputs()
-    identities = dict(save.world_identities)
-    identities[EVENT + 2] = _identity(generation="sha256:" + "9" * 64)   # H3's world, other run
+    # The ACTUAL H3 artifact is replaced by one from another run: the matrix AND
+    # its identity travel together, so the identity the evaluator would consume is
+    # the wrong one -- not a detached identity that disagrees with a good matrix.
+    import dataclasses as _dc
+    worlds = dict(save.certified_worlds_by_event)
+    worlds[EVENT + 2] = _dc.replace(worlds[EVENT + 2], identity=_identity(generation="sha256:" + "9" * 64))
     broken = ad.FreeHitArmRoute(
-        partial=save.partial, worlds_by_event=save.worlds_by_event,
+        partial=save.partial, certified_worlds_by_event=worlds,
         positions_of=save.positions_of, route_config=save.route_config,
-        world_identities=identities,
     )
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
@@ -829,12 +838,14 @@ def test_B2_a_route_event_world_from_another_run_refuses(conn):
 def test_B3_a_route_event_world_with_another_model_version_refuses(conn):
     _seed(conn)
     play, save = _arm_inputs()
-    identities = dict(play.world_identities)
-    identities[EVENT + 1] = _identity(model_config_identity="sha256:" + "8" * 64)
+    import dataclasses as _dc
+    worlds = dict(play.certified_worlds_by_event)
+    worlds[EVENT + 1] = _dc.replace(
+        worlds[EVENT + 1], identity=_identity(model_config_identity="sha256:" + "8" * 64)
+    )
     broken = ad.FreeHitArmRoute(
-        partial=play.partial, worlds_by_event=play.worlds_by_event,
+        partial=play.partial, certified_worlds_by_event=worlds,
         positions_of=play.positions_of, route_config=play.route_config,
-        world_identities=identities,
     )
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
@@ -849,40 +860,101 @@ def test_B3_a_route_event_world_with_another_model_version_refuses(conn):
     assert "model_config_identity" in str(caught.value)
 
 
-def test_B4_swapping_two_events_worlds_refuses(conn):
-    """The intrinsic event identity must agree with the key AND the certificate.
+def test_B4_an_artifact_under_the_wrong_event_key_refuses(conn):
+    """A genuine H3 artifact placed under the H2 key: no relabelling.
 
-    The certificate gives each event its OWN runs, so relabelling a world under
-    another event's key cannot pass: the identity is compared against the bundle
-    for the event it NAMES.
+    The artifact carries its OWN intrinsic event, so the container key is not
+    evidence and the three-way equality ``world.event == key == route event``
+    fails before any exact evaluation.
     """
 
     _seed(conn)
-    per_event = {
-        EVENT + 1: {"runs": {"xpts": 111, "minutes": 102, "team": 103}},
-        EVENT + 2: {"runs": {"xpts": 222, "minutes": 102, "team": 103}},
-        EVENT + 3: {"runs": {"xpts": 333, "minutes": 102, "team": 103}},
-    }
-    artifact = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), per_event=per_event)
-    split = cf.write_artifact(Path(tempfile.mkdtemp()), artifact, name="split.json")
     play, save = _arm_inputs()
-    swapped = dict(save.world_identities)
-    swapped[EVENT + 1] = cf.identity_for(artifact["certified_bundles"][str(EVENT + 2)])
+    worlds = dict(save.certified_worlds_by_event)
+    worlds[EVENT + 1] = save.certified_worlds_by_event[EVENT + 2]     # H3 world under the H2 key
     broken = ad.FreeHitArmRoute(
-        partial=save.partial, worlds_by_event=save.worlds_by_event,
+        partial=save.partial, certified_worlds_by_event=worlds,
         positions_of=save.positions_of, route_config=save.route_config,
-        world_identities=swapped,
     )
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(
-            _state(conn),
-            ad.FreeHitCertifiedInputs(
-                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool(), play=play, save=broken,
-            ),
-            conn=conn, certification_path=split,
-        )
+        _build_with(conn, play=play, save=broken)
     assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
+    assert "intrinsic event" in str(caught.value)
+
+
+def test_B5_a_missing_route_world_refuses(conn):
+    """PLAY must carry exactly H2,H3,H4; a missing event is not a smaller route."""
+
+    _seed(conn)
+    play, save = _arm_inputs()
+    for arm_name, route, drop in (("PLAY", play, EVENT + 2), ("SAVE", save, EVENT + 1)):
+        worlds = {k: v for k, v in route.certified_worlds_by_event.items() if int(k) != drop}
+        broken = ad.FreeHitArmRoute(
+            partial=route.partial, certified_worlds_by_event=worlds,
+            positions_of=route.positions_of, route_config=route.route_config,
+        )
+        with pytest.raises(ad.FreeHitAdapterError) as caught:
+            _build_with(conn, play=broken if arm_name == "PLAY" else play,
+                        save=broken if arm_name == "SAVE" else save)
+        assert "missing certified world" in str(caught.value), arm_name
+
+
+def test_B6_an_extra_route_world_refuses(conn):
+    """A world for an event outside the arm's horizon is a contradiction."""
+
+    _seed(conn)
+    play, save = _arm_inputs()
+    worlds = dict(play.certified_worlds_by_event)
+    worlds[EVENT] = save.certified_worlds_by_event[EVENT]     # H1 does not belong to PLAY
+    broken = ad.FreeHitArmRoute(
+        partial=play.partial, certified_worlds_by_event=worlds,
+        positions_of=play.positions_of, route_config=play.route_config,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        _build_with(conn, play=broken, save=save)
+    assert "non-route event" in str(caught.value)
+
+
+def test_B7_empty_route_worlds_refuse(conn):
+    """There is no identity-free mode: an empty map is REFUSED, never skipped."""
+
+    _seed(conn)
+    play, save = _arm_inputs()
+    bare = ad.FreeHitArmRoute(
+        partial=save.partial, certified_worlds_by_event={},
+        positions_of=save.positions_of, route_config=save.route_config,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        _build_with(conn, play=play, save=bare)
+    assert "missing certified world" in str(caught.value)
+
+
+def test_B8_a_raw_matrix_dict_is_not_a_certified_world(conn):
+    """The accepted provenance-carrying type is required, not a bare matrix."""
+
+    _seed(conn)
+    play, save = _arm_inputs()
+    worlds = dict(save.certified_worlds_by_event)
+    worlds[EVENT + 1] = {"worlds": 4, "player_ids": [1], "minutes": {1: (90.0,) * 4},
+                         "core": {1: (1.0,) * 4}}          # a raw dict, no provenance
+    broken = ad.FreeHitArmRoute(
+        partial=save.partial, certified_worlds_by_event=worlds,
+        positions_of=save.positions_of, route_config=save.route_config,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        _build_with(conn, play=play, save=broken)
+    assert "not a canonical certified world artifact" in str(caught.value)
+
+
+def _build_with(conn, *, play, save):
+    return ad.build_free_hit_request(
+        _state(conn),
+        ad.FreeHitCertifiedInputs(
+            horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
+            pool_binding=_pool(), play=play, save=save,
+        ),
+        conn=conn, certification_path=CERT_PATH,
+    )
 
 
 # ---------------------------------------------------------------------------
