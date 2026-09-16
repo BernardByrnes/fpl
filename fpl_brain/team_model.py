@@ -47,7 +47,12 @@ from .utils import parse_utc, utc_now
 # though every currently certified cutoff is unaffected (no stored row both
 # satisfies the old read and falls outside the boundary).
 TEAM_MODEL_VERSION = "team_strength_v1.1.0"
-TEAM_BASELINE_MODEL_VERSION = "team_naive_v1.0.0"
+# v1.1.0: the naive baseline derives its venue lambdas from ``team_match_rows``,
+# which now receives cutoff-causal fixture-xG evidence.  A post-cutoff write
+# that the old read accepted therefore changes the naive baseline too, so it
+# cannot share an identity with the version whose semantics differed -- the +50
+# xG counterexample is one such write.
+TEAM_BASELINE_MODEL_VERSION = "team_naive_v1.1.0"
 
 VENUE_HOME = "home"
 VENUE_AWAY = "away"

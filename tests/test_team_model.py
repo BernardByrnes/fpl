@@ -322,6 +322,10 @@ def test_naive_baseline_stored_separately_without_team_signal():
     for row in naive_rows:
         assert row["attack_rating"] is None and row["opponent_defence_rating"] is None
         assert row["provenance"]["baseline_kind"] == "LEAGUE_AVERAGE_VENUE"
+        # The naive baseline is fitted from the same fixture-xG evidence the
+        # causal repair changed, so it carries its own semantic version.
+        assert row["model_version"] == team_model.TEAM_BASELINE_MODEL_VERSION
+        assert row["model_version"] == "team_naive_v1.1.0"
     # Same home lambda for every home side (no team-specific signal).
     homes = {row["expected_goals_for"] for row in naive_rows if row["venue"] == "home"}
     assert len(homes) == 1
