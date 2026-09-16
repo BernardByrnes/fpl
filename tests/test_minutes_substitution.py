@@ -150,7 +150,11 @@ def test_red_card_rows_are_excluded_from_exit_inference():
                                        was_home=1, red_cards=1, source="element_summary", raw_json={})
         rows.append(PlayerGameweekRecord(player_id=12, event=1, fixture_id=1, minutes=20, starts=0,
                                          was_home=1, red_cards=0, source="element_summary", raw_json={}))
-        repo.upsert_player_gameweeks(conn, rows)
+        # The evidence window is bounded by the cutoff below (2026-09-10T12:00:00Z)
+        # and the fixture's own kickoff, so the rows must be declared as written
+        # inside it.  Leaving this to wall-clock now would put them after the
+        # cutoff, where the boundary is right to treat them as unavailable.
+        repo.upsert_player_gameweeks(conn, rows, "2026-09-10T08:00:00Z")
     evidence = sm.audit_substitution_evidence(conn, 2, "2026-09-10T12:00:00Z")
     assert evidence["red_card_exits"] == 1
     assert 30.0 not in evidence["exit_minutes"]  # the dismissal is not an exit
