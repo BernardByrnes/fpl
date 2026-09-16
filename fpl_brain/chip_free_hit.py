@@ -338,11 +338,6 @@ class FreeHitRequest:
     #: carry values computed by ``route_optimizer.exact_evaluate``.
     play_route: FreeHitRoute | None = None
     save_route: FreeHitRoute | None = None
-    #: The predictive identity of each ROUTE event's evaluation worlds, keyed by
-    #: the event itself.  The key is not evidence: the identity is compared against
-    #: the certified bundle for the event the map says, so swapping two events'
-    #: worlds cannot pass by relabelling the container.
-    route_world_identities: Mapping[int, Any] = field(default_factory=dict)
     #: The CANONICAL certified decision context every predictive dimension is
     #: anchored to.  Comparing two request-owned identities against each other
     #: proves nothing, so the authority -- not a second supplied object -- is
@@ -992,17 +987,14 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
                 f"player(s): {extra[:8]}"
             )
 
-    # ── route-evaluation worlds must BE the certified bundle for THEIR event ──
-    # Each arm's evaluation worlds are validated per event, not all against H1 and
-    # not merely against the artifact's global identity, so a run or model-version
-    # swap on one H2-H4 event refuses before any route value can enter the decision.
-    if request.route_world_identities:
-        for event in sorted(int(e) for e in request.route_world_identities):
-            supplied = request.route_world_identities[int(event)]
-            for dimension in authority.disagreements_with(
-                supplied, event=int(event), label=f"route event {int(event)} world identity"
-            ):
-                problems.append(f"{FH_DECISION_AUTHORITY_MISMATCH}: {dimension}")
+    # ── route worlds are already authoritative ────────────────────────────────
+    # There is deliberately NO parallel route-identity evidence here.  Each arm's
+    # matrices are loaded by the production adapter through
+    # ``route_optimizer.build_event_worlds`` keyed by THAT EVENT's certified bundle,
+    # and each is verified to carry that bundle's canonical world-cache key before
+    # it is used -- so the event, the bundle and the numbers are bound at the point
+    # of loading.  A second identity map could only restate that, and restating it
+    # from H1 was exactly the defect this removes.
 
     play_route = request.play_route
     save_route = request.save_route

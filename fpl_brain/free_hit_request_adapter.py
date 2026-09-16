@@ -512,10 +512,6 @@ def build_free_hit_request(
         pool_binding=certified.pool_binding,
         play_route=play_route,
         save_route=save_route,
-        route_world_identities={
-            **{int(e): certified.world_identity for e in horizon[1:]},
-            **{int(e): certified.world_identity for e in horizon},
-        },
         # The LOADED authority: derived here from the canonical certification
         # artifact, never accepted from the caller.
         decision_authority=authority,

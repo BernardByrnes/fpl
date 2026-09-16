@@ -824,7 +824,7 @@ def test_B2_an_absent_cache_regenerates_from_the_certified_runs(conn):
     from fpl_brain import route_optimizer as ro
     for event in (EVENT, EVENT + 1, EVENT + 2, EVENT + 3):
         assert (empty_cache / f"{ro.world_cache_key(
-            event=event, bundle=ad._CertifiedRunIds(event, cf.RUNS),
+            event=event, bundle=ad._CertifiedRunIds(event, cf.runs_for(event)),
             config=ro.OptimizerConfig(policy_selection_worlds=12),
             union_ids=tuple(int(p) for p in UNIVERSE),
         )}.json").exists(), f"event {event} was not materialised under its certified key"
@@ -871,7 +871,7 @@ def test_B4_the_loaded_matrix_is_the_canonical_one_for_the_certified_bundle(conn
     # The value loaded is the one written under the canonical key for the certified
     # bundle: a caller-supplied matrix could never have produced it.
     assert expected_key == ro.world_cache_key(
-        event=EVENT, bundle=ad._CertifiedRunIds(EVENT, cf.RUNS),
+        event=EVENT, bundle=ad._CertifiedRunIds(EVENT, cf.runs_for(EVENT)),
         config=request.save_route.events and ro.OptimizerConfig(policy_selection_worlds=12),
         union_ids=tuple(int(p) for p in UNIVERSE),
     )
@@ -907,3 +907,107 @@ def test_C2_a_forged_event_start_free_transfers_also_refuses(conn):
         ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
     assert "event-start free transfers" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# PER-EVENT CERTIFIED IDENTITY — the H1-stamped-on-H2 defect
+# ---------------------------------------------------------------------------
+
+
+def test_per_event_A_a_distinct_per_event_certificate_builds_and_evaluates(conn):
+    """Control: four events with their OWN certified runs must reach evaluation.
+
+    The shipped fixture reused one run mapping for all four events, which masked a
+    defect where the H1 identity was stamped onto H2-H4.  With genuinely distinct
+    certified runs this control fails at the reviewed SHA.
+    """
+
+    _seed(conn)
+    artifact = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3))
+    runs = [artifact["certified_bundles"][str(e)]["runs"] for e in (EVENT, EVENT + 1, EVENT + 2, EVENT + 3)]
+    assert len({tuple(sorted(r.items())) for r in runs}) == 4, "the fixture must differ per event"
+
+    path = cf.write_artifact(Path(tempfile.mkdtemp()), artifact, name="distinct.json")
+    cache = Path(tempfile.mkdtemp())
+    cf.write_world_cache(cache, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE)
+    request = ad.build_free_hit_request(
+        _state(conn), _certified(), conn=conn, certification_path=path, world_cache_dir=cache,
+    )
+    assert [e.event for e in request.save_route.events] == [EVENT, EVENT + 1, EVENT + 2, EVENT + 3]
+    assert [e.event for e in request.play_route.events] == [EVENT + 1, EVENT + 2, EVENT + 3]
+    evaluation = fh.evaluate_free_hit(request)
+    assert evaluation.mean_uplift is not None
+
+
+def test_per_event_B_no_parallel_route_identity_channel_exists(conn):
+    """The channel that carried the H1 identity onto H2-H4 is GONE.
+
+    Adapts attacks B/C/H from the review: with the map removed there is no stale
+    parallel identity to be wrong, and the event/bundle/numbers binding happens at
+    the point of loading instead.
+    """
+
+    import inspect
+
+    assert "route_world_identities" not in fh.FreeHitRequest.__dataclass_fields__
+    assert "route_world_identities" not in set(
+        inspect.signature(ad.build_free_hit_request).parameters
+    )
+    source = Path(ad.__file__).read_text(encoding="utf-8")
+    assert "route_world_identities" not in source
+    # No field of the request can carry a per-event predictive identity at all.
+    assert not set(fh.FreeHitRequest.__dataclass_fields__) & {
+        "route_world_identities", "world_identities", "route_identities",
+    }
+
+
+def test_per_event_D_each_events_certified_runs_drive_its_own_world_key(conn):
+    """The certified bundle for an event -- not its neighbours -- keys its matrix."""
+
+    _seed(conn)
+    from fpl_brain import route_optimizer as ro
+    config = fx_config()
+    keys = {
+        event: ro.world_cache_key(
+            event=event, bundle=ad._CertifiedRunIds(event, cf.runs_for(event)),
+            config=config, union_ids=tuple(int(p) for p in UNIVERSE),
+        )
+        for event in (EVENT, EVENT + 1, EVENT + 2, EVENT + 3)
+    }
+    assert len(set(keys.values())) == 4, "distinct certified runs must give distinct keys"
+    # Deriving H2's key from H1's runs is a DIFFERENT key, so the wrong bundle
+    # cannot silently select H2's matrix.
+    wrong = ro.world_cache_key(
+        event=EVENT + 1, bundle=ad._CertifiedRunIds(EVENT, cf.runs_for(EVENT)),
+        config=config, union_ids=tuple(int(p) for p in UNIVERSE),
+    )
+    assert wrong != keys[EVENT + 1]
+
+
+def test_per_event_F_swapping_two_events_certified_runs_changes_both_keys(conn):
+    """Per-event bundles are not interchangeable: the swap is visible in the keys."""
+
+    _seed(conn)
+    from fpl_brain import route_optimizer as ro
+    config = fx_config()
+    union = tuple(int(p) for p in UNIVERSE)
+    original = {
+        e: ro.world_cache_key(event=e, bundle=ad._CertifiedRunIds(e, cf.runs_for(e)),
+                              config=config, union_ids=union)
+        for e in (EVENT + 1, EVENT + 2)
+    }
+    swapped = {
+        EVENT + 1: ro.world_cache_key(event=EVENT + 1,
+                                      bundle=ad._CertifiedRunIds(EVENT + 1, cf.runs_for(EVENT + 2)),
+                                      config=config, union_ids=union),
+        EVENT + 2: ro.world_cache_key(event=EVENT + 2,
+                                      bundle=ad._CertifiedRunIds(EVENT + 2, cf.runs_for(EVENT + 1)),
+                                      config=config, union_ids=union),
+    }
+    assert swapped[EVENT + 1] != original[EVENT + 1]
+    assert swapped[EVENT + 2] != original[EVENT + 2]
+
+
+def fx_config():
+    import free_hit_route_fixtures as _fx
+    return _fx.route_config()

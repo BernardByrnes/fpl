@@ -39,6 +39,19 @@ MODEL_VERSIONS: dict[str, str] = {
 }
 
 
+def runs_for(event: int) -> dict[str, int]:
+    """The certified run ids for ONE event.
+
+    Real certifications commit DISTINCT runs per event -- the four Gameweeks are
+    separate planning events with their own projection runs.  The previous fixture
+    reused one mapping for all four, which masked a defect where the H1 predictive
+    identity was stamped onto H2-H4.
+    """
+
+    offset = int(event) - 5
+    return {family: run_id + offset for family, run_id in RUNS.items()}
+
+
 def bundle(
     event: int, *, cutoff: str = CUTOFF, snapshot: str = DATA_SNAPSHOT,
     code: str = CODE_SNAPSHOT, context: str = CONTEXT_HASH,
@@ -49,7 +62,7 @@ def bundle(
     return {
         "event": int(event),
         "cutoff": cutoff,
-        "runs": {k: int(v) for k, v in (runs or RUNS).items()},
+        "runs": {k: int(v) for k, v in (runs if runs is not None else runs_for(int(event))).items()},
         "model_versions": dict(models or MODEL_VERSIONS),
         "code_snapshot_sha256": code,
         "data_snapshot_sha256": snapshot,
@@ -156,7 +169,7 @@ def write_world_cache(
         event = int(event)
         from fpl_brain.free_hit_request_adapter import _CertifiedRunIds
 
-        bundle = _CertifiedRunIds(event, RUNS)
+        bundle = _CertifiedRunIds(event, runs_for(event))
         config = ro.OptimizerConfig(policy_selection_worlds=12)
         key = ro.world_cache_key(event=event, bundle=bundle, config=config, union_ids=union)
         value = float(per_event_scores.get(event, scores.get("default", 1.0)))
@@ -169,3 +182,19 @@ def write_world_cache(
         (cache_dir / f"{key}.json").write_text(json.dumps(matrix), encoding="utf-8")
         keys[event] = key
     return keys
+
+
+def identity_for_event(event: int, **overrides) -> Any:
+    """A world identity CONFORMING to the certified bundle for ``event``."""
+
+    return identity_for(bundle(int(event), **overrides))
+
+
+def bundle_key(event: int, *, config, union) -> str:
+    """The canonical world-cache key for one event's certified bundle."""
+
+    from fpl_brain import route_optimizer as ro
+    from fpl_brain.free_hit_request_adapter import _CertifiedRunIds
+
+    return ro.world_cache_key(event=int(event), bundle=_CertifiedRunIds(int(event), runs_for(int(event))),
+                              config=config, union_ids=tuple(int(p) for p in union))
