@@ -35,7 +35,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from . import analytics
 
-MINUTES_SUBSTITUTION_MODEL_VERSION = "minutes_v1.4.0"
+#: Bumped from ``minutes_v1.4.0`` by PE-1: this family's historical training
+#: semantics changed.  Stale pre-round placeholders are no longer read as
+#: zero-substitution team-fixtures, which corrected the fitted substitution rate.
+#: A run under the new semantics must not present itself as the old version.
+MINUTES_SUBSTITUTION_MODEL_VERSION = "minutes_v1.5.0"
 
 GK_POSITION_ID = 1
 MAX_ORDINARY_SUBSTITUTIONS = 5
@@ -86,16 +90,21 @@ def audit_substitution_evidence(
     is excluded (and counted) rather than treated as an exit.
     """
 
+    from . import historical_observations as historical
+
+    # The observation universe comes from the CANONICAL boundary, so a stale
+    # pre-round placeholder can never be read as a real zero-substitution fixture.
+    # The `minutes IS NOT NULL` filter that appeared to guard this was not history
+    # authority at all: placeholders carry minutes=0, not NULL, so it never
+    # excluded them.
     rows = conn.execute(
         """SELECT pg.player_id, pg.fixture_id, pg.was_home, pg.minutes, pg.starts, pg.red_cards,
                   f.team_h, f.team_a, p.element_type
              FROM player_gameweeks pg
              JOIN fixtures f ON f.id = pg.fixture_id
              JOIN players p ON p.id = pg.player_id
-            WHERE f.finished = 1 AND f.started = 1 AND pg.event < ? AND f.event < ?
-              AND f.event IS NOT NULL AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
-              AND pg.minutes IS NOT NULL""",
-        (int(planning_event), int(planning_event), cutoff),
+            WHERE {boundary}""".format(boundary=historical.OBSERVATION_SQL_CLAUSES),
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall()
 
     sides: dict[tuple[int, int], list[Any]] = {}

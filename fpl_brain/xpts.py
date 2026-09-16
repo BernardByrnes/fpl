@@ -41,6 +41,7 @@ from dataclasses import dataclass, fields
 from typing import Any, Iterable, Mapping
 
 from . import analytics, repositories as repo
+from . import historical_observations as historical
 from . import defcon_calibration as defcon_cal
 from .scoring_rules import POSITION_IDS, SCORING_RULES_VERSION, ScoringRules, DEFAULT_SCORING_RULES
 from .utils import parse_utc, utc_now
@@ -227,11 +228,11 @@ def current_player_aggregates(
     """Completed-row per-player totals (minutes, saves, yellow, bonus, DefCon)."""
 
     rows = conn.execute(
-        """SELECT pg.player_id, pg.minutes, pg.saves, pg.yellow_cards, pg.bonus, pg.defensive_contribution
+        f"""SELECT pg.player_id, pg.minutes, pg.saves, pg.yellow_cards, pg.bonus, pg.defensive_contribution
              FROM player_gameweeks pg JOIN fixtures f ON f.id=pg.fixture_id
-            WHERE f.finished=1 AND f.started=1 AND pg.event < ? AND f.event < ? AND f.event IS NOT NULL
-              AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
-        (int(planning_event), int(planning_event), cutoff),
+            WHERE {historical.OBSERVATION_SQL_CLAUSES}
+              AND f.event IS NOT NULL""",
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall()
     aggregates: dict[int, dict[str, float]] = {}
     for row in rows:
@@ -257,13 +258,13 @@ def position_pooled_current_rates(
     """Position-pooled current-season per-90 rates for saves/yellow/bonus/DefCon."""
 
     rows = conn.execute(
-        """SELECT p.element_type, pg.minutes, pg.saves, pg.yellow_cards, pg.bonus, pg.defensive_contribution
+        f"""SELECT p.element_type, pg.minutes, pg.saves, pg.yellow_cards, pg.bonus, pg.defensive_contribution
              FROM player_gameweeks pg
              JOIN players p ON p.id=pg.player_id
              JOIN fixtures f ON f.id=pg.fixture_id
-            WHERE f.finished=1 AND f.started=1 AND pg.event < ? AND f.event < ? AND f.event IS NOT NULL
-              AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?) AND pg.minutes > 0""",
-        (int(planning_event), int(planning_event), cutoff),
+            WHERE {historical.OBSERVATION_SQL_CLAUSES}
+              AND f.event IS NOT NULL AND pg.minutes > 0""",
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall()
     totals: dict[str, dict[str, float]] = {}
     for row in rows:

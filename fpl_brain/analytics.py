@@ -74,6 +74,10 @@ SOURCE_SNAPSHOT_FILES = (
     # its versioned spec determines the DEFCON term in every xPts row, so a
     # change to it must change the certified code identity.
     "fpl_brain/defcon_calibration.py",
+    "fpl_brain/historical_observations.py",
+    # The canonical point-in-time boundary selects which player-fixture
+    # observations every historical model may read, so a change to it changes WHAT
+    # the certified models consume and must change the certified code identity.
     "fpl_brain/history_completeness.py",
     "fpl_brain/joint_minutes.py",
     "fpl_brain/minutes_coherence.py",
@@ -641,26 +645,20 @@ def completed_rows_as_of(
     can never leak into a freeze.
     """
 
-    sql = """SELECT pg.*, f.kickoff_time AS fixture_kickoff, f.event AS fixture_event
-             FROM player_gameweeks pg JOIN fixtures f ON f.id=pg.fixture_id
-             WHERE pg.player_id=? AND f.finished=1 AND f.started=1
-               AND pg.event < ? AND f.event < ?
-               AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
-             ORDER BY f.event DESC, f.kickoff_time DESC, f.id DESC"""
-    params: list[Any] = [int(player_id), int(planning_event), int(planning_event), cutoff]
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(int(limit))
-    out: list[dict[str, Any]] = []
-    for row in conn.execute(sql, tuple(params)).fetchall():
-        record = dict(row)
-        # A completed-fixture row that carries no official observation is a stale
-        # schedule placeholder, NOT a did-not-play: a real DNP is all explicit
-        # zeros.  Consumers must report the gap rather than read it as absence of
-        # the player.  Flagged once here so every consumer shares one definition.
-        record["history_placeholder"] = repo.row_is_scheduled_placeholder(record)
-        out.append(record)
-    return out
+    from . import historical_observations as historical
+
+    rows = historical.historical_player_fixture_rows(
+        conn, as_of=str(cutoff), planning_event=int(planning_event),
+        player_id=int(player_id), limit=limit,
+    )
+    for record in rows:
+        # The observation universe now EXCLUDES stale schedule placeholders at the
+        # canonical boundary, so a returned row is a legitimate realised
+        # observation by construction.  The flag is retained for diagnostics and
+        # for consumers that still read it, but it is no longer the only thing
+        # standing between a model and placeholder history.
+        record["history_placeholder"] = False
+    return rows
 
 
 def snapshot_status_evidence(conn: sqlite3.Connection, player_id: int, cutoff: str) -> dict[str, Any]:

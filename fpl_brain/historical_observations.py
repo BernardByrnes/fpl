@@ -66,16 +66,12 @@ from . import repositories as repo
 
 HISTORICAL_OBSERVATION_BOUNDARY_VERSION = "historical_observations_v1.0.0"
 
-#: The columns every historical reader may rely on.
+#: The columns every historical reader may rely on.  ``pg.*`` is deliberate:
+#: consumers of the shared reader were written against the whole row, so the
+#: boundary returns the same shape rather than a curated subset.
 OBSERVATION_COLUMNS = (
-    "pg.player_id, pg.event, pg.fixture_id, pg.opponent_team, pg.was_home, pg.minutes, "
-    "pg.starts, pg.total_points, pg.goals_scored, pg.assists, pg.clean_sheets, "
-    "pg.goals_conceded, pg.saves, pg.bonus, pg.bps, pg.yellow_cards, pg.red_cards, "
-    "pg.penalties_saved, pg.penalties_missed, pg.own_goals, pg.influence, pg.creativity, "
-    "pg.threat, pg.ict_index, pg.expected_goals, pg.expected_assists, "
-    "pg.expected_goal_involvements, pg.expected_goals_conceded, pg.defensive_contribution, "
-    "pg.value, pg.selected, pg.source, pg.updated_at, "
-    "f.kickoff_time AS fixture_kickoff, f.event AS fixture_event, f.finished AS fixture_finished"
+    "pg.*, f.kickoff_time AS fixture_kickoff, f.event AS fixture_event, "
+    "f.finished AS fixture_finished"
 )
 
 #: The causal + observability clauses, in one place.  ``?`` order:
@@ -298,3 +294,29 @@ def _max_gap_days(captures: Sequence[str]) -> float | None:
         if parse_utc(a) is not None and parse_utc(b) is not None
     ]
     return round(max(days), 3) if days else None
+
+
+# ---------------------------------------------------------------------------
+# SQL composition for readers that keep their own SELECT/JOIN
+# ---------------------------------------------------------------------------
+
+#: The boundary as a SQL fragment for readers that have their own projection.
+#: Compose with :func:`boundary_params`; never restate the clauses.
+OBSERVATION_SQL_CLAUSES = """
+      f.finished = 1 AND f.started = 1
+      AND f.kickoff_time IS NOT NULL AND f.kickoff_time <= ?
+      AND pg.updated_at IS NOT NULL AND pg.updated_at <= ?
+      AND pg.updated_at >= f.kickoff_time
+      AND pg.event < ? AND f.event < ?
+"""
+
+
+def boundary_params(as_of: str, *, planning_event: int | None = None) -> tuple[str, ...]:
+    """The parameters for :data:`OBSERVATION_SQL_CLAUSES`, in order."""
+
+    cutoff = require_as_of(as_of)
+    if planning_event is None:
+        raise HistoricalBoundaryError(
+            "the composed clause includes the planning-event bound; supply planning_event"
+        )
+    return (cutoff, cutoff, int(planning_event), int(planning_event))

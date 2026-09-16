@@ -21,7 +21,8 @@ import sqlite3
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Sequence
 
-from . import analytics, history_completeness as hc, repositories as repo
+from . import analytics
+from . import historical_observations as historical, history_completeness as hc, repositories as repo
 from .utils import parse_utc, utc_now
 
 MINUTES_MODEL_VERSION = "minutes_v1.6.0"
@@ -258,12 +259,12 @@ def league_pools(conn: sqlite3.Connection, planning_event: int, cutoff: str) -> 
            FROM player_gameweeks pg
            JOIN players p ON p.id=pg.player_id
            JOIN fixtures f ON f.id=pg.fixture_id
-          WHERE f.finished=1 AND f.started=1
-            AND pg.event<? AND f.event<? AND f.event IS NOT NULL
+          WHERE {boundary}
             AND pg.starts IS NOT NULL AND pg.minutes IS NOT NULL
-            AND p.team_id IS NOT NULL AND p.element_type IS NOT NULL
-            AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
-        (int(planning_event), int(planning_event), cutoff),
+            AND p.team_id IS NOT NULL AND p.element_type IS NOT NULL""".format(
+            boundary=historical.OBSERVATION_SQL_CLAUSES
+        ),
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall()
     team_position: dict[tuple[int, int], dict[str, float]] = {}
     for row in rows:

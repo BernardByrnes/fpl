@@ -432,11 +432,15 @@ def test_I_player_rates_reports_the_gap(tmp_path):
 
     stale = _seed(tmp_path / "stale", event4_final=True, event4_row=PLACEHOLDER_ROW, aggregate_minutes=360, fixture4_finished=True)[1]
     evidence = player_rates.current_rate_evidence(stale, 1, "xG_per90", PLANNING_EVENT, CUTOFF)
-    # The placeholder contributes no exposure (it holds none) but is not silent:
+    # PE-1 changed the CONTRACT, not the exposure.  The canonical historical
+    # boundary now EXCLUDES a stale placeholder before any model reads it, so the
+    # reader no longer has one to report: it contributes no exposure either way,
+    # and the model is no longer responsible for spotting it.  Detection remains
+    # available to the certification audit, which reads the table directly.
     assert evidence["current_minutes"] == 270.0
     assert evidence["played_rows"] == 3
-    assert len(evidence["placeholder_rows"]) == 1
-    assert hc.DIAG_COMPLETED_EVENT_PLACEHOLDER_ROW in evidence["flags"]
+    assert evidence["placeholder_rows"] == []
+    assert hc.DIAG_COMPLETED_EVENT_PLACEHOLDER_ROW not in evidence["flags"]
     stale.close()
 
 
@@ -460,18 +464,24 @@ def test_J_minutes_evidence_reports_the_gap(tmp_path):
     _config_, conn = _seed(
         tmp_path, event4_final=True, event4_row=PLACEHOLDER_ROW, aggregate_minutes=360, fixture4_finished=True
     )
+    # PE-1: the stale placeholder is EXCLUDED at the canonical boundary rather than
+    # returned-and-flagged, so the shared reader yields three realised observations.
+    # The event-4 placeholder is still DETECTED -- by the audit, which reads the
+    # table directly -- so certification cannot silently proceed on it.
     rows = analytics.completed_rows_as_of(conn, 1, CUTOFF, PLANNING_EVENT)
-    assert len(rows) == 4
-    flagged = [row for row in rows if row["history_placeholder"]]
-    assert len(flagged) == 1
-    assert flagged[0]["event"] == 4
+    assert len(rows) == 3
+    assert [row for row in rows if row["history_placeholder"]] == []
 
     classified = minutes_model.classify_evidence_rows(rows)
-    placeholder = next(row for row in classified if row["history_placeholder"])
-    assert placeholder["evidence_class"] == minutes_model.EVIDENCE_UNKNOWN
-    assert "placeholder" in placeholder["evidence_reason"]
-    # A placeholder is NOT negative selection evidence.
-    assert placeholder["evidence_class"] not in minutes_model._START_OBSERVATION_CLASSES
+    assert all(not row["history_placeholder"] for row in classified)
+    # Both seeded players carry an event-4 placeholder, and the audit sees both.
+    audit = hc.structural_audit(conn, planning_event=PLANNING_EVENT, cutoff=CUTOFF)
+    assert audit["placeholder_rows"] == 2
+    assert audit["placeholder_rows_by_event"] == {"4": 2}
+    assert audit["complete"] is False
+    # Every row the reader returns is a REALISED observation, so none of them can
+    # be downgraded to unknown evidence by a placeholder sitting beside it.
+    assert all(row["evidence_class"] != minutes_model.EVIDENCE_UNKNOWN for row in classified)
     conn.close()
 
 

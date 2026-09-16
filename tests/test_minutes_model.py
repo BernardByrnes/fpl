@@ -18,6 +18,14 @@ from fpl_brain.models import (
 )
 
 CUTOFF = "2026-09-10T12:00:00Z"
+
+#: When the seeded historical rows were OBSERVED.  The canonical historical
+#: boundary admits a row only if it was written AFTER its own fixture kicked off
+#: (the latest seeded kickoff is 2026-09-09T19:45Z) and at or before the planning
+#: cutoff (2026-09-10T12:00Z).  Observation time is part of the fixture, so it is
+#: stated explicitly instead of being left to upsert_player_gameweeks' ambient
+#: utc_now(), which would place the write after the cutoff it is evidence for.
+OBSERVED_AT = "2026-09-10T08:00:00Z"
 EVENT_DEADLINE = "2026-09-12T12:30:00Z"
 
 
@@ -120,7 +128,7 @@ def analytics_repo_upserts(conn, seed):  # noqa: N802 (test-local helper)
                     raw_json={},
                 )
             )
-    repo.upsert_player_gameweeks(conn, gameweeks)
+    repo.upsert_player_gameweeks(conn, gameweeks, OBSERVED_AT)
     for player_id, (key, value) in seed.get("scout_notes", {}).items():
         import_id = repo.insert_scouting_import(conn, {"source_file": "world", "file_sha256": f"world-{player_id}", "players_total": 1, "players_resolved": 1, "notes_inserted": 1})
         repo.insert_scouting_note(
