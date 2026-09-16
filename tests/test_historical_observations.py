@@ -285,3 +285,113 @@ def test_one_predicate_definition_is_exposed_for_evidence(conn):
     assert "updated_at >= kickoff_time" in window.clauses
     assert "updated_at <= as_of" in window.clauses
     assert window.as_dict()["boundary_version"] == ho.HISTORICAL_OBSERVATION_BOUNDARY_VERSION
+
+
+# ---------------------------------------------------------------------------
+# CONSUMERS — a model prior reader must not re-derive the window locally
+# ---------------------------------------------------------------------------
+
+
+def test_the_minutes_position_priors_use_the_boundary_not_a_local_predicate(conn):
+    """``positional_pooled_engagement`` feeds the level-4 minutes priors.
+
+    Its old predicate pruned on event number and kickoff time but never asked
+    when the row was written, so a scheduled placeholder written before its own
+    kickoff was read as an observation.  The two rows share one position, so the
+    survivor proves the exclusion is the boundary clause and not an empty window.
+    """
+
+    from fpl_brain import analytics
+
+    _seed(
+        conn,
+        fixtures=[
+            # Its row is written after its own kickoff: causally valid.
+            {"id": 60, "event": 2, "kickoff_time": "2026-08-29T14:00:00Z"},
+            # Its row is written BEFORE its own kickoff: a scheduled placeholder.
+            {"id": 61, "event": 3, "kickoff_time": "2026-09-05T14:00:00Z"},
+        ],
+        observations=[
+            {"player_id": 5, "event": 2, "fixture_id": 60, "minutes": 90, "starts": 1,
+             "total_points": 6, "updated_at": WRITTEN},
+            {"player_id": 6, "event": 3, "fixture_id": 61, "minutes": 0, "starts": 0,
+             "total_points": 0, "updated_at": "2026-09-05T09:00:00Z"},
+        ],
+    )
+
+    pools = analytics.positional_pooled_engagement(conn, 5, LATE)
+    assert 3 in pools, "the causally valid starter must still reach the priors"
+    assert pools[3]["start_rows"] == 1, "the pre-kickoff placeholder was counted as an observation"
+    assert pools[3]["p_start"] == 1.0, "the pre-kickoff placeholder deflated the start-rate prior to 0.5"
+    assert pools[3]["minutes_if_start"] == 90.0
+
+    # A cutoff before either row was written leaves the priors empty: the
+    # boundary is a clock, not a shape, and it fails closed.
+    assert analytics.positional_pooled_engagement(conn, 5, EARLY) == {}
+
+
+def test_a_row_written_after_the_cutoff_never_reaches_the_minutes_priors(conn):
+    """The look-ahead gate.
+
+    The row's fixture has kicked off and finished before the cutoff, so the old
+    local predicate accepted it; only its write time is in the future relative
+    to the planning instant.  It must not be readable as history.
+    """
+
+    from fpl_brain import analytics
+
+    _seed(
+        conn,
+        fixtures=[{"id": 62, "event": 2, "kickoff_time": "2026-08-29T14:00:00Z"}],
+        observations=[
+            {"player_id": 7, "event": 2, "fixture_id": 62, "minutes": 90, "starts": 1,
+             "total_points": 9, "updated_at": "2026-09-30T00:00:00Z"},
+        ],
+    )
+
+    # The row's own fixture state satisfies every clause the old predicate had.
+    accepted_by_old = conn.execute(
+        """SELECT COUNT(*) FROM player_gameweeks pg JOIN fixtures f ON f.id=pg.fixture_id
+            WHERE f.finished=1 AND f.started=1 AND pg.event<? AND f.event<?
+              AND f.event IS NOT NULL AND pg.starts IS NOT NULL AND pg.minutes IS NOT NULL
+              AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
+        (5, 5, LATE),
+    ).fetchone()[0]
+    assert accepted_by_old == 1, "the old predicate is expected to accept this row"
+
+    # The reader must not.
+    assert analytics.positional_pooled_engagement(conn, 5, LATE) == {}
+
+
+def test_the_naive_minutes_baseline_uses_the_boundary_not_a_local_predicate(conn):
+    """``positional_pooled_minutes`` feeds the naive baseline projection run.
+
+    Its old predicate had no write-time clause and no ``starts`` filter, so the
+    scheduled placeholders were averaged in as genuine zero-minute appearances.
+    Against the certified data that understated every positional mean by 4.8 to
+    8.9 minutes, because all 456 placeholders passed every clause it had.
+    """
+
+    from fpl_brain import analytics
+
+    _seed(
+        conn,
+        fixtures=[
+            {"id": 70, "event": 2, "kickoff_time": "2026-08-29T14:00:00Z"},
+            {"id": 71, "event": 3, "kickoff_time": "2026-09-05T14:00:00Z"},
+        ],
+        observations=[
+            {"player_id": 8, "event": 2, "fixture_id": 70, "minutes": 90, "starts": 1,
+             "total_points": 6, "updated_at": WRITTEN},
+            # A scheduled placeholder: written before its own kickoff.
+            {"player_id": 9, "event": 3, "fixture_id": 71, "minutes": 0,
+             "total_points": None, "updated_at": "2026-09-05T09:00:00Z"},
+        ],
+    )
+
+    assert analytics.positional_pooled_minutes(conn, 5, LATE)[3] == 90.0, (
+        "the placeholder was averaged in as a zero-minute appearance"
+    )
+    # A cutoff before any row was written leaves the window empty: it fails closed
+    # rather than reaching for the rows it can see but may not use.
+    assert analytics.positional_pooled_minutes(conn, 5, EARLY) == {}
