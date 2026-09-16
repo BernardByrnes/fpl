@@ -341,3 +341,55 @@ def test_the_core_free_hit_semantics_are_unchanged():
     assert evaluation.execution_permitted is False
     assert evaluation.data_snapshot_bound is True
     assert evaluation.evidence["free_hit_quantitative_capability"] == "SUPPORTED_REVIEW_ONLY"
+
+
+# ---------------------------------------------------------------------------
+# P2 — WORLD KEYSET COMPLETENESS
+# ---------------------------------------------------------------------------
+
+
+def _world_keyset_problems(*, ids, values=None):
+    values = values or {pid: 1.0 for pid in ids}
+    core = _core_map(values)
+    minutes = {pid: tuple(90.0 for _ in range(8)) for pid in ids}
+    request = _request(worlds=_worlds(core, minutes, ids=ids), pool=_pool(UNIVERSE))
+    return fh.contract_problems(request)
+
+
+def test_P2_the_world_keyset_must_be_the_official_pool_exactly():
+    assert not any(fh.FH_WORLD_KEYSET_MISMATCH in p for p in _world_keyset_problems(ids=UNIVERSE))
+
+
+def test_P2_a_missing_official_player_in_the_world_matrix_refuses():
+    """No projection is a contradiction, not a screening exclusion."""
+
+    ids = tuple(pid for pid in UNIVERSE if pid != 7)
+    problems = _world_keyset_problems(ids=ids)
+    assert any(fh.FH_WORLD_KEYSET_MISMATCH in p and "omits" in p for p in problems), problems
+
+
+def test_P2_an_extra_world_only_player_refuses_before_any_search():
+    """999 in the MATRIX is refused even when every metadata map is canonical."""
+
+    ids = (*UNIVERSE, 999)
+    values = {pid: 1.0 for pid in UNIVERSE}
+    values[999] = 500.0
+    problems = _world_keyset_problems(ids=ids, values=values)
+    assert any(fh.FH_WORLD_KEYSET_MISMATCH in p and "non-official" in p for p in problems), problems
+
+
+def test_P2_the_same_count_with_wrong_ids_refuses():
+    ids = tuple(sorted(set(UNIVERSE) - {30} | {999}))
+    problems = _world_keyset_problems(ids=ids)
+    assert any(fh.FH_WORLD_KEYSET_MISMATCH in p for p in problems), problems
+
+
+def test_P2_a_contradictory_universe_never_becomes_a_smaller_search():
+    """The refusal happens BEFORE screening, so no search work begins."""
+
+    ids = (*UNIVERSE, 999)
+    request = _request(worlds=_worlds(ids=ids), pool=_pool(UNIVERSE))
+    evaluation = fh.evaluate_free_hit(request)
+    assert evaluation.mean_uplift is None
+    assert evaluation.candidate_metrics == {"mean_paired_uplift": None}
+    assert fh.FH_WORLD_KEYSET_MISMATCH in evaluation.reason_codes

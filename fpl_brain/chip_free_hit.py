@@ -128,6 +128,8 @@ FH_TAIL_ROUTE_MISSING = "FREE_HIT_FOUR_GW_TAIL_ROUTE_MISSING"
 FH_TAIL_ROUTE_INVALID = "FREE_HIT_FOUR_GW_TAIL_ROUTE_INVALID"
 FH_DECISION_AUTHORITY_REQUIRED = "FREE_HIT_CANONICAL_DECISION_AUTHORITY_REQUIRED"
 FH_DECISION_AUTHORITY_MISMATCH = "FREE_HIT_PREDICTIVE_EVIDENCE_NOT_THE_CERTIFIED_ONE"
+#: The world matrix keyset must BE the authoritative eligible universe.
+FH_WORLD_KEYSET_MISMATCH = "FREE_HIT_WORLD_KEYSET_IS_NOT_THE_OFFICIAL_POOL"
 
 
 class FreeHitError(ValueError):
@@ -928,6 +930,26 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
     for problem in worlds.problems():
         problems.append(f"{FH_WORLD_INPUTS_MALFORMED}: {problem}")
 
+    # The WORLD KEYSET must BE the authoritative eligible universe, exactly.  A
+    # missing official player has no predictive support and an extra id does not
+    # officially exist; neither may be turned into a screening exclusion, because
+    # that is how a contradictory universe silently becomes a smaller search.
+    if request.pool_binding is not None:
+        eligible = {int(p) for p in request.pool_binding.eligible_ids}
+        world_ids = {int(p) for p in worlds.player_ids}
+        missing = sorted(eligible - world_ids)
+        extra = sorted(world_ids - eligible)
+        if missing:
+            problems.append(
+                f"{FH_WORLD_KEYSET_MISMATCH}: the world matrix omits {len(missing)} officially "
+                f"eligible player(s): {missing[:8]}"
+            )
+        if extra:
+            problems.append(
+                f"{FH_WORLD_KEYSET_MISMATCH}: the world matrix carries {len(extra)} non-official "
+                f"player(s): {extra[:8]}"
+            )
+
     play_tail = request.play_tail
     save_tail = request.save_tail
     if play_tail is None or save_tail is None:
@@ -1012,8 +1034,9 @@ def evaluate_free_hit(request: FreeHitRequest) -> cd.ChipEvaluation:
         token = FH_PROJECTION_INVALID
         for candidate in (
             FH_HORIZON_NOT_CANONICAL, FH_DATA_SNAPSHOT_REQUIRED, FH_PREDICTIVE_IDENTITY_MISMATCH,
-            FH_WORLD_INPUTS_MALFORMED, FH_MANAGER_STATE_INVALID, FH_PRICING_UNAVAILABLE,
-            DIAG_FH_POOL_INCOMPLETE,
+            FH_WORLD_KEYSET_MISMATCH, FH_WORLD_INPUTS_MALFORMED, FH_MANAGER_STATE_INVALID,
+            FH_PRICING_UNAVAILABLE, DIAG_FH_POOL_INCOMPLETE, FH_DECISION_AUTHORITY_REQUIRED,
+            FH_DECISION_AUTHORITY_MISMATCH, FH_TAIL_ROUTE_MISSING, FH_TAIL_ROUTE_INVALID,
         ):
             if first.startswith(candidate):
                 token = candidate
