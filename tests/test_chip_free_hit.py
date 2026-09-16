@@ -65,12 +65,33 @@ def _identity(**overrides) -> WildcardPredictiveIdentity:
     return WildcardPredictiveIdentity(**base)
 
 
-def _binding(event: int = EVENT, snapshot: str = DATA, events=None) -> cd.ChipHorizonBinding:
+def _binding(event: int = EVENT, snapshot: str = DATA, events=None, identity=None) -> cd.ChipHorizonBinding:
     return cd.ChipHorizonBinding(
         planning_event=int(event),
         horizon_events=events if events is not None else cd.canonical_chip_horizon(int(event)),
-        certification_identity=CERT, data_snapshot_sha256=snapshot,
+        certification_identity=(identity or _authority().certification_identity),
+        data_snapshot_sha256=snapshot,
     )
+
+
+def _authority(**overrides):
+    """The canonical certified decision context, from a self-consistent artifact."""
+
+    from fpl_brain import four_gw_decision as fg
+
+    base = dict(cutoff=CUTOFF, data=DATA, source=SOURCE, generation=GENERATION, config=CONFIG)
+    base.update(overrides)
+    artifact = {
+        "planning_cutoff": base["cutoff"],
+        "data_snapshot_sha256": base["data"],
+        "certified_bundle_identity": {
+            "source_snapshot_sha256": base["source"],
+            "generation": base["generation"],
+            "model_config_identity": base["config"],
+        },
+    }
+    artifact["four_gw_certification_identity"] = fg.certification_identity_of(artifact)
+    return fh.FreeHitDecisionAuthority.from_certification(artifact)
 
 
 def _pool(ids: tuple[int, ...] = UNIVERSE) -> WildcardPoolBinding:
@@ -113,16 +134,91 @@ def _market(prices: dict[int, int] | None = None) -> dict[int, int]:
     return prices if prices is not None else {pid: 50 for pid in UNIVERSE}
 
 
+# ---------------------------------------------------------------------------
+# FOUR-GW ARM HELPERS — the canonical route shape, not a bespoke one
+# ---------------------------------------------------------------------------
+
+TAIL_EVENTS = (EVENT + 1, EVENT + 2, EVENT + 3)
+
+
+def _tail_events(values, *, owned, bank, basis, free_transfers):
+    """Build the accepted route-event DTOs the route engine produces."""
+
+    from fpl_brain import chip_wildcard as _wc
+
+    return tuple(
+        _wc.WildcardSaveRouteEvent(
+            event=int(event), squad_ids=tuple(sorted(int(p) for p in owned)),
+            bank_tenths=int(bank), purchase_price_tenths={int(k): int(v) for k, v in basis.items()},
+            free_transfers=int(free_transfers), mean_net_core=float(value),
+        )
+        for event, value in zip(TAIL_EVENTS, values)
+    )
+
+
+def _tails(
+    permanent,
+    *,
+    rules=None,
+    play_values=(10.0, 10.0, 10.0),
+    save_values=(10.0, 10.0, 10.0),
+):
+    """Both arms' H2-H4 routes, each anchored to its OWN canonical H2 state.
+
+    PLAY starts H2 with the RESTORED permanent state (post-Free-Hit FT); SAVE
+    starts H2 after ordinary Gameweek progression.  Those free-transfer counts
+    genuinely differ, which is exactly what the four-GW comparison must reflect.
+    """
+
+    from fpl_brain import chip_free_hit as _fh
+    from fpl_brain import season_rules as _sr
+
+    rules = rules if rules is not None else _sr.SeasonRules(season="2026/27")
+    restored = _fh.restore_permanent_state(permanent, rules=rules, restored_event=TAIL_EVENTS[0])
+    request = _fh.FreeHitRequest(
+        permanent=permanent, horizon_binding=_binding(), h1_worlds=None, world_identity=None,
+        positions={}, clubs={}, market_price_tenths={}, pool_binding=None, rules=rules,
+    )
+    save_state = _fh.save_arm_h2_state(request)
+    play = _fh.FreeHitTailRoute(
+        arm=_fh.FreeHitTailRoute.FREE_HIT_ARM_PLAY,
+        events=_tail_events(play_values, owned=permanent.owned_ids, bank=restored.bank_tenths,
+                            basis=permanent.purchase_price_tenths,
+                            free_transfers=restored.free_transfers),
+        h2_squad_ids=tuple(sorted(permanent.owned_ids)), h2_bank_tenths=int(restored.bank_tenths),
+        h2_purchase_price_tenths=dict(permanent.purchase_price_tenths),
+        h2_free_transfers=int(restored.free_transfers),
+    )
+    save = _fh.FreeHitTailRoute(
+        arm=_fh.FreeHitTailRoute.FREE_HIT_ARM_SAVE,
+        events=_tail_events(save_values, owned=save_state.owned_ids, bank=save_state.bank_tenths,
+                            basis=save_state.purchase_price_tenths,
+                            free_transfers=save_state.free_transfers),
+        h2_squad_ids=tuple(sorted(save_state.owned_ids)), h2_bank_tenths=int(save_state.bank_tenths),
+        h2_purchase_price_tenths=dict(save_state.purchase_price_tenths),
+        h2_free_transfers=int(save_state.free_transfers),
+    )
+    return play, save
+
+
 def _request(
     owned: tuple[int, ...] = LEGAL_OWNED,
     *, core=None, minutes=None, worlds=None, identity=None, event=EVENT,
     snapshot=DATA, prices=None, bank=20, ft=2, basis=None,
-    pool: WildcardPoolBinding | None = None, **overrides,
+    pool: WildcardPoolBinding | None = None, play_tail=None, save_tail=None,
+    authority=None, **overrides,
 ) -> fh.FreeHitRequest:
     h1 = worlds if worlds is not None else _worlds(core, minutes, event=event,
                                                     identity=identity)
+    permanent = _permanent(owned, bank=bank, ft=ft, basis=basis)
+    tails = play_tail, save_tail = (
+        (play_tail, save_tail) if play_tail is not None and save_tail is not None else _tails(permanent)
+    )
     base = dict(
-        permanent=_permanent(owned, bank=bank, ft=ft, basis=basis),
+        permanent=permanent,
+        play_tail=play_tail,
+        save_tail=save_tail,
+        decision_authority=_authority() if authority is None else authority,
         horizon_binding=_binding(event, snapshot),
         h1_worlds=h1,
         world_identity=identity if identity is not None else _identity(),
@@ -971,7 +1067,7 @@ def test_the_evaluation_carries_the_certified_context():
     evaluation = fh.evaluate_free_hit(_improving_request())
     assert evaluation.evidence["data_snapshot_sha256"] == DATA
     assert evaluation.evidence["horizon_events"] == list(cd.canonical_chip_horizon(EVENT))
-    assert evaluation.evidence["certification_identity"] == CERT
+    assert evaluation.evidence["certification_identity"] == _authority().certification_identity
     assert evaluation.evidence["free_hit_quantitative_capability"] == "SUPPORTED_REVIEW_ONLY"
 
 

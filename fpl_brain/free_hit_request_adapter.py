@@ -66,6 +66,9 @@ FH_CALLER_STATE_DISAGREES = "FREE_HIT_CALLER_STATE_DISAGREES_WITH_CANONICAL"
 FH_CANONICAL_AUTHORITY_REQUIRED = "FREE_HIT_CANONICAL_AUTHORITY_REQUIRED"
 FH_CERTIFIED_INPUTS_INVALID = "FREE_HIT_CERTIFIED_INPUTS_INVALID"
 FH_CUTOFF_MISMATCH = "FREE_HIT_PRICE_PREDICTION_CUTOFF_MISMATCH"
+FH_KEYSET_MISMATCH = "FREE_HIT_CALLER_KEYSET_IS_NOT_THE_CANONICAL_UNIVERSE"
+FH_POOL_MISMATCH = "FREE_HIT_POOL_IS_NOT_THE_ACCEPTED_GENERATION"
+FH_UNIVERSE_INCOMPLETE = "FREE_HIT_CANONICAL_UNIVERSE_INCOMPLETE"
 
 
 class FreeHitAdapterError(fh.FreeHitInputError):
@@ -91,6 +94,12 @@ class FreeHitManagerState:
     positions: Mapping[int, str]
     clubs: Mapping[int, int]
     market_price_tenths: Mapping[int, int]
+    #: The AUTHORITATIVE eligible universe, from the accepted generation.  Caller
+    #: maps never define it: a caller that omits a candidate from its own list
+    #: must not thereby narrow which players are canonically re-derived.
+    eligible_ids: tuple[int, ...] = ()
+    pool_generation_identity: str = ""
+    pool_generation_id_sha256: str = ""
     market_price_basis: str = "UNKNOWN"
     cached_selling_price_tenths: Mapping[int, int] = field(default_factory=dict)
 
@@ -107,6 +116,23 @@ class FreeHitManagerState:
 
     def problems(self) -> list[str]:
         found: list[str] = list(self.permanent_state().problems())
+        # EXACT keyset equality against the authoritative universe.  A missing key
+        # is a silently dropped player and an extra key is a player that does not
+        # officially exist; both are contradictions, not judgement calls.
+        expected = set(int(p) for p in self.eligible_ids)
+        for label, mapping in (
+            ("positions", self.positions), ("clubs", self.clubs),
+            ("market prices", self.market_price_tenths),
+        ):
+            supplied = set(int(k) for k in mapping)
+            extra = sorted(supplied - expected)
+            missing = sorted(expected - supplied)
+            if extra:
+                found.append(f"{label} carry {len(extra)} non-official player(s): {extra[:6]}")
+            if missing:
+                found.append(f"{label} omit {len(missing)} official player(s): {missing[:6]}")
+        if not expected:
+            found.append("no authoritative eligible universe")
         if not str(self.cutoff or "").strip():
             found.append("no decision cutoff")
         # Prices are a PRICING concern, not a state-consistency one: an unpriced
@@ -120,9 +146,8 @@ def free_hit_manager_state(
     entry_id: int,
     planning_event: int,
     *,
-    cutoff: str,
+    decision_cutoff: str,
     as_of: str | None = None,
-    player_ids: Sequence[int] | None = None,
 ) -> FreeHitManagerState:
     """Source the manager facts from canonical accessors, read-only.
 
@@ -156,9 +181,17 @@ def free_hit_manager_state(
         if row.get("effective_selling_price") is not None:
             cached[pid] = int(row["effective_selling_price"])
 
-    # Positions and clubs are canonical facts, and the club is the one fact the
-    # manager-world resolver discards entirely.
-    universe = tuple(sorted({int(p) for p in (player_ids or ())} | set(squad)))
+    # THE AUTHORITATIVE UNIVERSE comes from the accepted generation, never from a
+    # caller's list: narrowing the caller's list must not narrow what is verified.
+    pool = resolve_pool_binding(conn)
+    universe = tuple(sorted(int(p) for p in pool.eligible_ids))
+    for pid in squad:
+        if int(pid) not in set(universe):
+            raise FreeHitAdapterError(
+                f"{FH_UNIVERSE_INCOMPLETE}: the permanently owned player {pid} is not in the accepted "
+                "official eligible universe",
+                reasons=(FH_UNIVERSE_INCOMPLETE,),
+            )
     meta = rc.load_player_meta(conn, universe)
     missing_meta = sorted(pid for pid in universe if int(pid) not in meta)
     if missing_meta:
@@ -173,12 +206,15 @@ def free_hit_manager_state(
     # Point-in-time prices for the WHOLE eligible universe, not merely the owned
     # squad: an incoming Free Hit player's cost must never rest on a caller's
     # figure, and a historical replay must not see a later price.
-    prices = _canonical_market_prices(conn, universe, cutoff)
+    # PIT prices at the CERTIFIED decision cutoff.  A caller's cutoff never
+    # drives price retrieval, so a later cutoff cannot pull future prices back
+    # into an earlier decision.
+    prices = _canonical_market_prices(conn, universe, decision_cutoff)
 
     return FreeHitManagerState(
         entry_id=int(entry_id),
         planning_event=int(planning_event),
-        cutoff=str(cutoff),
+        cutoff=str(decision_cutoff),
         owned_ids=squad,
         purchase_price_tenths=basis,
         bank_tenths=int(bank),
@@ -186,7 +222,10 @@ def free_hit_manager_state(
         positions=positions,
         clubs=clubs,
         market_price_tenths=prices,
-        market_price_basis=f"analytics.snapshot_as_of@{cutoff}",
+        eligible_ids=universe,
+        pool_generation_identity=str(pool.generation_identity),
+        pool_generation_id_sha256=str(pool.generation_id_sha256),
+        market_price_basis=f"analytics.snapshot_as_of@{decision_cutoff}",
         cached_selling_price_tenths=cached,
     )
 
@@ -233,6 +272,15 @@ class FreeHitCertifiedInputs:
     h1_worlds: WildcardWorldInputs
     world_identity: WildcardPredictiveIdentity
     pool_binding: WildcardPoolBinding
+    #: The two arms' H2-H4 routes from the canonical route engine.  Both are
+    #: required: a played Free Hit and an ordinary Gameweek enter H2 with
+    #: different free-transfer banks, so an H1-only comparison is not an exact
+    #: four-GW chip decision.
+    play_tail: fh.FreeHitTailRoute
+    save_tail: fh.FreeHitTailRoute
+    #: The canonical certified decision context, built from the certification
+    #: artifact.  Every predictive dimension is anchored to it.
+    decision_authority: fh.FreeHitDecisionAuthority
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +295,6 @@ def build_free_hit_request(
     conn: sqlite3.Connection | None = None,
     as_of: str | None = None,
     allow_unverified_manager_state: bool = False,
-    player_ids: Sequence[int] | None = None,
     rules: sr.SeasonRules | None = None,
     chip_available: bool = True,
     calibration_status: str = cd.CALIBRATION_UNCALIBRATED,
@@ -282,10 +329,43 @@ def build_free_hit_request(
             reasons=(FH_MANAGER_STATE_MISSING,),
         )
 
+    # ── the canonical decision cutoff comes from the CERTIFIED context ────────
+    # The predictive identity owns the cutoff; a caller-supplied cutoff must agree
+    # with it or refuse.  Price retrieval below uses the CERTIFIED cutoff, so a
+    # later caller cutoff can never pull post-cutoff prices into this decision.
+    authority = certified.decision_authority
+    certified_cutoff = str(authority.planning_cutoff or "").strip()
+    if not certified_cutoff:
+        raise FreeHitAdapterError(
+            f"{FH_CUTOFF_MISMATCH}: the certified decision authority carries no planning cutoff",
+            reasons=(FH_CUTOFF_MISMATCH,),
+        )
+    if str(manager.cutoff or "").strip() and str(manager.cutoff) != certified_cutoff:
+        raise FreeHitAdapterError(
+            f"{FH_CUTOFF_MISMATCH}: the supplied cutoff {manager.cutoff!r} is not the certified decision "
+            f"cutoff {certified_cutoff!r}",
+            reasons=(FH_CUTOFF_MISMATCH,),
+        )
+    if str(certified.world_identity.cutoff or "").strip() != certified_cutoff:
+        raise FreeHitAdapterError(
+            f"{FH_CUTOFF_MISMATCH}: the predictive evidence was not produced at the certified cutoff",
+            reasons=(FH_CUTOFF_MISMATCH,),
+        )
+
     if conn is not None:
+        # The pool is the accepted generation from the store, and the supplied
+        # binding must BE it: identity, digest and exact ids.
+        canonical_pool = resolve_pool_binding(conn)
+        pool_problems = _pool_disagreements(canonical_pool, certified.pool_binding)
+        if pool_problems:
+            raise FreeHitAdapterError(
+                f"{FH_POOL_MISMATCH}: the supplied pool is not the accepted generation: "
+                + "; ".join(pool_problems),
+                reasons=(FH_POOL_MISMATCH,),
+            )
         canonical = free_hit_manager_state(
             conn, int(manager.entry_id), int(manager.planning_event),
-            cutoff=str(manager.cutoff), as_of=as_of, player_ids=player_ids,
+            decision_cutoff=certified_cutoff, as_of=as_of,
         )
         disagreements = _state_disagreements(canonical, manager)
         if disagreements:
@@ -294,9 +374,9 @@ def build_free_hit_request(
                 + "; ".join(disagreements),
                 reasons=(FH_CALLER_STATE_DISAGREES,),
             )
-        if str(canonical.cutoff) != str(manager.cutoff):
+        if str(canonical.cutoff) != certified_cutoff:
             raise FreeHitAdapterError(
-                f"{FH_CUTOFF_MISMATCH}: the supplied cutoff is not the canonical decision cutoff",
+                f"{FH_CUTOFF_MISMATCH}: prices were not retrieved at the certified decision cutoff",
                 reasons=(FH_CUTOFF_MISMATCH,),
             )
 
@@ -317,6 +397,9 @@ def build_free_hit_request(
         clubs=dict(manager.clubs),
         market_price_tenths=dict(manager.market_price_tenths),
         pool_binding=certified.pool_binding,
+        play_tail=certified.play_tail,
+        save_tail=certified.save_tail,
+        decision_authority=certified.decision_authority,
         chip_available=bool(chip_available),
         rules=rules if rules is not None else sr.SeasonRules(season="2026/27"),
         calibration_status=str(calibration_status),
@@ -331,6 +414,8 @@ def build_free_hit_request(
             fh.FH_HORIZON_NOT_CANONICAL, fh.FH_DATA_SNAPSHOT_REQUIRED,
             fh.FH_PREDICTIVE_IDENTITY_MISMATCH, fh.FH_WORLD_INPUTS_MALFORMED,
             fh.FH_MANAGER_STATE_INVALID, fh.FH_PRICING_UNAVAILABLE,
+            fh.FH_DECISION_AUTHORITY_REQUIRED, fh.FH_DECISION_AUTHORITY_MISMATCH,
+            fh.FH_TAIL_ROUTE_MISSING, fh.FH_TAIL_ROUTE_INVALID,
         ):
             if first.startswith(candidate):
                 token = candidate
@@ -341,6 +426,23 @@ def build_free_hit_request(
             reasons=(token,),
         )
     return request
+
+
+def _pool_disagreements(canonical: WildcardPoolBinding, supplied: WildcardPoolBinding) -> list[str]:
+    """Every way a supplied pool differs from the accepted generation."""
+
+    found: list[str] = []
+    if str(supplied.generation_identity) != str(canonical.generation_identity):
+        found.append("generation identity")
+    if str(supplied.generation_id_sha256) != str(canonical.generation_id_sha256):
+        found.append("generation id digest")
+    if int(supplied.official_count) != int(canonical.official_count):
+        found.append("official count")
+    if tuple(sorted(int(p) for p in supplied.eligible_ids)) != tuple(
+        sorted(int(p) for p in canonical.eligible_ids)
+    ):
+        found.append("eligible ids")
+    return found
 
 
 def _state_disagreements(canonical: FreeHitManagerState, supplied: FreeHitManagerState) -> list[str]:
@@ -385,6 +487,19 @@ def _state_disagreements(canonical: FreeHitManagerState, supplied: FreeHitManage
     )
     if repriced:
         found.append(f"market price of {repriced[:8]} is not the canonical one")
+    # EXACT keyset equality: an extra key is a non-official player and a missing
+    # key is a silently dropped one.  Neither is a matter of judgement.
+    for label, canonical_map, supplied_map in (
+        ("positions", canonical.positions, supplied.positions),
+        ("clubs", canonical.clubs, supplied.clubs),
+        ("market prices", canonical.market_price_tenths, supplied.market_price_tenths),
+    ):
+        extra = sorted(set(int(k) for k in supplied_map) - set(int(k) for k in canonical_map))
+        missing = sorted(set(int(k) for k in canonical_map) - set(int(k) for k in supplied_map))
+        if extra:
+            found.append(f"{label} carry {len(extra)} non-official player(s): {extra[:6]}")
+        if missing:
+            found.append(f"{label} omit {len(missing)} official player(s): {missing[:6]}")
     return found
 
 

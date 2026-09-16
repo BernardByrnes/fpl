@@ -123,6 +123,11 @@ FH_FRONTIER_EMPTY = "FREE_HIT_OPTIMIZER_FRONTIER_EMPTY"
 FH_DATA_SNAPSHOT_REQUIRED = "FREE_HIT_DATA_SNAPSHOT_REQUIRED"
 FH_PREDICTIVE_IDENTITY_MISMATCH = "FREE_HIT_PREDICTIVE_IDENTITY_MISMATCH"
 FH_HORIZON_NOT_CANONICAL = "FREE_HIT_HORIZON_NOT_CANONICAL"
+#: The four-GW comparison needs BOTH arms' H2-H4 routes.
+FH_TAIL_ROUTE_MISSING = "FREE_HIT_FOUR_GW_TAIL_ROUTE_MISSING"
+FH_TAIL_ROUTE_INVALID = "FREE_HIT_FOUR_GW_TAIL_ROUTE_INVALID"
+FH_DECISION_AUTHORITY_REQUIRED = "FREE_HIT_CANONICAL_DECISION_AUTHORITY_REQUIRED"
+FH_DECISION_AUTHORITY_MISMATCH = "FREE_HIT_PREDICTIVE_EVIDENCE_NOT_THE_CERTIFIED_ONE"
 
 
 class FreeHitError(ValueError):
@@ -304,6 +309,17 @@ class FreeHitRequest:
     market_price_tenths: Mapping[int, int]
     #: The official eligible universe this evaluation is exhaustive over.
     pool_binding: WildcardPoolBinding | None = None
+    #: The H2-H4 route each arm actually walks, evaluated by the canonical route
+    #: engine.  Both are REQUIRED: an H1-only comparison cannot be an exact
+    #: four-GW chip decision, because a played Free Hit and an ordinary Gameweek
+    #: enter H2 with different free-transfer banks.
+    play_tail: FreeHitTailRoute | None = None
+    save_tail: FreeHitTailRoute | None = None
+    #: The CANONICAL certified decision context every predictive dimension is
+    #: anchored to.  Comparing two request-owned identities against each other
+    #: proves nothing, so the authority -- not a second supplied object -- is
+    #: what the evidence must equal.
+    decision_authority: "FreeHitDecisionAuthority | None" = None
     chip_available: bool = True
     rules: sr.SeasonRules = field(default_factory=lambda: sr.SeasonRules(season="2026/27"))
     calibration_status: str = cd.CALIBRATION_UNCALIBRATED
@@ -792,6 +808,12 @@ def optimize_free_hit_squad(
 # ---------------------------------------------------------------------------
 
 
+def worlds_identity_of(request: "FreeHitRequest"):
+    """The world matrix's OWN identity -- never the request's companion object."""
+
+    return getattr(request.h1_worlds, "identity", None)
+
+
 def _refuse(token: str, detail: str) -> cd.ChipEvaluation:
     """A refusal shaped like the arbiter's ``ChipEvaluation``, with no number."""
 
@@ -829,6 +851,28 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
     canonical = cd.canonical_chip_horizon(int(binding.planning_event))
     if events != canonical:
         problems.append(f"{FH_HORIZON_NOT_CANONICAL}: horizon {list(events)} is not {list(canonical)}")
+
+    authority = request.decision_authority
+    if authority is None:
+        problems.append(
+            f"{FH_DECISION_AUTHORITY_REQUIRED}: no canonical certified decision authority is bound, so "
+            "the predictive evidence has nothing to be anchored to"
+        )
+    else:
+        for problem in authority.problems():
+            problems.append(f"{FH_DECISION_AUTHORITY_REQUIRED}: {problem}")
+        # BOTH the bound identity and the world's identity must be the CERTIFIED
+        # one.  Requiring only that they agree with each other is exactly the
+        # self-certification this closes.
+        for label, supplied in (("bound identity", identity := request.world_identity),
+                                ("world matrix identity", worlds_identity_of(request))):
+            for dimension in authority.disagreements_with(supplied, label=label):
+                problems.append(f"{FH_DECISION_AUTHORITY_MISMATCH}: {dimension}")
+        if str(binding.certification_identity) != str(authority.certification_identity):
+            problems.append(
+                f"{FH_DECISION_AUTHORITY_MISMATCH}: the horizon binding's certification identity is not "
+                "the certified one"
+            )
 
     binding_snapshot = str(binding.data_snapshot_sha256 or "").strip()
     identity = request.world_identity
@@ -883,6 +927,36 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
 
     for problem in worlds.problems():
         problems.append(f"{FH_WORLD_INPUTS_MALFORMED}: {problem}")
+
+    play_tail = request.play_tail
+    save_tail = request.save_tail
+    if play_tail is None or save_tail is None:
+        problems.append(
+            f"{FH_TAIL_ROUTE_MISSING}: both arms need their canonical H2-H4 route; an H1-only "
+            "comparison is not an exact four-GW chip decision"
+        )
+    else:
+        tail_events = list(events)[1:]
+        restored = restore_permanent_state(
+            request.permanent, rules=request.rules, restored_event=int(binding.planning_event) + 1
+        )
+        save_state = save_arm_h2_state(request)
+        problems.extend(
+            f"{FH_TAIL_ROUTE_INVALID}: {problem}"
+            for problem in play_tail.problems(
+                expected_arm=FreeHitTailRoute.FREE_HIT_ARM_PLAY, expected_events=tail_events,
+                expected_squad=request.permanent.owned_ids, expected_bank=restored.bank_tenths,
+                expected_free_transfers=restored.free_transfers,
+            )
+        )
+        problems.extend(
+            f"{FH_TAIL_ROUTE_INVALID}: {problem}"
+            for problem in save_tail.problems(
+                expected_arm=FreeHitTailRoute.FREE_HIT_ARM_SAVE, expected_events=tail_events,
+                expected_squad=save_state.owned_ids, expected_bank=save_state.bank_tenths,
+                expected_free_transfers=save_state.free_transfers,
+            )
+        )
 
     if int(request.permanent.event) != int(binding.planning_event):
         problems.append(
@@ -964,7 +1038,15 @@ def evaluate_free_hit(request: FreeHitRequest) -> cd.ChipEvaluation:
         float(temporary_series[index]) - float(baseline_series[index])
         for index in range(min(len(temporary_series), len(baseline_series)))
     ]
-    mean_uplift = float(sum(paired) / len(paired)) if paired else float("nan")
+    h1_uplift = float(sum(paired) / len(paired)) if paired else float("nan")
+    # The H2-H4 arms are valued on their OWN actual states -- the Free Hit arm
+    # from the restored permanent state, the SAVE arm from ordinary progression --
+    # so the free-transfer divergence between them enters the decision instead of
+    # being assumed away.
+    arms = four_gw_arm_values(
+        request, h1_temporary_value=float(temporary.expected_h1_core), h1_permanent_value=float(baseline_value)
+    )
+    mean_uplift = float(h1_uplift) + float(arms["tail_delta"])
     paired_se = _std(paired) / math.sqrt(len(paired)) if len(paired) > 1 else 0.0
     ordered = sorted(paired)
 
@@ -989,11 +1071,19 @@ def evaluate_free_hit(request: FreeHitRequest) -> cd.ChipEvaluation:
         evaluator_version=FREE_HIT_EVALUATOR_VERSION,
         candidate_metrics={
             "mean_paired_uplift": round(mean_uplift, 6),
+            "h1_paired_uplift": round(h1_uplift, 6),
             "permanent_h1_baseline": round(baseline_value, 6),
             "temporary_h1_value": round(temporary.expected_h1_core, 6),
             "h1_temporary_uplift": round(
                 float(temporary.expected_h1_core) - float(baseline_value), 6
             ),
+            # The four-GW decomposition: H1 temporary vs permanent, then the two
+            # ACTUAL H2-H4 tails, then the totals the chip is decided on.
+            **{key: round(value, 6) for key, value in arms.items()},
+            "play_tail_events": (request.play_tail.event_values() if request.play_tail else []),
+            "save_tail_events": (request.save_tail.event_values() if request.save_tail else []),
+            "play_h2_state": (request.play_tail.h2_state() if request.play_tail else {}),
+            "save_h2_state": (request.save_tail.h2_state() if request.save_tail else {}),
             "paired_se": round(paired_se, 6),
             "value_basis": "CORE_POINTS",
             "temporary_squad": list(temporary.squad_ids),
@@ -1006,10 +1096,12 @@ def evaluate_free_hit(request: FreeHitRequest) -> cd.ChipEvaluation:
             "permanent_squad_unchanged_by_chip": True,
             "normal_transfer_hits_charged": 0,
             "four_gw_basis": (
-                "Free Hit alters only the H1 squad; H2-H4 are the RESTORED permanent state in both "
-                "arms, so that consequence is identical across them and the horizon must be the exact "
-                "canonical four events"
+                "Free Hit alters the H1 squad AND the free-transfer bank the manager carries into H2: "
+                "a played chip preserves the saved bank while an ordinary Gameweek accrues one, so the "
+                "two arms are valued on their own restored/ordinarily-progressed H2 states through H4 "
+                "rather than assumed equal"
             ),
+            "arms_valued_separately": True,
             "horizon_events": list(request.horizon_events),
             "h1_event": int(request.planning_event),
             "restored_event": int(restored.event),
@@ -1067,3 +1159,283 @@ def _quantile(sorted_values: Sequence[float], q: float) -> float:
         return float("nan")
     index = min(len(sorted_values) - 1, max(0, int(round(q * (len(sorted_values) - 1)))))
     return float(sorted_values[index])
+
+# ---------------------------------------------------------------------------
+# THE H2-H4 TAIL — the four-GW comparison is not an H1-only one
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FreeHitTailRoute:
+    """One ARM's H2-H4 route, evaluated by the canonical route engine.
+
+    Free Hit's effect is not confined to H1.  A played Free Hit PRESERVES the
+    saved free-transfer bank while an ordinary Gameweek ACCRUES one, so the two
+    arms enter H2 with genuinely different states even when neither squad
+    changes -- and that difference propagates through H2-H4 route value.  An
+    H1-only comparison that asserts "H2-H4 are identical across arms" is
+    therefore wrong, and this type is how the real difference is carried.
+
+    ``events`` are the route engine's OWN per-event results.  Each
+    ``mean_net_core`` ALREADY nets that event's hit deduction, so no hit term is
+    subtracted again anywhere in this module -- double-counting a -4 hit as an
+    8-point swing is the one authority this contract exists to protect.
+
+    ``h2_*`` is the state this arm actually starts H2 from, and it is VALIDATED
+    against the arm it claims to be: the restored permanent squad with the
+    canonical post-Free-Hit free-transfer count for PLAY, and the permanent squad
+    with ordinary progression for SAVE.  A route that describes some other state
+    is refused rather than silently valued.
+    """
+
+    arm: str
+    events: tuple[Any, ...]
+    h2_squad_ids: tuple[int, ...]
+    h2_bank_tenths: int
+    h2_purchase_price_tenths: Mapping[int, int]
+    h2_free_transfers: int
+
+    FREE_HIT_ARM_PLAY = "PLAY"
+    FREE_HIT_ARM_SAVE = "SAVE"
+
+    def value(self) -> float:
+        """The arm's H2-H4 core: the sum of the route engine's per-event net core."""
+
+        return float(sum(float(getattr(entry, "mean_net_core")) for entry in self.events))
+
+    def event_values(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "event": int(getattr(entry, "event")),
+                "mean_net_core": round(float(getattr(entry, "mean_net_core")), 6),
+                "hit_points": int(getattr(entry, "hit_points", 0)),
+                "free_transfers": int(getattr(entry, "free_transfers", 0)),
+            }
+            for entry in self.events
+        ]
+
+    def h2_state(self) -> dict[str, Any]:
+        return {
+            "arm": str(self.arm),
+            "squad_ids": [int(p) for p in self.h2_squad_ids],
+            "bank_tenths": int(self.h2_bank_tenths),
+            "purchase_price_tenths": {int(k): int(v) for k, v in sorted(self.h2_purchase_price_tenths.items())},
+            "free_transfers": int(self.h2_free_transfers),
+        }
+
+    def problems(
+        self,
+        *,
+        expected_arm: str,
+        expected_events: Sequence[int],
+        expected_squad: Sequence[int],
+        expected_bank: int,
+        expected_free_transfers: int,
+    ) -> list[str]:
+        found: list[str] = []
+        if str(self.arm) != str(expected_arm):
+            found.append(f"the route is labelled {self.arm!r}, expected {expected_arm!r}")
+        events = tuple(int(getattr(entry, "event", -1)) for entry in self.events)
+        if len(events) != len(expected_events):
+            found.append(f"{expected_arm} tail has {len(events)} events, expected {len(expected_events)}")
+        if events and events != tuple(int(e) for e in expected_events):
+            found.append(f"{expected_arm} tail events {list(events)} != {list(expected_events)}")
+        if tuple(int(p) for p in self.h2_squad_ids) != tuple(int(p) for p in expected_squad):
+            # The arm must start H2 from the RESTORED permanent squad: a Free Hit
+            # temporary squad leaking into H2-H4 would be exactly the failure this
+            # check exists to catch.
+            found.append(f"{expected_arm} tail does not start H2 from the expected permanent squad")
+        if int(self.h2_bank_tenths) != int(expected_bank):
+            found.append(f"{expected_arm} tail H2 bank != the expected permanent bank")
+        if int(self.h2_free_transfers) != int(expected_free_transfers):
+            found.append(
+                f"{expected_arm} tail H2 free transfers {int(self.h2_free_transfers)} != the "
+                f"canonical {int(expected_free_transfers)}"
+            )
+        for entry in self.events:
+            for problem in (getattr(entry, "problems", lambda: [])() or []):
+                found.append(f"{expected_arm}: {problem}")
+        return found
+
+
+def save_arm_h2_state(request: "FreeHitRequest") -> RestoredPermanentState:
+    """The state the SAVE arm enters H2 with: ordinary Gameweek progression."""
+
+    permanent = request.permanent
+    normal_ft = int(
+        sr.free_transfers_after_gameweek(request.rules, int(permanent.event_start_free_transfers), 0)
+    )
+    return RestoredPermanentState(
+        event=int(request.planning_event) + 1,
+        owned_ids=tuple(int(p) for p in permanent.owned_ids),
+        purchase_price_tenths={int(k): int(v) for k, v in permanent.purchase_price_tenths.items()},
+        bank_tenths=int(permanent.bank_tenths),
+        free_transfers=normal_ft,
+        free_transfers_rule="ordinary_gameweek_progression",
+    )
+
+
+def four_gw_arm_values(
+    request: "FreeHitRequest",
+    *,
+    h1_temporary_value: float,
+    h1_permanent_value: float,
+) -> dict[str, Any]:
+    """The TRUE four-GW values of both arms, from their ACTUAL H2 states.
+
+    PLAY : H1 temporary Free Hit value, then the restored state's H2-H4 route
+    SAVE : H1 permanent value, then the ordinarily-progressed state's H2-H4 route
+
+    Nothing here assumes the tails are equal, and nothing invents a future
+    transfer: both tails come from the canonical route engine.
+    """
+
+    play_tail = request.play_tail
+    save_tail = request.save_tail
+    play_tail_value = play_tail.value() if play_tail is not None else float("nan")
+    save_tail_value = save_tail.value() if save_tail is not None else float("nan")
+    return {
+        "h1_temporary_value": float(h1_temporary_value),
+        "h1_permanent_value": float(h1_permanent_value),
+        "play_tail_value": float(play_tail_value),
+        "save_tail_value": float(save_tail_value),
+        "four_gw_play_value": float(h1_temporary_value) + float(play_tail_value),
+        "four_gw_save_value": float(h1_permanent_value) + float(save_tail_value),
+        "tail_delta": float(play_tail_value) - float(save_tail_value),
+    }
+
+# ---------------------------------------------------------------------------
+# THE CANONICAL DECISION AUTHORITY
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FreeHitDecisionAuthority:
+    """The CANONICAL certified decision context a Free Hit request is anchored to.
+
+    Comparing the request's world identity against ANOTHER request-owned identity
+    proves nothing: a caller can alter both together on the cutoff, the source
+    snapshot, the prediction run or the model/config while leaving the data
+    snapshot intact, and the two artifacts will happily agree with each other.
+    Agreement between two caller objects is not authority.
+
+    This type is built from the CERTIFICATION ARTIFACT -- the accepted canonical
+    object -- and its identity is RECOMPUTED from that artifact's own fields by
+    ``four_gw_decision.certification_identity_of``, so a copied identity on a
+    different artifact fails.  Every predictive dimension is then anchored here
+    rather than to another supplied object.
+    """
+
+    planning_cutoff: str
+    data_snapshot_sha256: str
+    certification_identity: str
+    certified_bundle_identity: Mapping[str, Any] = field(default_factory=dict)
+    source_snapshot_sha256: str = ""
+    prediction_generation: str = ""
+    model_config_identity: str = ""
+
+    def problems(self) -> list[str]:
+        found: list[str] = []
+        for name in ("planning_cutoff", "data_snapshot_sha256", "certification_identity",
+                     "source_snapshot_sha256", "prediction_generation", "model_config_identity"):
+            if not str(getattr(self, name) or "").strip():
+                found.append(f"the certified decision authority carries no {name}")
+        return found
+
+    def disagreements_with(
+        self, identity: WildcardPredictiveIdentity | None, *, event: int | None = None,
+        label: str = "identity",
+    ) -> list[str]:
+        """Every predictive dimension on which ``identity`` is not the certified one."""
+
+        found: list[str] = []
+        if identity is None:
+            return [f"{label} carries no predictive identity"]
+        if event is not None and int(event) != int(event):
+            found.append(f"{label} event")
+        pairs = (
+            ("cutoff", str(identity.cutoff), str(self.planning_cutoff)),
+            ("data_snapshot_sha256", str(identity.data_snapshot_sha256), str(self.data_snapshot_sha256)),
+            ("source_snapshot_sha256", str(identity.source_snapshot_sha256), str(self.source_snapshot_sha256)),
+            ("generation", str(identity.generation), str(self.prediction_generation)),
+            ("model_config_identity", str(identity.model_config_identity), str(self.model_config_identity)),
+        )
+        for name, supplied, certified in pairs:
+            if supplied != certified:
+                found.append(f"{label} {name}")
+        return found
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "planning_cutoff": str(self.planning_cutoff),
+            "data_snapshot_sha256": str(self.data_snapshot_sha256),
+            "certification_identity": str(self.certification_identity),
+            "source_snapshot_sha256": str(self.source_snapshot_sha256),
+            "prediction_generation": str(self.prediction_generation),
+            "model_config_identity": str(self.model_config_identity),
+        }
+
+    @classmethod
+    def from_certification(cls, artifact: Mapping[str, Any]) -> "FreeHitDecisionAuthority":
+        """Build the authority from a certification artifact, or refuse.
+
+        The artifact's own ``four_gw_certification_identity`` must equal the value
+        RECOMPUTED from its cutoff, bundle identities and data snapshot, so a
+        recognised identity copied onto a different artifact is refused.  Any
+        dimension the artifact does not carry refuses: this object is the anchor,
+        and an anchor with a missing dimension would silently stop anchoring it.
+        """
+
+        from . import four_gw_decision as fg
+
+        if not artifact:
+            raise FreeHitInputError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: no certification artifact supplied",
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        declared = str(
+            artifact.get("four_gw_certification_identity") or artifact.get("certification_identity") or ""
+        )
+        recomputed = fg.certification_identity_of(artifact)
+        if not declared:
+            raise FreeHitInputError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: the certification artifact declares no identity",
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        if str(declared) != str(recomputed):
+            raise FreeHitInputError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: the certification artifact's declared identity is not "
+                "the one its own fields produce",
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        bundles = artifact.get("certified_bundle_identity") or {}
+        authority = cls(
+            planning_cutoff=str(artifact.get("planning_cutoff") or ""),
+            data_snapshot_sha256=str(artifact.get("data_snapshot_sha256") or ""),
+            certification_identity=str(declared),
+            certified_bundle_identity=dict(bundles) if isinstance(bundles, Mapping) else {},
+            source_snapshot_sha256=str(
+                artifact.get("source_snapshot_sha256")
+                or (bundles.get("source_snapshot_sha256") if isinstance(bundles, Mapping) else "")
+                or ""
+            ),
+            prediction_generation=str(
+                artifact.get("prediction_generation")
+                or artifact.get("projection_run_identity")
+                or (bundles.get("generation") if isinstance(bundles, Mapping) else "")
+                or ""
+            ),
+            model_config_identity=str(
+                artifact.get("model_config_identity")
+                or artifact.get("config_hash")
+                or (bundles.get("model_config_identity") if isinstance(bundles, Mapping) else "")
+                or ""
+            ),
+        )
+        problems = authority.problems()
+        if problems:
+            raise FreeHitInputError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: " + "; ".join(problems[:6]),
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        return authority

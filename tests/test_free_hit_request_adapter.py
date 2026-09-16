@@ -157,10 +157,31 @@ def _h1_worlds(values: dict[int, float] | None = None, *, identity=None, event: 
     )
 
 
-def _binding(*, event: int = EVENT, snapshot: str = DATA):
+def _authority(**overrides) -> fh.FreeHitDecisionAuthority:
+    """The canonical certified decision context, from a self-consistent artifact."""
+
+    from fpl_brain import four_gw_decision as fg
+
+    base = dict(cutoff=CUTOFF, data=DATA, source=SOURCE, generation=CAPTURED_AT, config=CONFIG)
+    base.update(overrides)
+    artifact = {
+        "planning_cutoff": base["cutoff"],
+        "data_snapshot_sha256": base["data"],
+        "certified_bundle_identity": {
+            "source_snapshot_sha256": base["source"],
+            "generation": base["generation"],
+            "model_config_identity": base["config"],
+        },
+    }
+    artifact["four_gw_certification_identity"] = fg.certification_identity_of(artifact)
+    return fh.FreeHitDecisionAuthority.from_certification(artifact)
+
+
+def _binding(*, event: int = EVENT, snapshot: str = DATA, identity=None):
     return cd.ChipHorizonBinding(
         planning_event=int(event), horizon_events=cd.canonical_chip_horizon(int(event)),
-        certification_identity=CERT, data_snapshot_sha256=snapshot,
+        certification_identity=(identity or _authority().certification_identity),
+        data_snapshot_sha256=snapshot,
     )
 
 
@@ -171,15 +192,56 @@ def _pool() -> WildcardPoolBinding:
     )
 
 
+def _tails(*, play_values=(10.0, 10.0, 10.0), save_values=(10.0, 10.0, 10.0)):
+    from fpl_brain import chip_wildcard as _wc
+
+    permanent = _permanent()
+    events = (EVENT + 1, EVENT + 2, EVENT + 3)
+    restored_ft = fh.post_free_hit_ft_state(RULES, event_start_free_transfers=2)
+    save_ft = int(sr.free_transfers_after_gameweek(RULES, 2, 0))
+    basis = permanent.purchase_price_tenths
+
+    def _build(arm, values, free_transfers):
+        return fh.FreeHitTailRoute(
+            arm=arm,
+            events=tuple(
+                _wc.WildcardSaveRouteEvent(
+                    event=int(event), squad_ids=tuple(sorted(OWNED)), bank_tenths=20,
+                    purchase_price_tenths={int(k): int(v) for k, v in basis.items()},
+                    free_transfers=int(free_transfers), mean_net_core=float(value),
+                )
+                for event, value in zip(events, values)
+            ),
+            h2_squad_ids=tuple(sorted(OWNED)), h2_bank_tenths=20,
+            h2_purchase_price_tenths={int(k): int(v) for k, v in basis.items()},
+            h2_free_transfers=int(free_transfers),
+        )
+
+    return (
+        _build(fh.FreeHitTailRoute.FREE_HIT_ARM_PLAY, play_values, restored_ft),
+        _build(fh.FreeHitTailRoute.FREE_HIT_ARM_SAVE, save_values, save_ft),
+    )
+
+
+def _permanent() -> fh.FreeHitPermanentState:
+    return fh.FreeHitPermanentState(
+        event=EVENT, owned_ids=tuple(sorted(OWNED)),
+        purchase_price_tenths={pid: 50 for pid in OWNED}, bank_tenths=20,
+        event_start_free_transfers=2, positions=POSITION, clubs=CLUB,
+    )
+
+
 def _certified(**overrides) -> ad.FreeHitCertifiedInputs:
+    play_tail, save_tail = _tails()
     base = dict(horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool())
+                pool_binding=_pool(), play_tail=play_tail, save_tail=save_tail,
+                decision_authority=_authority())
     base.update(overrides)
     return ad.FreeHitCertifiedInputs(**base)
 
 
 def _state(conn) -> ad.FreeHitManagerState:
-    return ad.free_hit_manager_state(conn, ENTRY, EVENT, cutoff=CUTOFF, player_ids=UNIVERSE)
+    return ad.free_hit_manager_state(conn, ENTRY, EVENT, decision_cutoff=CUTOFF)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +262,7 @@ def test_the_canonical_manager_state_is_sourced_and_accepted(conn):
     assert state.market_price_tenths[1] == 50
     assert state.market_price_basis.startswith("analytics.snapshot_as_of@")
 
-    request = ad.build_free_hit_request(state, _certified(), conn=conn, player_ids=UNIVERSE)
+    request = ad.build_free_hit_request(state, _certified(), conn=conn)
     evaluation = fh.evaluate_free_hit(request)
     assert evaluation.action == cd.CHIP_ACTION_FH
     assert evaluation.candidate_metrics["mean_paired_uplift"] is not None
@@ -222,14 +284,22 @@ def test_a_rejected_or_absent_generation_refuses(conn):
 
 
 def test_a_missing_canonical_price_refuses(conn):
-    """A player with no point-in-time snapshot at the cutoff has no canonical price."""
+    """An official player with no point-in-time price is a contradiction, not a drop.
+
+    The exhaustive-discovery contract does not permit silently discarding an
+    eligible player because his price is missing, so the universe is incomplete
+    and the whole request refuses.
+    """
 
     _seed(conn, prices={pid: 50 for pid in UNIVERSE if pid != 16})
     state = _state(conn)
     assert 16 not in state.market_price_tenths
+    problems = state.problems()
+    assert any("market prices omit 1 official player" in problem for problem in problems), problems
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(state, _certified(), conn=conn, player_ids=UNIVERSE)
-    assert caught.value.reasons[0] == fh.FH_PRICING_UNAVAILABLE
+        ad.build_free_hit_request(state, _certified(), conn=conn)
+    assert caught.value.reasons[0] == ad.FH_MANAGER_STATE_MISSING
+    assert "market prices omit" in str(caught.value)
 
 
 def test_a_post_cutoff_price_is_invisible_to_a_historical_replay(conn):
@@ -287,7 +357,7 @@ def test_a_forged_permanent_component_refuses(conn, overrides, needle):
     forged = _forged(conn, **overrides)
     assert forged.problems() == [], "the forgery must pass every LOCAL rule"
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn, player_ids=UNIVERSE)
+        ad.build_free_hit_request(forged, _certified(), conn=conn)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
     assert needle in str(caught.value), str(caught.value)
 
@@ -299,7 +369,7 @@ def test_a_forged_position_map_cannot_change_the_budget(conn):
     forged = _forged(conn, positions={**POSITION, 6: "MID", 16: "DEF"})
     assert forged.problems() == []          # locally it still looks like 2/5/5/3
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn, player_ids=UNIVERSE)
+        ad.build_free_hit_request(forged, _certified(), conn=conn)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
 
 
@@ -315,21 +385,36 @@ def test_a_certified_input_that_is_not_the_bound_world_refuses(conn):
         ad.build_free_hit_request(
             state,
             _certified(h1_worlds=_h1_worlds(identity=_identity(cutoff="2026-09-16T12:00:00Z"))),
-            conn=conn, player_ids=UNIVERSE,
+            conn=conn,
         )
-    assert caught.value.reasons[0] == fh.FH_PREDICTIVE_IDENTITY_MISMATCH
+    # The world no longer matches the CERTIFIED authority, not merely the
+    # request's own companion object.
+    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
+    assert "cutoff" in str(caught.value)
 
 
 def test_an_empty_snapshot_refuses_before_any_numeric_work(conn):
+    """Every empty-snapshot route refuses, and the cause is named."""
+
     _seed(conn)
     state = _state(conn)
-    for certified in (
-        _certified(horizon_binding=_binding(snapshot="")),
-        _certified(h1_worlds=_h1_worlds(identity=_identity(data_snapshot_sha256=""))),
-    ):
+    cases = (
+        ("binding snapshot empty", _certified(horizon_binding=_binding(snapshot=""))),
+        ("world snapshot empty",
+         _certified(h1_worlds=_h1_worlds(identity=_identity(data_snapshot_sha256="")))),
+    )
+    # An authority that carries no data snapshot cannot even be built: the anchor
+    # is refused rather than becoming a hole in the anchoring.
+    with pytest.raises(fh.FreeHitInputError) as anchor:
+        _authority(data="")
+    assert anchor.value.reasons[0] == fh.FH_DECISION_AUTHORITY_REQUIRED
+    for label, certified in cases:
         with pytest.raises(ad.FreeHitAdapterError) as caught:
-            ad.build_free_hit_request(state, certified, conn=conn, player_ids=UNIVERSE)
-        assert caught.value.reasons[0] == fh.FH_DATA_SNAPSHOT_REQUIRED
+            ad.build_free_hit_request(state, certified, conn=conn)
+        reasons = set(caught.value.reasons)
+        assert reasons & {fh.FH_DATA_SNAPSHOT_REQUIRED, fh.FH_DECISION_AUTHORITY_REQUIRED,
+                          fh.FH_DECISION_AUTHORITY_MISMATCH}, (label, reasons)
+        assert "snapshot" in str(caught.value).lower(), (label, str(caught.value))
 
 
 def test_a_horizon_bound_to_another_event_refuses(conn):
@@ -338,7 +423,7 @@ def test_a_horizon_bound_to_another_event_refuses(conn):
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
             state, _certified(horizon_binding=_binding(event=EVENT + 1)),
-            conn=conn, player_ids=UNIVERSE,
+            conn=conn,
         )
     assert caught.value.reasons[0] == fh.FH_HORIZON_NOT_CANONICAL
 
@@ -352,7 +437,7 @@ def test_the_certified_path_reaches_the_evaluator_end_to_end(conn):
     for pid in (20, 21, 22, 23, 24, 28, 29, 30):
         values[pid] = 6.0
     request = ad.build_free_hit_request(
-        state, _certified(h1_worlds=_h1_worlds(values)), conn=conn, player_ids=UNIVERSE,
+        state, _certified(h1_worlds=_h1_worlds(values)), conn=conn,
     )
     evaluation = fh.evaluate_free_hit(request)
     assert evaluation.mean_uplift is not None and evaluation.mean_uplift > 0
