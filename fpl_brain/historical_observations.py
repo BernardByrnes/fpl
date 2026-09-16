@@ -302,11 +302,19 @@ def _max_gap_days(captures: Sequence[str]) -> float | None:
 
 #: The boundary as a SQL fragment for readers that have their own projection.
 #: Compose with :func:`boundary_params`; never restate the clauses.
-OBSERVATION_SQL_CLAUSES = """
+#:
+#: The scheduled-placeholder clause is part of the contract, not an optional
+#: extra.  Writing it as SQL only covered clauses 1-5, so a composed reader
+#: accepted a placeholder that happened to be written AFTER its own kickoff --
+#: the value signature in clause 6 was enforced for the helpers but not for the
+#: composable path.  ``repositories.scheduled_placeholder_sql`` is the same
+#: definition the Python predicate uses, so the two cannot drift.
+OBSERVATION_SQL_CLAUSES = f"""
       f.finished = 1 AND f.started = 1
       AND f.kickoff_time IS NOT NULL AND f.kickoff_time <= ?
       AND pg.updated_at IS NOT NULL AND pg.updated_at <= ?
       AND pg.updated_at >= f.kickoff_time
+      AND {repo.gameweek_has_performance_sql("pg")}
       AND pg.event < ? AND f.event < ?
 """
 

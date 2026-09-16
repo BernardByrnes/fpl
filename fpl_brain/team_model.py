@@ -36,9 +36,17 @@ from dataclasses import dataclass, fields
 from typing import Any, Iterable, Mapping
 
 from . import analytics
+from . import historical_observations as historical
 from .utils import parse_utc, utc_now
 
-TEAM_MODEL_VERSION = "team_strength_v1.0.0"
+# v1.1.0: the fixture-side xG evidence is read under the canonical causal
+# historical boundary.  Previously the fixture was bounded (event/kickoff) but
+# the ROWS were not, so a row written after the cutoff -- or a scheduled
+# placeholder written after kickoff -- contributed to the side xG sum.  This
+# changes the model's semantics for any cutoff where such a row exists, even
+# though every currently certified cutoff is unaffected (no stored row both
+# satisfies the old read and falls outside the boundary).
+TEAM_MODEL_VERSION = "team_strength_v1.1.0"
 TEAM_BASELINE_MODEL_VERSION = "team_naive_v1.0.0"
 
 VENUE_HOME = "home"
@@ -81,13 +89,13 @@ class TeamStrengthConfig:
 # ---------------------------------------------------------------------------
 
 
-def _fixture_side_xg(conn: sqlite3.Connection, fixture_id: int) -> dict[str, Any]:
-    """Side-summed official xG for one fixture, plus reconciliation evidence.
+def _side_xg_from_rows(rows: Iterable[Any]) -> dict[str, Any]:
+    """Side-summed official xG per side, from already-selected rows.
 
-    Returns ``home_xg``/``away_xg`` (sum of the side's players'
-    ``expected_goals``) and ``home_xgc_max``/``away_xgc_max`` (the largest
-    per-player ``expected_goals_conceded`` on that side — the closest official
-    approximation to the opponent's team xG).  ``missing`` counts null xG rows.
+    ``was_home`` decides the side (never ``players.team_id``), so a mid-season
+    transfer cannot re-attribute a past fixture.  ``expected_goals_conceded``
+    is pro-rated by time on pitch, so it is reported as a per-side maximum for
+    reconciliation only and never summed.
     """
 
     home_xg = away_xg = 0.0
@@ -95,11 +103,7 @@ def _fixture_side_xg(conn: sqlite3.Connection, fixture_id: int) -> dict[str, Any
     away_xgc_max: float | None = None
     missing = 0
     saw_home = saw_away = False
-    for row in conn.execute(
-        """SELECT was_home, expected_goals, expected_goals_conceded
-             FROM player_gameweeks WHERE fixture_id=? AND was_home IS NOT NULL""",
-        (int(fixture_id),),
-    ).fetchall():
+    for row in rows:
         was_home = int(row["was_home"])
         xg = row["expected_goals"]
         xgc = row["expected_goals_conceded"]
@@ -125,10 +129,51 @@ def _fixture_side_xg(conn: sqlite3.Connection, fixture_id: int) -> dict[str, Any
     }
 
 
-def fixture_side_xg(conn: sqlite3.Connection, fixture_id: int) -> dict[str, Any]:
-    """Public canonical side xG for one fixture (see ``_fixture_side_xg``)."""
+#: The row-level evidence for one fixture side.  ``fixture_id`` and
+#: ``was_home`` are this model's own identity/venue filters, applied AFTER the
+#: canonical causal boundary; the boundary itself is never restated here.
+_SIDE_XG_SELECT = (
+    "SELECT was_home, expected_goals, expected_goals_conceded "
+    "FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id WHERE "
+)
 
-    return _fixture_side_xg(conn, int(fixture_id))
+
+def fixture_side_xg(
+    conn: sqlite3.Connection, fixture_id: int, *, as_of: str, planning_event: int
+) -> dict[str, Any]:
+    """Canonical side xG for one fixture as of ``as_of``.
+
+    The fixture identity is explicit, but identity is not causality: a row for
+    this fixture that the league had not yet written at the cutoff, or a
+    scheduled placeholder, is not evidence about the match.  ``as_of`` is
+    required and there is no "now" default (see
+    :mod:`fpl_brain.historical_observations`).
+    """
+
+    cutoff = historical.require_as_of(as_of)
+    rows = conn.execute(
+        f"{_SIDE_XG_SELECT}{historical.OBSERVATION_SQL_CLAUSES}"
+        " AND pg.fixture_id = ? AND pg.was_home IS NOT NULL",
+        (*historical.boundary_params(cutoff, planning_event=int(planning_event)), int(fixture_id)),
+    ).fetchall()
+    return _side_xg_from_rows(rows)
+
+
+def realised_fixture_side_xg(conn: sqlite3.Connection, fixture_id: int) -> dict[str, Any]:
+    """The FINAL side xG of a played fixture, for scoring a past prediction.
+
+    This is deliberately outside the historical boundary: a calibration read
+    compares what the model said before a match with what the match actually
+    produced, so it must see the realised value rather than the value that was
+    observable at some earlier cutoff.  It has no cutoff parameter for that
+    reason, and it is not a historical model input.
+    """
+
+    rows = conn.execute(
+        f"{_SIDE_XG_SELECT}pg.fixture_id = ? AND pg.was_home IS NOT NULL",
+        (int(fixture_id),),
+    ).fetchall()
+    return _side_xg_from_rows(rows)
 
 
 def completed_fixture_xg(
@@ -138,8 +183,12 @@ def completed_fixture_xg(
 
     No-lookahead: a fixture must be finished and started, belong to an event
     strictly before the planning event, and kick off at or before the cutoff.
+    The fixture bound alone is not sufficient -- the row-level evidence for each
+    fixture is read under the same causal boundary -- and ``cutoff`` is
+    required, with no implicit "now".
     """
 
+    cutoff = historical.require_as_of(cutoff)
     out: list[dict[str, Any]] = []
     rows = conn.execute(
         """SELECT id, event, kickoff_time, team_h, team_a
@@ -151,7 +200,9 @@ def completed_fixture_xg(
         (int(planning_event), cutoff),
     ).fetchall()
     for fixture in rows:
-        sides = _fixture_side_xg(conn, int(fixture["id"]))
+        sides = fixture_side_xg(
+            conn, int(fixture["id"]), as_of=cutoff, planning_event=int(planning_event)
+        )
         if sides["home_xg"] is None or sides["away_xg"] is None:
             # A fixture with missing official xG cannot contribute team totals.
             continue

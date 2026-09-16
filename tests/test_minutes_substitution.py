@@ -302,3 +302,74 @@ def test_mc_consumes_the_same_substitution_profile():
     assert set(counts) == {5}
     assert all(abs(sum(w["minutes"].values()) - 990.0) < 1e-9
                for w in [mc._sample_side_world(side, random.Random(2), mc.MonteCarloConfig()) for _ in range(20)])
+
+
+# ---------------------------------------------------------------------------
+# PE1-P1-02 — a scheduled placeholder is not substitution evidence
+# ---------------------------------------------------------------------------
+
+
+def test_a_post_kickoff_placeholder_does_not_create_a_false_team_fixture():
+    """A placeholder written after kickoff satisfies every clause the old
+    composed boundary had, so it reached the side grouping and manufactured a
+    team-fixture that contained no substitution evidence at all.  Those are
+    not harmless: ``team_fixtures`` is the denominator of
+    ``expected_substitutions``, so each phantom side dilutes the league rate.
+    """
+
+    from fpl_brain import repositories as repo
+    from fpl_brain.database import connect_database
+    from fpl_brain.models import (
+        EventRecord, FixtureRecord, PlayerGameweekRecord, PlayerRecord, PositionRecord, TeamRecord,
+    )
+
+    cutoff = "2026-09-10T12:00:00Z"
+    observed_at = "2026-09-10T08:00:00Z"
+
+    def build(with_placeholder_side: bool):
+        conn = connect_database(":memory:")
+        with conn:
+            repo.upsert_teams(conn, [TeamRecord(id=1, name="A"), TeamRecord(id=2, name="B"),
+                                     TeamRecord(id=3, name="C"), TeamRecord(id=4, name="D")])
+            repo.upsert_positions(conn, [PositionRecord(id=p, singular_name_short=n)
+                                         for p, n in ((1, "GKP"), (2, "DEF"), (3, "MID"), (4, "FWD"))])
+            repo.upsert_players(conn, [PlayerRecord(id=i, web_name=f"P{i}", team_id=1, element_type=3)
+                                       for i in range(1, 40)])
+            repo.upsert_events(conn, [EventRecord(id=e, finished=1, data_checked=1, raw_json={})
+                                      for e in (1, 2)])
+            repo.upsert_fixtures(conn, [
+                # Fixture 1: a real, fully reported team-1 vs team-2 match.
+                FixtureRecord(id=1, event=1, team_h=1, team_a=2, finished=1, started=1,
+                              kickoff_time="2026-08-22T14:00:00Z", raw_json={}),
+                # Fixture 2: finished and pre-cutoff, but its rows were never refreshed.
+                FixtureRecord(id=2, event=1, team_h=3, team_a=4, finished=1, started=1,
+                              kickoff_time="2026-08-22T16:00:00Z", raw_json={}),
+            ])
+            rows = [PlayerGameweekRecord(player_id=i, event=1, fixture_id=1, was_home=1,
+                                         minutes=90, starts=1, red_cards=0,
+                                         source="element_summary", raw_json={}) for i in range(1, 12)]
+            rows += [PlayerGameweekRecord(player_id=i, event=1, fixture_id=1, was_home=0,
+                                          minutes=90, starts=1, red_cards=0,
+                                          source="element_summary", raw_json={}) for i in range(12, 23)]
+            repo.upsert_player_gameweeks(conn, rows, observed_at)
+            if with_placeholder_side:
+                # Written AFTER fixture 2's kickoff, so only the value signature
+                # can reject it: minutes=0 and no performance column at all.
+                placeholders = [
+                    PlayerGameweekRecord(player_id=i, event=1, fixture_id=2, was_home=side,
+                                         minutes=0, source="element_summary", raw_json={})
+                    for side, span in ((1, range(23, 34)), (0, range(34, 39)))
+                    for i in span
+                ]
+                repo.upsert_player_gameweeks(conn, placeholders, "2026-08-23T09:00:00Z")
+        return conn
+
+    clean = sm.audit_substitution_evidence(build(False), 2, cutoff)
+    assert clean["team_fixtures"] == 2
+
+    polluted = sm.audit_substitution_evidence(build(True), 2, cutoff)
+    assert polluted["team_fixtures"] == clean["team_fixtures"], (
+        "a placeholder-only side manufactured a false zero-substitution team-fixture"
+    )
+    assert polluted["expected_substitutions"] == clean["expected_substitutions"]
+    assert polluted["k_counts"] == clean["k_counts"]

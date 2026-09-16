@@ -395,3 +395,114 @@ def test_the_naive_minutes_baseline_uses_the_boundary_not_a_local_predicate(conn
     # A cutoff before any row was written leaves the window empty: it fails closed
     # rather than reaching for the rows it can see but may not use.
     assert analytics.positional_pooled_minutes(conn, 5, EARLY) == {}
+
+
+# ---------------------------------------------------------------------------
+# PE1-P1-02 — ONE scheduled-placeholder contract, in Python and in SQL
+# ---------------------------------------------------------------------------
+
+#: Case B is the shape senior review found missing: a placeholder written AFTER
+#: its own kickoff satisfies the write-after-kickoff clause, so only the value
+#: signature can reject it.  Every case is written into the same fixture so the
+#: only difference between them is the row itself.
+_KICKOFF = "2026-08-29T14:00:00Z"
+_AFTER_KICKOFF_BEFORE_CUTOFF = "2026-09-01T09:00:00Z"   # < LATE, > kickoff
+_PLACEHOLDER_CASES = [
+    # (name, minutes, explicit performance, updated_at, expect_included)
+    ("A placeholder written BEFORE kickoff", 0, None, "2026-08-29T09:00:00Z", False),
+    ("B placeholder written AFTER kickoff", 0, None, _AFTER_KICKOFF_BEFORE_CUTOFF, False),
+    ("C genuine zero-minute DNP", 0, {"starts": 0, "total_points": 0, "expected_goals": 0.0}, WRITTEN, True),
+    ("D normal played observation", 90, {"starts": 1, "total_points": 6, "expected_goals": 0.5}, WRITTEN, True),
+    ("E observation written AFTER the cutoff", 90, {"starts": 1, "total_points": 6}, "2026-09-30T00:00:00Z", False),
+]
+
+
+def _seed_placeholder_cases(conn):
+    observations = []
+    for index, (_name, minutes, perf, written, _expected) in enumerate(_PLACEHOLDER_CASES):
+        row = {"player_id": 200 + index, "event": 2, "fixture_id": 80, "minutes": minutes,
+               "updated_at": written, "source": "element_summary"}
+        row.update(perf or {})
+        observations.append(row)
+    _seed(
+        conn,
+        fixtures=[{"id": 80, "event": 2, "kickoff_time": _KICKOFF}],
+        observations=observations,
+    )
+
+
+def test_the_placeholder_signature_is_one_definition_in_python_and_sql(conn):
+    """SQL and Python must classify every shape identically.
+
+    The SQL form is derived from the same column tuple and the same two
+    branches, so this is a drift alarm rather than a second opinion.
+    """
+
+    from fpl_brain import repositories as repo
+
+    _seed_placeholder_cases(conn)
+    rows = conn.execute("SELECT pg.*, pg.rowid AS rid FROM player_gameweeks pg ORDER BY pg.rowid").fetchall()
+    assert len(rows) == len(_PLACEHOLDER_CASES)
+
+    for (name, _m, _p, _w, _e), row in zip(_PLACEHOLDER_CASES, rows):
+        values = dict(row)
+        python_says = repo.row_is_scheduled_placeholder(values)
+        sql_says = conn.execute(
+            f"SELECT ({repo.scheduled_placeholder_sql('pg')}) FROM player_gameweeks pg WHERE pg.rowid = ?",
+            (int(values["rid"]),),
+        ).fetchone()[0]
+        assert sql_says is not None, f"{name}: SQL returned NULL, which silently drops rows"
+        assert bool(sql_says) == python_says, f"{name}: SQL and Python disagree"
+
+
+def test_exclusion_is_not_minutes_zero_and_not_starts_zero(conn):
+    """A genuine zero-minute DNP survives; the two placeholders do not.
+
+    This is the property that forbids replacing the signature with
+    ``minutes == 0`` or ``starts == 0`` anywhere in the boundary.
+    """
+
+    _seed_placeholder_cases(conn)
+    included = {(int(r["player_id"])) for r in _read(conn, LATE, 5)}
+    dnp_player = 200 + 2   # case C
+    played_player = 200 + 3  # case D
+    assert dnp_player in included, "a genuine zero-minute non-appearance was erased"
+    assert played_player in included
+    assert (200 + 0) not in included, "case A: pre-kickoff placeholder leaked"
+    assert (200 + 1) not in included, "case B: post-kickoff placeholder leaked"
+    assert (200 + 4) not in included, "case E: post-cutoff observation leaked"
+
+
+def test_the_composed_boundary_and_the_filtered_helper_return_the_same_rows(conn):
+    """The composable SQL contract and the fully-filtered helper must be ONE contract."""
+
+    _seed_placeholder_cases(conn)
+    composed = {
+        (int(r[0]), int(r[1])) for r in conn.execute(
+            f"SELECT pg.player_id, pg.fixture_id FROM player_gameweeks pg "
+            f"JOIN fixtures f ON f.id = pg.fixture_id WHERE {ho.OBSERVATION_SQL_CLAUSES}",
+            ho.boundary_params(LATE, planning_event=5),
+        ).fetchall()
+    }
+    helper = {
+        (int(r["player_id"]), int(r["fixture_id"]))
+        for r in ho.historical_player_fixture_rows(conn, as_of=LATE, planning_event=5)
+    }
+    assert composed == helper, (
+        "a reader composing OBSERVATION_SQL_CLAUSES does not receive the same "
+        "evidence as the fully-filtered helper"
+    )
+
+
+def test_the_post_kickoff_placeholder_is_blocked_from_the_minutes_baseline(conn):
+    """PE1-P1-02 at a real consumer: ``analytics.positional_pooled_minutes``."""
+
+    from fpl_brain import analytics
+
+    _seed_placeholder_cases(conn)
+    # Only cases C and D are evidence, so the position mean is (0 + 90) / 2.
+    assert analytics.positional_pooled_minutes(conn, 5, LATE)[3] == 45.0, (
+        "a placeholder changed the naive positional mean"
+    )
+    # Case B alone, with no genuine observation present, leaves the window empty.
+    assert analytics.positional_pooled_minutes(conn, 5, "2026-09-02T00:00:00Z") == {}
