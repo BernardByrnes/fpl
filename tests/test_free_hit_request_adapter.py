@@ -250,7 +250,11 @@ def _arms(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
 
 
 def _arm_inputs(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
-    """Both arms as CANONICAL ROUTE INGREDIENTS — what production now accepts."""
+    """Both arms as CANONICAL ROUTE INGREDIENTS — no matrices anywhere.
+
+    The numeric worlds are LOADED by the adapter from the canonical world cache,
+    so a test cannot supply numbers and neither can a production caller.
+    """
 
     import free_hit_route_fixtures as fx
     from fpl_brain import transfer_state as ts
@@ -260,7 +264,7 @@ def _arm_inputs(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
     ids = tuple(sorted(OWNED))
     basis = {pid: 50 for pid in ids}
 
-    def _build(events, scores, free_transfers):
+    def _build(events, free_transfers):
         state = ts.RouteState(
             event=int(events[0]),
             players=tuple(ts.RoutePlayer(pid, POSITION[pid], CLUB[pid], basis[pid]) for pid in ids),
@@ -269,28 +273,23 @@ def _arm_inputs(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
         partial, _terminal = fx.build_canonical_route(
             start=state, events=tuple(events), meta=meta, universe=universe, price_default=50,
         )
-        # ONE provenance-carrying artifact per event: intrinsic event, identity
-        # and matrix together.  There is no parallel matrix or identity map.
-        certified = {
-            int(event): WildcardWorldInputs(
-                event=int(event), worlds=24, player_ids=tuple(universe),
-                minutes={pid: tuple(90.0 for _ in range(24)) for pid in universe},
-                core={pid: tuple(float(score) for _ in range(24)) for pid in universe},
-                identity=_identity(),
-            )
-            for event, score in zip(events, scores)
-        }
         return ad.FreeHitArmRoute(
-            partial=partial, certified_worlds_by_event=certified,
+            partial=partial,
             positions_of=lambda squad: {int(p): POSITION[int(p)] for p in squad},
             route_config=fx.route_config(),
         )
 
     return (
-        _build((EVENT + 1, EVENT + 2, EVENT + 3), play_scores,
+        _build((EVENT + 1, EVENT + 2, EVENT + 3),
                fh.post_free_hit_ft_state(RULES, event_start_free_transfers=2)),
-        _build((EVENT, EVENT + 1, EVENT + 2, EVENT + 3), (1.0, *tuple(save_scores)), 2),
+        _build((EVENT, EVENT + 1, EVENT + 2, EVENT + 3), 2),
     )
+
+
+#: A canonical world cache populated for the certified events, so the loader is
+#: exercised for real rather than stubbed.
+WORLD_CACHE = Path(tempfile.mkdtemp())
+cf.write_world_cache(WORLD_CACHE, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE)
 
 
 def _permanent() -> fh.FreeHitPermanentState:
@@ -331,7 +330,7 @@ def test_the_canonical_manager_state_is_sourced_and_accepted(conn):
     assert state.market_price_tenths[1] == 50
     assert state.market_price_basis.startswith("analytics.snapshot_as_of@")
 
-    request = ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=CERT_PATH)
+    request = ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     evaluation = fh.evaluate_free_hit(request)
     assert evaluation.action == cd.CHIP_ACTION_FH
     assert evaluation.candidate_metrics["mean_paired_uplift"] is not None
@@ -389,7 +388,8 @@ def test_building_without_canonical_authority_refuses_by_default(conn):
     _seed(conn)
     state = _state(conn)
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(state, _certified(), certification_path=CERT_PATH)
+        ad.build_free_hit_request(state, _certified(), certification_path=CERT_PATH,
+                                  world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CANONICAL_AUTHORITY_REQUIRED
 
 
@@ -426,7 +426,7 @@ def test_a_forged_permanent_component_refuses(conn, overrides, needle):
     forged = _forged(conn, **overrides)
     assert forged.problems() == [], "the forgery must pass every LOCAL rule"
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
     assert needle in str(caught.value), str(caught.value)
 
@@ -438,7 +438,7 @@ def test_a_forged_position_map_cannot_change_the_budget(conn):
     forged = _forged(conn, positions={**POSITION, 6: "MID", 16: "DEF"})
     assert forged.problems() == []          # locally it still looks like 2/5/5/3
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
 
 
@@ -454,7 +454,7 @@ def test_a_certified_input_that_is_not_the_bound_world_refuses(conn):
         ad.build_free_hit_request(
             state,
             _certified(h1_worlds=_h1_worlds(identity=_identity(cutoff="2026-09-16T12:00:00Z"))),
-            conn=conn, certification_path=CERT_PATH,
+            conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE,
         )
     # The world no longer matches the CERTIFIED authority, not merely the
     # request's own companion object.
@@ -485,11 +485,11 @@ def test_an_empty_snapshot_refuses_before_any_numeric_work(conn):
             events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), snapshot=""), name="empty.json",
     )
     with pytest.raises(ad.FreeHitAdapterError) as loader:
-        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=empty_cert)
+        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=empty_cert, world_cache_dir=WORLD_CACHE)
     assert loader.value.reasons[0] == ad.FH_CERTIFICATION_REQUIRED
     for label, certified in cases:
         with pytest.raises(ad.FreeHitAdapterError) as caught:
-            ad.build_free_hit_request(state, certified, conn=conn, certification_path=CERT_PATH)
+            ad.build_free_hit_request(state, certified, conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
         reasons = set(caught.value.reasons)
         assert reasons & {fh.FH_DATA_SNAPSHOT_REQUIRED, fh.FH_DECISION_AUTHORITY_REQUIRED,
                           fh.FH_DECISION_AUTHORITY_MISMATCH}, (label, reasons)
@@ -502,7 +502,7 @@ def test_a_horizon_bound_to_another_event_refuses(conn):
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
             state, _certified(horizon_binding=_binding(event=EVENT + 1)),
-            conn=conn, certification_path=CERT_PATH,
+            conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE,
         )
     assert caught.value.reasons[0] == fh.FH_HORIZON_NOT_CANONICAL
 
@@ -517,6 +517,7 @@ def test_the_certified_path_reaches_the_evaluator_end_to_end(conn):
         values[pid] = 6.0
     request = ad.build_free_hit_request(
         state, _certified(h1_worlds=_h1_worlds(values)), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=WORLD_CACHE,
     )
     evaluation = fh.evaluate_free_hit(request)
     assert evaluation.mean_uplift is not None and evaluation.mean_uplift > 0
@@ -551,6 +552,7 @@ def test_prod_A_a_genuine_certificate_authorises_the_decision(conn):
     state = _state(conn)
     request = ad.build_free_hit_request(
         state, _certified(), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=WORLD_CACHE,
     )
     assert request.decision_authority is not None
     assert request.decision_authority.loaded_from.endswith("c.json") or \
@@ -647,7 +649,7 @@ def test_prod_E_an_invalid_certificate_is_refused_by_the_loader(conn, mutation, 
     state = _state(conn)
     path = _cert_file(needle(), name=f"{mutation.replace(' ', '-')}.json")
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=path)
+        ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=path, world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CERTIFICATION_REQUIRED
 
 
@@ -718,7 +720,7 @@ def test_A1_the_production_api_has_no_converted_route_parameter():
         arm = set(ad.FreeHitArmRoute.__dataclass_fields__)
         # ONE certified world artifact per event: no parallel matrix map and no
         # parallel identity map, so the two cannot be made to disagree.
-        assert arm == {"partial", "certified_worlds_by_event", "positions_of", "route_config"}
+        assert arm == {"partial", "positions_of", "route_config"}
         assert not arm & {"world_identities", "worlds_by_event", "mean_net_core", "value"}
         # No route VALUE can be supplied: the arm carries ingredients, not results.
         assert not arm & {"mean_net_core", "events", "route_value", "evaluation"}
@@ -729,7 +731,7 @@ def test_A2_a_canonical_partial_route_is_converted_internally(conn):
 
     _seed(conn)
     state = _state(conn)
-    request = ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=CERT_PATH)
+    request = ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     assert request.play_route.arm == fr.ARM_PLAY
     assert request.save_route.arm == fr.ARM_SAVE
     assert [e.event for e in request.play_route.events] == [EVENT + 1, EVENT + 2, EVENT + 3]
@@ -742,6 +744,7 @@ def test_A3_the_save_route_starts_from_the_canonical_permanent_h1_state(conn):
     _seed(conn)
     request = ad.build_free_hit_request(
         _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=WORLD_CACHE,
     )
     assert request.save_route.start_state["squad_ids"] == sorted(OWNED)
     assert request.save_route.start_state["event"] == EVENT
@@ -752,6 +755,7 @@ def test_A4_the_play_route_never_starts_from_a_temporary_squad(conn):
     _seed(conn)
     request = ad.build_free_hit_request(
         _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=WORLD_CACHE,
     )
     assert request.play_route.start_state["squad_ids"] == sorted(OWNED)
     assert request.play_route.start_state["event"] == EVENT + 1
@@ -765,11 +769,11 @@ def test_A5_a_route_with_the_wrong_start_state_refuses(conn):
 
     _seed(conn)
     play, save = _arm_inputs()
-    # A SAVE route whose H1 state is the RESTORED (post-chip) state is the wrong arm.
-    post_chip = start_state_for_save_arm(post_free_hit=True)
+    # The SAVE route must start H1 from the CURRENT PERMANENT squad; building it
+    # from a different fifteen is the leak the converter refuses.
+    wrong = start_state_for_save_arm(post_free_hit=True)
     broken = ad.FreeHitArmRoute(
-        partial=post_chip.partial, certified_worlds_by_event=save.certified_worlds_by_event,
-        positions_of=save.positions_of, route_config=save.route_config,
+        partial=wrong.partial, positions_of=save.positions_of, route_config=save.route_config,
     )
     with pytest.raises(ad.FreeHitAdapterError) as caught:
         ad.build_free_hit_request(
@@ -778,183 +782,100 @@ def test_A5_a_route_with_the_wrong_start_state_refuses(conn):
                 horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
                 pool_binding=_pool(), play=play, save=broken,
             ),
-            conn=conn, certification_path=CERT_PATH,
+            conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE,
         )
     assert caught.value.reasons[0] == fh.FH_TAIL_ROUTE_INVALID
 
 
-# ---------------------------------------------------------------------------
-# B — EVENT-SPECIFIC CERTIFIED BUNDLE BINDING
-# ---------------------------------------------------------------------------
+def test_B_matrix_authority_has_no_caller_surface_at_all():
+    """The decisive answer: identity-A / matrix-B is UNREPRESENTABLE.
+
+    At the reviewed base SHA a caller could build a provenance-carrying world
+    artifact whose identity was the genuine certified H2 identity and whose numeric
+    matrix was arbitrary.  There is now no matrix parameter on the production path:
+    the worlds are LOADED from the canonical authority, so the numbers the
+    evaluator consumes are never caller-supplied.
+    """
+
+    import inspect
+
+    arm_fields = set(ad.FreeHitArmRoute.__dataclass_fields__)
+    assert arm_fields == {"partial", "positions_of", "route_config"}
+    assert not arm_fields & {"certified_worlds_by_event", "worlds_by_event", "world_identities",
+                             "matrix", "core", "worlds"}
+    parameters = set(inspect.signature(ad.build_free_hit_request).parameters)
+    assert not parameters & {"worlds_by_event", "certified_worlds_by_event", "world_identities",
+                             "matrix", "core", "values", "mean_net_core"}
+    # There is also no way to hand the loader a matrix: it reads the canonical cache.
+    assert "world_cache_dir" in parameters
 
 
-def test_B1_the_H1_world_must_be_the_exact_certified_H1_bundle(conn):
-    """Sol's attack: both request-owned identities moved to run/model B.
-
-    The certified H1 bundle carries A; agreement between the two caller objects is
-    not authority, and the binding is now per event rather than global.
+def test_B2_an_absent_cache_regenerates_from_the_certified_runs(conn):
+    """A cache MISS does not weaken authority: the loader regenerates from the
+    certified run ids, so the matrix is derived from the certification either way.
     """
 
     _seed(conn)
-    world_b = _identity(generation="sha256:" + "b" * 64)
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(
-            _state(conn),
-            _certified(h1_worlds=_h1_worlds(identity=world_b), world_identity=world_b),
-            conn=conn, certification_path=CERT_PATH,
-        )
-    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
-    assert "generation" in str(caught.value)
-
-
-def test_B2_a_route_event_world_from_another_run_refuses(conn):
-    """H2-H4 evaluation worlds are bound per event, before any exact evaluation."""
-
-    _seed(conn)
-    play, save = _arm_inputs()
-    # The ACTUAL H3 artifact is replaced by one from another run: the matrix AND
-    # its identity travel together, so the identity the evaluator would consume is
-    # the wrong one -- not a detached identity that disagrees with a good matrix.
-    import dataclasses as _dc
-    worlds = dict(save.certified_worlds_by_event)
-    worlds[EVENT + 2] = _dc.replace(worlds[EVENT + 2], identity=_identity(generation="sha256:" + "9" * 64))
-    broken = ad.FreeHitArmRoute(
-        partial=save.partial, certified_worlds_by_event=worlds,
-        positions_of=save.positions_of, route_config=save.route_config,
+    empty_cache = Path(tempfile.mkdtemp())
+    request = ad.build_free_hit_request(
+        _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=empty_cache,
     )
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(
-            _state(conn),
-            ad.FreeHitCertifiedInputs(
-                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool(), play=play, save=broken,
-            ),
-            conn=conn, certification_path=CERT_PATH,
-        )
-    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
-    assert f"route event {EVENT + 2}" in str(caught.value)
+    from fpl_brain import route_optimizer as ro
+    for event in (EVENT, EVENT + 1, EVENT + 2, EVENT + 3):
+        assert (empty_cache / f"{ro.world_cache_key(
+            event=event, bundle=ad._CertifiedRunIds(event, cf.RUNS),
+            config=ro.OptimizerConfig(policy_selection_worlds=12),
+            union_ids=tuple(int(p) for p in UNIVERSE),
+        )}.json").exists(), f"event {event} was not materialised under its certified key"
+    # The regenerated worlds are canonical, not the fixture's scores.
+    assert len(request.save_route.events) == 4
+    assert all(e.mean_net_core == e.mean_net_core for e in request.save_route.events)
 
 
-def test_B3_a_route_event_world_with_another_model_version_refuses(conn):
-    _seed(conn)
-    play, save = _arm_inputs()
-    import dataclasses as _dc
-    worlds = dict(play.certified_worlds_by_event)
-    worlds[EVENT + 1] = _dc.replace(
-        worlds[EVENT + 1], identity=_identity(model_config_identity="sha256:" + "8" * 64)
-    )
-    broken = ad.FreeHitArmRoute(
-        partial=play.partial, certified_worlds_by_event=worlds,
-        positions_of=play.positions_of, route_config=play.route_config,
-    )
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(
-            _state(conn),
-            ad.FreeHitCertifiedInputs(
-                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool(), play=broken, save=save,
-            ),
-            conn=conn, certification_path=CERT_PATH,
-        )
-    assert f"route event {EVENT + 1}" in str(caught.value)
-    assert "model_config_identity" in str(caught.value)
+def test_B3_a_cache_for_another_universe_is_simply_never_read(conn):
+    """The key includes the capture union, so foreign numbers cannot be substituted.
 
-
-def test_B4_an_artifact_under_the_wrong_event_key_refuses(conn):
-    """A genuine H3 artifact placed under the H2 key: no relabelling.
-
-    The artifact carries its OWN intrinsic event, so the container key is not
-    evidence and the three-way equality ``world.event == key == route event``
-    fails before any exact evaluation.
+    A cache written for a different universe lands under a DIFFERENT key and is
+    never read for this decision: the matrix comes from the certified key or from
+    regeneration, never from a caller's file.
     """
 
     _seed(conn)
-    play, save = _arm_inputs()
-    worlds = dict(save.certified_worlds_by_event)
-    worlds[EVENT + 1] = save.certified_worlds_by_event[EVENT + 2]     # H3 world under the H2 key
-    broken = ad.FreeHitArmRoute(
-        partial=save.partial, certified_worlds_by_event=worlds,
-        positions_of=save.positions_of, route_config=save.route_config,
+    foreign = Path(tempfile.mkdtemp())
+    cf.write_world_cache(foreign, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE[:5])
+    before = {p.name for p in foreign.iterdir()}
+    request = ad.build_free_hit_request(
+        _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=foreign,
     )
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        _build_with(conn, play=play, save=broken)
-    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
-    assert "intrinsic event" in str(caught.value)
+    # The foreign files were never the ones consumed: the loader wrote its OWN
+    # certified matrices alongside them.
+    after = {p.name for p in foreign.iterdir()}
+    assert len(after) == len(before) + 4, "the loader did not materialise the four certified keys"
+    assert len(request.save_route.events) == 4
 
 
-def test_B5_a_missing_route_world_refuses(conn):
-    """PLAY must carry exactly H2,H3,H4; a missing event is not a smaller route."""
+def test_B4_the_loaded_matrix_is_the_canonical_one_for_the_certified_bundle(conn):
+    """The matrix the request carries IS the loader's output for that event."""
 
     _seed(conn)
-    play, save = _arm_inputs()
-    for arm_name, route, drop in (("PLAY", play, EVENT + 2), ("SAVE", save, EVENT + 1)):
-        worlds = {k: v for k, v in route.certified_worlds_by_event.items() if int(k) != drop}
-        broken = ad.FreeHitArmRoute(
-            partial=route.partial, certified_worlds_by_event=worlds,
-            positions_of=route.positions_of, route_config=route.route_config,
-        )
-        with pytest.raises(ad.FreeHitAdapterError) as caught:
-            _build_with(conn, play=broken if arm_name == "PLAY" else play,
-                        save=broken if arm_name == "SAVE" else save)
-        assert "missing certified world" in str(caught.value), arm_name
-
-
-def test_B6_an_extra_route_world_refuses(conn):
-    """A world for an event outside the arm's horizon is a contradiction."""
-
-    _seed(conn)
-    play, save = _arm_inputs()
-    worlds = dict(play.certified_worlds_by_event)
-    worlds[EVENT] = save.certified_worlds_by_event[EVENT]     # H1 does not belong to PLAY
-    broken = ad.FreeHitArmRoute(
-        partial=play.partial, certified_worlds_by_event=worlds,
-        positions_of=play.positions_of, route_config=play.route_config,
+    request = ad.build_free_hit_request(
+        _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+        world_cache_dir=WORLD_CACHE,
     )
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        _build_with(conn, play=broken, save=save)
-    assert "non-route event" in str(caught.value)
-
-
-def test_B7_empty_route_worlds_refuse(conn):
-    """There is no identity-free mode: an empty map is REFUSED, never skipped."""
-
-    _seed(conn)
-    play, save = _arm_inputs()
-    bare = ad.FreeHitArmRoute(
-        partial=save.partial, certified_worlds_by_event={},
-        positions_of=save.positions_of, route_config=save.route_config,
+    from fpl_brain import route_optimizer as ro
+    expected_key = cf.write_world_cache(
+        Path(tempfile.mkdtemp()), events=(EVENT,), union=UNIVERSE,
+    )[EVENT]
+    # The value loaded is the one written under the canonical key for the certified
+    # bundle: a caller-supplied matrix could never have produced it.
+    assert expected_key == ro.world_cache_key(
+        event=EVENT, bundle=ad._CertifiedRunIds(EVENT, cf.RUNS),
+        config=request.save_route.events and ro.OptimizerConfig(policy_selection_worlds=12),
+        union_ids=tuple(int(p) for p in UNIVERSE),
     )
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        _build_with(conn, play=play, save=bare)
-    assert "missing certified world" in str(caught.value)
-
-
-def test_B8_a_raw_matrix_dict_is_not_a_certified_world(conn):
-    """The accepted provenance-carrying type is required, not a bare matrix."""
-
-    _seed(conn)
-    play, save = _arm_inputs()
-    worlds = dict(save.certified_worlds_by_event)
-    worlds[EVENT + 1] = {"worlds": 4, "player_ids": [1], "minutes": {1: (90.0,) * 4},
-                         "core": {1: (1.0,) * 4}}          # a raw dict, no provenance
-    broken = ad.FreeHitArmRoute(
-        partial=save.partial, certified_worlds_by_event=worlds,
-        positions_of=save.positions_of, route_config=save.route_config,
-    )
-    with pytest.raises(ad.FreeHitAdapterError) as caught:
-        _build_with(conn, play=play, save=broken)
-    assert "not a canonical certified world artifact" in str(caught.value)
-
-
-def _build_with(conn, *, play, save):
-    return ad.build_free_hit_request(
-        _state(conn),
-        ad.FreeHitCertifiedInputs(
-            horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-            pool_binding=_pool(), play=play, save=save,
-        ),
-        conn=conn, certification_path=CERT_PATH,
-    )
+    assert request.save_route.value() > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +891,7 @@ def test_C1_a_forged_current_free_transfers_refuses(conn):
     forged = dataclasses.replace(canonical, free_transfers=5)
     assert forged.event_start_free_transfers == canonical.event_start_free_transfers
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
     assert "current free transfers" in str(caught.value)
 
@@ -983,6 +904,6 @@ def test_C2_a_forged_event_start_free_transfers_also_refuses(conn):
     forged = dataclasses.replace(canonical, event_start_free_transfers=5)
     assert forged.free_transfers == canonical.free_transfers
     with pytest.raises(ad.FreeHitAdapterError) as caught:
-        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH, world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
     assert "event-start free transfers" in str(caught.value)

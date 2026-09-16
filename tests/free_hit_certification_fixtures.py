@@ -27,8 +27,16 @@ DATA_SNAPSHOT = "sha256:" + "d" * 64
 CUTOFF = "2026-09-16T11:00:00Z"
 CODE_SNAPSHOT = "sha256:" + "c" * 64
 CONTEXT_HASH = "sha256:" + "p" * 64
-RUNS: dict[str, int] = {"xpts": 101, "minutes": 102, "team": 103}
-MODEL_VERSIONS: dict[str, str] = {"xpts": "xpts_v1.0.0", "minutes": "minutes_v1.6.0"}
+#: The REAL run families the certifier records, so the canonical world-cache key
+#: (which names them minutes/team/rate/xpts) can be derived from the bundle.
+RUNS: dict[str, int] = {
+    "minutes_v1": 101, "team_strength_v1": 102,
+    "player_rates_v1": 103, "xpts_v1": 104,
+}
+MODEL_VERSIONS: dict[str, str] = {
+    "xpts_v1": "xpts_v1.0.0", "minutes_v1": "minutes_v1.6.0",
+    "team_strength_v1": "team_v1.0.0", "player_rates_v1": "rates_v6.1.0",
+}
 
 
 def bundle(
@@ -119,3 +127,45 @@ def identity_for(bundle_row: Mapping[str, Any]) -> Any:
         generation=runs_label(bundle_row["runs"]),
         model_config_identity=model_label(bundle_row["model_versions"]),
     )
+
+
+def write_world_cache(
+    cache_dir, *, events: Sequence[int], union: Sequence[int], scores: Mapping[int, float] | None = None,
+    worlds: int = 24, per_event_scores: Mapping[int, float] | None = None,
+):
+    """Populate the CANONICAL world cache so the loader can be exercised for real.
+
+    Each matrix is written under the exact ``world_cache_key`` derived from the
+    certified run ids, the config and the capture union -- the same key
+    ``route_optimizer.build_event_worlds`` computes and stamps.  This is the only
+    way to obtain a matrix the production adapter will accept.
+    """
+
+    import json
+    from pathlib import Path as _Path
+
+    from fpl_brain import route_optimizer as ro
+
+    cache_dir = _Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    scores = scores or {}
+    per_event_scores = per_event_scores or {}
+    union = tuple(int(p) for p in union)
+    keys = {}
+    for event in events:
+        event = int(event)
+        from fpl_brain.free_hit_request_adapter import _CertifiedRunIds
+
+        bundle = _CertifiedRunIds(event, RUNS)
+        config = ro.OptimizerConfig(policy_selection_worlds=12)
+        key = ro.world_cache_key(event=event, bundle=bundle, config=config, union_ids=union)
+        value = float(per_event_scores.get(event, scores.get("default", 1.0)))
+        matrix = {
+            "worlds": int(worlds),
+            "player_ids": list(union),
+            "core": {str(p): [value] * int(worlds) for p in union},
+            "minutes": {str(p): [90.0] * int(worlds) for p in union},
+        }
+        (cache_dir / f"{key}.json").write_text(json.dumps(matrix), encoding="utf-8")
+        keys[event] = key
+    return keys

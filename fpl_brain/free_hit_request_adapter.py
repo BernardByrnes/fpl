@@ -286,11 +286,13 @@ class FreeHitArmRoute:
     """
 
     partial: Any
-    #: event -> the certified world artifact for that event.  REQUIRED and
-    #: exactly keyed; there is no empty or optional form.
-    certified_worlds_by_event: Mapping[int, "WildcardWorldInputs"]
     positions_of: Any
     route_config: Any
+    #: There is deliberately NO world/matrix parameter.  The numeric matrices are
+    #: LOADED by the adapter through the accepted ``route_optimizer.build_event_worlds``
+    #: -- content-addressed by the CERTIFIED bundle's run ids -- so a caller cannot
+    #: supply numbers at all, and the matrix handed to ``exact_evaluate`` is always
+    #: the one the canonical loader produced for that certified event.
 
 
 @dataclass(frozen=True)
@@ -329,6 +331,8 @@ def build_free_hit_request(
     #: The canonical certification artifact the decision is authorised by.  This
     #: is the ONE production source of decision authority.
     certification_path: str | Path | None = None,
+    #: The canonical manager-world cache the route matrices are loaded from.
+    world_cache_dir: str | Path | None = None,
     as_of: str | None = None,
     allow_unverified_manager_state: bool = False,
     rules: sr.SeasonRules | None = None,
@@ -444,13 +448,22 @@ def build_free_hit_request(
     # exact_evaluate are the ones carried by the artifacts that were just proved
     # to be the certified event bundles.
     horizon = tuple(int(e) for e in binding.horizon_events)
-    save_worlds = certified_route_worlds(
-        certified.save, arm="SAVE", expected_events=horizon, authority=authority,
-        eligible_ids=manager.eligible_ids,
+    bundles = certified_event_bundles(authority)
+    if world_cache_dir is None:
+        raise FreeHitAdapterError(
+            f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: no world-cache directory is configured, so the "
+            "certified numeric worlds cannot be loaded",
+            reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
+        )
+    save_worlds = load_certified_route_worlds(
+        conn, bundles, arm="SAVE", expected_events=horizon,
+        union_ids=manager.eligible_ids, config=certified.save.route_config,
+        cache_dir=world_cache_dir,
     )
-    play_worlds = certified_route_worlds(
-        certified.play, arm="PLAY", expected_events=horizon[1:], authority=authority,
-        eligible_ids=manager.eligible_ids,
+    play_worlds = load_certified_route_worlds(
+        conn, bundles, arm="PLAY", expected_events=horizon[1:],
+        union_ids=manager.eligible_ids, config=certified.play.route_config,
+        cache_dir=world_cache_dir,
     )
 
     # ── A2: derive the expected start states, then CONVERT both arms HERE ─────
@@ -500,8 +513,8 @@ def build_free_hit_request(
         play_route=play_route,
         save_route=save_route,
         route_world_identities={
-            **{int(e): w.identity for e, w in certified.play.certified_worlds_by_event.items()},
-            **{int(e): w.identity for e, w in certified.save.certified_worlds_by_event.items()},
+            **{int(e): certified.world_identity for e in horizon[1:]},
+            **{int(e): certified.world_identity for e in horizon},
         },
         # The LOADED authority: derived here from the canonical certification
         # artifact, never accepted from the caller.
@@ -534,78 +547,103 @@ def build_free_hit_request(
     return request
 
 
-def certified_route_worlds(
-    arm_route: "FreeHitArmRoute",
+class _CertifiedRunIds:
+    """The four upstream run ids a certified bundle commits to.
+
+    ``route_optimizer.world_cache_key`` names them ``minutes/team/rate/xpts``; the
+    certification schema stores the same runs under their model-family names.
+    """
+
+    __slots__ = ("event", "minutes_run_id", "team_run_id", "rate_run_id", "xpts_run_id")
+
+    def __init__(self, event: int, runs: Mapping[str, Any]) -> None:
+        self.event = int(event)
+        self.minutes_run_id = int(runs["minutes_v1"])
+        self.team_run_id = int(runs["team_strength_v1"])
+        self.rate_run_id = int(runs["player_rates_v1"])
+        self.xpts_run_id = int(runs["xpts_v1"])
+
+
+def certified_event_bundles(authority: Any) -> dict[int, _CertifiedRunIds]:
+    """The certified run ids per event, straight from the loaded artifact."""
+
+    bundles: dict[int, _CertifiedRunIds] = {}
+    for event, row in (authority.bundle_map or {}).items():
+        runs = dict(row.get("runs") or {})
+        missing = [k for k in ("minutes_v1", "team_strength_v1", "player_rates_v1", "xpts_v1")
+                   if k not in runs]
+        if missing:
+            raise FreeHitAdapterError(
+                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the certified bundle for event {int(event)} "
+                f"omits run(s) {missing}; the numeric matrix cannot be loaded",
+                reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        bundles[int(event)] = _CertifiedRunIds(int(event), runs)
+    return bundles
+
+
+def load_certified_route_worlds(
+    conn: sqlite3.Connection,
+    bundles: Mapping[int, _CertifiedRunIds],
     *,
     arm: str,
     expected_events: Sequence[int],
-    authority: Any,
-    eligible_ids: Sequence[int] | None = None,
+    union_ids: Sequence[int],
+    config: Any,
+    cache_dir: Any | None = None,
 ) -> dict[int, dict[str, Any]]:
-    """Validate ONE arm's certified route worlds, then extract their matrices.
+    """Load ONE arm's route worlds from the CANONICAL matrix authority.
 
-    The invariant: the raw matrix handed to ``exact_evaluate`` is extracted from
-    the SAME artifact whose identity and intrinsic event were validated.  There is
-    no second map from which a matrix could come.
-
-    For every event this requires THREE-WAY equality --
-    ``world.event == mapping key == route event`` -- and then binds the world's
-    identity to the certified bundle for ``world.event``.  A missing key, an extra
-    key, a relabelled world or a world from another run/model refuses HERE, before
-    any exact evaluation.
+    ``route_optimizer.build_event_worlds`` is the accepted loader: it derives the
+    world-cache key from the CERTIFIED run ids, the Monte Carlo model identity, the
+    simulation count, the seed and the capture union, reads the matrix from the
+    content-addressed cache under that key (or regenerates it from those certified
+    runs), and STAMPS the result with that key.  The matrices returned here are the
+    loader's own output -- there is no caller matrix anywhere on the path.
     """
 
-    worlds = {int(k): w for k, w in (arm_route.certified_worlds_by_event or {}).items()}
-    expected = {int(e) for e in expected_events}
-    problems: list[str] = []
-    missing = sorted(expected - set(worlds))
-    extra = sorted(set(worlds) - expected)
-    if missing:
-        problems.append(f"{arm} route is missing certified world(s) for event(s) {missing}")
-    if extra:
-        problems.append(f"{arm} route carries certified world(s) for non-route event(s) {extra}")
-    for key, world in sorted(worlds.items()):
-        intrinsic = int(getattr(world, "event", -1))
-        if intrinsic != int(key):
-            problems.append(
-                f"{arm} route: the world stored under event {key} carries intrinsic event "
-                f"{intrinsic}; the container key is not evidence"
+    from . import route_optimizer as ro
+
+    loaded: dict[int, dict[str, Any]] = {}
+    union = tuple(int(p) for p in union_ids)
+    for event in expected_events:
+        event = int(event)
+        bundle = bundles.get(event)
+        if bundle is None:
+            raise FreeHitAdapterError(
+                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the certification certifies no bundle for "
+                f"{arm} route event {event}",
+                reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
             )
-        if not isinstance(world, WildcardWorldInputs):
-            problems.append(f"{arm} route event {key}: not a canonical certified world artifact")
-            continue
-        for problem in world.problems():
-            problems.append(f"{arm} route event {key}: {problem}")
-        # The matrix's PLAYER SET is bound too: a world from an unrelated universe
-        # cannot stand in for a route event's certified worlds.
-        if eligible_ids is not None:
-            expected_ids = {int(p) for p in eligible_ids}
-            actual_ids = {int(p) for p in world.player_ids}
-            if actual_ids != expected_ids:
-                problems.append(
-                    f"{arm} route event {key}: the world matrix covers "
-                    f"{len(actual_ids)} players, not the authoritative {len(expected_ids)}"
-                )
-        for dimension in authority.disagreements_with(
-            world.identity, event=intrinsic, label=f"{arm} route event {intrinsic} world identity"
-        ):
-            problems.append(f"{arm} route event {intrinsic}: {dimension}")
-    if problems:
-        raise FreeHitAdapterError(
-            f"{fh.FH_DECISION_AUTHORITY_MISMATCH}: "
-            + "; ".join(problems[:6]),
-            reasons=(fh.FH_DECISION_AUTHORITY_MISMATCH,),
-        )
-    # ONLY NOW are the matrices extracted -- from the artifacts just validated.
-    return {
-        int(key): {
-            "worlds": int(world.worlds),
-            "player_ids": tuple(world.player_ids),
-            "minutes": world.minutes,
-            "core": world.core,
+        try:
+            matrix, _info = ro.build_event_worlds(
+                conn, bundles, event, union, config, cache_dir=cache_dir
+            )
+        except Exception as exc:  # the canonical loader's own refusals are authoritative
+            raise FreeHitAdapterError(
+                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the canonical worlds for {arm} route event "
+                f"{event} could not be loaded from the certified bundle: {exc}",
+                reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
+            ) from exc
+        expected_key = ro.world_cache_key(event=event, bundle=bundle, config=config, union_ids=union)
+        stamp = str(matrix.get(ro.MANAGER_MATRIX_IDENTITY_KEY) or "")
+        if stamp != expected_key:
+            raise FreeHitAdapterError(
+                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the {arm} world matrix for event {event} does "
+                "not carry the canonical identity of its certified bundle",
+                reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        if {int(p) for p in matrix["player_ids"]} != set(union):
+            raise FreeHitAdapterError(
+                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the {arm} world matrix for event {event} does "
+                "not cover the authoritative universe",
+                reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        loaded[event] = {
+            "worlds": int(matrix["worlds"]), "player_ids": tuple(matrix["player_ids"]),
+            "minutes": matrix["minutes"], "core": matrix["core"],
         }
-        for key, world in worlds.items()
-    }
+    return loaded
 
 
 def _pool_disagreements(canonical: WildcardPoolBinding, supplied: WildcardPoolBinding) -> list[str]:
