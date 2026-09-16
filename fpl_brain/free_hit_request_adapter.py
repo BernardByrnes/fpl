@@ -49,6 +49,7 @@ from typing import Any, Mapping, Sequence
 
 from . import chip_decision as cd
 from . import chip_free_hit as fh
+from .free_hit_route import FreeHitRouteError
 from . import manager_lineup as ml
 from . import planning as planning_module
 from . import repositories as repo
@@ -268,6 +269,28 @@ def _canonical_market_prices(
 
 
 @dataclass(frozen=True)
+class FreeHitArmRoute:
+    """ONE arm's canonical route ingredients, before conversion.
+
+    These are the same inputs the accepted converter takes: the canonical
+    ``PartialRoute`` the route engine produced, the authoritative evaluation
+    worlds and position resolver and the route configuration.  Deliberately NOT a
+    ``FreeHitRoute``: accepting a converted DTO would bypass structural
+    validation, acquisition-basis validation, inter-event continuity, terminal-state
+    validation, ``exact_evaluate`` and route evaluation provenance all at once.
+    """
+
+    partial: Any
+    worlds_by_event: Mapping[int, Any]
+    positions_of: Any
+    route_config: Any
+    #: The predictive identity of each event's evaluation worlds, keyed BY the
+    #: event.  The key is not evidence -- it is compared against the certified
+    #: bundle for the event it names, so swapping two events' worlds cannot pass.
+    world_identities: Mapping[int, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class FreeHitCertifiedInputs:
     """The certified predictive evidence a caller must supply.
 
@@ -282,11 +305,12 @@ class FreeHitCertifiedInputs:
     h1_worlds: WildcardWorldInputs
     world_identity: WildcardPredictiveIdentity
     pool_binding: WildcardPoolBinding
-    #: The two arms' canonical routes.  Both are required: a played Free Hit and
-    #: an ordinary Gameweek enter H2 with different free-transfer banks, so an
-    #: H1-only comparison is not an exact four-GW chip decision.
-    play_route: fh.FreeHitRoute
-    save_route: fh.FreeHitRoute
+    #: The two arms' CANONICAL ROUTE INGREDIENTS -- never converted results.  The
+    #: adapter calls ``free_hit_route_from_canonical_route`` itself, so a caller has
+    #: no channel through which a route VALUE could reach the decision: there is no
+    #: ``FreeHitRoute`` parameter anywhere on the production path.
+    play: "FreeHitArmRoute"
+    save: "FreeHitArmRoute"
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +436,57 @@ def build_free_hit_request(
             reasons=(fh.FH_HORIZON_NOT_CANONICAL,),
         )
 
+    # ── B2: bind each arm's route-evaluation worlds to the certified bundle ──
+    # Per EVENT, before any exact evaluation, so a run or model-version swap on a
+    # single H2-H4 event refuses before its value could enter the decision.
+    play_worlds = {int(e): ident for e, ident in (certified.play.world_identities or {}).items()}
+    save_worlds = {int(e): ident for e, ident in (certified.save.world_identities or {}).items()}
+    for arm_label, identities in (("PLAY", play_worlds), ("SAVE", save_worlds)):
+        for event, supplied in sorted(identities.items()):
+            mismatches = authority.disagreements_with(
+                supplied, event=int(event), label=f"{arm_label} route event {int(event)} world identity"
+            )
+            if mismatches:
+                raise FreeHitAdapterError(
+                    f"{fh.FH_DECISION_AUTHORITY_MISMATCH}: " + "; ".join(mismatches),
+                    reasons=(fh.FH_DECISION_AUTHORITY_MISMATCH,),
+                )
+
+    # ── A2: derive the expected start states, then CONVERT both arms HERE ─────
+    # Conversion happens in the adapter, on the canonical routes, so the only
+    # routes that can enter the request are ones the accepted converter produced
+    # and ``exact_evaluate`` valued.
+    permanent = manager.permanent_state()
+    probe = fh.FreeHitRequest(
+        permanent=permanent, horizon_binding=binding, h1_worlds=certified.h1_worlds,
+        world_identity=certified.world_identity, positions=dict(manager.positions),
+        clubs=dict(manager.clubs), market_price_tenths=dict(manager.market_price_tenths),
+        pool_binding=certified.pool_binding, chip_available=bool(chip_available),
+        rules=rules if rules is not None else sr.SeasonRules(season="2026/27"),
+    )
+    play_expected = fh.play_h2_start_state(probe)
+    save_expected = fh.save_h1_start_state(probe)
+    try:
+        save_route = fh.free_hit_route_from_canonical_route(
+            certified.save.partial, arm=fh.ARM_SAVE,
+            expected_events=tuple(int(e) for e in binding.horizon_events),
+            rules=probe.rules, expected_start_state=save_expected,
+            worlds_by_event=dict(certified.save.worlds_by_event),
+            positions_of=certified.save.positions_of, route_config=certified.save.route_config,
+        )
+        play_route = fh.free_hit_route_from_canonical_route(
+            certified.play.partial, arm=fh.ARM_PLAY,
+            expected_events=tuple(int(e) for e in binding.horizon_events)[1:],
+            rules=probe.rules, expected_start_state=play_expected,
+            worlds_by_event=dict(certified.play.worlds_by_event),
+            positions_of=certified.play.positions_of, route_config=certified.play.route_config,
+        )
+    except FreeHitRouteError as exc:
+        raise FreeHitAdapterError(
+            f"{fh.FH_TAIL_ROUTE_INVALID}: the canonical route could not be converted: {exc}",
+            reasons=(fh.FH_TAIL_ROUTE_INVALID,),
+        ) from exc
+
     request = fh.FreeHitRequest(
         permanent=manager.permanent_state(),
         horizon_binding=binding,
@@ -421,8 +496,9 @@ def build_free_hit_request(
         clubs=dict(manager.clubs),
         market_price_tenths=dict(manager.market_price_tenths),
         pool_binding=certified.pool_binding,
-        play_route=certified.play_route,
-        save_route=certified.save_route,
+        play_route=play_route,
+        save_route=save_route,
+        route_world_identities={**play_worlds, **save_worlds},
         # The LOADED authority: derived here from the canonical certification
         # artifact, never accepted from the caller.
         decision_authority=authority,
@@ -482,10 +558,19 @@ def _state_disagreements(canonical: FreeHitManagerState, supplied: FreeHitManage
         )
     if int(supplied.bank_tenths) != int(canonical.bank_tenths):
         found.append(f"bank {int(supplied.bank_tenths)} != canonical {int(canonical.bank_tenths)}")
+    # The two free-transfer concepts are INDEPENDENT and both are authority.  The
+    # event-start bank is what a played chip preserves; the CURRENT bank is what a
+    # normal route may spend at H1.  Comparing only one lets the other be forged,
+    # and inferring either from the other is exactly the collapse to avoid.
     if int(supplied.event_start_free_transfers) != int(canonical.event_start_free_transfers):
         found.append(
             f"event-start free transfers {int(supplied.event_start_free_transfers)} != canonical "
             f"{int(canonical.event_start_free_transfers)}"
+        )
+    if int(supplied.free_transfers) != int(canonical.free_transfers):
+        found.append(
+            f"current free transfers {int(supplied.free_transfers)} != canonical "
+            f"{int(canonical.free_transfers)}"
         )
     basis_diff = sorted(
         pid for pid in supplied.owned_ids

@@ -24,6 +24,7 @@ from fpl_brain import chip_decision as cd  # noqa: E402
 from fpl_brain import chip_free_hit as fh  # noqa: E402
 from fpl_brain import free_hit_request_adapter as ad  # noqa: E402
 from fpl_brain import four_gw_decision as fg  # noqa: E402
+from fpl_brain import free_hit_route as fr  # noqa: E402
 from fpl_brain import repositories as repo  # noqa: E402
 from fpl_brain import season_rules as sr  # noqa: E402
 from fpl_brain.chip_wildcard import WildcardPoolBinding, WildcardPredictiveIdentity  # noqa: E402
@@ -44,6 +45,7 @@ CUTOFF = cf.CUTOFF
 DATA = cf.DATA_SNAPSHOT
 SOURCE = cf.CODE_SNAPSHOT
 CONFIG = cf.model_label(cf.MODEL_VERSIONS)
+GENERATION = cf.runs_label(cf.RUNS)
 CERT = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3))[
     "four_gw_certification_identity"
 ]
@@ -153,7 +155,7 @@ def conn(tmp_path):
 
 def _identity(**overrides) -> WildcardPredictiveIdentity:
     base = dict(cutoff=CUTOFF, data_snapshot_sha256=DATA, source_snapshot_sha256=SOURCE,
-                generation=CAPTURED_AT, model_config_identity=CONFIG)
+                generation=GENERATION, model_config_identity=CONFIG)
     base.update(overrides)
     return WildcardPredictiveIdentity(**base)
 
@@ -245,6 +247,48 @@ def _arms(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
     )
 
 
+def _arm_inputs(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
+    """Both arms as CANONICAL ROUTE INGREDIENTS — what production now accepts."""
+
+    import free_hit_route_fixtures as fx
+    from fpl_brain import transfer_state as ts
+
+    universe = tuple(int(pid) for pid in UNIVERSE)
+    meta = {pid: ts.PlayerMeta(pid, POSITION[pid], CLUB[pid]) for pid in universe}
+    ids = tuple(sorted(OWNED))
+    basis = {pid: 50 for pid in ids}
+
+    def _build(events, scores, free_transfers):
+        state = ts.RouteState(
+            event=int(events[0]),
+            players=tuple(ts.RoutePlayer(pid, POSITION[pid], CLUB[pid], basis[pid]) for pid in ids),
+            bank_tenths=20, free_transfers=int(free_transfers),
+        )
+        partial, _terminal = fx.build_canonical_route(
+            start=state, events=tuple(events), meta=meta, universe=universe, price_default=50,
+        )
+        worlds = {
+            int(event): {
+                "worlds": 24, "player_ids": list(universe),
+                "minutes": {pid: tuple(90.0 for _ in range(24)) for pid in universe},
+                "core": {pid: tuple(float(score) for _ in range(24)) for pid in universe},
+            }
+            for event, score in zip(events, scores)
+        }
+        return ad.FreeHitArmRoute(
+            partial=partial, worlds_by_event=worlds,
+            positions_of=lambda squad: {int(p): POSITION[int(p)] for p in squad},
+            route_config=fx.route_config(),
+            world_identities={int(event): _identity() for event in events},
+        )
+
+    return (
+        _build((EVENT + 1, EVENT + 2, EVENT + 3), play_scores,
+               fh.post_free_hit_ft_state(RULES, event_start_free_transfers=2)),
+        _build((EVENT, EVENT + 1, EVENT + 2, EVENT + 3), (1.0, *tuple(save_scores)), 2),
+    )
+
+
 def _permanent() -> fh.FreeHitPermanentState:
     return fh.FreeHitPermanentState(
         event=EVENT, owned_ids=tuple(sorted(OWNED)),
@@ -254,9 +298,9 @@ def _permanent() -> fh.FreeHitPermanentState:
 
 
 def _certified(**overrides) -> ad.FreeHitCertifiedInputs:
-    play_tail, save_tail = _arms()
+    play_tail, save_tail = _arm_inputs()
     base = dict(horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
-                pool_binding=_pool(), play_route=play_tail, save_route=save_tail)
+                pool_binding=_pool(), play=play_tail, save=save_tail)
     base.update(overrides)
     return ad.FreeHitCertifiedInputs(**base)
 
@@ -580,7 +624,7 @@ def test_prod_J_a_caller_certificate_matching_itself_cannot_replace_the_persiste
             ad.FreeHitCertifiedInputs(
                 horizon_binding=binding_b, h1_worlds=world_b, world_identity=_identity(
                     cutoff="2026-09-16T13:00:00Z"),
-                pool_binding=_pool(), play_route=_arms()[0], save_route=_arms()[1],
+                pool_binding=_pool(), play=_arm_inputs()[0], save=_arm_inputs()[1],
             ),
             conn=conn, certification_path=cert_b,
         )
@@ -626,3 +670,247 @@ def _permitted_false():
     payload = json.loads(json.dumps(cf.certification_artifact()))
     payload["decision_search_permitted"] = False
     return payload
+
+def start_state_for_save_arm(*, post_free_hit: bool = False):
+    """A SAVE-arm route built from a DIFFERENT fifteen when asked.
+
+    The SAVE arm must start H1 from the CURRENT PERMANENT squad, so a route built
+    from the temporary Free Hit squad is exactly the leak the converter refuses.
+    """
+
+    import free_hit_route_fixtures as fx
+    from fpl_brain import transfer_state as ts
+
+    universe = tuple(int(pid) for pid in UNIVERSE)
+    meta = {pid: ts.PlayerMeta(pid, POSITION[pid], CLUB[pid]) for pid in universe}
+    # A DIFFERENT fifteen: the temporary Free Hit squad must never be a route start.
+    ids = tuple(sorted(OWNED))
+    if post_free_hit:
+        ids = (3, 4, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 28, 29, 30)
+    state = ts.RouteState(
+        event=EVENT,
+        players=tuple(ts.RoutePlayer(pid, POSITION[pid], CLUB[pid], 50) for pid in ids),
+        bank_tenths=20, free_transfers=2,
+    )
+    partial, _terminal = fx.build_canonical_route(
+        start=state, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3),
+        meta=meta, universe=universe, price_default=50,
+    )
+    return type("R", (), {"partial": partial})()
+
+
+# ---------------------------------------------------------------------------
+# THE PRODUCTION ROUTE BOUNDARY — Sol's three P2 findings
+# ---------------------------------------------------------------------------
+
+
+def test_A1_the_production_api_has_no_converted_route_parameter():
+    """The direct-DTO 1,000,000 attack is impossible BY API, not merely guarded."""
+
+    fields = set(ad.FreeHitCertifiedInputs.__dataclass_fields__)
+    assert fields == {"horizon_binding", "h1_worlds", "world_identity", "pool_binding", "play", "save"}
+    assert "play_route" not in fields and "save_route" not in fields
+    for name in ("play", "save"):
+        arm = set(ad.FreeHitArmRoute.__dataclass_fields__)
+        assert arm == {"partial", "worlds_by_event", "positions_of", "route_config", "world_identities"}
+        # No route VALUE can be supplied: the arm carries ingredients, not results.
+        assert not arm & {"mean_net_core", "events", "value", "route_value", "evaluation"}
+
+
+def test_A2_a_canonical_partial_route_is_converted_internally(conn):
+    """The adapter calls the converter, so only converted routes reach the request."""
+
+    _seed(conn)
+    state = _state(conn)
+    request = ad.build_free_hit_request(state, _certified(), conn=conn, certification_path=CERT_PATH)
+    assert request.play_route.arm == fr.ARM_PLAY
+    assert request.save_route.arm == fr.ARM_SAVE
+    assert [e.event for e in request.play_route.events] == [EVENT + 1, EVENT + 2, EVENT + 3]
+    assert [e.event for e in request.save_route.events] == [EVENT, EVENT + 1, EVENT + 2, EVENT + 3]
+    # Both were valued by the canonical evaluator, not by the caller.
+    assert all(e.mean_gross_core > 0.0 for e in request.save_route.events)
+
+
+def test_A3_the_save_route_starts_from_the_canonical_permanent_h1_state(conn):
+    _seed(conn)
+    request = ad.build_free_hit_request(
+        _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+    )
+    assert request.save_route.start_state["squad_ids"] == sorted(OWNED)
+    assert request.save_route.start_state["event"] == EVENT
+    assert request.save_route.start_state["free_transfers"] == 2
+
+
+def test_A4_the_play_route_never_starts_from_a_temporary_squad(conn):
+    _seed(conn)
+    request = ad.build_free_hit_request(
+        _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
+    )
+    assert request.play_route.start_state["squad_ids"] == sorted(OWNED)
+    assert request.play_route.start_state["event"] == EVENT + 1
+    assert request.play_route.start_state["free_transfers"] == fh.post_free_hit_ft_state(
+        RULES, event_start_free_transfers=2
+    )
+
+
+def test_A5_a_route_with_the_wrong_start_state_refuses(conn):
+    """The converter's basis/state authority still applies through production."""
+
+    _seed(conn)
+    play, save = _arm_inputs()
+    # A SAVE route whose H1 state is the RESTORED (post-chip) state is the wrong arm.
+    post_chip = start_state_for_save_arm(post_free_hit=True)
+    broken = ad.FreeHitArmRoute(
+        partial=post_chip.partial, worlds_by_event=save.worlds_by_event,
+        positions_of=save.positions_of, route_config=save.route_config,
+        world_identities=save.world_identities,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            _state(conn),
+            ad.FreeHitCertifiedInputs(
+                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
+                pool_binding=_pool(), play=play, save=broken,
+            ),
+            conn=conn, certification_path=CERT_PATH,
+        )
+    assert caught.value.reasons[0] == fh.FH_TAIL_ROUTE_INVALID
+
+
+# ---------------------------------------------------------------------------
+# B — EVENT-SPECIFIC CERTIFIED BUNDLE BINDING
+# ---------------------------------------------------------------------------
+
+
+def test_B1_the_H1_world_must_be_the_exact_certified_H1_bundle(conn):
+    """Sol's attack: both request-owned identities moved to run/model B.
+
+    The certified H1 bundle carries A; agreement between the two caller objects is
+    not authority, and the binding is now per event rather than global.
+    """
+
+    _seed(conn)
+    world_b = _identity(generation="sha256:" + "b" * 64)
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            _state(conn),
+            _certified(h1_worlds=_h1_worlds(identity=world_b), world_identity=world_b),
+            conn=conn, certification_path=CERT_PATH,
+        )
+    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
+    assert "generation" in str(caught.value)
+
+
+def test_B2_a_route_event_world_from_another_run_refuses(conn):
+    """H2-H4 evaluation worlds are bound per event, before any exact evaluation."""
+
+    _seed(conn)
+    play, save = _arm_inputs()
+    identities = dict(save.world_identities)
+    identities[EVENT + 2] = _identity(generation="sha256:" + "9" * 64)   # H3's world, other run
+    broken = ad.FreeHitArmRoute(
+        partial=save.partial, worlds_by_event=save.worlds_by_event,
+        positions_of=save.positions_of, route_config=save.route_config,
+        world_identities=identities,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            _state(conn),
+            ad.FreeHitCertifiedInputs(
+                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
+                pool_binding=_pool(), play=play, save=broken,
+            ),
+            conn=conn, certification_path=CERT_PATH,
+        )
+    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
+    assert f"route event {EVENT + 2}" in str(caught.value)
+
+
+def test_B3_a_route_event_world_with_another_model_version_refuses(conn):
+    _seed(conn)
+    play, save = _arm_inputs()
+    identities = dict(play.world_identities)
+    identities[EVENT + 1] = _identity(model_config_identity="sha256:" + "8" * 64)
+    broken = ad.FreeHitArmRoute(
+        partial=play.partial, worlds_by_event=play.worlds_by_event,
+        positions_of=play.positions_of, route_config=play.route_config,
+        world_identities=identities,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            _state(conn),
+            ad.FreeHitCertifiedInputs(
+                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
+                pool_binding=_pool(), play=broken, save=save,
+            ),
+            conn=conn, certification_path=CERT_PATH,
+        )
+    assert f"route event {EVENT + 1}" in str(caught.value)
+    assert "model_config_identity" in str(caught.value)
+
+
+def test_B4_swapping_two_events_worlds_refuses(conn):
+    """The intrinsic event identity must agree with the key AND the certificate.
+
+    The certificate gives each event its OWN runs, so relabelling a world under
+    another event's key cannot pass: the identity is compared against the bundle
+    for the event it NAMES.
+    """
+
+    _seed(conn)
+    per_event = {
+        EVENT + 1: {"runs": {"xpts": 111, "minutes": 102, "team": 103}},
+        EVENT + 2: {"runs": {"xpts": 222, "minutes": 102, "team": 103}},
+        EVENT + 3: {"runs": {"xpts": 333, "minutes": 102, "team": 103}},
+    }
+    artifact = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), per_event=per_event)
+    split = cf.write_artifact(Path(tempfile.mkdtemp()), artifact, name="split.json")
+    play, save = _arm_inputs()
+    swapped = dict(save.world_identities)
+    swapped[EVENT + 1] = cf.identity_for(artifact["certified_bundles"][str(EVENT + 2)])
+    broken = ad.FreeHitArmRoute(
+        partial=save.partial, worlds_by_event=save.worlds_by_event,
+        positions_of=save.positions_of, route_config=save.route_config,
+        world_identities=swapped,
+    )
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(
+            _state(conn),
+            ad.FreeHitCertifiedInputs(
+                horizon_binding=_binding(), h1_worlds=_h1_worlds(), world_identity=_identity(),
+                pool_binding=_pool(), play=play, save=broken,
+            ),
+            conn=conn, certification_path=split,
+        )
+    assert caught.value.reasons[0] == fh.FH_DECISION_AUTHORITY_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# C — CURRENT FREE TRANSFERS ARE MANAGER AUTHORITY TOO
+# ---------------------------------------------------------------------------
+
+
+def test_C1_a_forged_current_free_transfers_refuses(conn):
+    """Canonical current FT = 2, caller current FT = 5, everything else canonical."""
+
+    _seed(conn)
+    canonical = _state(conn)
+    forged = dataclasses.replace(canonical, free_transfers=5)
+    assert forged.event_start_free_transfers == canonical.event_start_free_transfers
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
+    assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
+    assert "current free transfers" in str(caught.value)
+
+
+def test_C2_a_forged_event_start_free_transfers_also_refuses(conn):
+    """The two concepts stay INDEPENDENT: neither is inferred from the other."""
+
+    _seed(conn)
+    canonical = _state(conn)
+    forged = dataclasses.replace(canonical, event_start_free_transfers=5)
+    assert forged.free_transfers == canonical.free_transfers
+    with pytest.raises(ad.FreeHitAdapterError) as caught:
+        ad.build_free_hit_request(forged, _certified(), conn=conn, certification_path=CERT_PATH)
+    assert caught.value.reasons[0] == ad.FH_CALLER_STATE_DISAGREES
+    assert "event-start free transfers" in str(caught.value)

@@ -50,11 +50,21 @@ def bundle(
 
 
 def certification_artifact(
-    events: Sequence[int] = (5, 6, 7, 8), **bundle_overrides: Any
+    events: Sequence[int] = (5, 6, 7, 8),
+    per_event: Mapping[int, Mapping[str, Any]] | None = None,
+    **bundle_overrides: Any
 ) -> dict[str, Any]:
-    """A complete, schema-valid v2 artifact, self-consistent by construction."""
+    """A complete, schema-valid v2 artifact, self-consistent by construction.
 
-    bundles = {str(int(event)): bundle(int(event), **bundle_overrides) for event in events}
+    ``per_event`` gives ONE event its own bundle dimensions, so a test can prove
+    that a bundle is bound to its INTRINSIC event rather than to a container key.
+    """
+
+    per_event = per_event or {}
+    bundles = {
+        str(int(event)): bundle(int(event), **{**bundle_overrides, **per_event.get(int(event), {})})
+        for event in events
+    }
     declared = {event: cb.canonical_bundle_identity(row) for event, row in bundles.items()}
     first = bundles[str(int(events[0]))]
     payload = {

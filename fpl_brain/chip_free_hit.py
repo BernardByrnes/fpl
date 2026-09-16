@@ -338,6 +338,11 @@ class FreeHitRequest:
     #: carry values computed by ``route_optimizer.exact_evaluate``.
     play_route: FreeHitRoute | None = None
     save_route: FreeHitRoute | None = None
+    #: The predictive identity of each ROUTE event's evaluation worlds, keyed by
+    #: the event itself.  The key is not evidence: the identity is compared against
+    #: the certified bundle for the event the map says, so swapping two events'
+    #: worlds cannot pass by relabelling the container.
+    route_world_identities: Mapping[int, Any] = field(default_factory=dict)
     #: The CANONICAL certified decision context every predictive dimension is
     #: anchored to.  Comparing two request-owned identities against each other
     #: proves nothing, so the authority -- not a second supplied object -- is
@@ -898,9 +903,14 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
         # BOTH the bound identity and the world's identity must be the CERTIFIED
         # one.  Requiring only that they agree with each other is exactly the
         # self-certification this closes.
+        # Bound to the EXACT certified bundle for H1.  Without ``event=`` the
+        # authority can only compare the artifact's global fields, so a world whose
+        # run or model versions were swapped for another certified event's would
+        # pass.  The H1 event is the planning event.
+        h1_event = int(request.planning_event)
         for label, supplied in (("bound identity", identity := request.world_identity),
                                 ("world matrix identity", worlds_identity_of(request))):
-            for dimension in authority.disagreements_with(supplied, label=label):
+            for dimension in authority.disagreements_with(supplied, event=h1_event, label=label):
                 problems.append(f"{FH_DECISION_AUTHORITY_MISMATCH}: {dimension}")
         if str(binding.certification_identity) != str(authority.certification_identity):
             problems.append(
@@ -981,6 +991,18 @@ def contract_problems(request: FreeHitRequest) -> list[str]:
                 f"{FH_WORLD_KEYSET_MISMATCH}: the world matrix carries {len(extra)} non-official "
                 f"player(s): {extra[:8]}"
             )
+
+    # ── route-evaluation worlds must BE the certified bundle for THEIR event ──
+    # Each arm's evaluation worlds are validated per event, not all against H1 and
+    # not merely against the artifact's global identity, so a run or model-version
+    # swap on one H2-H4 event refuses before any route value can enter the decision.
+    if request.route_world_identities:
+        for event in sorted(int(e) for e in request.route_world_identities):
+            supplied = request.route_world_identities[int(event)]
+            for dimension in authority.disagreements_with(
+                supplied, event=int(event), label=f"route event {int(event)} world identity"
+            ):
+                problems.append(f"{FH_DECISION_AUTHORITY_MISMATCH}: {dimension}")
 
     play_route = request.play_route
     save_route = request.save_route
