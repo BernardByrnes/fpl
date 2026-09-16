@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fpl_brain import chip_decision as cd  # noqa: E402
 from fpl_brain import chip_free_hit as fh  # noqa: E402
@@ -26,15 +27,21 @@ from fpl_brain.chip_wildcard import (  # noqa: E402
     WildcardPoolBinding, WildcardPredictiveIdentity, WildcardWorldInputs,
 )
 from fpl_brain.ingest_provenance import element_id_sha256  # noqa: E402
+import free_hit_certification_fixtures as cf  # noqa: E402
 
 EVENT = 5
 WORLDS = 8
-CUTOFF = "2026-09-16T11:00:00Z"
-DATA = "sha256:" + "d" * 64
-SOURCE = "sha256:" + "s" * 64
-CERT = "sha256:" + "c" * 64
-GENERATION = "2026-09-16T08:00:00Z"
-CONFIG = "sha256:" + "f" * 64
+#: Every predictive constant is derived from the CERTIFICATION FIXTURE, because
+#: the authority now anchors each dimension to the certified bundle rather than to
+#: another request-owned object.
+CUTOFF = cf.CUTOFF
+DATA = cf.DATA_SNAPSHOT
+SOURCE = cf.CODE_SNAPSHOT
+GENERATION = cf.runs_label(cf.RUNS)
+CONFIG = cf.model_label(cf.MODEL_VERSIONS)
+CERT = cf.certification_artifact(events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3))[
+    "four_gw_certification_identity"
+]
 RULES = sr.SeasonRules(season="2026/27")
 
 #: A small but complete universe: 4 GKP / 10 DEF / 10 MID / 6 FWD, so a legal
@@ -65,11 +72,28 @@ def _identity(**overrides) -> WildcardPredictiveIdentity:
     return WildcardPredictiveIdentity(**base)
 
 
-def _binding(event: int = EVENT, snapshot: str = DATA, events=None) -> cd.ChipHorizonBinding:
+def _binding(event: int = EVENT, snapshot: str = DATA, events=None, identity=None) -> cd.ChipHorizonBinding:
     return cd.ChipHorizonBinding(
         planning_event=int(event),
         horizon_events=events if events is not None else cd.canonical_chip_horizon(int(event)),
-        certification_identity=CERT, data_snapshot_sha256=snapshot,
+        certification_identity=(identity or _authority().certification_identity),
+        data_snapshot_sha256=snapshot,
+    )
+
+
+def _authority(**overrides):
+    """The certified decision context, derived from a REAL-schema artifact.
+
+    ``overrides`` name the CERTIFIED BUNDLE dimensions (``cutoff``, ``snapshot``,
+    ``code``, ``context``, ``runs``, ``models``); a test that wants to attack one
+    dimension mutates the certificate rather than a request-owned object.
+    """
+
+    return fh.FreeHitDecisionAuthority.from_certification(
+        cf.certification_artifact(
+            events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), **overrides
+        ),
+        loaded_from="<test certificate>",
     )
 
 
@@ -104,7 +128,7 @@ def _permanent(owned: tuple[int, ...], *, bank: int = 20, ft: int = 2,
     return fh.FreeHitPermanentState(
         event=EVENT, owned_ids=tuple(sorted(owned)),
         purchase_price_tenths=basis if basis is not None else {pid: 50 for pid in owned},
-        bank_tenths=int(bank), event_start_free_transfers=int(ft),
+        bank_tenths=int(bank), free_transfers=int(ft), event_start_free_transfers=int(ft),
         positions=POSITION, clubs=CLUB,
     )
 
@@ -113,16 +137,138 @@ def _market(prices: dict[int, int] | None = None) -> dict[int, int]:
     return prices if prices is not None else {pid: 50 for pid in UNIVERSE}
 
 
+# ---------------------------------------------------------------------------
+# FOUR-GW ARM HELPERS — the canonical route shape, not a bespoke one
+# ---------------------------------------------------------------------------
+
+TAIL_EVENTS = (EVENT + 1, EVENT + 2, EVENT + 3)
+
+
+def _canonical_route(
+    *,
+    arm,
+    events,
+    permanent,
+    bank_tenths,
+    free_transfers,
+    values,
+    transfers=None,
+    universe=None,
+):
+    """Build ONE arm's route through the fixture builder and the converter.
+
+    ``values`` sets the per-event WORLD score, not a route value: a uniform score
+    ``s`` over the eleven starters plus the armband yields ``12 * s`` per event,
+    so a test controls the world and the ENGINE produces the number.
+    """
+
+    import free_hit_route_fixtures as fx
+    from fpl_brain import free_hit_route as fr
+
+    universe = tuple(int(p) for p in (universe if universe is not None else UNIVERSE))
+    ids = tuple(sorted(int(p) for p in permanent.owned_ids))
+    start = ts.RouteState(
+        event=int(events[0]),
+        players=tuple(
+            ts.RoutePlayer(int(pid), POSITION[int(pid)], CLUB[int(pid)],
+                           int(permanent.purchase_price_tenths.get(int(pid), 50)))
+            for pid in ids
+        ),
+        bank_tenths=int(bank_tenths),
+        free_transfers=int(free_transfers),
+    )
+    meta = {pid: ts.PlayerMeta(pid, POSITION[pid], CLUB[pid]) for pid in universe}
+    partial, _terminal = fx.build_canonical_route(
+        start=start, events=tuple(events), transfers=transfers or {}, meta=meta,
+        universe=universe, price_default=50,
+    )
+    worlds = {
+        int(event): _world_matrix(event=int(event), uniform=(float(value) / 12.0), universe=universe)
+        for event, value in zip(events, values)
+    }
+    expected_start = {
+        "event": int(events[0]),
+        "squad_ids": list(ids),
+        "bank_tenths": int(bank_tenths),
+        "free_transfers": int(free_transfers),
+        "purchase_price_tenths": {
+            int(pid): int(permanent.purchase_price_tenths.get(int(pid), 50)) for pid in ids
+        },
+    }
+    return fr.free_hit_route_from_canonical_route(
+        partial, arm=arm, expected_events=tuple(events), rules=RULES,
+        expected_start_state=expected_start, worlds_by_event=worlds,
+        positions_of=lambda squad: {int(p): POSITION[int(p)] for p in squad},
+        route_config=fx.route_config(),
+    )
+
+
+def _world_matrix(*, event, uniform, universe):
+    """A canonical world matrix with a UNIFORM score for every player."""
+
+    return {
+        "worlds": 24,
+        "player_ids": list(universe),
+        "minutes": {pid: tuple(90.0 for _ in range(24)) for pid in universe},
+        "core": {pid: tuple(float(uniform) for _ in range(24)) for pid in universe},
+    }
+
+
+def _tails(
+    permanent,
+    *,
+    rules=None,
+    play_values=(10.0, 10.0, 10.0),
+    save_values=(10.0, 10.0, 10.0),
+):
+    """Both arms' routes, each anchored to its OWN canonical starting state.
+
+    PLAY starts H2 from the RESTORED permanent state (post-Free-Hit FT); SAVE
+    starts H1 from the CURRENT permanent state.  Those free-transfer counts
+    genuinely differ, which is exactly what the four-GW comparison must reflect.
+    """
+
+    from fpl_brain import chip_free_hit as _fh
+    from fpl_brain import free_hit_route as fr
+
+    rules = rules if rules is not None else RULES
+    universe = tuple(int(p) for p in UNIVERSE)
+    save_ft = int(permanent.free_transfers)
+    play_ft = int(_fh.post_free_hit_ft_state(
+        rules, event_start_free_transfers=permanent.event_start_free_transfers))
+    play = _canonical_route(
+        arm=fr.ARM_PLAY, events=TAIL_EVENTS, permanent=permanent,
+        bank_tenths=int(permanent.bank_tenths), free_transfers=play_ft,
+        values=play_values, universe=universe,
+    )
+    # SAVE spans H1-H4.  Its H1 uses the SAME uniform world score as the permanent
+    # H1 baseline (12.0 on this fifteen), so the two arms remain commensurate.
+    save = _canonical_route(
+        arm=fr.ARM_SAVE, events=(EVENT, *TAIL_EVENTS), permanent=permanent,
+        bank_tenths=int(permanent.bank_tenths), free_transfers=save_ft,
+        values=(12.0, *tuple(save_values)), universe=universe,
+    )
+    return play, save
+
+
 def _request(
     owned: tuple[int, ...] = LEGAL_OWNED,
     *, core=None, minutes=None, worlds=None, identity=None, event=EVENT,
     snapshot=DATA, prices=None, bank=20, ft=2, basis=None,
-    pool: WildcardPoolBinding | None = None, **overrides,
+    pool: WildcardPoolBinding | None = None, play_tail=None, save_tail=None,
+    authority=None, **overrides,
 ) -> fh.FreeHitRequest:
     h1 = worlds if worlds is not None else _worlds(core, minutes, event=event,
                                                     identity=identity)
+    permanent = _permanent(owned, bank=bank, ft=ft, basis=basis)
+    tails = play_tail, save_tail = (
+        (play_tail, save_tail) if play_tail is not None and save_tail is not None else _tails(permanent)
+    )
     base = dict(
-        permanent=_permanent(owned, bank=bank, ft=ft, basis=basis),
+        permanent=permanent,
+        play_route=play_tail,
+        save_route=save_tail,
+        decision_authority=_authority() if authority is None else authority,
         horizon_binding=_binding(event, snapshot),
         h1_worlds=h1,
         world_identity=identity if identity is not None else _identity(),
@@ -372,7 +518,8 @@ def test_four_from_one_club_refuses():
         permanent=fh.FreeHitPermanentState(
             event=EVENT, owned_ids=_legal_owned(),
             purchase_price_tenths={pid: 50 for pid in _legal_owned()},
-            bank_tenths=20, event_start_free_transfers=2, positions=POSITION, clubs=crowded,
+            bank_tenths=20, free_transfers=2, event_start_free_transfers=2,
+            positions=POSITION, clubs=crowded,
         ),
         horizon_binding=request.horizon_binding, h1_worlds=request.h1_worlds,
         world_identity=request.world_identity, positions=POSITION, clubs=crowded,
@@ -971,7 +1118,7 @@ def test_the_evaluation_carries_the_certified_context():
     evaluation = fh.evaluate_free_hit(_improving_request())
     assert evaluation.evidence["data_snapshot_sha256"] == DATA
     assert evaluation.evidence["horizon_events"] == list(cd.canonical_chip_horizon(EVENT))
-    assert evaluation.evidence["certification_identity"] == CERT
+    assert evaluation.evidence["certification_identity"] == _authority().certification_identity
     assert evaluation.evidence["free_hit_quantitative_capability"] == "SUPPORTED_REVIEW_ONLY"
 
 
