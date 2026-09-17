@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import time
+from collections.abc import Callable
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -123,6 +124,7 @@ class FplClient:
         endpoint_slug: str | None = None,
         bootstrap_shape: bool = False,
         event: int | None = None,
+        validator: Callable[[Any], None] | None = None,
     ) -> dict[str, Any] | list[Any]:
         endpoint = path
         slug = endpoint_slug or path.strip("/").replace("/", "_").replace("?", "_").replace("=", "_")
@@ -168,6 +170,14 @@ class FplClient:
                     if not required.issubset(payload):  # type: ignore[arg-type]
                         missing = ", ".join(sorted(required.difference(payload)))  # type: ignore[arg-type]
                         raise FplInvalidResponseError(f"bootstrap-static missing top-level keys: {missing}")
+                if validator is not None:
+                    # The endpoint's own full validation contract gates archive
+                    # admission: a payload the endpoint rejects is never
+                    # admitted as historical evidence.  The failure propagates
+                    # unchanged (no retry, no archive).  Validation inspects
+                    # the parsed payload; the archive below still persists the
+                    # ORIGINAL response.content, never a reserialization.
+                    validator(payload)
                 # Archive the EXACT received bytes, and only after the response
                 # has been accepted as a valid capture.  A malformed or
                 # unexpected-shape body is therefore never admitted as
@@ -215,7 +225,20 @@ class FplClient:
             time.sleep(self.polite_delay - elapsed)
 
     def get_bootstrap_static(self) -> dict[str, Any]:
-        return self._get("bootstrap-static/", "dict", "bootstrap_static", bootstrap_shape=True)  # type: ignore[return-value]
+        from . import parsers as _parsers
+
+        def _validate_full_bootstrap(payload: Any) -> None:
+            # The SAME existing bootstrap validator ingest enforces, applied
+            # here so archive admission cannot certify an observation ingest
+            # would reject.  Parsed with the same call shape ingest uses; the
+            # local import keeps transport free of any import cycle.
+            records = _parsers.parse_bootstrap(payload, self.observed_at)
+            _parsers.validate_bootstrap_payload(payload, records)
+
+        return self._get(  # type: ignore[return-value]
+            "bootstrap-static/", "dict", "bootstrap_static",
+            bootstrap_shape=True, validator=_validate_full_bootstrap,
+        )
 
     def get_fixtures(self, event: int | None = None) -> list[Any]:
         path = "fixtures/" if event is None else f"fixtures/?event={int(event)}"

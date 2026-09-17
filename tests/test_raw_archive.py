@@ -19,8 +19,17 @@ from fpl_brain.api import FplClient, FplInvalidResponseError
 
 CAPTURE_A = "2026-09-17T01:23:45Z"
 CAPTURE_B = "2026-09-17T05:00:00Z"
-BODY_ONE = b'{"elements": [{"id": 1}], "teams": [], "events": []}'
-BODY_TWO = b'{"elements": [{"id": 1}, {"id": 2}], "teams": [], "events": []}'
+# Archive fixtures must satisfy the endpoint's own full validation contract
+# (DH-01 gates admission on it): non-empty elements with id/web_name and a
+# credible non-empty teams collection.
+BODY_ONE = (
+    b'{"elements": [{"id": 1, "web_name": "P1"}], '
+    b'"teams": [{"id": 1, "name": "Arsenal"}], "events": []}'
+)
+BODY_TWO = (
+    b'{"elements": [{"id": 1, "web_name": "P1"}, {"id": 2, "web_name": "P2"}], '
+    b'"teams": [{"id": 1, "name": "Arsenal"}], "events": []}'
+)
 
 
 class _FakeResponse:

@@ -50,7 +50,11 @@ def test_retry_timeout_retry_after_and_raw_persistence(monkeypatch, tmp_path):
     sleeps = []
     monkeypatch.setattr("fpl_brain.api.time.sleep", lambda delay: sleeps.append(delay))
     monkeypatch.setattr("fpl_brain.api.random.uniform", lambda *_: 0.0)
-    body = json.dumps({"elements": [], "teams": [], "events": []})
+    body = json.dumps({
+        "elements": [{"id": 1, "web_name": "P1"}],
+        "teams": [{"id": 1, "name": "Arsenal"}],
+        "events": [],
+    })
     client = FplClient(config, raw_dir=tmp_path / "raw", run_id=7)
     session = FakeSession([FakeResponse(500), FakeResponse(200, body)])
     client.session = session
