@@ -2155,7 +2155,15 @@ def strategy_row(conn: sqlite3.Connection) -> dict[str, Any] | None:
 
 
 _COMPLETED_PERFORMANCE_FROM = "FROM player_gameweeks p JOIN fixtures f ON f.id=p.fixture_id AND f.finished=1"
-_COMPLETED_PERFORMANCE_WHERE = "p.fixture_id IS NOT NULL AND p.fixture_id != -1"
+#: A finished fixture is NECESSARY but not sufficient: the same refresh sequence
+#: that skips the element-summary endpoint leaves pre-round schedule rows behind
+#: on a completed fixture, and those rows carry no observation at all.  The
+#: canonical placeholder signature is therefore part of this boundary, so every
+#: consumer of completed rows -- outcomes, completeness audits and the market
+#: report -- agrees with the causal-history readers on what an observation is.
+_COMPLETED_PERFORMANCE_WHERE = (
+    "p.fixture_id IS NOT NULL AND p.fixture_id != -1 AND " + gameweek_has_performance_sql("p")
+)
 
 
 def completed_player_fixture_rows(
@@ -2167,13 +2175,15 @@ def completed_player_fixture_rows(
     events: Sequence[int] | None = None,
     fixture_ids: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return only player-fixture rows proven complete by their fixture.
+    """Return only player-fixture rows that carry a real realised observation.
 
     This is the single reusable completed-performance boundary. A future
-    element-summary schedule can contain minutes=0, while a completed player
-    can legitimately also have zero minutes; neither value is a completion
-    marker. Sentinel/null fixture references are excluded and fixture
-    finished=1 is authoritative.
+    element-summary schedule can contain minutes=0, while a completed player can
+    legitimately also have zero minutes; neither value is a completion marker.
+    Sentinel/null fixture references are excluded, and a row must additionally
+    satisfy the canonical scheduled-placeholder signature -- a finished fixture
+    whose rows were never refreshed holds placeholders, not outcomes, and
+    admitting them would record "we do not know yet" as "he scored nothing".
     """
 
     if event is not None and events is not None:

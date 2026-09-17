@@ -47,16 +47,30 @@ NAIVE_P90_MINIMUM_PLAYED_MINUTES = 90
 
 
 def code_revision() -> str | None:
-    """Git revision of the running code tree, when available."""
+    """Git revision of the repository containing the EXECUTING source.
+
+    Resolved from this module's own location, never from the process working
+    directory: a caller may run from a different checkout or worktree, and the
+    recorded revision must identify the code that actually produced the
+    prediction.  Running ``git rev-parse`` in the CWD would silently record the
+    launcher's repository instead, so an execution run from a second worktree
+    would be attributed to unrelated commits.
+
+    Preserves the existing fallback: when the source is not inside a Git
+    worktree (or git is unavailable) this returns None rather than inventing a
+    revision.
+    """
 
     try:
         import subprocess
 
+        source_root = Path(__file__).resolve().parents[1]
         result = subprocess.run(
             ["git", "-c", "safe.directory=*", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
+            cwd=str(source_root),
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -976,6 +990,11 @@ def freeze_baselines_for_event(
             {"window": RECENT_BASELINE_WINDOW, "p90_min_minutes": NAIVE_P90_MINIMUM_PLAYED_MINUTES}
         ),
         deadline_status=deadline_status,
+        # The baselines are scored comparison arms inside the certified bundle,
+        # so they carry the same code fingerprint as every other family.  A NULL
+        # here is not "no claim": it silently escapes certified_bundle's
+        # cross-family code-snapshot check, leaving the arm unbound.
+        source_snapshot_sha256=source_snapshot_sha256(),
     )
     fixtures_by_team = event_fixture_map(conn, planning_event)
     pooled_minutes = positional_pooled_minutes(conn, planning_event, cutoff)

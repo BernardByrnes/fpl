@@ -702,10 +702,24 @@ def evaluate_monte_carlo_run(conn: sqlite3.Connection, run_id: int, event: int) 
         if payload.get("q10") is not None and payload.get("q90") is not None:
             inside80.append(1.0 if float(payload["q10"]) <= reconstructed <= float(payload["q90"]) else 0.0)
 
+        # ``p_clean_sheet_eligible`` is the simulator's P(the player EARNED clean-sheet
+        # points): its flag is set in the same block that awards them and requires
+        # ``clean_sheet_points_for(position) > 0``.  The realised target must therefore
+        # be the same scoring event, NOT the raw ``clean_sheets`` column, which the
+        # official feed sets for any player on for 60+ minutes of a non-conceding
+        # match -- forwards included, who score nothing for it.  Both clauses come
+        # from the one versioned rule object so producer and target cannot drift.
+        cs_scoring_event = (
+            1.0
+            if DEFAULT_SCORING_RULES.earns_clean_sheet_points(
+                str(position or ""), int(actual["minutes"] or 0), int(actual["goals_conceded"] or 0)
+            )
+            else 0.0
+        )
         for key, actual_value, bucket in (
             ("p_goal", 1.0 if int(actual["goals_scored"] or 0) > 0 else 0.0, brier_goal),
             ("p_assist", 1.0 if int(actual["assists"] or 0) > 0 else 0.0, brier_assist),
-            ("p_clean_sheet_eligible", 1.0 if int(actual["clean_sheets"] or 0) > 0 else 0.0, brier_cs),
+            ("p_clean_sheet_eligible", cs_scoring_event, brier_cs),
         ):
             value = payload.get(key)
             if value is not None and math.isfinite(float(value)):
@@ -826,6 +840,17 @@ def evaluate_xpts_run(conn: sqlite3.Connection, run_id: int, event: int) -> dict
         if payload.get("expected_xa") is not None and actual["expected_assists"] is not None:
             add("xa_mae", abs(float(payload["expected_xa"]) - float(actual["expected_assists"])))
         if payload.get("clean_sheet_probability") is not None:
+            # DELIBERATELY the raw physical flag, and deliberately NOT the
+            # position-conditioned scoring event used for ``p_clean_sheet_eligible``
+            # above.  These are two different persisted probabilities with two
+            # different meanings: ``xpts._clean_sheet_probability`` models
+            # "60+ minutes of exposure with no opponent goal during it" and is
+            # stored for every position (a forward's value is positive; only the
+            # expected-POINTS layer multiplies it by ``clean_sheet_points_for``),
+            # whereas the simulator's ``p_clean_sheet_eligible`` already excludes
+            # positions that score nothing for a clean sheet.  Matching each target
+            # to its own producer is what keeps them comparable; harmonising the two
+            # targets would break one of them.
             add("clean_sheet_brier", (float(payload["clean_sheet_probability"]) - (1.0 if actual["clean_sheets"] else 0.0)) ** 2)
         if payload.get("defcon_p_hit") is not None and actual["defensive_contribution"] is not None:
             threshold = (DEFAULT_SCORING_RULES.defcon_threshold_for(str(record["position"])) or 10**9)

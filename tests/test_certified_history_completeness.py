@@ -39,6 +39,15 @@ import certify_gw5_gw8 as certifier  # noqa: E402
 
 PLANNING_EVENT = 5
 CUTOFF = "2026-09-14T08:14:22Z"
+# The R5 artifact is a HISTORICAL fact, so the tests read the archived bytes
+# rather than the live working path: a normal certification run legitimately
+# supersedes that path (the PE-2 forward anchor did), and a test that pins it
+# would then assert R5 behaviour against a different artifact generation.  The
+# archive preserves the exact R5 bytes; the live path is the current certified
+# generation and is not addressed here.
+R5_ARTIFACT = Path(
+    "K:/FPL/data/exports/four_gw/gw05/archive_pre_pe2_anchor/certification_artifact.json"
+)
 R5_SNAPSHOT = Path(
     "K:/FPL/data/exports/four_gw/gw05/snapshots/"
     "1e7fd22e-8b2d-44d6-9442-789d147287b7/execution_source_snapshot.db"
@@ -797,11 +806,11 @@ def test_D_legacy_v1_without_the_audit_needs_a_recognised_identity(tmp_path, mon
 
 
 @pytest.mark.skipif(
-    not Path("K:/FPL/data/exports/four_gw/gw05/certification_artifact.json").exists(),
-    reason="the accepted R5 certification artifact is not present in this checkout",
+    not R5_ARTIFACT.exists(),
+    reason="the archived accepted R5 certification artifact is not present in this checkout",
 )
 def test_D2_the_real_accepted_r5_artifact_still_loads():
-    loaded = fg.load_certification_artifact("K:/FPL/data/exports/four_gw/gw05/certification_artifact.json")
+    loaded = fg.load_certification_artifact(R5_ARTIFACT)
     assert loaded["schema"] == fg.CERTIFICATION_ARTIFACT_SCHEMA_V1
     assert loaded["decision_search_permitted"] is True
     assert "history_completeness" not in loaded
@@ -1060,7 +1069,6 @@ def test_F3b_anchor_must_match_the_consumer_event_boundary(tmp_path):
 # F2 — legacy status is an explicit, self-verifying identity, not a schema label.
 # ---------------------------------------------------------------------------
 
-R5_ARTIFACT = Path("K:/FPL/data/exports/four_gw/gw05/certification_artifact.json")
 
 
 def _r5_v1_payload():
