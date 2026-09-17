@@ -623,3 +623,110 @@ def test_payload_reports_squad_evidence_as_unknown_and_prior_club_unverified(tmp
         "ROLE_DISCONTINUITY_PRIOR_DISCOUNT",
     ]
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.8.0 — a non-reproduced prior role may not out-pull the evidence against it
+# ---------------------------------------------------------------------------
+# The GW5 defect: a strong previous-season prior role that had NOT reproduced was
+# detected (MODEL_PRIOR_CONFLICT_WITH_CURRENT_ROLE), published, and then ignored by
+# the produced probability, because only the prior's effective sample size was
+# discounted while its PULL in the start blend stayed at full strength.  A
+# goalkeeper with zero current-season starts therefore kept a materially non-zero
+# start probability, which the lineup resolver then legitimately exploited through
+# goalkeeper autosub optionality.
+#
+# ``strong_zero_minute_non_start_evidence_threshold`` gates ONLY the strong
+# evidence diagnostic and (now) the extra prior-pull discount, so raising it
+# reproduces the pre-v1.8.0 probability on the repaired tree.  That is what makes
+# these tests discriminating without hard-coding a probability.
+
+NO_DISCOUNT_CONFIG = minutes_model.MinutesModelConfig(
+    strong_zero_minute_non_start_evidence_threshold=10 ** 6
+)
+
+
+def _stale_prior_subject(conn, config=None):
+    return _rows(conn, config)[60]
+
+
+def test_a_non_reproduced_prior_role_no_longer_out_pulls_the_evidence(tmp_path):
+    """The stale-prior GK's start probability must be materially reduced.
+
+    The probability assertion comes FIRST deliberately: on the predecessor this is
+    the assertion that fails, and it fails because the probability did not move --
+    the intended defect -- rather than on a missing diagnostic field.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _gk_world(conn, TRANSFER_BACKUP)
+    subject = _stale_prior_subject(conn)
+    predecessor = _stale_prior_subject(conn, NO_DISCOUNT_CONFIG)
+
+    # The discount is real and material: this is the defect, asserted against the
+    # SAME fixture evaluated with the gate disabled, not against a magic number.
+    assert subject["p_start"] < predecessor["p_start"]
+    assert subject["p_start"] < 0.75 * predecessor["p_start"]
+
+    cfg = minutes_model.MinutesModelConfig()
+    assert subject["role_evidence"]["prior_pull_discount"] == pytest.approx(
+        cfg.prev_season_role_discontinuity_ess_discount
+    )
+    assert subject["role_evidence"]["prior_pull_discount_basis"] == "ROLE_DISCONTINUITY_UNREPRODUCED_PRIOR"
+    assert subject["role_evidence"]["fresh_role_change_evidence"] is False
+    conn.close()
+
+
+def test_the_discount_is_a_downweight_never_a_ban(tmp_path):
+    """A contradicted prior still leaves the player selectable."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _gk_world(conn, TRANSFER_BACKUP)
+    subject = _stale_prior_subject(conn)
+    assert subject["p_start"] > 0.0
+    assert subject["expected_minutes"] > 0.0
+    assert subject["p_zero"] < 1.0
+    conn.close()
+
+
+def test_fresh_role_change_evidence_leaves_the_probability_untouched(tmp_path):
+    """COUNTEREXAMPLE: a genuine role change is never banned or forced to zero.
+
+    The same zero-current-season GK, now carrying canonical fresh evidence of a
+    role transition (a scouting role confirmation).  The extra discount must not
+    apply, and the estimate must be exactly what it was before this repair.
+    """
+
+    world = {
+        60: {
+            **TRANSFER_BACKUP[60],
+            "scout": ("role_security_5gw", "very_high"),
+        },
+        61: TRANSFER_BACKUP[61],
+    }
+    conn = connect_database(tmp_path / "fpl.db")
+    _gk_world(conn, world)
+    with_evidence = _stale_prior_subject(conn)
+    predecessor = _stale_prior_subject(conn, NO_DISCOUNT_CONFIG)
+
+    assert "START_ROLE_CONFIRMED" in with_evidence["risk_flags"]
+    assert with_evidence["role_evidence"]["fresh_role_change_evidence"] is True
+    assert with_evidence["role_evidence"]["prior_pull_discount"] == pytest.approx(1.0)
+    assert with_evidence["role_evidence"]["prior_pull_discount_basis"] == "FRESH_ROLE_CHANGE_EVIDENCE"
+    # Untouched, and strictly selectable.
+    assert with_evidence["p_start"] == pytest.approx(predecessor["p_start"])
+    assert with_evidence["p_start"] > 0.0
+    conn.close()
+
+
+def test_the_current_starter_is_never_touched_by_the_discount(tmp_path):
+    """A player with real current-season starts never reaches this branch."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _gk_world(conn, TRANSFER_BACKUP)
+    rows = _rows(conn)
+    competitor = rows[61]
+    assert competitor["role_evidence"]["prior_pull_discount"] == pytest.approx(1.0)
+    assert competitor["role_evidence"]["prior_pull_discount_basis"] == "NO_ROLE_CONFLICT"
+    assert competitor["p_start"] > rows[60]["p_start"]
+    conn.close()

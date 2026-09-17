@@ -12,6 +12,7 @@ the squad (a pure side effect).
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Sequence
 
 from . import manager_lineup, monte_carlo
@@ -49,6 +50,46 @@ def resolve_squad(context, conn) -> dict[str, Any]:
     }
 
 
+def expected_bonus_by_player(conn, *, xpts_run_id: int, event: int) -> dict[int, float]:
+    """Deterministic expected FPL bonus per player, summed over one event.
+
+    Bonus is NOT sampled by the accepted Monte Carlo kernel: the simulator reads
+    it as the deterministic analytic ``bonus`` component, which is the xPts
+    payload's own ``bonus_xpts`` (the ``mc_components`` mapping sends "bonus" to
+    that field).  Reading it from the certified xPts run therefore uses the SAME
+    single definition the simulator uses, without re-deriving or re-simulating it.
+
+    Summing across the player's fixtures is what makes a double gameweek one event
+    value, exactly as ``world_core`` already aggregates the player's fixtures.
+    """
+
+    totals: dict[int, float] = {}
+    for row in conn.execute(
+        "SELECT player_id, payload_json FROM player_fixture_xpts_projections "
+        "WHERE projection_run_id=? AND event=?",
+        (int(xpts_run_id), int(event)),
+    ):
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+        value = payload.get("bonus_xpts")
+        if value is None:
+            continue
+        player_id = int(row["player_id"])
+        totals[player_id] = totals.get(player_id, 0.0) + float(value)
+    return {player_id: round(value, 6) for player_id, value in totals.items()}
+
+
+def with_expected_bonus(world_matrix: dict[str, Any], bonus: Mapping[int, float]) -> dict[str, Any]:
+    """Attach the per-player deterministic bonus to a world matrix.
+
+    Only players the matrix actually captured are carried, so the block can never
+    claim a value for a player the captaincy terms cannot see.
+    """
+
+    captured = [int(pid) for pid in world_matrix["player_ids"]]
+    world_matrix["expected_bonus"] = {pid: float(bonus.get(pid, 0.0)) for pid in captured}
+    return world_matrix
+
+
 def build_manager_worlds(
     conn,
     *,
@@ -60,6 +101,7 @@ def build_manager_worlds(
     simulations: int = 10_000,
     seed: int = 20260911,
     occupancy_audit: bool = True,
+    expected_bonus: bool = True,
 ) -> dict[str, Any]:
     """Simulate the full frozen universe and extract the squad GW matrix."""
 
@@ -71,8 +113,13 @@ def build_manager_worlds(
         simulations=int(simulations), seed=int(seed), occupancy_audit=bool(occupancy_audit)
     )
     result = monte_carlo.simulate(fixtures, config, capture_player_ids=squad_ids)
+    matrix = result["world_matrix"]
+    if expected_bonus:
+        with_expected_bonus(
+            matrix, expected_bonus_by_player(conn, xpts_run_id=int(xpts_run_id), event=int(planning_event))
+        )
     return {
-        "world_matrix": result["world_matrix"],
+        "world_matrix": matrix,
         "simulation": {
             "worlds": int(config.simulations),
             "seed": int(config.seed),
@@ -448,21 +495,33 @@ def captain_terms(world_matrix: Mapping[str, Any]) -> tuple[dict[int, float], di
     manager_lineup.validate_world_matrix(world_matrix, context="captain_terms")
     minutes = world_matrix["minutes"]
     core = world_matrix["core"]
+    # The authoritative captain-value quantity is the realised FPL value the
+    # captain rule actually multiplies, which is CORE PLUS the deterministic
+    # expected bonus.  Bonus is not sampled (``distribution_basis`` is CORE with
+    # bonus deterministic), so it is one constant per player and it enters a
+    # conditional expectation exactly once: the extra copy is only scored when the
+    # player is on the pitch, so it contributes ``bonus * P(appears)`` and never a
+    # second unconditional copy.  When no bonus block is present the captain value
+    # is CORE-only, and ``captain_value_basis`` says so rather than claiming a
+    # total-value armband.
+    bonus = manager_lineup.expected_bonus_map(world_matrix)
     appeared = {pid: [float(minutes[pid][w]) > 0.0 for w in range(worlds)] for pid in player_ids}
     core_series = {pid: [float(core[pid][w]) for w in range(worlds)] for pid in player_ids}
     a_terms: dict[int, float] = {}
     for pid in player_ids:
+        bonus_pid = float(bonus.get(pid, 0.0))
         a_terms[pid] = sum(
-            core_series[pid][w] for w in range(worlds) if appeared[pid][w]
+            core_series[pid][w] + bonus_pid for w in range(worlds) if appeared[pid][w]
         ) / worlds
     c_terms: dict[int, dict[int, float]] = {}
     for vice in player_ids:
         inner: dict[int, float] = {}
+        bonus_vice = float(bonus.get(vice, 0.0))
         for captain in player_ids:
             if captain == vice:
                 continue
             inner[captain] = sum(
-                core_series[vice][w]
+                core_series[vice][w] + bonus_vice
                 for w in range(worlds)
                 if appeared[vice][w] and not appeared[captain][w]
             ) / worlds

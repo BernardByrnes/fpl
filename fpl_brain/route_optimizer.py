@@ -32,7 +32,7 @@ from .manager_worlds import (
 from .season_rules import window_flag
 
 PHASE8B_VERSION = "route_optimizer_v8b_1.0.0"
-CACHE_SCHEMA_VERSION = "manager_worlds_cache_v1"
+CACHE_SCHEMA_VERSION = "manager_worlds_cache_v2_expected_bonus"
 
 CANONICAL_UNSUPPORTED_FLAG = "CANONICAL_H4_H6_UNSUPPORTED"
 CROSS_GW_FLAG = rc.CROSS_GW_FLAG
@@ -811,6 +811,9 @@ def world_cache_key(*, event, bundle, config, union_ids) -> str:
         "mc_model": str(monte_carlo.MONTE_CARLO_MODEL_VERSION),
         "simulations": int(config.search_draws), "seed": int(config.seed),
         "union": hashlib.sha256(",".join(map(str, sorted(int(u) for u in union_ids))).encode()).hexdigest()[:16],
+        # The armband objective consumes the deterministic expected bonus, which is
+        # part of the matrix, so a matrix cached without it is not the same matrix.
+        "expected_bonus": True,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -822,7 +825,7 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
         _stamp_matrix_identity(matrix, f"injected:{int(event)}:{int(config.search_draws)}:{int(config.seed)}"
                                        f":{len(union_ids)}")
         return matrix, {"source": "injected"}
-    from . import monte_carlo
+    from . import monte_carlo, manager_worlds
 
     bundle = bundles[int(event)]
     key = world_cache_key(event=int(event), bundle=bundle, config=config, union_ids=union_ids)
@@ -832,7 +835,8 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             raw = json.loads(path.read_text(encoding="utf-8"))
             matrix = {"worlds": raw["worlds"], "player_ids": raw["player_ids"],
                       "core": {int(k): v for k, v in raw["core"].items()},
-                      "minutes": {int(k): v for k, v in raw["minutes"].items()}}
+                      "minutes": {int(k): v for k, v in raw["minutes"].items()},
+                      "expected_bonus": {int(k): v for k, v in raw["expected_bonus"].items()}}
             _stamp_matrix_identity(matrix, key)
             _stamp_matrix_path(matrix, path)
             return matrix, {"source": "cache", "key": key}
@@ -843,7 +847,12 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
     mc_config = monte_carlo.MonteCarloConfig(simulations=int(config.search_draws), seed=int(config.seed),
                                              occupancy_audit=True)
     result = monte_carlo.simulate(fixtures, mc_config, capture_player_ids=list(union_ids))
-    matrix = result["world_matrix"]
+    matrix = manager_worlds.with_expected_bonus(
+        result["world_matrix"],
+        manager_worlds.expected_bonus_by_player(
+            conn, xpts_run_id=int(bundle.xpts_run_id), event=int(event)
+        ),
+    )
     _stamp_matrix_identity(matrix, key)
     if cache_dir is not None:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -852,6 +861,7 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             "worlds": matrix["worlds"], "player_ids": matrix["player_ids"],
             "core": {str(k): v for k, v in matrix["core"].items()},
             "minutes": {str(k): v for k, v in matrix["minutes"].items()},
+            "expected_bonus": {str(k): v for k, v in matrix["expected_bonus"].items()},
         }), encoding="utf-8")
         _stamp_matrix_path(matrix, matrix_path)
     return matrix, {"source": "generated", "key": key}

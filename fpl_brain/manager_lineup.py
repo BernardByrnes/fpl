@@ -7,17 +7,27 @@ simulation) and evaluates a fixed 15-manager policy:
 
     starting XI + reserve GK + ordered outfield bench + captain + vice-captain
 
-Scoring basis is CORE (Phase 5 does not model bonus variance).  No transfer,
-chip, or route logic lives here.
+Scoring basis is CORE plus, where the matrix carries it, the per-player
+DETERMINISTIC expected bonus.  The armband objective maximises the value the
+captain rule actually multiplies, so it includes that bonus; ``captain_value_basis``
+records whether a given matrix supported that, and the XI/bench objective stays
+CORE.  No transfer, chip, or route logic lives here.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from itertools import combinations, permutations
 from typing import Any, Mapping, Sequence
 
 MANAGER_LINEUP_VERSION = "manager_lineup_v6.0.0"
+
+#: The authoritative captain-value bases.  The armband is a multiplier applied to
+#: the player's actual FPL points, which include bonus, so a CORE-only basis is a
+#: declared limitation rather than an equivalent definition.
+CAPTAIN_VALUE_BASIS_TOTAL = "CORE_PLUS_DETERMINISTIC_EXPECTED_BONUS"
+CAPTAIN_VALUE_BASIS_CORE_ONLY = "CORE_ONLY_BONUS_UNAVAILABLE"
 
 #: A player that is being scored but is ABSENT from the world matrix that is
 #: scoring it.  This is never a blank Gameweek: the Monte Carlo engine
@@ -75,7 +85,58 @@ def validate_world_matrix(matrix: Mapping[str, Any], *, context: str = "") -> in
                 f"player(s) {wrong[:8]}{'...' if len(wrong) > 8 else ''}"
                 + (f" ({context})" if context else "")
             )
+    # ``expected_bonus`` is OPTIONAL, but a malformed one fails closed: it decides
+    # the armband, and a silently ignored block would make the captain objective
+    # CORE-only while the caller believed bonus was included.
+    if "expected_bonus" in matrix:
+        block = matrix["expected_bonus"]
+        if not isinstance(block, Mapping):
+            raise RouteWorldPlayerMissing(
+                f"{ROUTE_WORLD_PLAYER_MISSING}: expected_bonus must be a mapping of player -> value"
+                + (f" ({context})" if context else "")
+            )
+        missing = sorted(pid for pid in player_ids if pid not in block)
+        if missing:
+            raise RouteWorldPlayerMissing(
+                f"{ROUTE_WORLD_PLAYER_MISSING}: expected_bonus has no value for captured player(s) "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''} ({len(missing)} of {len(player_ids)})"
+                + (f" ({context})" if context else "")
+            )
+        for pid in sorted(player_ids):
+            try:
+                value = float(block[pid])
+            except (TypeError, ValueError) as exc:
+                raise RouteWorldPlayerMissing(
+                    f"{ROUTE_WORLD_PLAYER_MISSING}: expected_bonus for player {pid} is not numeric"
+                    + (f" ({context})" if context else "")
+                ) from exc
+            if not math.isfinite(value) or value < 0.0:
+                raise RouteWorldPlayerMissing(
+                    f"{ROUTE_WORLD_PLAYER_MISSING}: expected_bonus for player {pid} is {value!r}, "
+                    "which is not a finite non-negative expected bonus"
+                    + (f" ({context})" if context else "")
+                )
     return worlds
+
+
+def expected_bonus_map(matrix: Mapping[str, Any]) -> dict[int, float]:
+    """The per-player deterministic expected bonus carried by a world matrix.
+
+    Returns an empty mapping when the matrix carries none, which means the captain
+    value is CORE-only; :func:`captain_value_basis` names that state so a caller
+    can never mistake it for the total-value armband.
+    """
+
+    block = matrix.get("expected_bonus")
+    if not isinstance(block, Mapping):
+        return {}
+    return {int(pid): float(value) for pid, value in block.items()}
+
+
+def captain_value_basis(matrix: Mapping[str, Any]) -> str:
+    """Which quantity the armband objective maximised for this matrix."""
+
+    return CAPTAIN_VALUE_BASIS_TOTAL if expected_bonus_map(matrix) else CAPTAIN_VALUE_BASIS_CORE_ONLY
 
 
 def validate_matrix_covers_players(

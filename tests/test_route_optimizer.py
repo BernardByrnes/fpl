@@ -589,7 +589,8 @@ def test_world_cache_hit_and_key_sensitivity(tmp_path):
     key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union)
     payload = {"worlds": 2, "player_ids": [int(p) for p in union],
                "core": {str(p): [1.0, 2.0] for p in union},
-               "minutes": {str(p): [90.0, 90.0] for p in union}}
+               "minutes": {str(p): [90.0, 90.0] for p in union},
+               "expected_bonus": {str(p): 0.0 for p in union}}
     (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
     matrix, info = ro.build_event_worlds(None, {4: bundle}, 4, union, config, cache_dir=tmp_path)
     assert info["source"] == "cache" and info["key"] == key
@@ -667,3 +668,35 @@ def test_no_player_name_exception_in_stability_code():
         source = inspect.getsource(module)
         for name in ("Salah", "Haaland", "Palmer", "Bruno", "Mbeumo"):
             assert name not in source
+
+def test_a_cache_entry_without_the_bonus_block_fails_closed(tmp_path):
+    """A v2-keyed matrix whose content has no bonus block must NOT be used.
+
+    The cache key carries the schema version, so an entry keyed v2 while missing
+    the block is internally inconsistent.  Silently using it would rank the armband
+    on CORE while the caller believed bonus was included.
+    """
+
+    universe, state, meta = _universe()
+    union = list(SQUAD_IDS)
+    bundle = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3, xpts_run_id=4, mc_run_id=5)
+    config = _config()
+    key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union)
+    payload = {"worlds": 2, "player_ids": [int(p) for p in union],
+               "core": {str(p): [1.0, 2.0] for p in union},
+               "minutes": {str(p): [90.0, 90.0] for p in union}}
+    (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(KeyError):
+        ro.build_event_worlds(None, {4: bundle}, 4, union, config, cache_dir=tmp_path)
+
+
+def test_the_bonus_is_part_of_the_world_cache_identity():
+    """A matrix cached without the bonus block is not the same matrix.
+
+    The schema version is part of the cache key, so bumping it for the bonus block
+    guarantees no pre-existing core-only matrix can be reused as if it carried one.
+    """
+
+    from fpl_brain import route_optimizer
+
+    assert route_optimizer.CACHE_SCHEMA_VERSION.endswith("expected_bonus")
