@@ -14,6 +14,10 @@ class FakeResponse:
     def __init__(self, status_code: int, body: str = "{}", headers: dict[str, str] | None = None):
         self.status_code = status_code
         self.text = body
+        # A real requests.Response exposes both, and the raw archive preserves
+        # the received bytes, so the stub must not be narrower than the object
+        # it stands in for.
+        self.content = body.encode("utf-8")
         self.headers = headers or {}
 
 

@@ -12,7 +12,8 @@ from typing import Any, Literal
 
 import requests
 
-from .utils import ensure_directory
+from . import raw_archive
+from .utils import ensure_directory, utc_now
 
 LOGGER = logging.getLogger(__name__)
 BASE_URL = "https://fantasy.premierleague.com/api/"
@@ -50,6 +51,7 @@ class FplClient:
         raw_dir: str | Path | None = None,
         run_id: int | str | None = None,
         dry_run: bool = False,
+        observed_at: str | None = None,
     ) -> None:
         request_config = config.get("request", {})
         self.timeout = (
@@ -62,6 +64,14 @@ class FplClient:
         self.raw_dir = Path(raw_dir) if raw_dir is not None else None
         self.run_id = str(run_id) if run_id is not None else None
         self.dry_run = dry_run
+        # ONE observation identity for this client.  The capture instant is
+        # taken once, here, and every archived payload and every database row
+        # derived from this fetch shares it, so a raw capture and the snapshot
+        # population built from it cannot disagree by a few milliseconds.
+        # ``ingest.run_fetch`` owns that instant and passes it in explicitly.
+        self.observed_at = str(observed_at).strip() if observed_at else utc_now()
+        #: The most recent successful capture, for callers that report it.
+        self.last_capture: raw_archive.RawCapture | None = None
         self._last_request_at: float | None = None
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": request_config.get("user_agent", "fpl-brain/1.0")})
@@ -112,6 +122,7 @@ class FplClient:
         expect: Literal["dict", "list"],
         endpoint_slug: str | None = None,
         bootstrap_shape: bool = False,
+        event: int | None = None,
     ) -> dict[str, Any] | list[Any]:
         endpoint = path
         slug = endpoint_slug or path.strip("/").replace("/", "_").replace("?", "_").replace("=", "_")
@@ -157,6 +168,20 @@ class FplClient:
                     if not required.issubset(payload):  # type: ignore[arg-type]
                         missing = ", ".join(sorted(required.difference(payload)))  # type: ignore[arg-type]
                         raise FplInvalidResponseError(f"bootstrap-static missing top-level keys: {missing}")
+                # Archive the EXACT received bytes, and only after the response
+                # has been accepted as a valid capture.  A malformed or
+                # unexpected-shape body is therefore never admitted as
+                # historical evidence, even though the legacy convenience file
+                # is still written above for compatibility.
+                if raw_path is not None:
+                    self.last_capture = raw_archive.archive_raw_capture(
+                        self.raw_dir,
+                        source=slug,
+                        observed_at=self.observed_at,
+                        body=response.content,
+                        event=event,
+                        run_id=self.run_id,
+                    )
                 return payload
             except FplNotFoundError:
                 raise
@@ -195,13 +220,13 @@ class FplClient:
     def get_fixtures(self, event: int | None = None) -> list[Any]:
         path = "fixtures/" if event is None else f"fixtures/?event={int(event)}"
         slug = "fixtures" if event is None else f"fixtures_event_{int(event)}"
-        return self._get(path, "list", slug)  # type: ignore[return-value]
+        return self._get(path, "list", slug, event=event)  # type: ignore[return-value]
 
     def get_element_summary(self, player_id: int) -> dict[str, Any]:
         return self._get(f"element-summary/{int(player_id)}/", "dict", f"element_summary_{int(player_id)}")  # type: ignore[return-value]
 
     def get_event_live(self, event: int) -> dict[str, Any]:
-        return self._get(f"event/{int(event)}/live/", "dict", f"event_live_{int(event)}")  # type: ignore[return-value]
+        return self._get(f"event/{int(event)}/live/", "dict", f"event_live_{int(event)}", event=event)  # type: ignore[return-value]
 
     def get_entry(self, entry_id: int) -> dict[str, Any]:
         return self._get(f"entry/{int(entry_id)}/", "dict", f"entry_{int(entry_id)}")  # type: ignore[return-value]
@@ -223,6 +248,7 @@ class FplClient:
                 f"entry/{int(entry_id)}/event/{int(event)}/picks/",
                 "dict",
                 f"entry_{int(entry_id)}_event_{int(event)}_picks",
+                event=event,
             )  # type: ignore[return-value]
         except FplNotFoundError:
             return None
