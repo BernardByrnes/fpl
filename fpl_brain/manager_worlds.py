@@ -498,21 +498,31 @@ def captain_terms(world_matrix: Mapping[str, Any]) -> tuple[dict[int, float], di
     # The authoritative captain-value quantity is the realised FPL value the
     # captain rule actually multiplies, which is CORE PLUS the deterministic
     # expected bonus.  Bonus is not sampled (``distribution_basis`` is CORE with
-    # bonus deterministic), so it is one constant per player and it enters a
-    # conditional expectation exactly once: the extra copy is only scored when the
-    # player is on the pitch, so it contributes ``bonus * P(appears)`` and never a
-    # second unconditional copy.  When no bonus block is present the captain value
-    # is CORE-only, and ``captain_value_basis`` says so rather than claiming a
-    # total-value armband.
+    # bonus deterministic) and the producer computes it as
+    # ``bonus_xpts = bonus_per90 * expected_minutes / 90``, where
+    # ``expected_minutes`` is already the availability-weighted expectation.  So
+    # ``expected_bonus`` is ALREADY ``E[bonus * appeared]``: it is an unconditional
+    # expected-points quantity, and it must be added ONCE per holder without being
+    # multiplied by an appearance probability again.  Multiplying it by
+    # P(appeared) would discount it a second time for the very non-appearance the
+    # producer already priced in.
+    #
+    # When no bonus block is present the captain value is CORE-only, and
+    # ``captain_value_basis`` says so rather than claiming a total-value armband.
     bonus = manager_lineup.expected_bonus_map(world_matrix)
     appeared = {pid: [float(minutes[pid][w]) > 0.0 for w in range(worlds)] for pid in player_ids}
     core_series = {pid: [float(core[pid][w]) for w in range(worlds)] for pid in player_ids}
     a_terms: dict[int, float] = {}
     for pid in player_ids:
-        bonus_pid = float(bonus.get(pid, 0.0))
+        # E[core * appeared] + E[bonus * appeared], the latter already unconditional.
+        # The bonus is attached only if the matrix ever puts him on the pitch: the
+        # producer's ``bonus_xpts`` is proportional to expected minutes, so a player
+        # who never appears in these worlds cannot have earned any of it, and a
+        # block that claims otherwise is inconsistent rather than informative.
+        appeared_any = appeared[pid]
         a_terms[pid] = sum(
-            core_series[pid][w] + bonus_pid for w in range(worlds) if appeared[pid][w]
-        ) / worlds
+            core_series[pid][w] for w in range(worlds) if appeared_any[w]
+        ) / worlds + (float(bonus.get(pid, 0.0)) if any(appeared_any) else 0.0)
     c_terms: dict[int, dict[int, float]] = {}
     for vice in player_ids:
         inner: dict[int, float] = {}
@@ -520,11 +530,28 @@ def captain_terms(world_matrix: Mapping[str, Any]) -> tuple[dict[int, float], di
         for captain in player_ids:
             if captain == vice:
                 continue
-            inner[captain] = sum(
-                core_series[vice][w] + bonus_vice
-                for w in range(worlds)
-                if appeared[vice][w] and not appeared[captain][w]
-            ) / worlds
+            # The vice's extra copy is scored only when the armband falls to him:
+            # his CORE is earned when he plays AND the captain does not, while his
+            # already-unconditional expected bonus is scaled by the probability the
+            # armband falls to him at all.  His minutes and the captain's are drawn
+            # independently for different clubs; for club-mates the matrix cannot
+            # recover the joint bonus (it is deterministic, not per-world), so the
+            # independent reading is the one this term can honestly make.
+            inner[captain] = (
+                sum(
+                    core_series[vice][w]
+                    for w in range(worlds)
+                    if appeared[vice][w] and not appeared[captain][w]
+                )
+                / worlds
+                + (
+                    bonus_vice
+                    * sum(1 for w in range(worlds) if not appeared[captain][w])
+                    / worlds
+                    if any(appeared[vice])
+                    else 0.0
+                )
+            )
         c_terms[vice] = inner
     if identity is not None:
         _MATRIX_MEMO[("captain_terms", identity)] = (a_terms, c_terms)
