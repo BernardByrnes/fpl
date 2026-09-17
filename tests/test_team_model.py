@@ -17,6 +17,12 @@ from fpl_brain.models import (
 
 CUTOFF = "2026-09-10T12:00:00Z"
 EVENT_DEADLINE = "2026-09-12T12:30:00Z"
+# Every completed fixture in the seeded season kicks off on or before
+# 2026-09-05T16:00:00Z, and the cutoff is 2026-09-10T12:00:00Z.  A row observed
+# here is therefore after its own match and before the cutoff: the window the
+# model is allowed to read.  Stating it is what makes these rows history rather
+# than a read of the future.
+HISTORY_OBSERVED_AT = "2026-09-10T08:00:00Z"
 
 # Completed season: team 1 plays home/away/home; team 6 has a single match.
 BASE_FIXTURES = [
@@ -37,7 +43,8 @@ TEAMS = (1, 2, 3, 5, 6)
 CARRIER = {team: 100 + team for team in TEAMS}
 
 
-def _world(conn, *, xg=None, xgc=None, extra_fixtures=(), gameweeks_extra=()):
+def _world(conn, *, xg=None, xgc=None, extra_fixtures=(), gameweeks_extra=(),
+           extra_players=(), observed_at=HISTORY_OBSERVED_AT):
     """Seed a small league whose team-fixture xG is carried by one player/team."""
 
     from fpl_brain import repositories as repo
@@ -55,7 +62,8 @@ def _world(conn, *, xg=None, xgc=None, extra_fixtures=(), gameweeks_extra=()):
         repo.upsert_players(
             conn,
             [PlayerRecord(id=CARRIER[team], web_name=f"C{team}", full_name=f"Carrier {team}", team_id=team, element_type=3)
-             for team in TEAMS],
+             for team in TEAMS]
+            + list(extra_players),
         )
         repo.upsert_events(
             conn,
@@ -87,7 +95,7 @@ def _world(conn, *, xg=None, xgc=None, extra_fixtures=(), gameweeks_extra=()):
                                              expected_goals=axg, expected_goals_conceded=axgc,
                                              source="element_summary", raw_json={}))
         rows.extend(gameweeks_extra)
-        repo.upsert_player_gameweeks(conn, rows)
+        repo.upsert_player_gameweeks(conn, rows, observed_at)
     return fixtures
 
 
@@ -314,6 +322,10 @@ def test_naive_baseline_stored_separately_without_team_signal():
     for row in naive_rows:
         assert row["attack_rating"] is None and row["opponent_defence_rating"] is None
         assert row["provenance"]["baseline_kind"] == "LEAGUE_AVERAGE_VENUE"
+        # The naive baseline is fitted from the same fixture-xG evidence the
+        # causal repair changed, so it carries its own semantic version.
+        assert row["model_version"] == team_model.TEAM_BASELINE_MODEL_VERSION
+        assert row["model_version"] == "team_naive_v1.1.0"
     # Same home lambda for every home side (no team-specific signal).
     homes = {row["expected_goals_for"] for row in naive_rows if row["venue"] == "home"}
     assert len(homes) == 1
@@ -348,3 +360,111 @@ def test_xg_source_reconciliation_surfaces_discrepancy():
     home_row = _find(_project(conn), 7, 1)
     assert "XG_XGC_RECONCILIATION_DISCREPANCY" in home_row["risk_flags"]
     assert home_row["provenance"]["reconciliation_status"] == "DISCREPANCY"
+
+
+# ---------------------------------------------------------------------------
+# Historical causality of the fixture-side xG evidence.  Written AFTER the
+# other tests because the fixture world above now declares its observation
+# time; these two gates isolate ROW-LEVEL write time, which the accepted
+# no-lookahead test (fixture event / kickoff) does not cover.
+# ---------------------------------------------------------------------------
+
+#: A distinctive value, so a leaked row is unmistakable in the aggregate.
+LATE_XG = 50.0
+
+
+def _seed_post_cutoff_xg_row(conn, *, player_id, written_at, xg=LATE_XG):
+    """One extra player on team 1 staking a huge xG claim on completed fixture 1."""
+
+    from fpl_brain import repositories as repo
+
+    with conn:
+        repo.upsert_player_gameweeks(
+            conn,
+            [PlayerGameweekRecord(player_id=player_id, event=1, fixture_id=1, was_home=1,
+                                  minutes=90, starts=1, expected_goals=xg,
+                                  expected_goals_conceded=1.0,
+                                  source="element_summary", raw_json={})],
+            written_at,
+        )
+
+
+def test_a_future_written_xg_row_never_reaches_the_team_model():
+    """PE1-P1-01.  Fixture 1 is completed and kicked off before the cutoff, so
+    the OLD fixture-side reader accepted whatever ``player_gameweeks`` held for
+    it -- including a row the league had not written when the cutoff passed.
+    Only the ROW's write time is out of bounds here: the fixture, event and
+    kickoff are all legitimately historical.
+    """
+
+    from fpl_brain.models import PlayerRecord
+
+    conn = connect_database(":memory:")
+    _world(conn, extra_players=[PlayerRecord(id=900, web_name="LATE", full_name="Late Row",
+                                             team_id=1, element_type=3)])
+    baseline = team_model.fixture_side_xg(conn, 1, as_of=CUTOFF, planning_event=4)
+    assert baseline["home_xg"] == 1.6, "the causally valid carrier row must be read"
+
+    _seed_post_cutoff_xg_row(conn, player_id=900, written_at="2026-09-12T09:00:00Z")
+    after = team_model.fixture_side_xg(conn, 1, as_of=CUTOFF, planning_event=4)
+    assert after["home_xg"] == baseline["home_xg"], (
+        "a row written after the cutoff contributed to the fixture-side xG sum"
+    )
+
+
+def test_a_post_kickoff_placeholder_never_reaches_the_team_model():
+    """PE1-P1-02.  A row written after kickoff satisfies the write-after-kickoff
+    clause, so only the canonical placeholder signature can reject it.  Its
+    columns are the placeholder shape: no performance evidence at all.
+    """
+
+    from fpl_brain import repositories as repo
+    from fpl_brain.models import PlayerRecord
+
+    conn = connect_database(":memory:")
+    _world(conn, extra_players=[PlayerRecord(id=901, web_name="PH", full_name="Placeholder",
+                                             team_id=1, element_type=3)])
+    baseline = team_model.fixture_side_xg(conn, 1, as_of=CUTOFF, planning_event=4)
+
+    with conn:
+        repo.upsert_player_gameweeks(
+            conn,
+            [PlayerGameweekRecord(player_id=901, event=1, fixture_id=1, was_home=1,
+                                  minutes=0, source="element_summary", raw_json={})],
+            HISTORY_OBSERVED_AT,
+        )
+    after = team_model.fixture_side_xg(conn, 1, as_of=CUTOFF, planning_event=4)
+    assert after["home_xg"] == baseline["home_xg"], (
+        "a scheduled placeholder written after kickoff was read as a real xG observation"
+    )
+    # A placeholder carries no xG column at all, so the aggregate alone would not
+    # reveal it -- the reconciliation diagnostic would.  Excluded means excluded
+    # from the evidence entirely, not read and then found empty.
+    assert after["missing_xg_rows"] == 0, (
+        "the placeholder was read and counted as a missing-xG evidence row"
+    )
+
+
+def test_a_genuine_zero_minute_non_appearance_is_still_readable_evidence():
+    """The placeholder rule must never degrade into ``minutes == 0``."""
+
+    from fpl_brain import repositories as repo
+    from fpl_brain.models import PlayerRecord
+
+    conn = connect_database(":memory:")
+    _world(conn, extra_players=[PlayerRecord(id=902, web_name="DNP", full_name="Zero Min",
+                                             team_id=1, element_type=3)])
+    with conn:
+        repo.upsert_player_gameweeks(
+            conn,
+            [PlayerGameweekRecord(player_id=902, event=1, fixture_id=1, was_home=1,
+                                  minutes=0, starts=0, total_points=0, expected_goals=0.0,
+                                  expected_goals_conceded=0.0,
+                                  source="element_summary", raw_json={})],
+            HISTORY_OBSERVED_AT,
+        )
+    sides = team_model.fixture_side_xg(conn, 1, as_of=CUTOFF, planning_event=4)
+    # The DNP is read (it is not a placeholder) and contributes its explicit
+    # zero, so the side total is unchanged but the row is not silently dropped.
+    assert sides["home_xg"] == 1.6
+    assert sides["missing_xg_rows"] == 0

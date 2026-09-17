@@ -408,7 +408,10 @@ def evaluate_team_run(conn: sqlite3.Connection, run_id: int, event: int) -> dict
         p2 = payload.get("p_goals_2_plus")
         if p2 is not None:
             p2_brier.append((float(p2) - (1.0 if actual_goals >= 2 else 0.0)) ** 2)
-        sides = team_model.fixture_side_xg(conn, int(record["fixture_id"]))
+        # Realised outcome, not a historical model input: this scores a past
+        # prediction against what the match actually produced, so it must not be
+        # windowed to an earlier cutoff.
+        sides = team_model.realised_fixture_side_xg(conn, int(record["fixture_id"]))
         actual_xg = sides["home_xg"] if side == "home" else sides["away_xg"]
         if actual_xg is not None:
             xg_mae.append(abs(lam - float(actual_xg)))

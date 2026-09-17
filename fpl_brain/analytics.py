@@ -16,6 +16,7 @@ from typing import Any, Iterable, Mapping
 
 from .planning import PlanningContext
 from .utils import utc_now
+from . import historical_observations as historical
 from . import repositories as repo
 
 BASELINE_MODEL_FAMILY = "baseline"
@@ -25,7 +26,13 @@ TEAM_BASELINE_MODEL_FAMILY = "team_baseline"
 PLAYER_RATES_MODEL_FAMILY = "player_rates_v1"
 PLAYER_RATE_BASELINE_MODEL_FAMILY = "player_rate_baseline"
 XPTS_MODEL_FAMILY = "xpts_v1"
-BASELINE_MODEL_VERSION = "baseline_v1.0.0"
+# v1.1.0: the naive position-mean-minutes baseline now reads only the causal
+# historical window.  Its previous local predicate averaged the 456 scheduled
+# placeholders in as real zero-minute appearances, understating every
+# positional mean by 4.8-8.9 minutes.  Baseline runs are comparison artifacts
+# and are not part of any certified bundle, so no certification identity moves;
+# existing baseline runs stay immutable and simply carry the older version.
+BASELINE_MODEL_VERSION = "baseline_v1.1.0"
 
 EP_NEXT_KIND = "OFFICIAL_FPL_EP_NEXT"
 RECENT_POINTS_KIND = "RECENT_POINTS_BASELINE"
@@ -74,6 +81,10 @@ SOURCE_SNAPSHOT_FILES = (
     # its versioned spec determines the DEFCON term in every xPts row, so a
     # change to it must change the certified code identity.
     "fpl_brain/defcon_calibration.py",
+    "fpl_brain/historical_observations.py",
+    # The canonical point-in-time boundary selects which player-fixture
+    # observations every historical model may read, so a change to it changes WHAT
+    # the certified models consume and must change the certified code identity.
     "fpl_brain/history_completeness.py",
     "fpl_brain/joint_minutes.py",
     "fpl_brain/minutes_coherence.py",
@@ -641,26 +652,18 @@ def completed_rows_as_of(
     can never leak into a freeze.
     """
 
-    sql = """SELECT pg.*, f.kickoff_time AS fixture_kickoff, f.event AS fixture_event
-             FROM player_gameweeks pg JOIN fixtures f ON f.id=pg.fixture_id
-             WHERE pg.player_id=? AND f.finished=1 AND f.started=1
-               AND pg.event < ? AND f.event < ?
-               AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
-             ORDER BY f.event DESC, f.kickoff_time DESC, f.id DESC"""
-    params: list[Any] = [int(player_id), int(planning_event), int(planning_event), cutoff]
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(int(limit))
-    out: list[dict[str, Any]] = []
-    for row in conn.execute(sql, tuple(params)).fetchall():
-        record = dict(row)
-        # A completed-fixture row that carries no official observation is a stale
-        # schedule placeholder, NOT a did-not-play: a real DNP is all explicit
-        # zeros.  Consumers must report the gap rather than read it as absence of
-        # the player.  Flagged once here so every consumer shares one definition.
-        record["history_placeholder"] = repo.row_is_scheduled_placeholder(record)
-        out.append(record)
-    return out
+    rows = historical.historical_player_fixture_rows(
+        conn, as_of=str(cutoff), planning_event=int(planning_event),
+        player_id=int(player_id), limit=limit,
+    )
+    for record in rows:
+        # The observation universe now EXCLUDES stale schedule placeholders at the
+        # canonical boundary, so a returned row is a legitimate realised
+        # observation by construction.  The flag is retained for diagnostics and
+        # for consumers that still read it, but it is no longer the only thing
+        # standing between a model and placeholder history.
+        record["history_placeholder"] = False
+    return rows
 
 
 def snapshot_status_evidence(conn: sqlite3.Connection, player_id: int, cutoff: str) -> dict[str, Any]:
@@ -803,19 +806,24 @@ def naive_p90_baseline(
 
 
 def positional_pooled_minutes(conn: sqlite3.Connection, planning_event: int, cutoff: str) -> dict[int, float]:
-    """Position-pooled mean minutes across completed rows before the cutoff."""
+    """Position-pooled mean minutes over the causally available window.
+
+    A genuine zero-minute non-appearance is an observation and is retained; a
+    scheduled placeholder is not and is excluded at the canonical boundary.
+    This reader previously applied the local predicate directly, so the 456
+    placeholders stored for a finished-but-unreported fixture were averaged in
+    as real zero-minute appearances and dragged every positional mean down.
+    """
 
     pooled: dict[int, float] = {}
     for row in conn.execute(
-        """SELECT p.element_type AS pos, AVG(pg.minutes) AS avg_minutes
+        f"""SELECT p.element_type AS pos, AVG(pg.minutes) AS avg_minutes
            FROM player_gameweeks pg
            JOIN players p ON p.id=pg.player_id
            JOIN fixtures f ON f.id=pg.fixture_id
-          WHERE f.finished=1 AND f.started=1
-            AND pg.event<? AND f.event<? AND f.event IS NOT NULL
-            AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)
+          WHERE {historical.OBSERVATION_SQL_CLAUSES}
           GROUP BY p.element_type""",
-        (int(planning_event), int(planning_event), cutoff),
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall():
         if row["pos"] is not None and row["avg_minutes"] is not None:
             pooled[int(row["pos"])] = round(float(row["avg_minutes"]), 6)
@@ -832,21 +840,25 @@ def positional_pooled_engagement(
     These are the transparent level-4 priors of the minutes hierarchy (start
     rate, mean minutes given start, share of starts reaching 60/80 minutes,
     cameo rate among not-starting rows and their mean minutes).  They come
-    from the entire stored league window before the cutoff with no player
+    from the causally available league window before the cutoff with no player
     identity involved.
+
+    The window is the canonical historical boundary, not a local predicate: a
+    row the league had not written when the cutoff passed is not evidence, and
+    a row whose own fixture had not kicked off is a scheduled placeholder
+    rather than an observation.  ``starts IS NOT NULL AND minutes IS NOT NULL``
+    is this reader's own modelling filter on top of that window.
     """
 
     fallback: dict[int, dict[str, float]] = {}
     rows = conn.execute(
-        """SELECT p.element_type AS pos, pg.starts AS started, pg.minutes AS minutes
+        f"""SELECT p.element_type AS pos, pg.starts AS started, pg.minutes AS minutes
            FROM player_gameweeks pg
            JOIN players p ON p.id=pg.player_id
            JOIN fixtures f ON f.id=pg.fixture_id
-          WHERE f.finished=1 AND f.started=1
-            AND pg.event<? AND f.event<? AND f.event IS NOT NULL
-            AND pg.starts IS NOT NULL AND pg.minutes IS NOT NULL
-            AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
-        (int(planning_event), int(planning_event), cutoff),
+          WHERE {historical.OBSERVATION_SQL_CLAUSES}
+            AND pg.starts IS NOT NULL AND pg.minutes IS NOT NULL""",
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall()
     pools: dict[int, dict[str, float]] = {}
     for row in rows:

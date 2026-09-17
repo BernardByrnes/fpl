@@ -420,6 +420,40 @@ def _gameweek_has_performance(values: dict[str, Any]) -> bool:
 GAMEWEEK_PERFORMANCE_COLUMNS = _GAMEWEEK_PERFORMANCE_COLUMNS
 
 
+def gameweek_has_performance_sql(alias: str = "pg") -> str:
+    """``_gameweek_has_performance`` as a WHERE predicate for one row alias.
+
+    This is not a second definition of the signature, it is the same one
+    written for SQL: the field list comes from ``_GAMEWEEK_PERFORMANCE_COLUMNS``
+    and the two branches mirror ``_gameweek_has_performance`` exactly, so the
+    Python and SQL forms cannot drift without the parity test failing.  A
+    caller that wants the placeholder predicate applies ``NOT`` to this, which
+    is literally how :func:`row_is_scheduled_placeholder` defines it.
+
+    ``COALESCE(source, '')`` is load-bearing.  Without it, SQL three-valued
+    logic makes ``source IS NULL AND minutes = 0`` evaluate to NULL, which
+    excludes the row, while the Python predicate includes it -- a divergence no
+    amount of column-list sharing would repair.
+    """
+
+    non_minutes = [column for column in _GAMEWEEK_PERFORMANCE_COLUMNS if column != "minutes"]
+    # The outer parentheses are load-bearing: without them the top-level ``OR``
+    # binds looser than a composing ``AND``, so ``a AND <predicate> AND b``
+    # would parse as ``(a AND (A)) OR ((B) AND b)`` -- silently dropping the
+    # caller's remaining predicates on one branch and fanning the row set out.
+    return (
+        "((" + " OR ".join(f"{alias}.{column} IS NOT NULL" for column in non_minutes) + ")"
+        f" OR ({alias}.minutes IS NOT NULL AND NOT "
+        f"(COALESCE({alias}.source, '') = 'element_summary' AND {alias}.minutes = 0)))"
+    )
+
+
+def scheduled_placeholder_sql(alias: str = "pg") -> str:
+    """The placeholder predicate: the exact negation of the above."""
+
+    return f"NOT ({gameweek_has_performance_sql(alias)})"
+
+
 def row_is_scheduled_placeholder(values: Mapping[str, Any]) -> bool:
     """True when a player-fixture row carries no official observation at all.
 

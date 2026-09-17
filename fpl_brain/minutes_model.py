@@ -21,10 +21,17 @@ import sqlite3
 from dataclasses import dataclass, field, fields
 from typing import Any, Mapping, Sequence
 
-from . import analytics, history_completeness as hc, repositories as repo
+from . import analytics
+from . import historical_observations as historical, history_completeness as hc, repositories as repo
 from .utils import parse_utc, utc_now
 
-MINUTES_MODEL_VERSION = "minutes_v1.6.0"
+MINUTES_MODEL_VERSION = "minutes_v1.7.0"
+# v1.7.0: the no-causal-history position prior now asserts the 990-minute /
+# 11-starter identity (see ``structural_no_history_priors``), so an empty and
+# legitimate causal window produces a coherent side instead of an impossible
+# cameo budget.  This is a semantic change to the primary model's contract for
+# the empty-history state; certified-cutoff outputs are unchanged because every
+# position has causal observations there, so the fallback never activates.
 # Team-coherence challenger (Phase 4 acceptance pass).  This is a deterministic
 # post-processing layer over the raw v1.1 independent marginals: the raw model
 # is preserved untouched in the same run payload (``*_raw_independent``).
@@ -133,6 +140,46 @@ class MinutesModelConfig:
                 "start_band_deltas": _START_BAND_DELTAS,
             }
         )
+
+
+# Regulation match length.  The coherent minutes layer already fixes a side at
+# 11 starters sharing 990 player-minutes (``MinutesCoherenceConfig``), so 990/11
+# is the only start-minutes anchor an uninformed side may assert.
+REGULATION_MATCH_MINUTES = 90.0
+
+
+def structural_no_history_priors(config: MinutesModelConfig) -> dict[str, float]:
+    """The position prior used when the causal window holds NO observation.
+
+    This is a statement of structural fact, not a fitted statistic.  A side is
+    eleven players sharing ``990`` player-minutes, so the only start-minutes
+    anchor consistent with that identity -- and therefore the only one that
+    cannot manufacture an impossible cameo budget for an ordinary squad -- is
+    that the XI plays the match.  Required cameo minutes are then exactly zero
+    and any available bench satisfies them, for every squad size.
+
+    The previous anchor of 65 minutes contradicted the coherence layer's own
+    990-minute identity: it demanded ``990 - 11 x 65 = 275`` cameo minutes,
+    while a normal 25-man squad supplies only ``(25 - 11) x 15 = 210``.  That
+    is not an edge case; it held for every squad below 30 players, so an empty
+    (and perfectly legitimate) causal window could never produce a coherent
+    side.  ``p60``/``p80`` follow the same fact: a player who plays the match
+    reaches both.
+
+    Fields the config already owns are taken from it, so this cannot drift.
+    """
+
+    return {
+        # Unknown role: the solver shifts this to the real XI size.
+        "p_start": 0.35,
+        "minutes_if_start": REGULATION_MATCH_MINUTES,
+        "p60_if_start": 1.0,
+        "p80_if_start": 1.0,
+        "cameo_rate": float(config.cameo_rate_prior),
+        "cameo_minutes": float(config.cameo_minutes_prior),
+        "cameo_p60": float(config.cameo_p60_prior),
+        "start_rows": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +305,12 @@ def league_pools(conn: sqlite3.Connection, planning_event: int, cutoff: str) -> 
            FROM player_gameweeks pg
            JOIN players p ON p.id=pg.player_id
            JOIN fixtures f ON f.id=pg.fixture_id
-          WHERE f.finished=1 AND f.started=1
-            AND pg.event<? AND f.event<? AND f.event IS NOT NULL
+          WHERE {boundary}
             AND pg.starts IS NOT NULL AND pg.minutes IS NOT NULL
-            AND p.team_id IS NOT NULL AND p.element_type IS NOT NULL
-            AND (f.kickoff_time IS NULL OR f.kickoff_time <= ?)""",
-        (int(planning_event), int(planning_event), cutoff),
+            AND p.team_id IS NOT NULL AND p.element_type IS NOT NULL""".format(
+            boundary=historical.OBSERVATION_SQL_CLAUSES
+        ),
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
     ).fetchall()
     team_position: dict[tuple[int, int], dict[str, float]] = {}
     for row in rows:
@@ -381,10 +428,7 @@ def project_player_fixture(
     adjustments, modifier_ids, scout_flags = fold_scout_modifiers(scout_notes, cutoff, config)
     flags.extend(scout_flags)
 
-    pos_pool = pool.position.get(position) or {
-        "p_start": 0.35, "minutes_if_start": 65.0, "p60_if_start": 0.55, "p80_if_start": 0.4,
-        "cameo_rate": 0.5, "cameo_minutes": 15.0, "cameo_p60": 0.04, "start_rows": 0,
-    }
+    pos_pool = pool.position.get(position) or structural_no_history_priors(config)
     team_pos_pool = pool.team_position.get((team_id, position))
 
     # --- availability -------------------------------------------------------
@@ -490,7 +534,7 @@ def project_player_fixture(
     else:
         level34_rate = pos_pool["p_start"]
         prior_source = "position pooled rate"
-    level34_minutes_anchor = float(pos_pool.get("minutes_if_start") or 65.0)
+    level34_minutes_anchor = float(pos_pool.get("minutes_if_start") or REGULATION_MATCH_MINUTES)
 
     # --- previous-season player prior (v1.1.0, ESS semantics) ----------------
     role_weakened = "START_ROLE_WEAKENED" in flags or "ROTATION_RISK_HIGH" in flags

@@ -17,6 +17,13 @@ from fpl_brain.models import (
 )
 
 CUTOFF = "2026-09-10T12:00:00Z"
+
+#: When the seeded historical rows were OBSERVED.  The canonical historical
+#: boundary admits a row only if it was written AFTER its own fixture kicked off
+#: (the latest seeded kickoff is 2026-09-05T14:00Z) and at or before the planning
+#: cutoff.  Observation time is part of the fixture, so it is explicit rather than
+#: the ambient utc_now() that upsert_player_gameweeks would otherwise apply.
+OBSERVED_AT = "2026-09-06T10:00:00Z"
 DEADLINE = "2026-09-12T12:30:00Z"
 KICKOFFS = ["2026-08-22T14:00:00Z", "2026-08-29T14:00:00Z", "2026-09-05T14:00:00Z"]
 COMPONENT = player_rates.COMPONENT_XG
@@ -72,6 +79,7 @@ def _seed(conn, *, players, histories=(), fixtures=(), gameweeks=(), notes=()):
                                       expected_goals=xg, expected_assists=xa,
                                       source="element_summary", raw_json={})
                  for pid, event, fid, minutes, xg, xa in gameweeks],
+                OBSERVED_AT,
             )
         for pid, key, value_text, observed_at, expires_at in notes:
             conn.execute(

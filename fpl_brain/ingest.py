@@ -24,6 +24,7 @@ from .parsers import (
 )
 from . import repositories as repo
 from . import ingest_provenance as provenance
+from . import raw_archive
 from .utils import ensure_directory, utc_now
 
 LOGGER = logging.getLogger(__name__)
@@ -63,12 +64,20 @@ def run_fetch(
     summaries: str = "none",
     live_gw: int | None = None,
     dry_run: bool = False,
+    observed_at: str | None = None,
 ) -> dict[str, Any]:
-    """Run bootstrap/fixture ingest and optional detail fan-out."""
+    """Run bootstrap/fixture ingest and optional detail fan-out.
+
+    ``observed_at`` is the capture instant.  It is taken once here and shared by
+    the raw archive, every ``player_snapshots`` row and the bootstrap generation
+    record, so the file evidence and the database evidence for one refresh are
+    the same observation.  Tests inject it explicitly; production leaves it None
+    and one wall-clock read establishes it for the whole capture.
+    """
 
     if summaries not in {"none", "squad", "all"}:
         raise ValueError("summaries must be none, squad, or all")
-    captured_at = utc_now()
+    captured_at = str(observed_at).strip() if observed_at else utc_now()
     raw_dir = config_path(config, "raw_dir")
     database_path = config_path(config, "database")
     conn: sqlite3.Connection | None = None
@@ -77,6 +86,7 @@ def run_fetch(
     endpoint_failures: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     current_event: int | None = None
+    completeness: dict[str, Any] | None = None
     if not dry_run:
         ensure_directory(raw_dir)
         conn = connect_database(database_path)
@@ -84,7 +94,8 @@ def run_fetch(
             run_id = repo.create_fetch_run(conn, "fetch_fpl", str(raw_dir))
     client: FplClient | None = None
     try:
-        client = FplClient(config, raw_dir=None if dry_run else raw_dir, run_id=run_id, dry_run=dry_run)
+        client = FplClient(config, raw_dir=None if dry_run else raw_dir, run_id=run_id,
+                            dry_run=dry_run, observed_at=captured_at)
         try:
             bootstrap_payload = client.get_bootstrap_static()
             first_records = parse_bootstrap(bootstrap_payload, captured_at)
@@ -130,6 +141,20 @@ def run_fetch(
                             list(generation.rejection_reasons),
                         )
                     snapshot_count = repo.insert_snapshots(conn, records.snapshots, run_id)
+                    # A capture that stores fewer snapshot rows than the payload
+                    # claims players is partial, and a partial population is not
+                    # a complete availability snapshot.  Raising here rolls the
+                    # whole capture back rather than leaving half a population
+                    # recorded as if it were the round's availability.
+                    completeness = provenance.snapshot_completeness(
+                        official_element_count=generation.official_element_count,
+                        parsed_snapshot_count=len(records.snapshots),
+                        persisted_snapshot_count=snapshot_count,
+                    )
+                    if not completeness["complete"]:
+                        raise provenance.PartialSnapshotCapture(
+                            "incomplete availability snapshot: " + "; ".join(completeness["problems"])
+                        )
                     # Persist the generation INSIDE SQLite so the accepted pool
                     # identity travels into every execution snapshot.  Rejected
                     # generations are recorded for audit but are never read as
@@ -253,8 +278,14 @@ def run_fetch(
             "snapshots": snapshot_count,
             "summaries": summary_count,
             "counts": counts,
+            "snapshot_completeness": completeness,
             "endpoints_failed": endpoint_failures,
             "bootstrap_generation": None if generation is None else generation.as_dict(),
+            # The refresh command reports its own capture state, so an operator
+            # sees the cadence and any partial capture without a second tool.
+            "capture_cadence": (
+                None if conn is None else raw_archive.capture_cadence_health(conn, raw_dir=raw_dir)
+            ),
         }
     except Exception as exc:
         if not dry_run and conn is not None and run_id is not None:
@@ -293,6 +324,7 @@ def run_manager_sync(
     event: int | None = None,
     all_events: bool = False,
     dry_run: bool = False,
+    observed_at: str | None = None,
 ) -> dict[str, Any]:
     """Sync public manager summary/history and any available squad picks."""
 
@@ -304,7 +336,7 @@ def run_manager_sync(
         }
     raw_dir = config_path(config, "raw_dir")
     database_path = config_path(config, "database")
-    captured_at = utc_now()
+    captured_at = str(observed_at).strip() if observed_at else utc_now()
     conn: sqlite3.Connection | None = None
     run_id: int | None = None
     failures: list[dict[str, Any]] = []
@@ -314,7 +346,8 @@ def run_manager_sync(
         conn = connect_database(database_path)
         with conn:
             run_id = repo.create_fetch_run(conn, "sync_manager", str(raw_dir))
-    client = FplClient(config, raw_dir=None if dry_run else raw_dir, run_id=run_id, dry_run=dry_run)
+    client = FplClient(config, raw_dir=None if dry_run else raw_dir, run_id=run_id,
+                        dry_run=dry_run, observed_at=captured_at)
     try:
         try:
             entry_payload = client.get_entry(int(entry_id))

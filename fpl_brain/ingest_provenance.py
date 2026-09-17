@@ -313,6 +313,44 @@ def generation_dir(raw_dir: str | Path) -> Path:
     return Path(raw_dir) / GENERATIONS_DIRNAME
 
 
+class PartialSnapshotCapture(ValueError):
+    """A bootstrap capture would have stored an incomplete availability snapshot."""
+
+
+def snapshot_completeness(
+    *,
+    official_element_count: int,
+    parsed_snapshot_count: int,
+    persisted_snapshot_count: int,
+) -> dict[str, Any]:
+    """Compare the payload's own player population with what was written.
+
+    The payload is the authority for how many players a capture claims to
+    describe, so a capture that persists fewer snapshot rows than the payload
+    contains is partial, and must be reported rather than silently accepted as
+    a complete availability snapshot.
+    """
+
+    problems: list[str] = []
+    if int(parsed_snapshot_count) != int(official_element_count):
+        problems.append(
+            f"parsed {int(parsed_snapshot_count)} snapshot records for "
+            f"{int(official_element_count)} payload elements"
+        )
+    if int(persisted_snapshot_count) != int(official_element_count):
+        problems.append(
+            f"persisted {int(persisted_snapshot_count)} snapshot rows for "
+            f"{int(official_element_count)} payload elements"
+        )
+    return {
+        "official_element_count": int(official_element_count),
+        "parsed_snapshot_count": int(parsed_snapshot_count),
+        "persisted_snapshot_count": int(persisted_snapshot_count),
+        "complete": not problems,
+        "problems": problems,
+    }
+
+
 def write_generation(raw_dir: str | Path, generation: BootstrapGeneration) -> Path:
     """Persist the generation record (accepted or rejected) plus a timestamped copy."""
 

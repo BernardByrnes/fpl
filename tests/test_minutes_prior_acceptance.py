@@ -10,7 +10,7 @@ from fpl_brain.database import connect_database
 from fpl_brain.models import PlayerSeasonHistoryRecord
 from fpl_brain.parsers import parse_element_history_past
 
-from test_minutes_model import analytics_repo_upserts, CUTOFF, EVENT_DEADLINE
+from test_minutes_model import OBSERVED_AT, analytics_repo_upserts, CUTOFF, EVENT_DEADLINE
 
 
 def _prior_world(conn, *, season_rows=None, minutes_seed=None, snapshots_seed=None):
@@ -88,6 +88,7 @@ def test_small_current_evidence_gradually_outweighs_prior(tmp_path):
                 Pgw(player_id=30, event=event, fixture_id=fixture, minutes=90, starts=1, total_points=3, source="element_summary", raw_json={})
                 for event, fixture in ((1, 1), (2, 2), (3, 3), (2, 2), (3, 3))
             ],
+            OBSERVED_AT,
         )
     with_current = _freeze_rows(conn, config)
     baseline_p = no_current[(30, 4)]["p_start_given_available"]
@@ -249,7 +250,7 @@ def test_injury_absence_does_not_destroy_tactical_prior(tmp_path):
         for player_id in (40, 41, 42, 43):
             for event, fixture, minutes, starts in ((1, 1, 90, 1), (2, 2, 0, 0), (3, 3, 0, 0)):
                 background.append(Pgw(player_id=player_id, event=event, fixture_id=fixture, minutes=minutes, starts=starts, total_points=2 if starts else 0, source="element_summary", raw_json={}))
-        repo.upsert_player_gameweeks(conn, background)
+        repo.upsert_player_gameweeks(conn, background, OBSERVED_AT)
         # Player 35 started GW1 and GW2, then sat out GW3 (observed, minutes 0).
         repo.upsert_player_gameweeks(
             conn,
@@ -258,6 +259,7 @@ def test_injury_absence_does_not_destroy_tactical_prior(tmp_path):
                 Pgw(player_id=35, event=2, fixture_id=2, minutes=90, starts=1, total_points=3, source="element_summary", raw_json={}),
                 Pgw(player_id=35, event=3, fixture_id=3, minutes=0, starts=0, total_points=0, source="element_summary", raw_json={}),
             ],
+            OBSERVED_AT,
         )
     with_absence = minutes_model.build_minutes_predictions(conn, 4, CUTOFF, config)
     pick = lambda rows: [r for r in rows if r["player_id"] == 35][0]  # noqa: E731

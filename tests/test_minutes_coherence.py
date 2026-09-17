@@ -21,6 +21,9 @@ from fpl_brain.models import (
 CUTOFF = "2026-09-10T12:00:00Z"
 DEADLINE = "2026-09-12T12:30:00Z"
 EVENT = 4
+# Fixture 90 kicks off at 2026-08-22T14:00:00Z, so a row observed here is after
+# its own match and before the cutoff: the window the model is allowed to read.
+HISTORY_OBSERVED_AT = "2026-09-10T08:00:00Z"
 CFG = mc.MinutesCoherenceConfig()
 
 
@@ -69,7 +72,7 @@ def _solve(payloads, fixture_id=1, team_id=1, config=CFG):
 # ---------------------------------------------------------------------------
 
 
-def _world(conn):
+def _world(conn, *, with_history: bool = True):
     from fpl_brain import repositories as repo
     from fpl_brain.models import PlayerGameweekRecord
 
@@ -109,13 +112,16 @@ def _world(conn):
         )
         # One completed 88-minute start per player gives realistic conditional
         # minutes (E[min|start] ~ 88), so a 25-man side can supply 990 minutes.
+        # The rows are observed between fixture 90's kickoff and CUTOFF; saying
+        # so explicitly is what makes them history rather than a future read.
         gameweeks = [
             PlayerGameweekRecord(player_id=p.id, event=1, fixture_id=90,
                                  was_home=1 if p.team_id == 1 else 0, minutes=88, starts=1,
                                  expected_goals=0.2, expected_assists=0.1, source="element_summary", raw_json={})
             for p in players if p.team_id in (1, 2)
         ]
-        repo.upsert_player_gameweeks(conn, gameweeks)
+        if with_history:
+            repo.upsert_player_gameweeks(conn, gameweeks, HISTORY_OBSERVED_AT)
         run = repo.create_fetch_run(conn, "fetch_fpl")
         repo.insert_snapshots(
             conn,
@@ -463,3 +469,70 @@ def test_gc_deduction_exact_identity():
         got = xpts._goals_conceded_deduction(payload, lam, goals_per_deduction=2, points_per_deduction=1)
         assert got == pytest.approx(-1.0 * xpts.expected_floor_half(lam), abs=1e-12)
         assert got != pytest.approx(-(lam / 2.0), abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# EMPTY CAUSAL PRIOR WINDOW — a legitimate model state, not an error
+# ---------------------------------------------------------------------------
+
+
+def test_the_empty_prior_fallback_satisfies_the_990_minute_identity():
+    """The no-history anchor must be able to fill a real side's minutes.
+
+    An empty causal window is an ordinary state (early season, a newly promoted
+    side, a position with no observation yet).  The model's own default may not
+    make a coherent side impossible, so the anchor is checked against the very
+    identity the coherence layer enforces.
+    """
+
+    from fpl_brain.minutes_model import MinutesModelConfig, structural_no_history_priors
+
+    prior = structural_no_history_priors(MinutesModelConfig())
+    for squad in (12, 15, 20, 25, 30):
+        supplyable = (
+            CFG.target_starters * prior["minutes_if_start"]
+            + (squad - CFG.target_starters) * prior["cameo_minutes"]
+        )
+        assert supplyable >= CFG.target_minutes, f"a {squad}-man side cannot reach 990 minutes"
+
+    # The anchor that preceded this repair, stated arithmetically: it demanded
+    # 275 cameo minutes from a 25-man squad that supplies only 210.  For a
+    # 25-man side the old anchor could not produce a coherent side at all.
+    previous_minutes_if_start, previous_cameo_minutes = 65.0, 15.0
+    required = CFG.target_minutes - CFG.target_starters * previous_minutes_if_start
+    achievable = (25 - CFG.target_starters) * previous_cameo_minutes
+    assert required == 275.0
+    assert achievable == 210.0
+    assert required > achievable
+
+
+def test_an_empty_causal_window_still_builds_a_coherent_side():
+    """No history at all: the side must be coherent, and read nothing future."""
+
+    conn = connect_database(":memory:")
+    _world(conn, with_history=False)
+    rows, records = mc.build_minutes_predictions_coherent(conn, EVENT, CUTOFF)
+
+    assert records, "an empty prior window must still produce sides"
+    for record in records:
+        assert record["adjusted_start_sum"] == pytest.approx(11.0, abs=1e-4)
+        assert record["adjusted_minutes_sum"] == pytest.approx(990.0, abs=1e-2)
+        assert abs(record["start_residual"]) <= CFG.verify_start_tolerance
+        assert abs(record["minutes_residual"]) <= CFG.verify_minutes_tolerance
+    assert mc.coherence_readiness(records)["status"] == "PASS"
+
+    for row in rows:
+        assert 0.0 <= row["p_start"] <= 1.0
+        assert 0.0 <= row["p_cameo_given_not_start"] <= 1.0
+        assert 0.0 <= row["expected_minutes"] <= 90.0
+        assert row["expected_minutes"] >= 0.0
+
+
+def test_the_minutes_priors_are_readable_without_any_causal_observation():
+    """The priors themselves must be empty, not fabricated, with no history."""
+
+    from fpl_brain import analytics
+
+    conn = connect_database(":memory:")
+    _world(conn, with_history=False)
+    assert analytics.positional_pooled_engagement(conn, EVENT, CUTOFF) == {}
