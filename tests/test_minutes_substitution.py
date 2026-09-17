@@ -227,14 +227,69 @@ def test_team_identities_hold():
     assert identities["expected_minutes"] == pytest.approx(990.0, abs=1e-3)
 
 
-def test_gk_and_outfield_start_mass_in_the_real_model():
-    import sqlite3
+def test_gk_and_outfield_start_mass_in_the_real_model(tmp_path):
+    """The REAL end-to-end model must produce a coherent positional start mass.
 
-    conn = sqlite3.connect("file:K:/FPL/fpl.db?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    rows, profiles = sm.build_minutes_predictions_substitution_coherent(conn, 4, "2026-09-12T12:00:00Z")
+    One goalkeeper and ten outfielders per side, 990 minutes, and matching exit
+    and entry mass -- on real model output flowing through the substitution
+    layer, not on the pure solver's synthetic payloads.
+
+    Hermetic by construction: a temporary database with its own completed
+    history, whose write times are stated relative to the synthetic cutoff.  The
+    test previously read the live database at a fixed historical cutoff, so it
+    depended on what an official refresh last wrote: the sanctioned refresh
+    advanced ``updated_at`` on every historical row, the causal boundary
+    correctly refused that cutoff's evidence, and the model raised.  A test that
+    a routine refresh can break is measuring the database, not the model.
+    """
+
+    from fpl_brain import repositories as repo
+    from fpl_brain.database import connect_database
+    from fpl_brain.models import PlayerGameweekRecord
+    from test_minutes_coherence import CUTOFF, EVENT, HISTORY_OBSERVED_AT, _world
+
+    conn = connect_database(tmp_path / "substitution.db")
+    _world(conn)
+    # Genuine substitution evidence on the completed fixture: two players who
+    # came off the bench, written after kickoff and before the cutoff.  Without
+    # a non-starter who played there is no entry mass to be coherent about.
+    with conn:
+        repo.upsert_player_gameweeks(
+            conn,
+            [
+                PlayerGameweekRecord(player_id=25, event=1, fixture_id=90, was_home=1, minutes=20,
+                                     starts=0, total_points=1, source="element_summary", raw_json={}),
+                PlayerGameweekRecord(player_id=125, event=1, fixture_id=90, was_home=0, minutes=15,
+                                     starts=0, total_points=1, source="element_summary", raw_json={}),
+            ],
+            HISTORY_OBSERVED_AT,
+        )
+
+    rows, profiles = sm.build_minutes_predictions_substitution_coherent(conn, EVENT, CUTOFF)
+
+    assert profiles, "the real model produced no side profiles"
     assert all(p["status"] == "COHERENT" for p in profiles)
-    assert len(profiles) == 20
+    for profile in profiles:
+        identities = profile["identities"]
+        assert identities["p_start_total"] == pytest.approx(11.0, abs=1e-4)
+        assert identities["expected_minutes"] == pytest.approx(990.0, abs=1e-2)
+        assert identities["exit_mass"] == pytest.approx(identities["entry_mass"], abs=1e-6)
+
+    # The property the test is named for: exactly one goalkeeper and ten
+    # outfielders of start mass on every side of the real output.
+    team_of = {
+        int(row[0]): int(row[1])
+        for row in conn.execute("SELECT id, team_id FROM players WHERE team_id IS NOT NULL")
+    }
+    sides: dict = {}
+    for row in rows:
+        sides.setdefault((int(row["fixture_id"]), team_of[int(row["player_id"])]), []).append(row)
+    assert len(sides) == len(profiles)
+    for (fixture_id, team_id), side in sorted(sides.items()):
+        keeper = sum(float(r["p_start"]) for r in side if int(r.get("position_id") or 0) == 1)
+        outfield = sum(float(r["p_start"]) for r in side if int(r.get("position_id") or 0) != 1)
+        assert keeper == pytest.approx(1.0, abs=1e-4), f"fixture {fixture_id} team {team_id} goalkeeper mass"
+        assert outfield == pytest.approx(10.0, abs=1e-4), f"fixture {fixture_id} team {team_id} outfield mass"
     conn.close()
 
 

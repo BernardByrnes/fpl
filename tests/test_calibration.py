@@ -425,3 +425,27 @@ def test_the_shared_completed_row_boundary_applies_the_placeholder_contract(tmp_
     assert _stored_row(conn, player_id=12, event=3, fixture_id=3)["minutes"] == 0
     assert _stored_row(conn, player_id=30, event=3, fixture_id=3)["minutes"] == 0
     conn.close()
+
+
+def test_the_baseline_arm_carries_the_code_fingerprint(tmp_path):
+    """Every scored comparison arm in a certified bundle carries the code fingerprint.
+
+    ``certified_bundle`` compares each family's recorded
+    ``source_snapshot_sha256`` against the bundle's code snapshot.  A NULL is not
+    a weaker claim, it is the absence of one: the family is skipped by that check
+    entirely, so the arm is certified without its implementation being bound.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    context = _freeze_context(conn)
+    run_id, _counts = analytics.freeze_baselines_for_event(
+        conn, context, CUTOFF, event=4, deadline_status="PRE_DEADLINE"
+    )
+    row = conn.execute(
+        "SELECT model_family, source_snapshot_sha256 FROM projection_runs WHERE id=?", (run_id,)
+    ).fetchone()
+    assert row[0] == analytics.BASELINE_MODEL_FAMILY
+    assert row[1], "the baseline arm records no code fingerprint"
+    assert row[1] == analytics.source_snapshot_sha256()
+    conn.close()
