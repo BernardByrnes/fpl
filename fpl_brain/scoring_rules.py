@@ -121,6 +121,32 @@ class ScoringRules:
     def clean_sheet_points_for(self, position: str) -> int:
         return int(self.clean_sheet_points[position])
 
+    def earns_clean_sheet_points(self, position: str, minutes: int, goals_conceded: int) -> bool:
+        """Whether the clean-sheet SCORING event occurred for one player-fixture.
+
+        This is the canonical definition of the event a position-conditioned
+        clean-sheet probability is a probability OF: the player was on the pitch
+        for the required duration, no goal was conceded while they were on, AND
+        their position actually receives clean-sheet points.
+
+        The third clause is load-bearing and is not about the team.  The official
+        feed records ``clean_sheets = 1`` for ANY player who was on for 60+ minutes
+        of a match their side did not concede in -- including forwards, who are
+        awarded nothing for it.  Scoring a forward's clean-sheet probability
+        against that raw flag would grade a probability of one event against the
+        occurrence of a different one.
+
+        Deliberately a method on the versioned rule object so the producer, the
+        calibration target and the walk-forward target cannot drift apart: every
+        clause is read from this object's own fields.
+        """
+
+        return (
+            int(minutes) >= self.clean_sheet_minutes_required
+            and int(goals_conceded) == 0
+            and self.clean_sheet_points_for(position) > 0
+        )
+
     def defcon_threshold_for(self, position: str) -> int | None:
         return self.defcon_thresholds.get(position)
 

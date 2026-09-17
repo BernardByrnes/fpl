@@ -19,6 +19,83 @@ ROOT = Path("K:/FPL-pe1")
 METRICS = ROOT / "fpl_brain" / "walk_forward_metrics.py"
 SCOREBOARD = ROOT / "fpl_brain" / "walk_forward_scoreboard.py"
 WF = ROOT / "fpl_brain" / "walk_forward.py"
+RULES = ROOT / "fpl_brain" / "scoring_rules.py"
+
+#: The position clause of the canonical clean-sheet scoring rule.  It is the ONE
+#: clause separating "the side did not concede while he was on" from "he was
+#: awarded something for it", and two independent consumers depend on it.
+_CS_POSITION_CLAUSE = (
+    RULES,
+    "            and self.clean_sheet_points_for(position) > 0\n        )",
+    "            # BYPASS: position clause removed\n        )",
+)
+#: The predecessor's exact defect, re-injected: collapse the per-event run map into
+#: one family-keyed map, so only the last run per family survives.
+_PER_EVENT_COLLAPSE = (
+    WF,
+    "        return {\n"
+    "            str(event): self.runs_for_event(event)\n"
+    "            for event in sorted({int(e) for e, _family, _run in self.per_event_runs})\n"
+    "        }",
+    "        return {family: run for _event, family, run in self.per_event_runs}  # BYPASS",
+)
+#: The scoreboard's cross-check of each population's recorded runs against the
+#: runs it resolved from the anchor.
+_WIRING_VERIFY_RUNS = (
+    SCOREBOARD,
+    "    _verify_recorded_runs(\n"
+    "        model_population, populations, xpts_runs=xpts_runs, baseline_runs=baseline_runs\n"
+    "    )",
+    "    None  # BYPASS: the recorded-run cross-check is never called",
+)
+_AGREE_GUARD = (
+    SCOREBOARD,
+    "            if int(recorded) != int(run_id):",
+    "            if False:  # BYPASS",
+)
+
+MULTI_BYPASS_OWN_CHECKS = [
+    (
+        "PE2E-P2-01: the shared helper's position clause drives the CALIBRATION target",
+        [_CS_POSITION_CLAUSE],
+        "tests/test_pe2e_evaluation_contracts.py::test_the_mc_clean_sheet_brier_target_matches_the_producer",
+    ),
+    (
+        "PE2E-P2-01: the SAME clause drives the SCOREBOARD target (one definition)",
+        [_CS_POSITION_CLAUSE],
+        "tests/test_pe2e_evaluation_contracts.py::test_the_scoreboard_clean_sheet_target_is_zero_for_a_forward",
+    ),
+    (
+        "PE2E-P2-01: a forward is never a clean-sheet scoring event",
+        [_CS_POSITION_CLAUSE],
+        "tests/test_pe2e_evaluation_contracts.py::test_a_forward_clean_sheet_is_not_a_clean_sheet_scoring_event",
+    ),
+    (
+        "PE2E-P2-02: the shape-agnostic multi-event regression catches the collapse",
+        [_PER_EVENT_COLLAPSE],
+        "tests/test_pe2e_evaluation_contracts.py::test_a_real_multi_event_build_preserves_every_events_run",
+    ),
+    (
+        "PE2E-P2-02: the exact-shape multi-event regression catches the collapse",
+        [_PER_EVENT_COLLAPSE],
+        "tests/test_pe2e_evaluation_contracts.py::test_a_multi_event_identity_preserves_every_event_run",
+    ),
+    (
+        "PE2E-P2-02: the scoreboard's digest moves when a run changes",
+        [_PER_EVENT_COLLAPSE],
+        "tests/test_pe2e_evaluation_contracts.py::test_the_scoreboard_artifact_changes_when_one_events_run_changes",
+    ),
+    (
+        "PE2E-P2-02: the recorded-run cross-check is WIRED into build_scoreboard",
+        [_WIRING_VERIFY_RUNS],
+        "tests/test_pe2e_evaluation_contracts.py::test_the_scoreboard_verifies_the_populations_recorded_runs",
+    ),
+    (
+        "PE2E-P2-02: the disagreement guard itself raises",
+        [_AGREE_GUARD],
+        "tests/test_pe2e_evaluation_contracts.py::test_the_scoreboard_rejects_a_recorded_run_that_disagrees_with_the_anchor",
+    ),
+]
 
 CHECKS = [
     (
@@ -220,14 +297,27 @@ def run(selector: str) -> bool:
 
 
 def main() -> int:
-    originals = {path: path.read_bytes() for path in {METRICS, SCOREBOARD, WF}}
+    originals = {path: path.read_bytes() for path in {METRICS, SCOREBOARD, WF, RULES}}
     digests = {path: digest(path) for path in originals}
     failures: list[str] = []
-    checks = [(label, [(path, needle, replacement)], selector)
-              for label, path, needle, replacement, selector in CHECKS] + MULTI_BYPASS_CHECKS
+    checks = (
+        [(label, [(path, needle, replacement)], selector)
+         for label, path, needle, replacement, selector in CHECKS]
+        + MULTI_BYPASS_CHECKS
+        + MULTI_BYPASS_OWN_CHECKS
+    )
     try:
         for label, edits, selector in checks:
-            bodies = {path: originals[path].decode("utf-8") for path in originals}
+            # Anchors are written with LF.  Two of the files under test are checked
+            # out with CRLF (core.autocrlf), so matching happens on a newline-
+            # normalised copy and each file's own convention is restored on write.
+            newlines = {
+                path: "\r\n" if b"\r\n" in originals[path] else "\n" for path in originals
+            }
+            originals_text = {
+                path: originals[path].decode("utf-8").replace("\r\n", "\n") for path in originals
+            }
+            bodies = dict(originals_text)
             ok = True
             for path, needle, replacement in edits:
                 if bodies[path].count(needle) != 1:
@@ -240,7 +330,8 @@ def main() -> int:
             if not ok:
                 continue
             for path, body in bodies.items():
-                path.write_bytes(body.encode("utf-8"))
+                text = body.replace("\n", newlines[path]) if newlines[path] == "\r\n" else body
+                path.write_bytes(text.encode("utf-8"))
             try:
                 passed = run(selector)
             finally:
@@ -266,7 +357,8 @@ def main() -> int:
         for item in failures:
             print("  -", item)
         return 1
-    print(f"all {len(CHECKS)} guards are live and every file was restored byte-identically")
+    total = len(CHECKS) + len(MULTI_BYPASS_CHECKS) + len(MULTI_BYPASS_OWN_CHECKS)
+    print(f"all {total} guards are live and every file was restored byte-identically")
     return 0
 
 

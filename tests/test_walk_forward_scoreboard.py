@@ -630,9 +630,15 @@ def test_the_minutes_run_comes_from_the_dependency_closure_not_the_bundle_label(
     assert "dependency closure" in block["resolved_from"]
 
     identity_runs = _scoreboard(conn, built)["identity"]["per_event_runs"]
-    assert identity_runs["minutes_v1"] == {5: built["minutes_run"]}
-    assert identity_runs["xpts_v1"] == {5: built["xpts_run"]}
-    assert identity_runs["monte_carlo_v1"] == {5: built["mc_run"]}
+    # One event-first map carrying every run this scoreboard consumed.
+    assert identity_runs == {
+        "5": {
+            "xpts_v1": built["xpts_run"],
+            "monte_carlo_v1": built["mc_run"],
+            "minutes_v1": built["minutes_run"],
+            wf.BASELINE_FAMILY: built["baseline_run"],
+        }
+    }
 
 
 def test_an_ambiguous_minutes_dependency_fails_closed(tmp_path):

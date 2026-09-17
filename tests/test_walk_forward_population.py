@@ -480,8 +480,11 @@ def test_the_identity_carries_everything_needed_to_reproduce_the_population(tmp_
     assert identity["grain"] == wf.GRAIN_PLAYER_EVENT
     assert identity["target_events"] == [5]
     assert identity["planning_cutoff"] == CUTOFF
-    assert identity["projection_run_ids"]["xpts_v1"] == world["xpts_run"]
-    assert identity["baseline_run_ids"][analytics.RECENT_POINTS_KIND] == world["baseline_run"]
+    assert identity["per_event_runs"]["5"]["xpts_v1"] == world["xpts_run"]
+    assert identity["per_event_runs"]["5"][wf.BASELINE_FAMILY] == world["baseline_run"]
+    # Run identity is recorded PER EVENT: one family can name a different run in
+    # every target event, so a family-keyed map would keep only the last one.
+    assert population.identity.run_id_for(5, "xpts_v1") == world["xpts_run"]
     assert identity["eligible_population_digest"] == population.digest
     assert identity["code_snapshot_sha256"] == CODE_SNAPSHOT
     assert identity["missing_data_policy_version"] == wf.MISSING_DATA_POLICY_VERSION

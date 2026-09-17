@@ -23,6 +23,10 @@ config.json
 # Runtime API data, generated reports, and scouting workflow state
 data/raw/
 data/exports/
+# Generated evaluation evidence: content-addressed walk-forward scoreboard
+# artifacts.  Runtime output rather than source, and the directory is created on
+# the first write.  Ignored narrowly -- never all of data/.
+/data/evaluation/
 data/scouting/briefs/
 data/scouting/inbox/*
 !data/scouting/inbox/

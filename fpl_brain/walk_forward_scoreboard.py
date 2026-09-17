@@ -405,12 +405,26 @@ def _top_k_over_events(
     ).as_dict()
 
 
+def _shared_run(runs: Mapping[int, int]) -> int | None:
+    """The single run when every target event declares the same one, else ``None``.
+
+    An arm spanning several events is not produced by one run when the bundle
+    declares a different run per event, so reporting the first event's run would
+    claim a provenance the arm does not have.  ``None`` says "not one run", and the
+    per-event detail is always carried in ``run_ids_by_event``.
+    """
+
+    values = {int(run_id) for run_id in runs.values()}
+    return values.pop() if len(values) == 1 else None
+
+
 def _arm_entry(
     conn: sqlite3.Connection,
     *,
     name: str,
     kind: str,
     run_id: int | None,
+    run_ids_by_event: Mapping[int, int],
     keys: Sequence[tuple[int, int]],
     predicted: Sequence[float],
     actual: Sequence[float],
@@ -422,6 +436,7 @@ def _arm_entry(
         "kind": kind,
         "version": _run_version(conn, run_id),
         "run_id": run_id,
+        "run_ids_by_event": {int(e): int(r) for e, r in sorted(run_ids_by_event.items())},
         "N": len(keys),
         "mae": wm.mean_absolute_error(predicted, actual).as_dict(),
         "rmse": wm.root_mean_squared_error(predicted, actual).as_dict(),
@@ -443,7 +458,11 @@ def _arm_entry(
 
 
 def _unavailable_arm(
-    conn: sqlite3.Connection, name: str, run_id: int | None, gate: Mapping[str, Any]
+    conn: sqlite3.Connection,
+    name: str,
+    run_id: int | None,
+    gate: Mapping[str, Any],
+    run_ids_by_event: Mapping[int, int] | None = None,
 ) -> dict[str, Any]:
     """An arm that cannot cover the shared population: no metric, and it says why."""
 
@@ -458,6 +477,7 @@ def _unavailable_arm(
         "kind": "baseline",
         "version": _run_version(conn, run_id),
         "run_id": run_id,
+        "run_ids_by_event": {int(e): int(r) for e, r in sorted((run_ids_by_event or {}).items())},
         "N": None,
         "mae": dict(unreachable),
         "rmse": dict(unreachable),
@@ -495,11 +515,9 @@ def _realised_probability_outcome(
         conceded = outcome.get("goals_conceded")
         if conceded is None:
             return None
-        achieved = (
-            minutes >= DEFAULT_SCORING_RULES.clean_sheet_minutes_required
-            and int(conceded) == 0
-            and DEFAULT_SCORING_RULES.clean_sheet_points_for(position) > 0
-        )
+        # The canonical rule, read from the versioned scoring contract rather than
+        # restated here, so the producer's event and this target cannot drift apart.
+        achieved = DEFAULT_SCORING_RULES.earns_clean_sheet_points(position, minutes, int(conceded))
         return 1.0 if achieved else 0.0
     if selector == "defcon_hit":
         threshold = DEFAULT_SCORING_RULES.defcon_threshold_for(position)
@@ -730,6 +748,87 @@ def _has_minutes_dependency(conn: sqlite3.Connection, xpts_run_id: int) -> bool:
         (int(xpts_run_id),),
     ).fetchone()
     return row is not None
+
+
+def assert_recorded_runs_agree(
+    identity_map: Mapping[str, Mapping[str, int]],
+    *,
+    resolved: Mapping[str, Mapping[int, int]],
+) -> None:
+    """The identity's recorded runs must equal the runs this module resolved again.
+
+    Two independent paths produce them: the population build reads each event's run
+    out of the certified bundle, and the scoreboard resolves the same run from the
+    anchor.  Asserting equality means a disagreement cannot be hidden by whichever
+    path happened to be used, and it is what lets the artifact quote ONE record
+    instead of carrying a second, competing copy.
+    """
+
+    for family, runs in resolved.items():
+        for event, run_id in runs.items():
+            recorded = (identity_map.get(str(int(event))) or {}).get(str(family))
+            if recorded is None:
+                raise ScoreboardError(
+                    f"the evaluation identity records no {family} run for event {int(event)}"
+                )
+            if int(recorded) != int(run_id):
+                raise ScoreboardError(
+                    f"the evaluation identity records {family} run {int(recorded)} for event "
+                    f"{int(event)}, but the anchor resolves {int(run_id)}"
+                )
+
+
+def _verify_recorded_runs(
+    model_population: wf.Population,
+    populations: Mapping[str, wf.Population],
+    *,
+    xpts_runs: Mapping[int, int],
+    baseline_runs: Mapping[int, int],
+) -> None:
+    """Check every population's recorded runs against an independent resolution.
+
+    A model population is built with no baseline, so it records only xPts runs; a
+    baseline arm records the baseline run it read.  Each is verified against what
+    the scoreboard resolved from the anchor directly.
+    """
+
+    assert_recorded_runs_agree(
+        model_population.identity.per_event_run_map(), resolved={"xpts_v1": xpts_runs}
+    )
+    for population in populations.values():
+        assert_recorded_runs_agree(
+            population.identity.per_event_run_map(), resolved={wf.BASELINE_FAMILY: baseline_runs}
+        )
+
+
+def _merged_per_event_runs(
+    identity_map: Mapping[str, Mapping[str, int]],
+    *,
+    baseline_runs: Mapping[int, int],
+    monte_carlo_runs: Mapping[int, int],
+    minutes_runs: Mapping[int, int],
+) -> dict[str, dict[str, int]]:
+    """One complete event-first run map: ``{"5": {"xpts_v1": 380, ...}, ...}``.
+
+    The xPts entries come from the model population's identity -- the authoritative
+    record of what the headline population was built from -- and the remaining
+    families are added on top, keyed by the same event.  Monte Carlo and minutes
+    are added here rather than recorded by the population build because the
+    population build never reads them.
+    """
+
+    merged: dict[int, dict[str, int]] = {
+        int(event): {str(family): int(run) for family, run in runs.items()}
+        for event, runs in identity_map.items()
+    }
+    for family, runs in (
+        (wf.BASELINE_FAMILY, baseline_runs),
+        ("monte_carlo_v1", monte_carlo_runs),
+        ("minutes_v1", minutes_runs),
+    ):
+        for event, run_id in runs.items():
+            merged.setdefault(int(event), {})[family] = int(run_id)
+    return {str(event): merged[event] for event in sorted(merged)}
 
 
 def minutes_component_metrics(
@@ -989,7 +1088,9 @@ def build_scoreboard(
 
     xpts_runs = _event_runs(anchor, target_events, "xpts_v1")
     baseline_runs = _baseline_runs(conn, anchor, target_events)
-    arm_runs: dict[str, dict[int, int]] = {str(kind): dict(baseline_runs) for kind in kinds}
+    _verify_recorded_runs(
+        model_population, populations, xpts_runs=xpts_runs, baseline_runs=baseline_runs
+    )
 
     model_rows = _rows_by_key(model_population)
     arms: list[dict[str, Any]] = []
@@ -1002,7 +1103,8 @@ def build_scoreboard(
                 conn,
                 name=ARM_MODEL,
                 kind="xpts_v1",
-                run_id=xpts_runs.get(target_events[0]),
+                run_id=_shared_run(xpts_runs),
+                run_ids_by_event=xpts_runs,
                 keys=scorable,
                 predicted=[float(_model_value(model_rows[key])) for key in scorable],
                 actual=model_actual,
@@ -1019,9 +1121,9 @@ def build_scoreboard(
         for kind in kinds:
             name = str(kind)
             arm_gate = gate["arms"][name]
-            run_id = sorted(arm_runs[name].values())[0] if arm_runs[name] else None
+            baseline_run = _shared_run(baseline_runs)
             if arm_gate["status"] != ARM_OK:
-                arms.append(_unavailable_arm(conn, name, run_id, arm_gate))
+                arms.append(_unavailable_arm(conn, name, baseline_run, arm_gate, baseline_runs))
                 continue
             rows = _rows_by_key(populations[name])
             arm_predicted = [float(_baseline_value(rows[key])) for key in scorable]
@@ -1030,7 +1132,8 @@ def build_scoreboard(
                     conn,
                     name=name,
                     kind="baseline",
-                    run_id=run_id,
+                    run_id=baseline_run,
+                    run_ids_by_event=baseline_runs,
                     keys=scorable,
                     predicted=arm_predicted,
                     actual=model_actual,
@@ -1056,7 +1159,7 @@ def build_scoreboard(
         "status": status,
         "status_reasons": _status_reasons(model_population, target_events, scorable),
         "identity": _identity(
-            conn, model_population, anchor, target_events, kinds, top_k, xpts_runs, arm_runs
+            conn, model_population, anchor, target_events, kinds, top_k, xpts_runs, baseline_runs
         ),
         "target_events": [int(event) for event in target_events],
         "population": _population_block(model_population, scorable, unscorable, shared_digest),
@@ -1078,7 +1181,7 @@ def _identity(
     kinds: Sequence[str],
     top_k: int,
     xpts_runs: Mapping[int, int],
-    arm_runs: Mapping[str, Mapping[int, int]],
+    baseline_runs: Mapping[int, int],
 ) -> dict[str, Any]:
     base = model_population.identity.as_dict()
     monte_carlo_runs = _event_runs(anchor, target_events, "monte_carlo_v1")
@@ -1090,6 +1193,10 @@ def _identity(
             # AMBIGUOUS closure is still raised, by resolve_component_run itself.
             continue
         minutes_runs[int(event)] = resolve_component_run(conn, int(run_id))
+    # The population build already wrote down which run produced each event's xPts
+    # rows.  That record is authoritative and is used directly; the scoreboard's own
+    # resolution was compared against it above rather than substituted for it, so a
+    # disagreement surfaces instead of whichever path won silently.
     return {
         "walk_forward_identity": base,
         "certification_identity": anchor.certification_identity,
@@ -1110,18 +1217,11 @@ def _identity(
         "ranking_policy": "NONE; measurements only, no arm is ranked or named best",
         "probability_metric_definitions": [d.as_dict() for d in PROBABILITY_METRICS],
         "probability_population_policy": PROBABILITY_POPULATION_POLICY,
-        "per_event_runs": {
-            "xpts_v1": {int(k): int(v) for k, v in sorted(xpts_runs.items())},
-            "monte_carlo_v1": {int(k): int(v) for k, v in sorted(monte_carlo_runs.items())},
-            "minutes_v1": {int(k): int(v) for k, v in sorted(minutes_runs.items())},
-            "baselines": {
-                str(name): {int(k): int(v) for k, v in sorted(runs.items())}
-                for name, runs in sorted(arm_runs.items())
-            },
-        },
-        "note_on_per_event_runs": (
-            "recorded per target event because a bundle declares one run set per event; the "
-            "family-keyed map inside walk_forward_identity names only the last event's run"
+        "per_event_runs": _merged_per_event_runs(
+            base["per_event_runs"],
+            baseline_runs=baseline_runs,
+            monte_carlo_runs=monte_carlo_runs,
+            minutes_runs=minutes_runs,
         ),
     }
 

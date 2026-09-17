@@ -77,6 +77,11 @@ from . import xpts as xpts_module
 WALK_FORWARD_VERSION = "walk_forward_v1.0.0"
 MISSING_DATA_POLICY_VERSION = "wf_missing_policy_v1.0.0"
 
+#: The family every headline points baseline run is declared under.  One run
+#: serves all of :data:`HEADLINE_POINTS_BASELINE_KINDS`, which is why the identity
+#: records the family rather than repeating the run once per kind.
+BASELINE_FAMILY = analytics.BASELINE_MODEL_FAMILY
+
 GRAIN_PLAYER_EVENT = "player_event"
 GRAIN_PLAYER_FIXTURE = "player_fixture"
 
@@ -164,14 +169,21 @@ def canonical_population_digest(keys: Iterable[Sequence[Any]], *, grain: str) ->
 
 @dataclass(frozen=True)
 class EvaluationIdentity:
-    """Enough information to reproduce the population that was judged."""
+    """Enough information to reproduce the population that was judged.
+
+    Run identity is recorded PER EVENT.  A certified bundle declares its own run
+    for each target event, so one family can legitimately name a different run in
+    every event; a ``family -> run_id`` map would silently keep only the last one
+    and an evaluation over GW5-GW8 would claim to have been produced by GW8's
+    runs alone.  ``per_event_runs`` holds ``(event, family, run_id)`` triples, so
+    nothing is lost and nothing has to be inferred from a family name.
+    """
 
     evaluation_version: str
     grain: str
     target_events: tuple[int, ...]
     planning_cutoff: str | None
-    projection_run_ids: tuple[tuple[str, int], ...]
-    baseline_run_ids: tuple[tuple[str, int], ...]
+    per_event_runs: tuple[tuple[int, str, int], ...]
     baseline_kinds: tuple[str, ...]
     eligible_population_digest: str
     model_versions: tuple[tuple[str, str], ...]
@@ -180,14 +192,34 @@ class EvaluationIdentity:
     missing_data_policy_version: str
     outcome_state: tuple[tuple[int, str], ...]
 
+    def runs_for_event(self, event: int) -> dict[str, int]:
+        """``family -> run_id`` for one event, exact and lossless."""
+
+        wanted = int(event)
+        return {
+            str(family): int(run_id)
+            for recorded_event, family, run_id in self.per_event_runs
+            if int(recorded_event) == wanted
+        }
+
+    def run_id_for(self, event: int, family: str) -> int | None:
+        return self.runs_for_event(int(event)).get(str(family))
+
+    def per_event_run_map(self) -> dict[str, dict[str, int]]:
+        """``{event: {family: run_id}}``, deterministically ordered."""
+
+        return {
+            str(event): self.runs_for_event(event)
+            for event in sorted({int(e) for e, _family, _run in self.per_event_runs})
+        }
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "evaluation_version": self.evaluation_version,
             "grain": self.grain,
             "target_events": [int(e) for e in self.target_events],
             "planning_cutoff": self.planning_cutoff,
-            "projection_run_ids": {name: int(rid) for name, rid in self.projection_run_ids},
-            "baseline_run_ids": {name: int(rid) for name, rid in self.baseline_run_ids},
+            "per_event_runs": self.per_event_run_map(),
             "baseline_kinds": [str(k) for k in self.baseline_kinds],
             "eligible_population_digest": self.eligible_population_digest,
             "model_versions": {name: str(v) for name, v in self.model_versions},
@@ -486,8 +518,7 @@ def build_event_population(
     """
 
     population = Population(grain=GRAIN_PLAYER_EVENT, baseline_kind=baseline_kind)
-    projection_runs: list[tuple[str, int]] = []
-    baseline_runs: list[tuple[str, int]] = []
+    per_event_runs: list[tuple[int, str, int]] = []
     outcome_state: list[tuple[int, str]] = []
     versions: list[tuple[str, str]] = []
     code_snapshot: str | None = None
@@ -505,7 +536,7 @@ def build_event_population(
         )
         if not current:
             raise WalkForwardError(f"xpts run {xpts_run} is not current semantics: {'; '.join(reasons)}")
-        projection_runs.append(("xpts_v1", xpts_run))
+        per_event_runs.append((event, "xpts_v1", int(xpts_run)))
         versions.append(("xpts_v1", xpts_run and _run_version(conn, xpts_run)))
 
         state = entry.outcome_state
@@ -520,7 +551,11 @@ def build_event_population(
         baseline_values: dict[tuple[int, int], float] = {}
         baseline_run = resolve_baseline_run(conn, entry) if baseline_kind else None
         if baseline_run is not None:
-            baseline_runs.append((baseline_kind or "baseline", baseline_run))
+            # Recorded under its FAMILY, not the requested kind: one baseline run
+            # serves every declared kind, and the kinds are already carried in
+            # ``baseline_kinds``.  Recording the kind here would name the same run
+            # several times and invite the belief that they are different runs.
+            per_event_runs.append((event, BASELINE_FAMILY, int(baseline_run)))
             baseline_values = baseline_event_values(conn, baseline_run, str(baseline_kind))
 
         for player_id in sorted(pool):
@@ -576,8 +611,7 @@ def build_event_population(
         grain=GRAIN_PLAYER_EVENT,
         target_events=tuple(sorted(int(e) for e in events)),
         planning_cutoff=cutoff or anchor.planning_cutoff,
-        projection_run_ids=tuple(sorted(projection_runs)),
-        baseline_run_ids=tuple(sorted(baseline_runs)),
+        per_event_runs=tuple(sorted(per_event_runs)),
         baseline_kinds=(str(baseline_kind),) if baseline_kind else (),
         eligible_population_digest=population.digest,
         model_versions=tuple(sorted(versions)),
