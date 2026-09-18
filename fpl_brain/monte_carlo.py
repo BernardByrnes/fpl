@@ -1256,7 +1256,7 @@ def simulate(
                 _commit_draw(draw_components, accumulators, fixture_id, simulation_index,
                              world_core, world_minutes)
 
-    summaries = _summarise(accumulators, analytic, config, player_meta, calibration_by_player)
+    summaries = _summarise(accumulators, analytic, config, player_meta, calibration_by_player, rules)
     return {
         "summaries": summaries,
         "team_minutes": team_minutes,
@@ -1304,13 +1304,24 @@ def _calibration_diagnostic(fixture_id: int, team_id: int, calibration: Mapping[
     }
 
 
-def _classify_standardised(value: float, std: float, sims: int, materiality: float) -> tuple[float, str]:
+def _classify_standardised(value: float, std: float, sims: int, materiality: float,
+                           analytic_variance_per_world: float | None = None) -> tuple[float, str]:
     """Standardise a mismatch, distinguishing broken instruments from noise.
 
     Returns ``(standardised_error, status)`` where status is ``ok``,
     ``below_materiality`` (a microscopic finite-draw residual with no variance,
     recorded but never claimed as z=0 evidence) or ``mismatch`` (a MATERIAL
     non-zero mismatch with zero variance, which is a HARD FAIL).
+
+    ``analytic_variance_per_world`` is the model's OWN per-world variance for a
+    component whose sampling distribution makes it computable, in the SAME score-point
+    units as ``value``.  It is used ONLY when the observed sample standard deviation is
+    exactly zero, and only as a LOWER bound on the true variance, so the resulting
+    standardised error is an UPPER bound: it can only make the gate stricter, never
+    looser.  A zero sample variance then means "the event did not occur in this sample",
+    which for a low-rate count is an ordinary outcome of a working generator, and the
+    exact standard error of the mean is not zero.  Components without such a bound pass
+    ``None`` and keep the historical ``inf`` behaviour.
     """
 
     se = std / math.sqrt(max(1, sims))
@@ -1320,7 +1331,47 @@ def _classify_standardised(value: float, std: float, sims: int, materiality: flo
         return 0.0, "ok"
     if abs(value) <= materiality:
         return 0.0, "below_materiality"
+    if analytic_variance_per_world is not None and analytic_variance_per_world > 0.0:
+        floor_se = math.sqrt(analytic_variance_per_world / max(1, sims))
+        if floor_se > 0.0:
+            return value / floor_se, "ok"
     return float("inf"), "mismatch"
+
+
+def _analytic_variance_floor_per_world(name: str, analytic_value: float, position: str | None,
+                                       rules: ScoringRules) -> float | None:
+    """A PROVABLE lower bound on a component's per-world variance, in score points.
+
+    Today only ``goal`` qualifies, and the justification is structural rather than an
+    assumption that per-player counts are Poisson:
+
+      * the simulator draws ONE team goal total per side per world,
+        ``Poisson(expected_goals_for)``, and then assigns each goal independently to a
+        scorer by a categorical draw over the players on the pitch;
+      * so a player's goal count conditioned on the world is ``Poisson(lambda * p)``,
+        where ``p`` is that world's probability a goal is his -- a Poisson THINNING;
+      * ``p`` varies across worlds (who is on the pitch, and when the goals fall), so the
+        count is a Poisson MIXTURE, and for any Poisson mixture
+        ``Var = E[rate] + Var(rate) >= E[rate] = mean``.
+
+    Hence ``Var(points) = weight^2 * Var(count) >= weight^2 * mean_count``, and because
+    ``mean_count = analytic_points / weight`` this collapses to ``weight * analytic_points``.
+    Being a lower bound on variance it yields an UPPER bound on the standardised error, so
+    using it can only make the gate stricter, never looser.
+
+    Components that do NOT admit this bound keep ``None`` (historical behaviour):
+    ``assist`` is a Poisson-BINOMIAL over the goals, whose variance
+    ``mean - sum(q_k^2)`` can fall BELOW the mean; ``save`` is thresholded by
+    ``floor(saves / rules.saves_per_point)``; and ``defcon``/``yellow`` are per-player
+    Bernoulli draws, whose variance ``mean * (1 - p)`` is also below the mean.
+    """
+
+    if name != "goal" or analytic_value <= 0.0:
+        return None
+    weight = float(rules.goal_points_for(position)) if position else 0.0
+    if weight <= 0.0:
+        return None
+    return weight * float(analytic_value)
 
 
 PROBABILITY_KEYS = (
@@ -1573,9 +1624,11 @@ def _summarise(
     config: MonteCarloConfig,
     player_meta: Mapping[int, Mapping[str, Any]],
     calibration_by_player: Mapping[tuple[int, int], Mapping[str, Any]] | None = None,
+    rules: ScoringRules | None = None,
 ) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     calibration_by_player = calibration_by_player or {}
+    rules = rules or DEFAULT_SCORING_RULES
     materiality = float(config.zero_variance_materiality_points)
     for (player_id, fixture_id) in sorted(accumulators):
         acc = accumulators[(player_id, fixture_id)]
@@ -1621,7 +1674,11 @@ def _summarise(
         zero_variance_below_materiality = []
         for name, value in reconciliation.items():
             std = moments["std"] if name == "core" else component_std.get(name, 0.0)
-            z_value, status = _classify_standardised(value, std, sims, materiality)
+            z_value, status = _classify_standardised(
+                value, std, sims, materiality,
+                _analytic_variance_floor_per_world(name, float(reference.get(name, 0.0)),
+                                                   meta.get("position"), rules),
+            )
             standardised[name] = z_value
             if status == "below_materiality":
                 zero_variance_below_materiality.append(name)
