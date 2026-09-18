@@ -9,8 +9,10 @@ These tests therefore drive ``scripts/run_four_gw_decision.py`` and
   * Stage-2 ``optimize`` receives ``parallel_workers = PRODUCTION_PARALLEL_EXACT_WORKERS``;
   * the ONE stability escalation receives the same value;
   * the SAME run-scoped ``exact_cache`` object is retained across both;
-  * Stage 1 does NOT receive it (asserted on the runner's own AST, because that call site
-    cannot be driven without a database);
+  * Stage 1 ALSO receives it, since the B1 equivalence proof and scaling measurement in
+    ``tests/test_stage1_parallel_exact.py`` replaced the original "Stage 1 stays sequential"
+    decision (asserted on the runner's own AST, because that call site cannot be driven
+    without a database);
   * the library defaults stay conservative, so no other caller inherits a pool;
   * the parallel path is genuinely REACHED and reports its worker processes — i.e. there is
     no silent fallback to sequential when the pool is healthy.
@@ -111,11 +113,19 @@ def test_the_cli_default_is_the_production_constant():
     assert defaults.get("--parallel-workers") == "PRODUCTION_PARALLEL_EXACT_WORKERS", defaults
 
 
-def test_stage1_call_site_does_not_request_parallelism():
-    """Stage 1 stays sequential: the 10k target was Stage-2 and the escalation only."""
+def test_stage1_call_site_requests_the_production_worker_count():
+    """SUPERSEDES test_stage1_call_site_does_not_request_parallelism.
 
-    assert "parallel_workers" not in _keywords(_stage1_optimize_call()), (
-        "the Stage-1 optimize call must not pass parallel_workers"
+    The original decision kept Stage 1 sequential because a 2,000-draw evaluation is much
+    shorter than a 10,000-draw one (so pool overhead might outweigh the gain) and the P3
+    bit-identity proof covered only the 10,000-draw path.  Performance Spike B1 supplied the
+    missing equivalence proof and measured the scaling, so Stage 1 now dispatches through the
+    SAME scheduler.  This is asserted on the runner's own AST because the real call site
+    cannot be driven without a database.
+    """
+
+    assert "parallel_workers" in _keywords(_stage1_optimize_call()), (
+        "the Stage-1 optimize call must pass parallel_workers"
     )
 
 
@@ -160,9 +170,9 @@ def spy_optimize(monkeypatch):
     return recorded
 
 
-def _stage1_result(universe, state, meta, scenario, config, provider):
+def _stage1_result(universe, state, meta, scenario, config, provider, **over):
     return ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                       player_meta=meta, config=config, world_provider=provider)
+                       player_meta=meta, config=config, world_provider=provider, **over)
 
 
 def test_stage2_refinement_receives_the_production_worker_count_and_cache(spy_optimize):
@@ -248,17 +258,28 @@ def test_parallel_stage2_is_bit_identical_to_sequential_stage2():
     assert parallel["roll_baseline"] == sequential["roll_baseline"]
 
 
-def test_stage1_stays_sequential_in_the_real_call_graph(spy_optimize):
-    """The Stage-1 call the runner makes carries no worker count."""
+def test_stage1_honours_the_worker_count_in_the_real_call_graph(spy_optimize):
+    """SUPERSEDES test_stage1_stays_sequential_in_the_real_call_graph.
+
+    The predecessor asserted that the Stage-1 call carried no worker count and that the
+    result therefore reported no parallel scheduling.  Both halves are now inverted: the
+    count is forwarded, and the result reports the schedule it actually used.
+    """
 
     universe, state, meta = _universe()
     scenario, config, provider = _scenario(), _config(), _provider()
-    _stage1_result(universe, state, meta, scenario, config, provider)
+    _stage1_result(universe, state, meta, scenario, config, provider,
+                   parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
+    assert spy_optimize, "the Stage-1 call must have reached optimize"
     for kwargs in spy_optimize:
-        assert kwargs.get("parallel_workers") is None
-    # and the Stage-1 result therefore reports no parallel scheduling at all
-    result = _stage1_result(universe, state, meta, scenario, config, provider)
-    assert result.get("parallel_exact") is None
+        assert kwargs.get("parallel_workers") == runner.PRODUCTION_PARALLEL_EXACT_WORKERS
+    result = _stage1_result(universe, state, meta, scenario, config, provider,
+                            parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
+    reported = result.get("parallel_exact") or {}
+    assert reported.get("worker_count") == runner.PRODUCTION_PARALLEL_EXACT_WORKERS
+    assert reported.get("path") == "parallel", (
+        "Stage 1 must report the parallel path it actually used, not a sequential label"
+    )
 
 
 def test_production_worker_count_is_a_real_pool_not_a_sequential_label(spy_optimize):

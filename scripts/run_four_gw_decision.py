@@ -187,10 +187,16 @@ STAGE2_DRAWS = fr.STAGE2_DRAWS
 #: and ``parallel_exact.DEFAULT_WORKER_COUNT`` still defaults to 1, so no caller inherits a
 #: process pool by accident.
 #:
-#: STAGE 1 STAYS SEQUENTIAL.  The P3 acceptance target was the 10,000-draw Stage-2/escalation
-#: path; a 2,000-draw Stage-1 evaluation is ~48 s, so a pool would add spawn/matrix-load
-#: overhead for a small gain and would need its own equivalence proof.  The Stage-1
-#: `stage1_result` search call below therefore passes no `parallel_workers`.
+#: STAGE 1 ALSO USES THE POOL, now that it has its own equivalence proof.  The original
+#: decision kept Stage 1 sequential on two grounds: a 2,000-draw evaluation is much shorter
+#: than a 10,000-draw one, so spawn/matrix-load overhead might outweigh the gain; and the
+#: P3 bit-identity proof covered only the 10,000-draw path.  Performance Spike B1 supplied
+#: the missing proof (serial == parallel across the real Stage-1 unit population, including
+#: the exact cache keys and values, out-of-order completion, worker failure and the
+#: role-actionability policy set) and measured the scaling, so both grounds are now resolved
+#: by evidence rather than by assumption.  The Stage-1 `stage1_result` search call below
+#: passes `parallel_workers` for that reason; `worker_count <= 1` still selects the
+#: unchanged sequential evaluator.
 #:
 #: (Note on wording: this block deliberately does not spell the Stage-1 call as source
 #: text, because `tests/test_r4b2a_search_coverage.py` greps this file for the first
@@ -646,6 +652,7 @@ def main(argv=None) -> int:
             provenance={**search_provenance,
                         "discovery_certification_identity": discovery_identity,
                         "exact_evaluation_certification_identity": exact_identity},
+            parallel_workers=parallel_workers,
         )
         search_seconds = time.time() - t0
 
