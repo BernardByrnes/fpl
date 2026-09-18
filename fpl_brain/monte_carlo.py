@@ -1155,6 +1155,12 @@ def simulate(
     world_core: dict[int, list[float]] = {pid: [0.0] * int(config.simulations) for pid in captured_players}
     world_minutes: dict[int, list[float]] = {pid: [0.0] * int(config.simulations) for pid in captured_players}
     accumulators: dict[tuple[int, int], dict[str, Any]] = {}
+    #: Sum over worlds of the per-world scoring intensity the PRODUCTION mechanism
+    #: induced for each player/fixture.  Accumulated from the sampled world state, the
+    #: team's Poisson lambda and the calibrated scorer weights -- before any scorer draw
+    #: is consumed and independent of the realised number of team goals.  The
+    #: zero-variance goal check is judged against THIS, never against the analytic target.
+    production_goal_expectation: dict[tuple[int, int], float] = {}
     player_meta: dict[int, dict[str, Any]] = {}
     team_minutes: list[float] = []
     invalid_lineups = 0
@@ -1249,6 +1255,11 @@ def simulate(
             # clean-sheet and concession exposure.
             for side_index, entry in enumerate(per_side):
                 opponent = per_side[1 - side_index]
+                # BEFORE the scorer draw: what opportunity did this world's play expose?
+                for player_id, induced_goals in _production_goal_intensity(entry, rules).items():
+                    expectation_key = (player_id, fixture_id)
+                    production_goal_expectation[expectation_key] = (
+                        production_goal_expectation.get(expectation_key, 0.0) + induced_goals)
                 draw_components: dict[int, dict[str, float]] = {}
                 _allocate_and_score(entry, rules, config, fixture_id, draw_components)
                 _score_personal_events(entry, opponent, rules, accumulators, config, fixture_id,
@@ -1256,7 +1267,8 @@ def simulate(
                 _commit_draw(draw_components, accumulators, fixture_id, simulation_index,
                              world_core, world_minutes)
 
-    summaries = _summarise(accumulators, analytic, config, player_meta, calibration_by_player, rules)
+    summaries = _summarise(accumulators, analytic, config, player_meta, calibration_by_player,
+                           rules, production_goal_expectation)
     return {
         "summaries": summaries,
         "team_minutes": team_minutes,
@@ -1371,50 +1383,122 @@ def _classify_standardised(value: float, std: float, sims: int, materiality: flo
     return float("inf"), "mismatch"
 
 
-def _analytic_variance_floor_per_world(name: str, analytic_value: float, position: str | None,
-                                       rules: ScoringRules, sims: int) -> "_ZeroVarianceAllowance | None":
-    """A PROVABLE lower bound on a component's per-world variance, in score points.
+def _production_goal_intensity(entry: Mapping[str, Any], rules: ScoringRules) -> dict[int, float]:
+    """Per-player EXPECTED GOALS in THIS world, from the production mechanism's own state.
 
-    Today only ``goal`` qualifies, and the justification is structural rather than an
-    assumption that per-player counts are Poisson:
+    Derived from the sampled play, never from the analytic comparator and never from any
+    realised outcome: it consumes NO randomness and is computed independently of how many
+    goals the team actually scored, so it still exists in a world where the team scores
+    none.  That is what lets it certify that the goal mechanism exposed a scoring
+    opportunity for a player even when the sample caught zero goals.
 
-      * the simulator draws ONE team goal total per side per world,
-        ``Poisson(expected_goals_for)``, and then assigns each goal independently to a
-        scorer by a categorical draw over the players on the pitch;
-      * so a player's goal count conditioned on the world is ``Poisson(lambda * p)``,
-        where ``p`` is that world's probability a goal is his -- a Poisson THINNING;
-      * ``p`` varies across worlds (who is on the pitch, and when the goals fall), so the
-        count is a Poisson MIXTURE, and for any Poisson mixture
-        ``Var = E[rate] + Var(rate) >= E[rate]``.
+    The production mechanism (`_allocate_and_score` above):
 
-    That theorem bounds the variance by the PRODUCTION mean, not by the analytic
-    comparator target.  The two are only equal if the scorer calibration reproduces each
-    player's analytic share exactly, which is the very agreement the gate exists to test,
-    so the target is NEVER treated as proof that the generator is live.  It is passed
-    alongside as a plausibility expectation instead, and the classifier refuses the row
-    unless a zero count is genuinely unsurprising under it.
+      * the team's goals are ``Poisson(lambda_for)`` with INDEPENDENT uniform times on
+        ``[0, 90]``;
+      * each goal's scorer is a categorical draw over the players on the pitch at that
+        time, with weight ``max(0, w_i)`` and an explicit residual bucket.
 
-    ``variance_per_world = weight * analytic_points`` follows from
-    ``Var(points) = weight^2 * Var(count) >= weight^2 * mean_count`` together with
-    ``mean_count = analytic_points / weight``.  It is a LOWER bound, so the standardised
-    error it yields is an UPPER bound and the gate can only get stricter.
+    So a player's goal count in this world is ``Poisson(lambda_for * p_i)`` where ``p_i``
+    is his share of one goal averaged over the uniform goal time::
 
-    Components that do NOT admit this bound keep ``None`` (historical behaviour):
-    ``assist`` is a Poisson-BINOMIAL over the goals, whose variance
-    ``mean - sum(q_k^2)`` can fall BELOW the mean; ``save`` is thresholded by
-    ``floor(saves / rules.saves_per_point)``; and ``defcon``/``yellow`` are per-player
-    Bernoulli draws, whose variance ``mean * (1 - p)`` is also below the mean.
+        p_i = (1/90) * Integral_0^90  [i on pitch at t] * w_i / D(t)  dt
+        D(t) = residual + sum of on-pitch weights at t
+
+    Both the on-pitch set and ``D`` are piecewise constant between interval endpoints, so
+    the integral is EXACT.  Segments sharing an on-pitch set are merged, which collapses
+    the ~2 * substitutions configurations to a handful and keeps this cheap in the hot
+    loop.
     """
 
-    if name != "goal" or analytic_value <= 0.0:
+    side = entry["side"]
+    players = side["players"]
+    intervals = entry["intervals"]
+    calibration = entry["calibration"]
+    scorer = calibration.get("scorer") or {}
+    residual = max(0.0, float(scorer.get("residual_weight") or 0.0))
+    lam = float(side.get("lambda_for") or 0.0)
+
+    player_ids = [int(player["player_id"]) for player in players]
+    weights = scorer.get("weights") or [0.0] * len(players)
+    weight_of = [max(0.0, float(weights[i])) if i < len(weights) else 0.0
+                 for i in range(len(players))]
+
+    intensity = {player_id: 0.0 for player_id in player_ids}
+    if lam <= 0.0:
+        return intensity
+
+    bounds = {0.0, 90.0}
+    for player_id in player_ids:
+        interval = intervals.get(player_id)
+        if interval is None:
+            continue
+        bounds.add(min(90.0, max(0.0, float(interval[0]))))
+        bounds.add(min(90.0, max(0.0, float(interval[1]))))
+    ordered = sorted(bounds)
+
+    # Merge segments that share an on-pitch set: D depends only on the set.
+    span_by_set: dict[tuple[int, ...], float] = {}
+    for index in range(len(ordered) - 1):
+        low, high = ordered[index], ordered[index + 1]
+        width = high - low
+        if width <= 0.0:
+            continue
+        key = tuple(i for i, player_id in enumerate(player_ids)
+                    if player_id in intervals
+                    and float(intervals[player_id][0]) <= low
+                    and float(intervals[player_id][1]) >= high)
+        span_by_set[key] = span_by_set.get(key, 0.0) + width
+
+    for on_pitch, span in span_by_set.items():
+        denom = residual + sum(weight_of[i] for i in on_pitch)
+        if denom <= 0.0:
+            continue
+        factor = lam * span / (90.0 * denom)
+        for i in on_pitch:
+            if weight_of[i] > 0.0:
+                intensity[player_ids[i]] += factor * weight_of[i]
+    return intensity
+
+
+def _production_goal_zero_variance_allowance(
+    name: str, position: str | None, rules: ScoringRules, sims: int,
+    production_expected_goals: float,
+) -> "_ZeroVarianceAllowance | None":
+    """The zero-variance allowance for ``goal``, built from the PRODUCTION generator.
+
+    ``production_expected_goals`` is the sum, over the sampled worlds, of the per-world
+    scoring intensity that the production mechanism actually induced for this player
+    (see :func:`_production_goal_intensity`).  It is a property of the production
+    world state, the team's Poisson lambda and the calibrated scorer weights -- NOT of
+    the analytic comparator, which is only ever the quantity being tested.
+
+    Conditional on those sampled world states the player's total goal count over the
+    sample is ``Poisson(E)`` with ``E = production_expected_goals``, so
+
+        P(zero goals) = exp(-E)
+        Var(mean goal points) = weight^2 * E / sims^2   =>   SE = weight * sqrt(E) / sims
+
+    Both are production-derived.  No claim is made that E equals the analytic target: if
+    the mechanism exposes no opportunity at all (E == 0) the row HARD FAILS, and a large
+    E convicts it.  Only ``goal`` qualifies; the other count components do not admit this
+    derivation and keep the historical ``inf`` behaviour.
+    """
+
+    if name != "goal":
+        return None
+    if production_expected_goals <= 0.0:
+        # The production mechanism exposed no scoring opportunity for this player in ANY
+        # sampled world, yet the row carries a material goal error.  That is the
+        # dead/mis-wired generator signature: no allowance is offered.
         return None
     weight = float(rules.goal_points_for(position)) if position else 0.0
     if weight <= 0.0:
         return None
-    # Expected GOALS over the whole sample: analytic points -> goals -> count over sims.
-    expected_count = float(sims) * float(analytic_value) / weight
-    return _ZeroVarianceAllowance(variance_per_world=weight * float(analytic_value),
-                                  expected_count_in_sample=expected_count)
+    return _ZeroVarianceAllowance(
+        variance_per_world=weight * weight * production_expected_goals / max(1, int(sims)),
+        expected_count_in_sample=float(production_expected_goals),
+    )
 
 
 PROBABILITY_KEYS = (
@@ -1668,10 +1752,12 @@ def _summarise(
     player_meta: Mapping[int, Mapping[str, Any]],
     calibration_by_player: Mapping[tuple[int, int], Mapping[str, Any]] | None = None,
     rules: ScoringRules | None = None,
+    production_goal_expectation: Mapping[tuple[int, int], float] | None = None,
 ) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     calibration_by_player = calibration_by_player or {}
     rules = rules or DEFAULT_SCORING_RULES
+    production_goal_expectation = production_goal_expectation or {}
     materiality = float(config.zero_variance_materiality_points)
     for (player_id, fixture_id) in sorted(accumulators):
         acc = accumulators[(player_id, fixture_id)]
@@ -1719,8 +1805,10 @@ def _summarise(
             std = moments["std"] if name == "core" else component_std.get(name, 0.0)
             z_value, status = _classify_standardised(
                 value, std, sims, materiality,
-                _analytic_variance_floor_per_world(name, float(reference.get(name, 0.0)),
-                                                   meta.get("position"), rules, sims),
+                _production_goal_zero_variance_allowance(
+                    name, meta.get("position"), rules, sims,
+                    float(production_goal_expectation.get((player_id, fixture_id), 0.0)),
+                ),
             )
             standardised[name] = z_value
             if status == "below_materiality":
