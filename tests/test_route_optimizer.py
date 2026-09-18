@@ -66,9 +66,16 @@ def _provider(events=EVENTS, worlds=6, core=None):
     values = dict(BASE_CORE)
     values.update(core or {})
     def provider(event, union_ids):
+        # The two policy blocks are part of the canonical semantic matrix
+        # (parallel_exact.SEMANTIC_MATRIX_BLOCKS) and a worker fails closed without them.
+        # They are NEUTRAL here -- zero bonus and no restriction -- so every caller's
+        # expected values are unchanged: x + 0.0 is x, and an unrestricted keeper is the
+        # policy this fixture already produced.
         return {"worlds": worlds, "player_ids": list(union_ids),
                 "core": {pid: [values.get(pid, 0.0)] * worlds for pid in union_ids},
-                "minutes": {pid: [90.0] * worlds for pid in union_ids}}
+                "minutes": {pid: [90.0] * worlds for pid in union_ids},
+                "expected_bonus": {pid: 0.0 for pid in union_ids},
+                "role_actionability": {pid: False for pid in union_ids}}
     return provider
 
 
