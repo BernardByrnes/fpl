@@ -39,7 +39,7 @@ import re
 import sqlite3
 import sys
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from . import analytics, joint_minutes
 from . import defcon_calibration as defcon_cal
@@ -1304,8 +1304,42 @@ def _calibration_diagnostic(fixture_id: int, team_id: int, calibration: Mapping[
     }
 
 
+#: Zero-variance rows are only judged, never blanket-excused.  A zero observed variance
+#: means the component contributed the SAME value in every draw; for a discrete count
+#: that almost always means "no events at all", which is either an ordinary low-rate
+#: sample or a generator that is not delivering the player's events.  Those two are
+#: indistinguishable from the sample alone, so the deciding evidence is the MODEL's own
+#: expected number of events over the whole sample, E: observing zero has probability
+#: exp(-E) under the model.  A row is tolerated only when that probability is at least
+#: this floor; otherwise it keeps the historical HARD FAIL.
+#:
+#: The two regimes are separated by many orders of magnitude, so the verdict is not
+#: sensitive to the exact value.  Reference points (2000 draws, DEF): the real GW7 row
+#: expects E = 4.38 goals -> exp(-E) = 1.25e-02, tolerated; a dead instrument with a
+#: 0.10-point expectation has E = 33.3 -> exp(-E) = 3.5e-15, refused.  This stays a
+#: module constant rather than a MonteCarloConfig field ON PURPOSE: config_hash() hashes
+#: every dataclass field, so a new field would change the calibration namespace and with
+#: it every simulated number.
+ZERO_EVENT_PLAUSIBILITY_FLOOR = 1e-3
+
+
+class _ZeroVarianceAllowance(NamedTuple):
+    """Evidence that lets a zero-variance row be JUDGED instead of blanket-failed.
+
+    ``variance_per_world`` is a provable LOWER bound on the component's per-world
+    variance in score points (so the standard error it yields is an upper bound).
+    ``expected_count_in_sample`` is the model's expected number of EVENTS over the whole
+    sample, which is the only quantity that can separate an unlucky zero from a dead
+    generator.  It is used as a plausibility test, NOT as proof that the generator is
+    live -- if the expectation is itself too large the row still fails.
+    """
+
+    variance_per_world: float
+    expected_count_in_sample: float
+
+
 def _classify_standardised(value: float, std: float, sims: int, materiality: float,
-                           analytic_variance_per_world: float | None = None) -> tuple[float, str]:
+                           allowance: _ZeroVarianceAllowance | None = None) -> tuple[float, str]:
     """Standardise a mismatch, distinguishing broken instruments from noise.
 
     Returns ``(standardised_error, status)`` where status is ``ok``,
@@ -1313,15 +1347,12 @@ def _classify_standardised(value: float, std: float, sims: int, materiality: flo
     recorded but never claimed as z=0 evidence) or ``mismatch`` (a MATERIAL
     non-zero mismatch with zero variance, which is a HARD FAIL).
 
-    ``analytic_variance_per_world`` is the model's OWN per-world variance for a
-    component whose sampling distribution makes it computable, in the SAME score-point
-    units as ``value``.  It is used ONLY when the observed sample standard deviation is
-    exactly zero, and only as a LOWER bound on the true variance, so the resulting
-    standardised error is an UPPER bound: it can only make the gate stricter, never
-    looser.  A zero sample variance then means "the event did not occur in this sample",
-    which for a low-rate count is an ordinary outcome of a working generator, and the
-    exact standard error of the mean is not zero.  Components without such a bound pass
-    ``None`` and keep the historical ``inf`` behaviour.
+    The zero-variance branch is evaluated ONLY when ``allowance`` is supplied, which the
+    caller does solely for components whose production generator has a provable variance
+    bound.  Even then the row is tolerated only if the observed zero is plausible under
+    the model's own expected event count; a material expectation with zero events remains
+    a HARD FAIL, so a dead or mis-wired generator cannot be converted into an ordinary
+    finite-sampling row.
     """
 
     se = std / math.sqrt(max(1, sims))
@@ -1331,15 +1362,17 @@ def _classify_standardised(value: float, std: float, sims: int, materiality: flo
         return 0.0, "ok"
     if abs(value) <= materiality:
         return 0.0, "below_materiality"
-    if analytic_variance_per_world is not None and analytic_variance_per_world > 0.0:
-        floor_se = math.sqrt(analytic_variance_per_world / max(1, sims))
-        if floor_se > 0.0:
-            return value / floor_se, "ok"
+    if allowance is not None and allowance.variance_per_world > 0.0:
+        expected = float(allowance.expected_count_in_sample)
+        if expected > 0.0 and math.exp(-expected) >= ZERO_EVENT_PLAUSIBILITY_FLOOR:
+            floor_se = math.sqrt(allowance.variance_per_world / max(1, sims))
+            if floor_se > 0.0:
+                return value / floor_se, "ok"
     return float("inf"), "mismatch"
 
 
 def _analytic_variance_floor_per_world(name: str, analytic_value: float, position: str | None,
-                                       rules: ScoringRules) -> float | None:
+                                       rules: ScoringRules, sims: int) -> "_ZeroVarianceAllowance | None":
     """A PROVABLE lower bound on a component's per-world variance, in score points.
 
     Today only ``goal`` qualifies, and the justification is structural rather than an
@@ -1352,12 +1385,19 @@ def _analytic_variance_floor_per_world(name: str, analytic_value: float, positio
         where ``p`` is that world's probability a goal is his -- a Poisson THINNING;
       * ``p`` varies across worlds (who is on the pitch, and when the goals fall), so the
         count is a Poisson MIXTURE, and for any Poisson mixture
-        ``Var = E[rate] + Var(rate) >= E[rate] = mean``.
+        ``Var = E[rate] + Var(rate) >= E[rate]``.
 
-    Hence ``Var(points) = weight^2 * Var(count) >= weight^2 * mean_count``, and because
-    ``mean_count = analytic_points / weight`` this collapses to ``weight * analytic_points``.
-    Being a lower bound on variance it yields an UPPER bound on the standardised error, so
-    using it can only make the gate stricter, never looser.
+    That theorem bounds the variance by the PRODUCTION mean, not by the analytic
+    comparator target.  The two are only equal if the scorer calibration reproduces each
+    player's analytic share exactly, which is the very agreement the gate exists to test,
+    so the target is NEVER treated as proof that the generator is live.  It is passed
+    alongside as a plausibility expectation instead, and the classifier refuses the row
+    unless a zero count is genuinely unsurprising under it.
+
+    ``variance_per_world = weight * analytic_points`` follows from
+    ``Var(points) = weight^2 * Var(count) >= weight^2 * mean_count`` together with
+    ``mean_count = analytic_points / weight``.  It is a LOWER bound, so the standardised
+    error it yields is an UPPER bound and the gate can only get stricter.
 
     Components that do NOT admit this bound keep ``None`` (historical behaviour):
     ``assist`` is a Poisson-BINOMIAL over the goals, whose variance
@@ -1371,7 +1411,10 @@ def _analytic_variance_floor_per_world(name: str, analytic_value: float, positio
     weight = float(rules.goal_points_for(position)) if position else 0.0
     if weight <= 0.0:
         return None
-    return weight * float(analytic_value)
+    # Expected GOALS over the whole sample: analytic points -> goals -> count over sims.
+    expected_count = float(sims) * float(analytic_value) / weight
+    return _ZeroVarianceAllowance(variance_per_world=weight * float(analytic_value),
+                                  expected_count_in_sample=expected_count)
 
 
 PROBABILITY_KEYS = (
@@ -1677,7 +1720,7 @@ def _summarise(
             z_value, status = _classify_standardised(
                 value, std, sims, materiality,
                 _analytic_variance_floor_per_world(name, float(reference.get(name, 0.0)),
-                                                   meta.get("position"), rules),
+                                                   meta.get("position"), rules, sims),
             )
             standardised[name] = z_value
             if status == "below_materiality":

@@ -112,30 +112,98 @@ def test_low_rate_zero_count_is_not_an_infinite_standardised_error():
 
 
 @pytest.mark.parametrize("position", ["FWD", "MID", "DEF", "GKP"])
-def test_a_dead_goal_instrument_still_fails(position):
-    """CASE B: analytic expectation far above materiality, zero goals in every world.
+def test_a_grossly_dead_goal_instrument_keeps_the_historical_classification(position):
+    """CASE B at a large expectation: the original ``inf`` rule still applies, unchanged.
 
-    The floor is a LOWER bound on variance, so it yields an UPPER bound on the
-    standardised error for a real instrument; a genuinely dead one lands far beyond the
-    existing gates and must still be refused.
+    With E in the hundreds or thousands, observing zero is impossible under the model, so
+    the plausibility test refuses the row and the standardised error stays ``inf`` — the
+    exact historical outcome, with the same `ZERO_VARIANCE_MISMATCH` reason.
     """
 
     analytic_goal = 2.0
-    weight = RULES.goal_points_for(position)
     summary, gate = _drive(
         player_id=1, position=position, worlds=TOSIN_WORLDS, appearances=TOSIN_WORLDS,
         goal_counts=[0] * TOSIN_WORLDS,
         analytic=_matched_analytic(TOSIN_WORLDS, TOSIN_WORLDS, analytic_goal),
     )
 
-    expected_floor_se = math.sqrt(weight * analytic_goal / TOSIN_WORLDS)
-    z = summary["standardised_error"]["goal"]
-    assert math.isfinite(z)
-    assert abs(z) == pytest.approx(analytic_goal / expected_floor_se, rel=1e-12)
-    assert abs(z) > mc.MonteCarloConfig().individual_max_z
+    assert summary["mc_component_std"]["goal"] == 0.0
+    assert math.isinf(summary["standardised_error"]["goal"])
+    assert "goal" in summary["zero_variance_mismatch"]
 
     assert gate["status"] == "FAIL"
+    assert any("ZERO_VARIANCE_MISMATCH" in reason for reason in gate["fail_reasons"])
     assert gate["individual_material_failures"], "a dead instrument must be a material failure"
+
+
+# ---------------------------------------------------------------------------
+# P1-01 — THE MID-RATE BAND.  The variance floor alone cannot catch these, because
+# for a zero-event sample it saturates at |z| = sqrt(analytic_points * sims / weight),
+# which only crosses individual_max_z (8) above ~0.19 points (DEF).  A dead generator
+# expecting 0.10 points therefore produced z ~ 5.8 and PASSED.  The plausibility test
+# closes that band: observing zero when 33.3 goals were expected has probability
+# 3.3e-15 and must be refused.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("position,analytic_goal", [
+    ("DEF", 0.10),   # the exact P1-01 counterexample
+    ("GKP", 0.10),   # its 10-point-weight analogue: even more permissive before
+    ("DEF", 0.05),   # between the two regimes
+    ("MID", 0.09),
+    ("FWD", 0.07),
+])
+def test_a_mid_rate_dead_goal_instrument_is_refused(position, analytic_goal):
+    """P1-01 KILL: RED on 33fab651, which returned a finite z with status ``ok`` here.
+
+    These rows sit ABOVE the 0.01 zero-variance materiality but BELOW the analytic
+    expectation at which the variance-floor standardised error reaches 8, so the floor
+    alone could not fail them and the historical 0.01 guard was effectively relaxed.
+    """
+
+    weight = RULES.goal_points_for(position)
+    expected_goals = TOSIN_WORLDS * analytic_goal / weight
+    # Read the boundary tolerantly: this test must be RUNNABLE against the reviewed
+    # predecessor 33fab651 so that it fails there BEHAVIOURALLY (a finite z that should
+    # have been inf), never with an AttributeError on a constant that did not exist yet.
+    floor = getattr(mc, "ZERO_EVENT_PLAUSIBILITY_FLOOR", 1e-3)
+    assert expected_goals > math.log(1.0 / floor), "in the refused regime"
+
+    summary, gate = _drive(
+        player_id=2, position=position, worlds=TOSIN_WORLDS, appearances=TOSIN_WORLDS,
+        goal_counts=[0] * TOSIN_WORLDS,
+        analytic=_matched_analytic(TOSIN_WORLDS, TOSIN_WORLDS, analytic_goal),
+    )
+
+    assert summary["mc_component_std"]["goal"] == 0.0
+    assert abs(summary["mean_reconciliation_error"]["goal"]) > 0.01
+    assert math.isinf(summary["standardised_error"]["goal"])
+    assert "goal" in summary["zero_variance_mismatch"]
+
+    assert gate["status"] == "FAIL"
+    assert any("ZERO_VARIANCE_MISMATCH" in reason for reason in gate["fail_reasons"])
+
+
+def test_the_tolerance_limit_is_the_expected_event_count_not_the_point_value():
+    """The band is set by E (expected goals over the sample), so the point weight matters.
+
+    Pinning the boundary keeps the rule from silently drifting: a row is judged only
+    while its expected count stays under ``ln(1 / floor)``.
+    """
+
+    limit = math.log(1.0 / mc.ZERO_EVENT_PLAUSIBILITY_FLOOR)
+    for position, allowed_points in (("DEF", 6 * limit / TOSIN_WORLDS),
+                                     ("GKP", 10 * limit / TOSIN_WORLDS),
+                                     ("MID", 5 * limit / TOSIN_WORLDS),
+                                     ("FWD", 4 * limit / TOSIN_WORLDS)):
+        weight = RULES.goal_points_for(position)
+        just_inside = mc._analytic_variance_floor_per_world("goal", allowed_points * 0.99, position, RULES, TOSIN_WORLDS)
+        just_outside = mc._analytic_variance_floor_per_world("goal", allowed_points * 1.01, position, RULES, TOSIN_WORLDS)
+        assert just_inside.expected_count_in_sample < limit
+        assert just_outside.expected_count_in_sample > limit
+        assert mc._classify_standardised(-allowed_points * 0.99, 0.0, TOSIN_WORLDS, 0.01, just_inside)[1] == "ok"
+        assert math.isinf(mc._classify_standardised(-allowed_points * 1.01, 0.0, TOSIN_WORLDS, 0.01, just_outside)[0])
+        assert weight > 0
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +236,21 @@ def test_microscopic_zero_variance_rows_stay_below_materiality(analytic_goal):
 
 
 def test_the_floor_cannot_change_a_nonzero_variance_outcome():
-    """Structural pin: with std > 0 the floor argument is never consulted."""
+    """Structural pin: with std > 0 the allowance is never consulted."""
 
+    huge = mc._ZeroVarianceAllowance(variance_per_world=1e9, expected_count_in_sample=0.0)
+    plausible = mc._ZeroVarianceAllowance(variance_per_world=1e9, expected_count_in_sample=1.0)
     for value, std, sims in ((0.5, 0.2, 2000), (-2.0, 0.9, 2000), (12.5, 0.05, 2000),
                              (0.013, 0.19, 2000), (1.0, 1e-12, 500)):
         without = mc._classify_standardised(value, std, sims, 0.01)
-        with_floor = mc._classify_standardised(value, std, sims, 0.01, 1e9)
-        assert without == with_floor, (value, std, sims)
+        assert without == mc._classify_standardised(value, std, sims, 0.01, huge)
+        assert without == mc._classify_standardised(value, std, sims, 0.01, plausible)
 
 
 def test_zero_variance_with_zero_error_is_still_allowed_with_a_floor():
-    assert mc._classify_standardised(0.0, 0.0, 2000, 0.01, 5.0) == (0.0, "ok")
+    assert mc._classify_standardised(0.0, 0.0, 2000, 0.01, None) == (0.0, "ok")
+    huge = mc._ZeroVarianceAllowance(variance_per_world=5.0, expected_count_in_sample=1.0)
+    assert mc._classify_standardised(0.0, 0.0, 2000, 0.01, huge) == (0.0, "ok")
 
 
 def test_a_goal_row_that_does_sample_goals_keeps_its_exact_standardisation():
@@ -206,14 +278,20 @@ def test_a_goal_row_that_does_sample_goals_keeps_its_exact_standardisation():
 def test_the_floor_is_defined_only_where_it_is_provable():
     """goal only.  assist/save/defcon/yellow keep the historical behaviour."""
 
-    assert mc._analytic_variance_floor_per_world("goal", 0.013145, "DEF", RULES) == pytest.approx(6 * 0.013145)
-    assert mc._analytic_variance_floor_per_world("goal", 2.0, "FWD", RULES) == pytest.approx(8.0)
-    assert mc._analytic_variance_floor_per_world("goal", 0.0, "DEF", RULES) is None
-    assert mc._analytic_variance_floor_per_world("goal", 0.013, None, RULES) is None
+    tosin = mc._analytic_variance_floor_per_world("goal", 0.013145, "DEF", RULES, TOSIN_WORLDS)
+    assert tosin.variance_per_world == pytest.approx(6 * 0.013145)
+    assert tosin.expected_count_in_sample == pytest.approx(TOSIN_WORLDS * 0.013145 / 6)
+
+    big = mc._analytic_variance_floor_per_world("goal", 2.0, "FWD", RULES, TOSIN_WORLDS)
+    assert big.variance_per_world == pytest.approx(8.0)
+    assert big.expected_count_in_sample == pytest.approx(TOSIN_WORLDS * 2.0 / 4)
+
+    assert mc._analytic_variance_floor_per_world("goal", 0.0, "DEF", RULES, TOSIN_WORLDS) is None
+    assert mc._analytic_variance_floor_per_world("goal", 0.013, None, RULES, TOSIN_WORLDS) is None
 
     for component in ("assist", "save", "defcon", "yellow", "clean_sheet",
                       "goals_conceded", "appearance", "core", "core_linear"):
-        assert mc._analytic_variance_floor_per_world(component, 2.0, "DEF", RULES) is None, component
+        assert mc._analytic_variance_floor_per_world(component, 2.0, "DEF", RULES, TOSIN_WORLDS) is None, component
 
 
 def test_a_component_without_a_provable_bound_keeps_the_infinite_classification():
