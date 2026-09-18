@@ -25,7 +25,18 @@ from . import analytics
 from . import historical_observations as historical, history_completeness as hc, repositories as repo
 from .utils import parse_utc, utc_now
 
-MINUTES_MODEL_VERSION = "minutes_v1.7.0"
+MINUTES_MODEL_VERSION = "minutes_v1.8.0"
+# v1.8.0: a strong previous-season prior role that has NOT reproduced at the
+# current club (``role_discontinuity``) now has its PULL in the start blend
+# discounted by the same declared factor the model already applies to that
+# prior's effective sample size, whenever the current-season evidence is a
+# repeated available zero-minute non-start and no fresh role-change evidence
+# exists.  Before this, the contradiction was detected, published as
+# ``MODEL_PRIOR_CONFLICT_WITH_CURRENT_ROLE`` and then ignored by the produced
+# probability, so a player with zero current-season starts kept a materially
+# non-zero start probability carried by a prior whose role had already been
+# contradicted.  It is a downweight, never a ban: the estimate stays non-zero and
+# fresh role-change evidence leaves it untouched.
 # v1.7.0: the no-causal-history position prior now asserts the 990-minute /
 # 11-starter identity (see ``structural_no_history_priors``), so an empty and
 # legitimate causal window produces a coherent side instead of an impossible
@@ -603,12 +614,65 @@ def project_player_fixture(
             ) / (ess + minutes_anchor_strength)
     prior_start = level34_rate
 
+    # --- role-discontinuity prior pull (v1.8.0) ------------------------------
+    # ``role_discontinuity`` means a STRONG previous-season prior role has not
+    # reproduced while the player was available often enough to have shown it, and
+    # the prior club cannot be established from stored evidence.  The declared
+    # factor ``prev_season_role_discontinuity_ess_discount`` already states how much
+    # such a prior is worth, and it is applied to the prior's effective sample size
+    # in the level blend above.  It must bound the prior's PULL in the start blend
+    # below for the same reason: otherwise a role the current evidence has already
+    # contradicted still drags the estimate back toward its stale rate at FULL
+    # strength, which is how a player with zero current-season starts and repeated
+    # available zero-minute non-starts retained a materially non-zero start
+    # probability.
+    #
+    # This is a DOWNWEIGHT, never a ban.  It fires only when the contradiction is
+    # established -- a strong prior role, zero current-season starts, enough
+    # available observations (that is ``role_discontinuity``), AND strong
+    # current-season zero-minute non-start evidence -- and it leaves a non-zero
+    # estimate.  Fresh authoritative evidence of an actual role transition (a
+    # scouting role confirmation, or an established club/role transition) disables
+    # the extra discount entirely, so a genuine role change is never banned: a new
+    # signing, a promoted backup, a keeper replacing an injured starter or any
+    # manager-confirmed change moves the estimate exactly as it did before.
+    fresh_role_change_evidence = (
+        "START_ROLE_CONFIRMED" in flags or FLAG_TRANSFER_ROLE_CHANGE in flags
+    )
+    strong_current_non_start_evidence = (
+        available_non_start_zero_minute_observations
+        >= config.strong_zero_minute_non_start_evidence_threshold
+    )
+    actionability_unresolved = role_actionability_unresolved(
+        {
+            "prior_role_discontinuity": role_discontinuity,
+            "conflict_flags": [
+                flag
+                for flag in (FLAG_MODEL_PRIOR_CONFLICT, FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG)
+                if (flag == FLAG_MODEL_PRIOR_CONFLICT and role_discontinuity)
+                or (flag == FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG and strong_current_non_start_evidence)
+            ],
+            "fresh_role_change_evidence": fresh_role_change_evidence,
+        }
+    )
+    prior_pull_discount = 1.0
+    prior_pull_discount_basis = "NO_ROLE_CONFLICT"
+    if role_discontinuity and strong_current_non_start_evidence:
+        if fresh_role_change_evidence:
+            prior_pull_discount_basis = "FRESH_ROLE_CHANGE_EVIDENCE"
+        else:
+            prior_pull_discount = float(config.prev_season_role_discontinuity_ess_discount)
+            prior_pull_discount_basis = "ROLE_DISCONTINUITY_UNREPRODUCED_PRIOR"
+    start_prior_strength = float(config.start_prior_strength) * prior_pull_discount
+    if actionability_unresolved:
+        flags.append(FLAG_ROLE_ACTIONABILITY_UNRESOLVED)
+
     if weighted_obs <= 0:
         p_start_given_available_raw = prior_start
         flags.append("NO_LEAGUE_START_EVIDENCE")
     else:
         p_start_given_available_raw = _shrink(
-            weighted_starts, weighted_obs, prior_start, config.start_prior_strength
+            weighted_starts, weighted_obs, prior_start, start_prior_strength
         )
 
     # --- role-evidence diagnostics (v1.6.0) ---------------------------------
@@ -804,6 +868,17 @@ def project_player_fixture(
                 )
                 if flag in flags
             ),
+            # How much of the previous-season prior's pull survived into the start
+            # blend, and why.  1.0 means the prior was used at full strength; the
+            # discounted value means a strong prior role that has NOT reproduced
+            # (with strong current-season zero-minute non-start evidence and no
+            # fresh role-change evidence) was downweighted, not discarded.
+            "prior_pull_discount": _round(prior_pull_discount),
+            "prior_pull_discount_basis": prior_pull_discount_basis,
+            "fresh_role_change_evidence": bool(fresh_role_change_evidence),
+            # The canonical actionability state, so the manager layer consumes a
+            # structured boolean rather than re-deriving it from flag strings.
+            "role_actionability_unresolved": bool(actionability_unresolved),
             "uncertainty_reasons": sorted(
                 {
                     *(reason for reason in _role_uncertainty_reasons(
@@ -921,6 +996,56 @@ FLAG_MODEL_PRIOR_CONFLICT = "MODEL_PRIOR_CONFLICT_WITH_CURRENT_ROLE"
 FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG = "CURRENT_SEASON_ZERO_MINUTE_NON_START_EVIDENCE_STRONG"
 FLAG_SCOUTING_ROLE_CONFLICT = "SCOUTING_ROLE_CONFLICT"
 FLAG_MATCHDAY_SQUAD_EVIDENCE_UNAVAILABLE = "MATCHDAY_SQUAD_EVIDENCE_UNAVAILABLE"
+FLAG_START_ROLE_CONFIRMED = "START_ROLE_CONFIRMED"
+
+#: The ONE role-actionability state the authoritative manager layer consumes.
+#: A player whose current-team role is CONTRADICTED by the evidence and whose
+#: previous-season prior has not reproduced, with nothing fresh establishing a
+#: role transition, still has a predictive value -- that value is what uncertainty
+#: modelling is for -- but the authoritative optimizer must not treat the disputed
+#: role as calibrated tactical optionality.
+FLAG_ROLE_ACTIONABILITY_UNRESOLVED = "ROLE_ACTIONABILITY_UNRESOLVED"
+
+
+def role_actionability_unresolved(
+    role_evidence: Mapping[str, Any] | None,
+    risk_flags: Iterable[str] = (),
+) -> bool:
+    """Canonical role-actionability state, read from the STRUCTURED evidence.
+
+    ONE definition, used by the producer (which calls it on the evidence it has
+    just assembled) and by every consumer (which calls it on the persisted
+    ``role_evidence`` dict).  It reads booleans and the structured conflict-flag
+    list, never a display label.
+
+    Deliberately NOT ``minutes == 0``: a new signing, a promoted backup, a keeper
+    replacing an injured starter or any manager-confirmed role change is a genuine
+    role transition, and fresh evidence of one clears the state.  It is True only
+    where the current-team role is CONTRADICTED (a strong prior role that did not
+    reproduce, with strong available zero-minute non-start evidence and a recorded
+    model/current-role conflict) AND nothing establishes that the role has changed.
+
+    Payloads written before the state existed carry the same structured fields, so
+    the state is recoverable from them rather than from a re-derivation: the only
+    thing they lack is the explicit fresh-evidence boolean, which is then read from
+    its own channel (a scouting role confirmation in ``risk_flags``).
+    """
+
+    if not isinstance(role_evidence, Mapping):
+        return False
+    recorded = role_evidence.get("role_actionability_unresolved")
+    if recorded is not None:
+        return bool(recorded)
+    fresh = role_evidence.get("fresh_role_change_evidence")
+    if fresh is None:
+        fresh = FLAG_START_ROLE_CONFIRMED in set(risk_flags or ())
+    conflicts = set(role_evidence.get("conflict_flags") or ())
+    return bool(
+        role_evidence.get("prior_role_discontinuity")
+        and FLAG_MODEL_PRIOR_CONFLICT in conflicts
+        and FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG in conflicts
+        and not fresh
+    )
 
 ROLE_CONFLICT_FLAGS = (
     FLAG_MODEL_PRIOR_CONFLICT,

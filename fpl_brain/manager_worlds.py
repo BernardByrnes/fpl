@@ -12,6 +12,7 @@ the squad (a pure side effect).
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Sequence
 
 from . import manager_lineup, monte_carlo
@@ -49,6 +50,82 @@ def resolve_squad(context, conn) -> dict[str, Any]:
     }
 
 
+def expected_bonus_by_player(conn, *, xpts_run_id: int, event: int) -> dict[int, float]:
+    """Deterministic expected FPL bonus per player, summed over one event.
+
+    Bonus is NOT sampled by the accepted Monte Carlo kernel: the simulator reads
+    it as the deterministic analytic ``bonus`` component, which is the xPts
+    payload's own ``bonus_xpts`` (the ``mc_components`` mapping sends "bonus" to
+    that field).  Reading it from the certified xPts run therefore uses the SAME
+    single definition the simulator uses, without re-deriving or re-simulating it.
+
+    Summing across the player's fixtures is what makes a double gameweek one event
+    value, exactly as ``world_core`` already aggregates the player's fixtures.
+    """
+
+    totals: dict[int, float] = {}
+    for row in conn.execute(
+        "SELECT player_id, payload_json FROM player_fixture_xpts_projections "
+        "WHERE projection_run_id=? AND event=?",
+        (int(xpts_run_id), int(event)),
+    ):
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+        value = payload.get("bonus_xpts")
+        if value is None:
+            continue
+        player_id = int(row["player_id"])
+        totals[player_id] = totals.get(player_id, 0.0) + float(value)
+    return {player_id: round(value, 6) for player_id, value in totals.items()}
+
+
+def role_actionability_by_player(conn, *, minutes_run_id: int, event: int) -> dict[int, bool]:
+    """Per-player ROLE ACTIONABILITY for one event, from the CERTIFIED minutes run.
+
+    Reads the producer's own structured state (``role_evidence.role_actionability_
+    unresolved``) rather than re-deriving it from flag strings, so the producer and
+    the manager layer share ONE definition.  A player absent from the run is absent
+    from the map, which constrains nothing.
+    """
+
+    from . import minutes_model
+
+    out: dict[int, bool] = {}
+    for row in conn.execute(
+        "SELECT player_id, payload_json FROM frozen_predictions "
+        "WHERE projection_run_id=? AND event=?",
+        (int(minutes_run_id), int(event)),
+    ):
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+        out[int(row["player_id"])] = minutes_model.role_actionability_unresolved(
+            payload.get("role_evidence"), payload.get("risk_flags") or ()
+        )
+    return out
+
+
+def with_role_actionability(world_matrix: dict[str, Any], actionability: Mapping[int, bool]) -> dict[str, Any]:
+    """Attach the per-player role-actionability state to a world matrix.
+
+    Only captured players are carried, and an unrecorded player is False: a
+    restriction must never be invented for a player the evidence did not flag.
+    """
+
+    captured = [int(pid) for pid in world_matrix["player_ids"]]
+    world_matrix["role_actionability"] = {pid: bool(actionability.get(pid, False)) for pid in captured}
+    return world_matrix
+
+
+def with_expected_bonus(world_matrix: dict[str, Any], bonus: Mapping[int, float]) -> dict[str, Any]:
+    """Attach the per-player deterministic bonus to a world matrix.
+
+    Only players the matrix actually captured are carried, so the block can never
+    claim a value for a player the captaincy terms cannot see.
+    """
+
+    captured = [int(pid) for pid in world_matrix["player_ids"]]
+    world_matrix["expected_bonus"] = {pid: float(bonus.get(pid, 0.0)) for pid in captured}
+    return world_matrix
+
+
 def build_manager_worlds(
     conn,
     *,
@@ -60,6 +137,7 @@ def build_manager_worlds(
     simulations: int = 10_000,
     seed: int = 20260911,
     occupancy_audit: bool = True,
+    expected_bonus: bool = True,
 ) -> dict[str, Any]:
     """Simulate the full frozen universe and extract the squad GW matrix."""
 
@@ -71,8 +149,19 @@ def build_manager_worlds(
         simulations=int(simulations), seed=int(seed), occupancy_audit=bool(occupancy_audit)
     )
     result = monte_carlo.simulate(fixtures, config, capture_player_ids=squad_ids)
+    matrix = result["world_matrix"]
+    if expected_bonus:
+        with_expected_bonus(
+            matrix, expected_bonus_by_player(conn, xpts_run_id=int(xpts_run_id), event=int(planning_event))
+        )
+    with_role_actionability(
+        matrix,
+        role_actionability_by_player(
+            conn, minutes_run_id=int(minutes_run_id), event=int(planning_event)
+        ),
+    )
     return {
-        "world_matrix": result["world_matrix"],
+        "world_matrix": matrix,
         "simulation": {
             "worlds": int(config.simulations),
             "seed": int(config.seed),
@@ -448,12 +537,42 @@ def captain_terms(world_matrix: Mapping[str, Any]) -> tuple[dict[int, float], di
     manager_lineup.validate_world_matrix(world_matrix, context="captain_terms")
     minutes = world_matrix["minutes"]
     core = world_matrix["core"]
+    # The authoritative captain-value quantity is the realised FPL value the
+    # captain rule actually multiplies: CORE plus the deterministic expected bonus.
+    #
+    # ``bonus_xpts = bonus_per90 * expected_minutes / 90`` and ``expected_minutes``
+    # is availability-weighted, so the block is ALREADY ``E[bonus * appeared]`` --
+    # an unconditional expected-points quantity.  Rewriting it as
+    # ``bonus_per_appearance = bonus / P(appears)`` lets both armband terms be the
+    # SAME conditional sum:
+    #
+    #     A[c]     = E[(core_c + bonus_per_appearance_c) * 1{c appears}]
+    #     C[v][c]  = E[(core_v + bonus_per_appearance_v) * 1{v appears, c does not}]
+    #
+    # which is exactly the realised extra copy in each world, so it is exact for any
+    # correlation between the two players' appearances -- no independence assumption.
+    # A player the matrix never puts on the pitch has no per-appearance bonus and is
+    # therefore worth nothing, rather than collecting an unconditional constant.
+    #
+    # When no bonus block is present the captain value is CORE-only, and
+    # ``captain_value_basis`` says so rather than claiming a total-value armband.
+    bonus = manager_lineup.expected_bonus_map(world_matrix)
     appeared = {pid: [float(minutes[pid][w]) > 0.0 for w in range(worlds)] for pid in player_ids}
     core_series = {pid: [float(core[pid][w]) for w in range(worlds)] for pid in player_ids}
+    per_appearance_bonus: dict[int, float] = {}
+    for pid in player_ids:
+        appearances = sum(1 for w in range(worlds) if appeared[pid][w])
+        per_appearance_bonus[pid] = (
+            float(bonus.get(pid, 0.0)) * worlds / appearances if appearances else 0.0
+        )
+
+    def _value(pid: int, world: int) -> float:
+        return core_series[pid][world] + per_appearance_bonus[pid]
+
     a_terms: dict[int, float] = {}
     for pid in player_ids:
         a_terms[pid] = sum(
-            core_series[pid][w] for w in range(worlds) if appeared[pid][w]
+            _value(pid, w) for w in range(worlds) if appeared[pid][w]
         ) / worlds
     c_terms: dict[int, dict[int, float]] = {}
     for vice in player_ids:
@@ -462,7 +581,7 @@ def captain_terms(world_matrix: Mapping[str, Any]) -> tuple[dict[int, float], di
             if captain == vice:
                 continue
             inner[captain] = sum(
-                core_series[vice][w]
+                _value(vice, w)
                 for w in range(worlds)
                 if appeared[vice][w] and not appeared[captain][w]
             ) / worlds

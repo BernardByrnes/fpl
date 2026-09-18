@@ -145,6 +145,7 @@ def identity_for(bundle_row: Mapping[str, Any]) -> Any:
 def write_world_cache(
     cache_dir, *, events: Sequence[int], union: Sequence[int], scores: Mapping[int, float] | None = None,
     worlds: int = 24, per_event_scores: Mapping[int, float] | None = None,
+    bonus: Mapping[int, float] | None = None,
 ):
     """Populate the CANONICAL world cache so the loader can be exercised for real.
 
@@ -163,6 +164,7 @@ def write_world_cache(
     cache_dir.mkdir(parents=True, exist_ok=True)
     scores = scores or {}
     per_event_scores = per_event_scores or {}
+    per_event_bonus = bonus or {}
     union = tuple(int(p) for p in union)
     keys = {}
     for event in events:
@@ -178,6 +180,11 @@ def write_world_cache(
             "player_ids": list(union),
             "core": {str(p): [value] * int(worlds) for p in union},
             "minutes": {str(p): [90.0] * int(worlds) for p in union},
+            # The world-cache schema carries the per-player deterministic expected
+            # bonus, because the armband objective consumes it.  A matrix without it
+            # is a pre-v2 entry and is not a valid cache hit.
+            "expected_bonus": {str(p): float(per_event_bonus.get(p, 0.0)) for p in union},
+            "role_actionability": {str(p): False for p in union},
         }
         (cache_dir / f"{key}.json").write_text(json.dumps(matrix), encoding="utf-8")
         keys[event] = key
