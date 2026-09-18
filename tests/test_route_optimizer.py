@@ -590,7 +590,8 @@ def test_world_cache_hit_and_key_sensitivity(tmp_path):
     payload = {"worlds": 2, "player_ids": [int(p) for p in union],
                "core": {str(p): [1.0, 2.0] for p in union},
                "minutes": {str(p): [90.0, 90.0] for p in union},
-               "expected_bonus": {str(p): 0.0 for p in union}}
+               "expected_bonus": {str(p): 0.0 for p in union},
+               "role_actionability": {str(p): False for p in union}}
     (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
     matrix, info = ro.build_event_worlds(None, {4: bundle}, 4, union, config, cache_dir=tmp_path)
     assert info["source"] == "cache" and info["key"] == key
@@ -693,10 +694,12 @@ def test_a_cache_entry_without_the_bonus_block_fails_closed(tmp_path):
 def test_the_bonus_is_part_of_the_world_cache_identity():
     """A matrix cached without the bonus block is not the same matrix.
 
-    The schema version is part of the cache key, so bumping it for the bonus block
-    guarantees no pre-existing core-only matrix can be reused as if it carried one.
+    The schema version is part of the cache key, so bumping it whenever the matrix
+    content changes guarantees no pre-existing matrix can be reused as if it carried
+    the new block.  The current schema covers the bonus AND the role-actionability
+    state, both of which the policy layer consumes.
     """
 
     from fpl_brain import route_optimizer
 
-    assert route_optimizer.CACHE_SCHEMA_VERSION.endswith("expected_bonus")
+    assert route_optimizer.CACHE_SCHEMA_VERSION.endswith("role_actionability")

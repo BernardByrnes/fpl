@@ -120,11 +120,24 @@ def test_the_expected_bonus_is_unconditional_but_the_vice_armband_is_not():
         "expected_bonus": {1: 0.20, 2: 0.60},
     }
     a_terms, c_terms = mw.captain_terms(split)
-    # A[2] = E[core_2 * appeared] + bonus_2 = 0.5 * 3.00 + 0.60 (not 0.5 * 0.60)
-    assert a_terms[2] == pytest.approx(0.5 * 3.00 + 0.60)
-    # C[2][1]: his CORE only when he plays and 1 does not, but his unconditional
-    # bonus scaled by the probability the armband falls to him at all.
-    assert c_terms[2][1] == pytest.approx(0.5 * 3.00 + 0.60 * 0.5)
+    # The exact form rewrites the unconditional bonus as a rate PER APPEARANCE:
+    # bonus_per_appearance(2) = 0.60 * 50 / 25 appearances = 1.20, so both terms are
+    # the same conditional sum and no independence assumption is needed.
+    # A[2]  = 25 worlds * (3.00 + 1.20) / 50
+    # C[2][1] = the same 25 worlds (2 plays, 1 does not) -> identical here.
+    assert a_terms[2] == pytest.approx(0.5 * (3.00 + 1.20))
+    assert c_terms[2][1] == pytest.approx(0.5 * (3.00 + 1.20))
+
+    # A player who never appears has no per-appearance bonus at all, so a block
+    # that claims one cannot conjure value for him.
+    never = {
+        "worlds": worlds, "player_ids": [1, 2],
+        "minutes": {1: [90.0] * worlds, 2: [0.0] * worlds},
+        "core": {1: [4.00] * worlds, 2: [0.0] * worlds},
+        "expected_bonus": {1: 0.20, 2: 0.60},
+    }
+    a_never, _ = mw.captain_terms(never)
+    assert a_never[2] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -380,3 +393,196 @@ def test_the_final_policy_gives_the_armband_to_the_higher_total_value():
     assert int(policy_core.captain_id) == 40
     assert ml.captain_value_basis(matrix) == ml.CAPTAIN_VALUE_BASIS_TOTAL
     assert ml.captain_value_basis(core_only) == ml.CAPTAIN_VALUE_BASIS_CORE_ONLY
+
+
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# PART 4 — brute-force verification of the captain terms
+# ---------------------------------------------------------------------------
+
+
+def test_the_captain_terms_agree_with_brute_force_world_scoring():
+    """Explicitly enumerate every world and score the armband directly.
+
+    For each world the ACTUAL FPL multiplier is: captain doubled when he appears,
+    otherwise vice doubled when he appears, otherwise nobody.  The extra copy is
+    therefore ``core + bonus_earned`` for whoever holds the armband.  This is
+    compared to the analytical ``A[captain] + C[vice][captain]`` for every pair.
+    """
+
+    worlds = 60
+    ids = [1, 2, 3]
+    # Deliberately CORRELATED appearance patterns, so an independence assumption
+    # would be caught rather than hidden.
+    minutes = {
+        1: [90.0] * 40 + [0.0] * 20,
+        2: [90.0] * 35 + [0.0] * 25,          # nearly aligned with player 1
+        3: [0.0] * 30 + [90.0] * 30,          # anti-aligned
+    }
+    core = {pid: [0.0] * worlds for pid in ids}
+    for pid, base in ((1, 4.0), (2, 3.0), (3, 2.5)):
+        core[pid] = [base if minutes[pid][w] > 0 else 0.0 for w in range(worlds)]
+    bonus = {1: 0.50, 2: 0.80, 3: 0.20}
+    matrix = {"worlds": worlds, "player_ids": ids, "minutes": minutes, "core": core,
+              "expected_bonus": bonus}
+
+    earned = {}
+    for pid in ids:
+        appearances = sum(1 for w in range(worlds) if minutes[pid][w] > 0)
+        earned[pid] = (bonus[pid] * worlds / appearances) if appearances else 0.0
+
+    def brute(captain: int, vice: int) -> float:
+        total = 0.0
+        for w in range(worlds):
+            if minutes[captain][w] > 0:
+                holder = captain
+            elif minutes[vice][w] > 0:
+                holder = vice
+            else:
+                continue
+            total += core[holder][w] + earned[holder]
+        return total / worlds
+
+    a_terms, c_terms = mw.captain_terms(matrix)
+    for captain in ids:
+        for vice in ids:
+            if captain == vice:
+                continue
+            assert a_terms[captain] + c_terms[vice][captain] == pytest.approx(brute(captain, vice)), (
+                f"analytical armband value disagrees with brute force for ({captain}, {vice})"
+            )
+
+
+def test_brute_force_covers_every_armband_state():
+    """captain appears / captain absent + vice appears / both absent, and no
+    phantom bonus for a holder who never takes the field."""
+
+    worlds = 6
+    ids = [1, 2]
+    minutes = {1: [90.0, 90.0, 0.0, 0.0, 0.0, 0.0], 2: [0.0, 0.0, 90.0, 90.0, 0.0, 0.0]}
+    core = {1: [4.0, 4.0, 0.0, 0.0, 0.0, 0.0], 2: [0.0, 0.0, 3.0, 3.0, 0.0, 0.0]}
+    matrix = {"worlds": worlds, "player_ids": ids, "minutes": minutes, "core": core,
+              "expected_bonus": {1: 0.60, 2: 0.90}}
+    a_terms, _ = mw.captain_terms(matrix)
+    # Player 1 appears in 2 of 6 worlds: per-appearance bonus 0.60 * 3 = 1.80,
+    # so A[1] = 2 * (4.0 + 1.80) / 6.
+    assert a_terms[1] == pytest.approx(2 * (4.0 + 1.80) / 6)
+    assert a_terms[2] == pytest.approx(2 * (3.0 + 0.90 * 3) / 6)
+
+
+# ---------------------------------------------------------------------------
+# PART 5 — role actionability
+# ---------------------------------------------------------------------------
+
+
+def _actionability_matrix(*, unresolved, cond_better):
+    """A legal squad where the disputed keeper is the better player if he plays."""
+
+    established, conflicted = 11, 10
+    conditional = {pid: 2.60 for pid in E2E_SQUAD}
+    conditional[conflicted] = 3.66 if cond_better else 2.90
+    conditional[established] = 2.90 if cond_better else 3.66
+    matrix = _e2e_matrix(
+        played={**{pid: 0.90 for pid in E2E_SQUAD if pid not in (established, conflicted)},
+                established: 0.90, conflicted: 0.1562},
+        core_on_play=conditional,
+        bonus={pid: 0.0 for pid in E2E_SQUAD},
+    )
+    matrix["role_actionability"] = {pid: (pid in unresolved) for pid in E2E_SQUAD}
+    return matrix, established, conflicted
+
+
+def test_A_a_role_conflicted_keeper_cannot_start_over_a_trusted_one():
+    """The disputed role may not buy the shirt through autosub optionality."""
+
+    matrix, established, conflicted = _actionability_matrix(unresolved={10}, cond_better=True)
+
+    # WITHOUT the actionability block (the predecessor behaviour) the disputed
+    # keeper starts, because his conditional value is higher.
+    without = {k: v for k, v in matrix.items() if k != "role_actionability"}
+    policy_before, _ = _top_policy(without)
+    gk_before = next(pid for pid in policy_before.starter_ids if E2E_POS[int(pid)] == "GKP")
+    assert int(gk_before) == conflicted, "the predecessor must reproduce the exploit"
+
+    # WITH it, the trusted keeper starts and the disputed one remains the cover.
+    policy_after, _ = _top_policy(matrix)
+    starters = {int(pid) for pid in policy_after.starter_ids}
+    gk_after = next(pid for pid in starters if E2E_POS[pid] == "GKP")
+    assert gk_after == established
+    assert int(policy_after.bench_gk_id) == conflicted, "he stays the legal autosub cover"
+
+
+def test_A2_the_restriction_needs_a_trusted_alternative():
+    """With no trusted keeper, the disputed one is still perfectly selectable."""
+
+    matrix, _established, conflicted = _actionability_matrix(unresolved={10, 11}, cond_better=True)
+    policy, _ = _top_policy(matrix)
+    starters = {int(pid) for pid in policy.starter_ids}
+    assert next(pid for pid in starters if E2E_POS[pid] == "GKP") == conflicted
+
+
+def test_B_fresh_role_change_evidence_restores_full_eligibility():
+    """COUNTEREXAMPLE: a cleared keeper is not banned and may start again."""
+
+    matrix, _established, conflicted = _actionability_matrix(unresolved=set(), cond_better=True)
+    policy, _ = _top_policy(matrix)
+    starters = {int(pid) for pid in policy.starter_ids}
+    assert next(pid for pid in starters if E2E_POS[pid] == "GKP") == conflicted
+
+
+def test_C_a_role_conflicted_player_cannot_be_captain_or_vice():
+    """No phantom captain may be manufactured from an unresolved role."""
+
+    phantom = 40
+    matrix = _e2e_matrix(
+        played={**{pid: 1.0 for pid in E2E_SQUAD}, phantom: 0.10},
+        core_on_play={**{pid: 2.00 for pid in E2E_SQUAD}, phantom: 7.50},
+        bonus={pid: 0.0 for pid in E2E_SQUAD},
+    )
+    matrix["role_actionability"] = {pid: (pid == phantom) for pid in E2E_SQUAD}
+
+    without = {k: v for k, v in matrix.items() if k != "role_actionability"}
+    policy_before, _ = _top_policy(without)
+    assert int(policy_before.captain_id) == phantom, "the predecessor must allow the phantom captain"
+
+    policy_after, _ = _top_policy(matrix)
+    assert int(policy_after.captain_id) != phantom
+    assert int(policy_after.vice_captain_id) != phantom
+
+
+def test_D_a_trusted_low_appearance_player_remains_captain_eligible():
+    """An ordinary availability doubt is NOT an unresolved role conflict."""
+
+    doubtful = 40
+    matrix = _e2e_matrix(
+        played={**{pid: 1.0 for pid in E2E_SQUAD}, doubtful: 0.30},
+        core_on_play={**{pid: 2.00 for pid in E2E_SQUAD}, doubtful: 9.00},
+        bonus={pid: 0.0 for pid in E2E_SQUAD},
+    )
+    matrix["role_actionability"] = {pid: False for pid in E2E_SQUAD}
+    policy, _ = _top_policy(matrix)
+    assert int(policy.captain_id) == doubtful, "a trusted role at any probability stays eligible"
+
+
+def test_E_a_trusted_goalkeeper_remains_captain_eligible():
+    """This is not 'keepers cannot be captains'."""
+
+    keeper = 10
+    matrix = _e2e_matrix(
+        played={pid: 1.0 for pid in E2E_SQUAD},
+        core_on_play={**{pid: 2.00 for pid in E2E_SQUAD}, keeper: 6.00},
+        bonus={pid: 0.0 for pid in E2E_SQUAD},
+    )
+    matrix["role_actionability"] = {pid: False for pid in E2E_SQUAD}
+    policy, _ = _top_policy(matrix)
+    assert int(policy.captain_id) == keeper
+
+
+def test_a_malformed_actionability_block_fails_closed():
+    matrix, _established, _conflicted = _actionability_matrix(unresolved=set(), cond_better=True)
+    for bad in ({10: False}, [True, False], "unresolved"):
+        broken = dict(matrix, role_actionability=bad)
+        with pytest.raises(ml.RouteWorldPlayerMissing):
+            ml.validate_world_matrix(broken, context="test")

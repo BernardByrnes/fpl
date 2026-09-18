@@ -32,7 +32,7 @@ from .manager_worlds import (
 from .season_rules import window_flag
 
 PHASE8B_VERSION = "route_optimizer_v8b_1.0.0"
-CACHE_SCHEMA_VERSION = "manager_worlds_cache_v2_expected_bonus"
+CACHE_SCHEMA_VERSION = "manager_worlds_cache_v3_role_actionability"
 
 CANONICAL_UNSUPPORTED_FLAG = "CANONICAL_H4_H6_UNSUPPORTED"
 CROSS_GW_FLAG = rc.CROSS_GW_FLAG
@@ -814,6 +814,9 @@ def world_cache_key(*, event, bundle, config, union_ids) -> str:
         # The armband objective consumes the deterministic expected bonus, which is
         # part of the matrix, so a matrix cached without it is not the same matrix.
         "expected_bonus": True,
+        # The policy layer consumes the role-actionability state, which is part of
+        # the matrix, so a matrix cached without it is not the same matrix.
+        "role_actionability": True,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -836,7 +839,8 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             matrix = {"worlds": raw["worlds"], "player_ids": raw["player_ids"],
                       "core": {int(k): v for k, v in raw["core"].items()},
                       "minutes": {int(k): v for k, v in raw["minutes"].items()},
-                      "expected_bonus": {int(k): v for k, v in raw["expected_bonus"].items()}}
+                      "expected_bonus": {int(k): v for k, v in raw["expected_bonus"].items()},
+                      "role_actionability": {int(k): bool(v) for k, v in raw["role_actionability"].items()}}
             _stamp_matrix_identity(matrix, key)
             _stamp_matrix_path(matrix, path)
             return matrix, {"source": "cache", "key": key}
@@ -853,6 +857,12 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             conn, xpts_run_id=int(bundle.xpts_run_id), event=int(event)
         ),
     )
+    matrix = manager_worlds.with_role_actionability(
+        matrix,
+        manager_worlds.role_actionability_by_player(
+            conn, minutes_run_id=int(bundle.minutes_run_id), event=int(event)
+        ),
+    )
     _stamp_matrix_identity(matrix, key)
     if cache_dir is not None:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -862,6 +872,7 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             "core": {str(k): v for k, v in matrix["core"].items()},
             "minutes": {str(k): v for k, v in matrix["minutes"].items()},
             "expected_bonus": {str(k): v for k, v in matrix["expected_bonus"].items()},
+            "role_actionability": {str(k): bool(v) for k, v in matrix["role_actionability"].items()},
         }), encoding="utf-8")
         _stamp_matrix_path(matrix, matrix_path)
     return matrix, {"source": "generated", "key": key}

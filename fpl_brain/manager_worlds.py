@@ -78,6 +78,42 @@ def expected_bonus_by_player(conn, *, xpts_run_id: int, event: int) -> dict[int,
     return {player_id: round(value, 6) for player_id, value in totals.items()}
 
 
+def role_actionability_by_player(conn, *, minutes_run_id: int, event: int) -> dict[int, bool]:
+    """Per-player ROLE ACTIONABILITY for one event, from the CERTIFIED minutes run.
+
+    Reads the producer's own structured state (``role_evidence.role_actionability_
+    unresolved``) rather than re-deriving it from flag strings, so the producer and
+    the manager layer share ONE definition.  A player absent from the run is absent
+    from the map, which constrains nothing.
+    """
+
+    from . import minutes_model
+
+    out: dict[int, bool] = {}
+    for row in conn.execute(
+        "SELECT player_id, payload_json FROM frozen_predictions "
+        "WHERE projection_run_id=? AND event=?",
+        (int(minutes_run_id), int(event)),
+    ):
+        payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+        out[int(row["player_id"])] = minutes_model.role_actionability_unresolved(
+            payload.get("role_evidence"), payload.get("risk_flags") or ()
+        )
+    return out
+
+
+def with_role_actionability(world_matrix: dict[str, Any], actionability: Mapping[int, bool]) -> dict[str, Any]:
+    """Attach the per-player role-actionability state to a world matrix.
+
+    Only captured players are carried, and an unrecorded player is False: a
+    restriction must never be invented for a player the evidence did not flag.
+    """
+
+    captured = [int(pid) for pid in world_matrix["player_ids"]]
+    world_matrix["role_actionability"] = {pid: bool(actionability.get(pid, False)) for pid in captured}
+    return world_matrix
+
+
 def with_expected_bonus(world_matrix: dict[str, Any], bonus: Mapping[int, float]) -> dict[str, Any]:
     """Attach the per-player deterministic bonus to a world matrix.
 
@@ -118,6 +154,12 @@ def build_manager_worlds(
         with_expected_bonus(
             matrix, expected_bonus_by_player(conn, xpts_run_id=int(xpts_run_id), event=int(planning_event))
         )
+    with_role_actionability(
+        matrix,
+        role_actionability_by_player(
+            conn, minutes_run_id=int(minutes_run_id), event=int(planning_event)
+        ),
+    )
     return {
         "world_matrix": matrix,
         "simulation": {
@@ -496,62 +538,53 @@ def captain_terms(world_matrix: Mapping[str, Any]) -> tuple[dict[int, float], di
     minutes = world_matrix["minutes"]
     core = world_matrix["core"]
     # The authoritative captain-value quantity is the realised FPL value the
-    # captain rule actually multiplies, which is CORE PLUS the deterministic
-    # expected bonus.  Bonus is not sampled (``distribution_basis`` is CORE with
-    # bonus deterministic) and the producer computes it as
-    # ``bonus_xpts = bonus_per90 * expected_minutes / 90``, where
-    # ``expected_minutes`` is already the availability-weighted expectation.  So
-    # ``expected_bonus`` is ALREADY ``E[bonus * appeared]``: it is an unconditional
-    # expected-points quantity, and it must be added ONCE per holder without being
-    # multiplied by an appearance probability again.  Multiplying it by
-    # P(appeared) would discount it a second time for the very non-appearance the
-    # producer already priced in.
+    # captain rule actually multiplies: CORE plus the deterministic expected bonus.
+    #
+    # ``bonus_xpts = bonus_per90 * expected_minutes / 90`` and ``expected_minutes``
+    # is availability-weighted, so the block is ALREADY ``E[bonus * appeared]`` --
+    # an unconditional expected-points quantity.  Rewriting it as
+    # ``bonus_per_appearance = bonus / P(appears)`` lets both armband terms be the
+    # SAME conditional sum:
+    #
+    #     A[c]     = E[(core_c + bonus_per_appearance_c) * 1{c appears}]
+    #     C[v][c]  = E[(core_v + bonus_per_appearance_v) * 1{v appears, c does not}]
+    #
+    # which is exactly the realised extra copy in each world, so it is exact for any
+    # correlation between the two players' appearances -- no independence assumption.
+    # A player the matrix never puts on the pitch has no per-appearance bonus and is
+    # therefore worth nothing, rather than collecting an unconditional constant.
     #
     # When no bonus block is present the captain value is CORE-only, and
     # ``captain_value_basis`` says so rather than claiming a total-value armband.
     bonus = manager_lineup.expected_bonus_map(world_matrix)
     appeared = {pid: [float(minutes[pid][w]) > 0.0 for w in range(worlds)] for pid in player_ids}
     core_series = {pid: [float(core[pid][w]) for w in range(worlds)] for pid in player_ids}
+    per_appearance_bonus: dict[int, float] = {}
+    for pid in player_ids:
+        appearances = sum(1 for w in range(worlds) if appeared[pid][w])
+        per_appearance_bonus[pid] = (
+            float(bonus.get(pid, 0.0)) * worlds / appearances if appearances else 0.0
+        )
+
+    def _value(pid: int, world: int) -> float:
+        return core_series[pid][world] + per_appearance_bonus[pid]
+
     a_terms: dict[int, float] = {}
     for pid in player_ids:
-        # E[core * appeared] + E[bonus * appeared], the latter already unconditional.
-        # The bonus is attached only if the matrix ever puts him on the pitch: the
-        # producer's ``bonus_xpts`` is proportional to expected minutes, so a player
-        # who never appears in these worlds cannot have earned any of it, and a
-        # block that claims otherwise is inconsistent rather than informative.
-        appeared_any = appeared[pid]
         a_terms[pid] = sum(
-            core_series[pid][w] for w in range(worlds) if appeared_any[w]
-        ) / worlds + (float(bonus.get(pid, 0.0)) if any(appeared_any) else 0.0)
+            _value(pid, w) for w in range(worlds) if appeared[pid][w]
+        ) / worlds
     c_terms: dict[int, dict[int, float]] = {}
     for vice in player_ids:
         inner: dict[int, float] = {}
-        bonus_vice = float(bonus.get(vice, 0.0))
         for captain in player_ids:
             if captain == vice:
                 continue
-            # The vice's extra copy is scored only when the armband falls to him:
-            # his CORE is earned when he plays AND the captain does not, while his
-            # already-unconditional expected bonus is scaled by the probability the
-            # armband falls to him at all.  His minutes and the captain's are drawn
-            # independently for different clubs; for club-mates the matrix cannot
-            # recover the joint bonus (it is deterministic, not per-world), so the
-            # independent reading is the one this term can honestly make.
-            inner[captain] = (
-                sum(
-                    core_series[vice][w]
-                    for w in range(worlds)
-                    if appeared[vice][w] and not appeared[captain][w]
-                )
-                / worlds
-                + (
-                    bonus_vice
-                    * sum(1 for w in range(worlds) if not appeared[captain][w])
-                    / worlds
-                    if any(appeared[vice])
-                    else 0.0
-                )
-            )
+            inner[captain] = sum(
+                _value(vice, w)
+                for w in range(worlds)
+                if appeared[vice][w] and not appeared[captain][w]
+            ) / worlds
         c_terms[vice] = inner
     if identity is not None:
         _MATRIX_MEMO[("captain_terms", identity)] = (a_terms, c_terms)

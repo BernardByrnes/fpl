@@ -184,6 +184,7 @@ def write_world_cache(
             # bonus, because the armband objective consumes it.  A matrix without it
             # is a pre-v2 entry and is not a valid cache hit.
             "expected_bonus": {str(p): float(per_event_bonus.get(p, 0.0)) for p in union},
+            "role_actionability": {str(p): False for p in union},
         }
         (cache_dir / f"{key}.json").write_text(json.dumps(matrix), encoding="utf-8")
         keys[event] = key

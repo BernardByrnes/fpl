@@ -116,6 +116,20 @@ def validate_world_matrix(matrix: Mapping[str, Any], *, context: str = "") -> in
                     "which is not a finite non-negative expected bonus"
                     + (f" ({context})" if context else "")
                 )
+    if "role_actionability" in matrix:
+        block = matrix["role_actionability"]
+        if not isinstance(block, Mapping):
+            raise RouteWorldPlayerMissing(
+                f"{ROUTE_WORLD_PLAYER_MISSING}: role_actionability must be a mapping of player -> bool"
+                + (f" ({context})" if context else "")
+            )
+        missing = sorted(pid for pid in player_ids if pid not in block)
+        if missing:
+            raise RouteWorldPlayerMissing(
+                f"{ROUTE_WORLD_PLAYER_MISSING}: role_actionability has no value for captured player(s) "
+                f"{missing[:8]}{'...' if len(missing) > 8 else ''} ({len(missing)} of {len(player_ids)})"
+                + (f" ({context})" if context else "")
+            )
     return worlds
 
 
@@ -131,6 +145,21 @@ def expected_bonus_map(matrix: Mapping[str, Any]) -> dict[int, float]:
     if not isinstance(block, Mapping):
         return {}
     return {int(pid): float(value) for pid, value in block.items()}
+
+
+def role_actionability_map(matrix: Mapping[str, Any]) -> dict[int, bool]:
+    """Per-player ROLE ACTIONABILITY carried by a world matrix.
+
+    Missing means "no unresolved role conflict is recorded", which is the honest
+    default for a matrix built before the block existed: it constrains nothing and
+    so cannot silently block a legal policy.  The block is a RESTRICTION, so its
+    absence is fail-open by construction while a malformed block fails closed.
+    """
+
+    block = matrix.get("role_actionability")
+    if not isinstance(block, Mapping):
+        return {}
+    return {int(pid): bool(value) for pid, value in block.items()}
 
 
 def captain_value_basis(matrix: Mapping[str, Any]) -> str:
@@ -512,17 +541,39 @@ def _std(values: Sequence[float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def enumerate_skeletons(squad_ids: Sequence[int], positions: Mapping[int, str]):
+def enumerate_skeletons(
+    squad_ids: Sequence[int],
+    positions: Mapping[int, str],
+    *,
+    actionability: Mapping[int, bool] | None = None,
+):
     """Yield (starter_ids, bench_gk_id, bench_outfield_order) for legal XIs.
 
     Deterministic iteration: goalkeepers ascending, outfield combinations in the
     given squad order, bench orders in permutation order.
+
+    GOALKEEPER ACTIONABILITY.  Only one keeper starts and the other is his autosub
+    cover, so epistemic uncertainty about a keeper's role would otherwise read as
+    free tactical optionality.  When at least one keeper has a TRUSTED role, a
+    keeper whose role evidence is explicitly UNRESOLVED may not be the intentional
+    starter: the trusted keeper starts and the unresolved one remains the legal
+    cover.  This is not an autosub change (the substitution is untouched) and not a
+    zero-minute ban (he stays selectable whenever no trusted keeper exists, and
+    fresh role evidence clears the state).  The filter is consulted once per
+    skeleton, outside every world loop.
     """
 
     squad = sorted(int(pid) for pid in squad_ids)
     gks = [pid for pid in squad if positions.get(pid) == "GKP"]
     outfield = [pid for pid in squad if positions.get(pid) != "GKP"]
-    for starting_gk in gks:
+    unresolved = {int(pid) for pid, value in (actionability or {}).items() if value}
+    eligible_starters = [pid for pid in gks if pid not in unresolved]
+    if eligible_starters:
+        # A trusted keeper exists, so the disputed role cannot buy the shirt.
+        starting_gks = eligible_starters
+    else:
+        starting_gks = gks
+    for starting_gk in starting_gks:
         bench_gk = next(pid for pid in gks if pid != starting_gk)
         for combo in combinations(outfield, XI_SIZE - 1):
             counts = _position_counts(combo, positions)
@@ -558,7 +609,14 @@ def rank_policies(
     validate_matrix_covers_players(world_matrix, {int(pid) for pid in squad_ids},
                                    context="rank_policies")
     captain_a, captain_c = captain_terms(world_matrix)
-    skeletons = list(enumerate_skeletons(squad_ids, positions))
+    unresolved_ids = {
+        int(pid)
+        for pid, value in role_actionability_map(world_matrix).items()
+        if value
+    }
+    skeletons = list(
+        enumerate_skeletons(squad_ids, positions, actionability=role_actionability_map(world_matrix))
+    )
     base = skeleton_stats or base_skeleton_stats(skeletons, positions, world_matrix)
 
     heap: list[tuple] = []
@@ -566,8 +624,16 @@ def rank_policies(
     for index, (starter_ids, bench_gk, order) in enumerate(skeletons):
         mean_base = base[index]["mean_core_base"]
         for captain in starter_ids:
+            if captain in unresolved_ids:
+                # The armband is a claim about a role; a role our own evidence
+                # layer calls unresolved cannot carry it, and must not be used to
+                # manufacture a nominal captain whose absence routes the multiplier
+                # to a vice.  This is not "keepers cannot captain" and not "low
+                # p_start cannot captain": a trusted role at any probability stays
+                # fully eligible, and fresh role evidence clears this state.
+                continue
             for vice in starter_ids:
-                if vice == captain:
+                if vice == captain or vice in unresolved_ids:
                     continue
                 evaluated += 1
                 mean_total = mean_base + captain_a.get(captain, 0.0) + captain_c.get(vice, {}).get(captain, 0.0)

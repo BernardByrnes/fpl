@@ -643,6 +643,18 @@ def project_player_fixture(
         available_non_start_zero_minute_observations
         >= config.strong_zero_minute_non_start_evidence_threshold
     )
+    actionability_unresolved = role_actionability_unresolved(
+        {
+            "prior_role_discontinuity": role_discontinuity,
+            "conflict_flags": [
+                flag
+                for flag in (FLAG_MODEL_PRIOR_CONFLICT, FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG)
+                if (flag == FLAG_MODEL_PRIOR_CONFLICT and role_discontinuity)
+                or (flag == FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG and strong_current_non_start_evidence)
+            ],
+            "fresh_role_change_evidence": fresh_role_change_evidence,
+        }
+    )
     prior_pull_discount = 1.0
     prior_pull_discount_basis = "NO_ROLE_CONFLICT"
     if role_discontinuity and strong_current_non_start_evidence:
@@ -652,6 +664,8 @@ def project_player_fixture(
             prior_pull_discount = float(config.prev_season_role_discontinuity_ess_discount)
             prior_pull_discount_basis = "ROLE_DISCONTINUITY_UNREPRODUCED_PRIOR"
     start_prior_strength = float(config.start_prior_strength) * prior_pull_discount
+    if actionability_unresolved:
+        flags.append(FLAG_ROLE_ACTIONABILITY_UNRESOLVED)
 
     if weighted_obs <= 0:
         p_start_given_available_raw = prior_start
@@ -862,6 +876,9 @@ def project_player_fixture(
             "prior_pull_discount": _round(prior_pull_discount),
             "prior_pull_discount_basis": prior_pull_discount_basis,
             "fresh_role_change_evidence": bool(fresh_role_change_evidence),
+            # The canonical actionability state, so the manager layer consumes a
+            # structured boolean rather than re-deriving it from flag strings.
+            "role_actionability_unresolved": bool(actionability_unresolved),
             "uncertainty_reasons": sorted(
                 {
                     *(reason for reason in _role_uncertainty_reasons(
@@ -979,6 +996,56 @@ FLAG_MODEL_PRIOR_CONFLICT = "MODEL_PRIOR_CONFLICT_WITH_CURRENT_ROLE"
 FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG = "CURRENT_SEASON_ZERO_MINUTE_NON_START_EVIDENCE_STRONG"
 FLAG_SCOUTING_ROLE_CONFLICT = "SCOUTING_ROLE_CONFLICT"
 FLAG_MATCHDAY_SQUAD_EVIDENCE_UNAVAILABLE = "MATCHDAY_SQUAD_EVIDENCE_UNAVAILABLE"
+FLAG_START_ROLE_CONFIRMED = "START_ROLE_CONFIRMED"
+
+#: The ONE role-actionability state the authoritative manager layer consumes.
+#: A player whose current-team role is CONTRADICTED by the evidence and whose
+#: previous-season prior has not reproduced, with nothing fresh establishing a
+#: role transition, still has a predictive value -- that value is what uncertainty
+#: modelling is for -- but the authoritative optimizer must not treat the disputed
+#: role as calibrated tactical optionality.
+FLAG_ROLE_ACTIONABILITY_UNRESOLVED = "ROLE_ACTIONABILITY_UNRESOLVED"
+
+
+def role_actionability_unresolved(
+    role_evidence: Mapping[str, Any] | None,
+    risk_flags: Iterable[str] = (),
+) -> bool:
+    """Canonical role-actionability state, read from the STRUCTURED evidence.
+
+    ONE definition, used by the producer (which calls it on the evidence it has
+    just assembled) and by every consumer (which calls it on the persisted
+    ``role_evidence`` dict).  It reads booleans and the structured conflict-flag
+    list, never a display label.
+
+    Deliberately NOT ``minutes == 0``: a new signing, a promoted backup, a keeper
+    replacing an injured starter or any manager-confirmed role change is a genuine
+    role transition, and fresh evidence of one clears the state.  It is True only
+    where the current-team role is CONTRADICTED (a strong prior role that did not
+    reproduce, with strong available zero-minute non-start evidence and a recorded
+    model/current-role conflict) AND nothing establishes that the role has changed.
+
+    Payloads written before the state existed carry the same structured fields, so
+    the state is recoverable from them rather than from a re-derivation: the only
+    thing they lack is the explicit fresh-evidence boolean, which is then read from
+    its own channel (a scouting role confirmation in ``risk_flags``).
+    """
+
+    if not isinstance(role_evidence, Mapping):
+        return False
+    recorded = role_evidence.get("role_actionability_unresolved")
+    if recorded is not None:
+        return bool(recorded)
+    fresh = role_evidence.get("fresh_role_change_evidence")
+    if fresh is None:
+        fresh = FLAG_START_ROLE_CONFIRMED in set(risk_flags or ())
+    conflicts = set(role_evidence.get("conflict_flags") or ())
+    return bool(
+        role_evidence.get("prior_role_discontinuity")
+        and FLAG_MODEL_PRIOR_CONFLICT in conflicts
+        and FLAG_ZERO_MINUTE_NON_START_EVIDENCE_STRONG in conflicts
+        and not fresh
+    )
 
 ROLE_CONFLICT_FLAGS = (
     FLAG_MODEL_PRIOR_CONFLICT,
