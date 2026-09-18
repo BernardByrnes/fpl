@@ -32,6 +32,18 @@ Spawn-safe (Windows): the entry point is a module-level picklable function, the 
 uses an explicit ``spawn`` context, and the worker keeps a bounded, process-local
 matrix cache so resident memory stays small.  A worker never opens a database, never
 writes anything, and never mutates the parent's cache.
+
+The semantic matrix contract
+----------------------------
+A worker receives a matrix by one of two transports: a certified cache FILE, or a
+pickled BLOB when the parent holds a matrix that has no cache path (a provider-injected
+or prebuilt one).  Both must hand exact evaluation the SAME decision problem, so both
+pass through :func:`normalise_semantic_matrix`, which requires every
+:data:`SEMANTIC_MATRIX_BLOCKS` entry and FAILS CLOSED when one is absent.  A worker is
+never the place where a missing policy block is defaulted: ``manager_lineup`` reads an
+absent ``expected_bonus`` as "score the armband on CORE alone" and an absent
+``role_actionability`` as "nothing is restricted", and either default silently replaces
+the parent's decision with a different one.
 """
 
 from __future__ import annotations
@@ -47,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-PARALLEL_EXACT_VERSION = "parallel_exact_p3_1.0.0"
+PARALLEL_EXACT_VERSION = "parallel_exact_p3_2.0.0"
 
 #: Sequential (in-parent) evaluation.  ``optimize(parallel_workers=None)`` uses it.
 SEQUENTIAL = None
@@ -61,6 +73,16 @@ DEFAULT_WORKER_COUNT = 1
 #: matrix plus its derived memos; larger values trade memory for fewer cold
 #: ``captain_terms`` recomputations when tasks for different events interleave.
 DEFAULT_WORKER_MATRIX_CACHE = 1
+
+#: The blocks exact evaluation actually consumes.  A world matrix is only usable for a
+#: decision when ALL of them are present: ``expected_bonus`` drives the armband objective
+#: and ``role_actionability`` restricts the legal policy set, so a matrix missing either
+#: describes a DIFFERENT decision problem rather than a degraded one.  The two leading
+#: underscores in ``manager_worlds``' names are internal transport metadata
+#: (``_p2_matrix_identity`` / ``_p2_matrix_path``) and are deliberately NOT part of this
+#: contract: they travel separately and are re-stamped by the loader.
+SEMANTIC_MATRIX_BLOCKS = ("worlds", "player_ids", "core", "minutes",
+                          "expected_bonus", "role_actionability")
 
 
 @dataclass(frozen=True)
@@ -187,6 +209,44 @@ def _digest_file(path) -> str:
     return digest.hexdigest()
 
 
+def normalise_semantic_matrix(raw, *, event: int | None = None, source: str = "") -> dict[str, Any]:
+    """The ONE reader for a world matrix entering exact evaluation.
+
+    BOTH transports — a certified cache FILE and a pickled BLOB — pass through here, so a
+    worker can never evaluate a matrix whose meaning depends on how it arrived.  Blob mode
+    previously bypassed validation entirely, which is how a field loss could hide.
+
+    A missing semantic block FAILS CLOSED.  ``manager_lineup`` reads an absent
+    ``expected_bonus`` as "the captain is chosen on CORE alone" and an absent
+    ``role_actionability`` as "nothing is restricted"; both are correct defaults for a
+    caller that knows it has no policy layer, and both are wrong for a worker that is
+    supposed to be reproducing the parent's decision.  A worker must never be the place
+    where that default gets applied, so the absence is an error, not a fallback.
+
+    Normalisation is value-preserving: it only fixes key types and rebuilds the canonical
+    shape, never the numbers.  ``core``/``minutes`` values are carried by reference.
+    """
+
+    missing = [name for name in SEMANTIC_MATRIX_BLOCKS if name not in raw]
+    if missing:
+        raise ParallelExactError(
+            f"PARALLEL_EXACT_SEMANTIC_BLOCK_MISSING: the {source or 'supplied'} matrix for "
+            f"event {event} is missing {missing}. A worker scores the matrix the parent "
+            "scored; it refuses to substitute a default for a missing policy block, "
+            "because that would silently change the armband objective or the legal policy "
+            "set. Provision the matrix through the current cache schema instead."
+        )
+    return {
+        "worlds": int(raw["worlds"]),
+        "player_ids": [int(pid) for pid in raw["player_ids"]],
+        "core": {int(pid): series for pid, series in raw["core"].items()},
+        "minutes": {int(pid): series for pid, series in raw["minutes"].items()},
+        "expected_bonus": {int(pid): float(value) for pid, value in raw["expected_bonus"].items()},
+        "role_actionability": {int(pid): bool(value)
+                               for pid, value in raw["role_actionability"].items()},
+    }
+
+
 def _load_worker_matrix(event: int) -> tuple[Mapping[str, Any], str]:
     """Load (or reuse) the certified world matrix for one event, worker-locally.
 
@@ -210,23 +270,28 @@ def _load_worker_matrix(event: int) -> tuple[Mapping[str, Any], str]:
             "refuses to evaluate against anything it was not given"
         )
     kind, payload = source
+    from . import route_optimizer as ro
     load_started = time.perf_counter()
     if kind == "file":
-        from . import route_optimizer as ro
         data = json.loads(Path(str(payload)).read_text(encoding="utf-8"))
-        matrix = {"worlds": data["worlds"], "player_ids": data["player_ids"],
-                  "core": {int(k): v for k, v in data["core"].items()},
-                  "minutes": {int(k): v for k, v in data["minutes"].items()}}
-        identity = _WORKER_STATE["matrix_identity"].get(event)
-        if identity:
-            ro._stamp_matrix_identity(matrix, identity)
+        matrix = normalise_semantic_matrix(data, event=event, source=f"file {payload}")
         ro._stamp_matrix_path(matrix, payload)
         digest = _digest_file(payload)
     elif kind == "blob":
-        matrix = pickle.loads(payload)
+        raw = pickle.loads(payload)
+        matrix = normalise_semantic_matrix(raw, event=event, source="blob")
+        path = raw.get(mw.MATRIX_PATH_KEY) if hasattr(raw, "get") else None
+        if path:
+            ro._stamp_matrix_path(matrix, path)
         digest = _digest_blob(payload)
     else:  # pragma: no cover - defensive
         raise ParallelExactError(f"WORKER_MATRIX_SOURCE_UNKNOWN: {kind!r}")
+    # The identity is transport metadata, not matrix content, so it is re-stamped here for
+    # BOTH transports rather than inherited from a pickle.  A worker's memos must key on
+    # the identity the parent dispatched, whichever way the bytes arrived.
+    identity = _WORKER_STATE["matrix_identity"].get(event)
+    if identity:
+        ro._stamp_matrix_identity(matrix, identity)
     _WORKER_STATE["last_load_seconds"] = time.perf_counter() - load_started
 
     # Bound resident memory: evict the oldest event (and the process-local matrix-keyed
@@ -593,8 +658,10 @@ __all__ = [
     "PARALLEL_EXACT_VERSION",
     "ParallelExactError",
     "SEQUENTIAL",
+    "SEMANTIC_MATRIX_BLOCKS",
     "ScheduleCounters",
     "describe_matrix_source",
+    "normalise_semantic_matrix",
     "prefetch_exact_cache",
     "recommended_worker_count",
     "required_keys",
