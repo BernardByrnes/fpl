@@ -129,3 +129,47 @@ def test_bool_discount_is_rejected():
         calculate_total(10.0, 3, True)
     with pytest.raises(ValueError):
         calculate_total(10.0, 3, False)
+
+
+# 15 ----------------------------------------------------------------
+
+
+def test_nan_price_is_rejected():
+    with pytest.raises(ValueError):
+        calculate_total(float("nan"), 3, 10)
+
+
+# 16 ----------------------------------------------------------------
+
+
+def test_infinite_price_is_rejected():
+    with pytest.raises(ValueError):
+        calculate_total(float("inf"), 3, 10)
+    with pytest.raises(ValueError):
+        calculate_total(float("-inf"), 3, 10)
+
+
+# 17 ----------------------------------------------------------------
+
+
+def test_nan_discount_is_rejected():
+    with pytest.raises(ValueError):
+        calculate_total(10.0, 3, float("nan"))
+
+
+# 18 ----------------------------------------------------------------
+
+
+def test_infinite_discount_is_rejected():
+    with pytest.raises(ValueError):
+        calculate_total(10.0, 3, float("inf"))
+    with pytest.raises(ValueError):
+        calculate_total(10.0, 3, float("-inf"))
+
+
+# 19 ----------------------------------------------------------------
+
+
+def test_overflowing_arithmetic_never_returns_a_non_finite_total():
+    with pytest.raises(ValueError):
+        calculate_total(1e308, 10, 0)
