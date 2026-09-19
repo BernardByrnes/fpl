@@ -70,8 +70,8 @@ def test_ruleset_fingerprint_exposes_version_hash_and_removal():
 
 
 def test_every_official_rule_row_has_exactly_one_implemented_spec():
-    assert set(b.OFFICIAL_RULE_ROWS) == set(b.IMPLEMENTED_RULE_ROWS)
-    assert len(b.OFFICIAL_RULE_ROWS) == len(set(b.OFFICIAL_RULE_ROWS)) == 41
+    assert set(b.INTERNAL_RULE_ROWS) == set(b.IMPLEMENTED_RULE_ROWS)
+    assert len(b.INTERNAL_RULE_ROWS) == len(set(b.INTERNAL_RULE_ROWS)) == 41
     assert len(b.RULE_SPECS) == 41
 
 

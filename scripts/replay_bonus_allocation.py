@@ -61,7 +61,8 @@ def replay(conn: sqlite3.Connection) -> dict:
         "player_rows": 0,
         "exact_matches": 0,
         "mismatches": 0,
-        "tie_fixtures": 0,
+        "any_bps_tie_fixtures": 0,
+        "bonus_affecting_tie_fixtures": 0,
         "fixtures_exceeding_six_total_bonus": 0,
         "excluded": [],
         "mismatch_examples": [],
@@ -82,13 +83,27 @@ def replay(conn: sqlite3.Connection) -> dict:
         totals = ba.bonus_totals(official)
         if totals["exceeds_six"]:
             report["fixtures_exceeding_six_total_bonus"] += 1
-        distinct = len({v for v in bps_by_player.values()})
+        counts_by_bps: dict[int, int] = {}
+        for value in bps_by_player.values():
+            counts_by_bps[value] = counts_by_bps.get(value, 0) + 1
+        distinct = len(counts_by_bps)
         if distinct < len(bps_by_player):
-            report["tie_fixtures"] += 1
-            values = sorted(bps_by_player.values(), reverse=True)[:4]
+            # ANY equal-BPS pair anywhere in the table.  Technically true but
+            # diagnostically weak: with ~60 players a match almost always contains one.
+            report["any_bps_tie_fixtures"] += 1
+        # BONUS-AFFECTING: an equal-BPS group of more than one player that actually
+        # RECEIVES positive bonus.  Two low-ranked players on the same BPS with no bonus
+        # are not a bonus tie, and reporting them as one is misleading.
+        bonus_tied = sorted({bps_by_player[pid] for pid, value in ours.items()
+                             if value > 0 and counts_by_bps[bps_by_player[pid]] > 1},
+                            reverse=True)
+        if bonus_tied:
+            report["bonus_affecting_tie_fixtures"] += 1
             if len(report["tie_examples"]) < 5:
                 report["tie_examples"].append(
-                    {"fixture_id": fixture_id, "top_bps": values,
+                    {"fixture_id": fixture_id,
+                     "bonus_affecting_bps": bonus_tied,
+                     "top_bps": sorted(bps_by_player.values(), reverse=True)[:4],
                      "official_total_bonus": totals["total_bonus"]}
                 )
 
@@ -158,7 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"player rows   : {report['player_rows']}")
     print(f"exact matches : {report['exact_matches']}")
     print(f"mismatches    : {report['mismatches']}")
-    print(f"tie fixtures  : {report['tie_fixtures']}")
+    print(f"ANY_BPS_TIE_FIXTURES          : {report['any_bps_tie_fixtures']}")
+    print(f"BONUS_AFFECTING_TIE_FIXTURES  : {report['bonus_affecting_tie_fixtures']}")
     print(f"fixtures whose OFFICIAL total bonus exceeds 6: "
           f"{report['fixtures_exceeding_six_total_bonus']}")
     for item in report["tie_examples"]:

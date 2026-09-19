@@ -196,8 +196,15 @@ RULE_SPECS: tuple[BPSPrimitiveSpec, ...] = (
     BPSPrimitiveSpec("being_tackled", BPSMode.REMOVED_2026_27),
 )
 
-#: The official 2026/27 rule rows, for the completeness gate.
-OFFICIAL_RULE_ROWS: tuple[str, ...] = (
+#: Internal rule rows, for the completeness gate.  NOTE ON WORDING: this is NOT "the
+#: number of rows in the official source table".  The official table combines the goal
+#: values into a single position-dependent row and states being-tackled's removal in prose;
+#: this representation SPLITS the position-dependent rows apart and carries an explicit
+#: tombstone for the removed rule.  Report the three quantities separately:
+#:   INTERNAL_ACTIVE_SPECS   - specs that apply a calculation
+#:   REMOVED_RULE_TOMBSTONES - rules that exist only to record their removal
+#:   official source table   - as published (fewer, combined rows)
+INTERNAL_RULE_ROWS: tuple[str, ...] = (
     "plays_1_to_60_minutes", "plays_over_60_minutes",
     "direct_penalty_goal", "gkp_non_penalty_goal", "def_non_penalty_goal",
     "mid_non_penalty_goal", "fwd_non_penalty_goal",
@@ -214,6 +221,16 @@ OFFICIAL_RULE_ROWS: tuple[str, ...] = (
 )
 
 IMPLEMENTED_RULE_ROWS: tuple[str, ...] = tuple(spec.rule_row for spec in RULE_SPECS)
+
+#: Rules retained ONLY to record that the official rule no longer exists.
+REMOVED_RULE_TOMBSTONES: tuple[str, ...] = tuple(
+    spec.rule_row for spec in RULE_SPECS if spec.mode == BPSMode.REMOVED_2026_27
+)
+
+#: Internal specs that apply a calculation (the tombstone is excluded).
+INTERNAL_ACTIVE_SPECS: tuple[str, ...] = tuple(
+    spec.rule_row for spec in RULE_SPECS if spec.mode != BPSMode.REMOVED_2026_27
+)
 
 
 def ruleset_fingerprint() -> dict[str, Any]:
