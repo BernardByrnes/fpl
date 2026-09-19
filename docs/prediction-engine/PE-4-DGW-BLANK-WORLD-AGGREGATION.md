@@ -1,5 +1,15 @@
 # Prediction Engine V1 — PE-4 DGW / Blank World Aggregation
 
+**STATUS: FROZEN**
+
+REVIEWED SOURCE:
+`c75efb5b3359f154c786f171ad6e4780ea9c5c15`
+
+MERGED INTO `feature/prediction-engine-v1`:
+`4849299d1653e75a62fbdf2aa8ade4493c181195`
+
+PE-5 is next. PE-4 must not be reopened absent a concrete regression.
+
 ## Objective
 
 Certify that fixture-level simulated football worlds aggregate correctly into FPL event worlds for:
@@ -158,8 +168,18 @@ Do not rewrite working aggregation unless a failing contract test proves a real 
 
 ## Terminal state
 
-`READY_FOR_MERGE`
+The historical source-branch terminal state was `READY_FOR_MERGE`.
 
-No merge.
+PE-4 has since been human-approved, merged and **FROZEN**:
 
-No PE-5 implementation.
+- reviewed source: `c75efb5b3359f154c786f171ad6e4780ea9c5c15`
+- merge commit: `4849299d1653e75a62fbdf2aa8ade4493c181195` on
+  `feature/prediction-engine-v1`
+- the merge tree is byte-identical to the reviewed source tree, so the merged
+  content is exactly the content that was reviewed
+
+The accepted semantic contract above is unchanged by the merge.
+
+PE-5 is next.
+
+PE-4 must not be reopened absent a concrete regression.

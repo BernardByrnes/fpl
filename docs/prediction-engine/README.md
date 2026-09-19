@@ -26,6 +26,10 @@ boundary.
 
 **STATUS: FROZEN**
 
+reviewed source: `c75efb5b3359f154c786f171ad6e4780ea9c5c15`
+
+merge: `4849299d1653e75a62fbdf2aa8ade4493c181195`
+
 ### PE-5 — Outcome Capture / Prediction-to-Reality Ledger
 
 **STATUS: NEXT**
