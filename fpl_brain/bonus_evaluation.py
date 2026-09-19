@@ -49,7 +49,9 @@ from . import bonus_allocation as ba
 from . import bonus_challenger as bc
 from . import bps_rules as bps
 from . import monte_carlo as mc
+from . import repositories
 from . import scoring_rules
+from . import utils
 from . import walk_forward_metrics as wfm
 
 PE3_EVALUATION_SCHEMA = "pe3_bonus_evaluation_v1.0.0"
@@ -135,6 +137,19 @@ class LegacyBootstrapEvidence:
         }
 
 
+def _parse_utc_or_fail(value: Any, label: str) -> Any:
+    """Parse a timestamp via the repository's UTC parser; malformed fails closed.
+
+    Lexical string ordering is not a time comparison, so every ordering decision in this
+    module goes through here.
+    """
+
+    parsed = utils.parse_utc(value if isinstance(value, str) else None)
+    if parsed is None:
+        raise BackgroundAuthorityError(f"{label} is missing or unparseable: {value!r}")
+    return parsed
+
+
 def _id_digest(ids: Iterable[int]) -> str:
     payload = ",".join(str(int(i)) for i in sorted({int(i) for i in ids}))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -182,9 +197,20 @@ def verify_legacy_bootstrap_generation(conn: sqlite3.Connection, *, fetch_run_id
 
     payload = json.loads(raw_bytes.decode("utf-8"))
     try:
-        parsers.validate_bootstrap_payload(payload)
+        records = parsers.parse_bootstrap(payload, str(run["finished_at"]),
+                                          event_context=run["current_event"])
+        parsers.validate_bootstrap_payload(payload, records)
     except Exception as failure:  # noqa: BLE001 - any rejection is a hard stop
-        raise BackgroundAuthorityError(f"canonical bootstrap validation failed: {failure}") from failure
+        raise BackgroundAuthorityError(
+            f"canonical bootstrap validation failed: {failure}") from failure
+    raw_count = len(payload.get("elements") or [])
+    if len(records.players) != raw_count:
+        raise BackgroundAuthorityError(
+            f"parsed players {len(records.players)} != raw elements {raw_count}")
+    if len(records.snapshots) != len(records.players):
+        raise BackgroundAuthorityError(
+            f"parsed snapshots {len(records.snapshots)} != parsed players "
+            f"{len(records.players)}")
     elements = {int(item["id"]): item for item in (payload.get("elements") or [])}
 
     rows = list(conn.execute(
@@ -215,26 +241,57 @@ def verify_legacy_bootstrap_generation(conn: sqlite3.Connection, *, fetch_run_id
         raise BackgroundAuthorityError(
             f"snapshot capture is not one coherent instant: {captured[:5]}")
     finished_at = str(run["finished_at"])
-    if not (finished_at < str(deadline)):
+    finished_dt = _parse_utc_or_fail(finished_at, "fetch finished_at")
+    if not (finished_dt < _parse_utc_or_fail(deadline, "target deadline")):
         raise BackgroundAuthorityError(
             f"fetch finished {finished_at} is not before the deadline {deadline}")
-    kickoffs = [str(r[0]) for r in conn.execute(
-        "SELECT kickoff_time FROM fixtures WHERE event = ? AND kickoff_time IS NOT NULL",
-        (int(target_event),))]
-    late = [k for k in kickoffs if k <= finished_at]
-    if late:
+    # COVERAGE: a target fixture with a missing kickoff must not silently skip the gate.
+    target_rows = list(conn.execute(
+        "SELECT id, kickoff_time FROM fixtures WHERE event = ? ORDER BY id",
+        (int(target_event),)))
+    if not target_rows:
+        raise BackgroundAuthorityError(f"target event {target_event} has no fixture rows")
+    unparseable = [int(r["id"]) for r in target_rows
+                   if utils.parse_utc(r["kickoff_time"]) is None]
+    if unparseable:
         raise BackgroundAuthorityError(
-            f"{len(late)} target fixture(s) kicked off before the fetch completed; earliest {min(late)}")
+            f"target fixtures {unparseable} have missing/unparseable kickoff times; the "
+            "pre-kickoff gate cannot be evaluated without them")
+    started = [int(r["id"]) for r in target_rows
+               if _parse_utc_or_fail(r["kickoff_time"], f"fixture {r['id']} kickoff")
+               <= finished_dt]
+    if started:
+        raise BackgroundAuthorityError(
+            f"{len(started)} target fixture(s) kicked off before the fetch completed: {started}")
 
-    previous_id, previous_ids = _previous_legacy_population(
+    previous_id, previous_teams = _previous_legacy_population(
         conn, fetch_run_id=int(fetch_run_id), raw_dir=raw_dir)
+    # Bound outside the branch: the FIRST legacy fetch has no validated predecessor, and the
+    # evidence record must still be constructible with ``previous_population = None``.
+    previous_ids: set[int] = set()
     retained = absolute = None
     whole_club_loss = None
-    if previous_ids:
-        retained = len(previous_ids & set(elements)) / len(previous_ids)
-        absolute = len(previous_ids - set(elements))
-        whole_club_loss = _whole_club_loss(conn, removed=previous_ids - set(elements),
-                                           surviving=set(elements))
+    if previous_teams:
+        previous_ids = set(previous_teams)
+        current_ids = set(elements)
+        retained = len(previous_ids & current_ids) / len(previous_ids)
+        absolute = len(previous_ids - current_ids)
+        whole_club_loss = _whole_club_loss(
+            {pid: team for pid, team in previous_teams.items() if pid not in current_ids},
+            {pid: int(item["team"]) for pid, item in elements.items()})
+        # §4: these MUST gate, not merely be reported.
+        if retained < LEGACY_RETAINED_FRACTION_MIN:
+            raise BackgroundAuthorityError(
+                f"retained fraction {retained:.4f} < {LEGACY_RETAINED_FRACTION_MIN} against "
+                f"previous legacy fetch {previous_id}")
+        if absolute > LEGACY_ABSOLUTE_DROP_MAX:
+            raise BackgroundAuthorityError(
+                f"absolute drop {absolute} > {LEGACY_ABSOLUTE_DROP_MAX} against previous "
+                f"legacy fetch {previous_id}")
+        if whole_club_loss:
+            raise BackgroundAuthorityError(
+                f"a whole club disappeared between previous legacy fetch {previous_id} and "
+                f"fetch {fetch_run_id}")
     return LegacyBootstrapEvidence(
         fetch_run_id=int(fetch_run_id), status=status, raw_path=str(raw_path),
         raw_sha256=raw_sha256, raw_elements=len(elements), snapshots=len(rows),
@@ -246,38 +303,60 @@ def verify_legacy_bootstrap_generation(conn: sqlite3.Connection, *, fetch_run_id
 
 
 def _previous_legacy_population(conn: sqlite3.Connection, *, fetch_run_id: int,
-                                raw_dir: str | Path) -> tuple[int | None, set[int]]:
-    """Nearest EARLIER successful fetch proven to carry a complete raw<->snapshot population."""
+                                raw_dir: str | Path,
+                                ) -> tuple[int | None, dict[int, int]]:
+    """Nearest EARLIER fetch itself PROVEN complete, for the truncation gate.
+
+    A candidate becomes the authority for the retained-fraction gate only when it passes the
+    same completeness checks as the run under audit: status success, canonically valid
+    payload, raw ID set == snapshot ID set, equal counts, and semantic raw_json parity.  A
+    failing candidate is SKIPPED, so an unvalidated population can never set the baseline.
+    """
+
+    from . import parsers
 
     for run in conn.execute(
-            "SELECT id FROM fetch_runs WHERE id < ? AND status = 'success' ORDER BY id DESC",
+            "SELECT id, finished_at, current_event FROM fetch_runs "
+            "WHERE id < ? AND status = 'success' ORDER BY id DESC",
             (int(fetch_run_id),)):
         path = Path(raw_dir) / str(int(run["id"])) / "bootstrap_static.json"
         if not path.exists():
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001 - an unreadable legacy file is simply skipped
+            elements = {int(item["id"]): item for item in (payload.get("elements") or [])}
+            records = parsers.parse_bootstrap(payload, str(run["finished_at"]),
+                                              event_context=run["current_event"])
+            parsers.validate_bootstrap_payload(payload, records)
+        except Exception:  # noqa: BLE001 - an unusable candidate is skipped
             continue
-        element_ids = {int(item["id"]) for item in (payload.get("elements") or [])}
-        if not element_ids:
+        if not elements:
             continue
-        snapshot_ids = {int(r[0]) for r in conn.execute(
-            "SELECT player_id FROM player_snapshots WHERE fetch_run_id = ?", (int(run["id"]),))}
-        if element_ids == snapshot_ids:
-            return int(run["id"]), element_ids
-    return None, set()
+        rows = list(conn.execute(
+            "SELECT player_id, raw_json FROM player_snapshots WHERE fetch_run_id = ?",
+            (int(run["id"]),)))
+        if set(elements) != {int(r["player_id"]) for r in rows} or len(elements) != len(rows):
+            continue
+        if any(json.loads(r["raw_json"]) != elements[int(r["player_id"])] for r in rows):
+            continue
+        return int(run["id"]), {pid: int(item["team"]) for pid, item in elements.items()}
+    return None, {}
 
 
-def _whole_club_loss(conn: sqlite3.Connection, *, removed: set[int],
-                     surviving: set[int]) -> bool | None:
-    """True when every player of some club disappeared between two populations."""
+def _whole_club_loss(removed_teams: Mapping[int, int],
+                     surviving_teams: Mapping[int, int]) -> bool:
+    """True when every player of some club disappeared between two LEGACY populations.
+
+    Club membership comes from the two historical raw bootstrap payloads themselves.  The
+    CURRENT ``players.team_id`` is not historical authority and must never decide whether an
+    old population lost a club.
+    """
 
     clubs: dict[int, set[int]] = {}
-    for row in conn.execute("SELECT id, team_id FROM players"):
-        clubs.setdefault(int(row["team_id"]), set()).add(int(row["id"]))
+    for player_id, team_id in removed_teams.items():
+        clubs.setdefault(int(team_id), set()).add(int(player_id))
     for members in clubs.values():
-        if members & removed and not (members & surviving):
+        if not (members & set(surviving_teams)):
             return True
     return False
 
@@ -563,11 +642,14 @@ def _world_diagnostics(*, fixture_id: int, proxy_by_world: Sequence[Mapping[int,
 
 
 def _is_placeholder(record: Mapping[str, Any]) -> bool:
-    """The repository's scheduled-placeholder signature: minutes only, nothing realised."""
+    """Delegate to the repository's canonical player-gameweek placeholder semantics.
 
-    if record.get("bonus") is not None or record.get("bps") is not None:
-        return False
-    return record.get("updated_at") is None or record.get("starts") is None
+    PE-3 must not maintain a second definition of "no official observation": a REAL
+    did-not-play is all explicit zeros and is a valid realised zero, while a schedule
+    placeholder has no performance evidence at all.
+    """
+
+    return repositories.row_is_scheduled_placeholder(record)
 
 
 def final_outcomes(conn: sqlite3.Connection, *, event: int) -> tuple[dict[tuple[int, int], dict], dict]:
@@ -578,14 +660,14 @@ def final_outcomes(conn: sqlite3.Connection, *, event: int) -> tuple[dict[tuple[
     """
 
     rows = conn.execute(
-        """
-        SELECT pg.player_id AS player_id, pg.fixture_id AS fixture_id, pg.bonus AS bonus,
-               pg.minutes AS minutes, pg.bps AS bps, pg.starts AS starts,
-               pg.updated_at AS updated_at
+        f"""
+        SELECT pg.*, f.kickoff_time AS fixture_kickoff
         FROM player_gameweeks pg
         JOIN fixtures f ON f.id = pg.fixture_id
         JOIN events e ON e.id = f.event
         WHERE f.event = ? AND f.finished = 1 AND e.finished = 1 AND e.data_checked = 1
+          AND ({repositories.gameweek_has_performance_sql('pg')}
+               OR pg.minutes IS NOT NULL)
         """,
         (int(event),)).fetchall()
     outcomes: dict[tuple[int, int], dict] = {}
@@ -731,6 +813,48 @@ def snapshot_vs_gameweek_diagnostic(conn: sqlite3.Connection, *, fetch_run_id: i
             "bps_mismatches": comparable - bps_matches, "examples": examples}
 
 
+def _verify_frozen_chain(conn: sqlite3.Connection, *, chain: Mapping[str, int], as_of: str,
+                         deadline: str, fetch_run_id: int) -> None:
+    """Prove the four frozen predictive runs ARE the declared historical chain.
+
+    Checked here, inside the canonical evaluator, so a caller cannot pair a chain with an
+    unrelated cutoff, deadline or official fetch.
+    """
+
+    as_of_dt = _parse_utc_or_fail(as_of, "chain as_of")
+    deadline_dt = _parse_utc_or_fail(deadline, "chain deadline")
+    if not (as_of_dt < deadline_dt):
+        raise BackgroundAuthorityError(f"as_of {as_of} is not before the deadline {deadline}")
+    families = {"xpts": "xpts_v1", "minutes": "minutes_v1", "team": "team_strength_v1",
+                "rate": "player_rates_v1"}
+    for role, family in families.items():
+        row = conn.execute("SELECT * FROM projection_runs WHERE id = ?", (int(chain[role]),)).fetchone()
+        if row is None:
+            raise BackgroundAuthorityError(f"chain {role} run {chain[role]} does not exist")
+        if str(row["status"]) != "complete":
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} status is {row['status']!r}, not complete")
+        if str(row["model_family"]) != family:
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} is {row['model_family']!r}, expected {family!r}")
+        if str(row["data_cutoff"]) != str(as_of):
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} cutoff {row['data_cutoff']} != declared {as_of}")
+        if not (_parse_utc_or_fail(row["data_cutoff"], f"chain {role} cutoff") < deadline_dt):
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} cutoff is not pre-deadline")
+        # §10: the chain's own recorded official fetch must be the one supplying history.
+        recorded = row["official_run_ids"]
+        if recorded:
+            payload = json.loads(recorded)
+            fetch = payload.get("fetch") or {}
+            if fetch.get("run_id") is not None and int(fetch["run_id"]) != int(fetch_run_id):
+                raise BackgroundAuthorityError(
+                    f"chain {role} run {chain[role]} records official fetch "
+                    f"{int(fetch['run_id'])}, but bootstrap history is taken from fetch "
+                    f"{int(fetch_run_id)}; refusing to pair them")
+
+
 def _calibration_state_identity(config: "mc.MonteCarloConfig") -> str:
     if not hasattr(mc, "calibration_provenance"):
         raise CaptureContractError("monte_carlo.calibration_provenance is unavailable")
@@ -750,14 +874,21 @@ def evaluate_event(conn: sqlite3.Connection, *, event: int, as_of: str, deadline
                    rules: Sequence[bps.BPSPrimitiveSpec] = bps.RULE_SPECS,
                    shrinkage_minutes: int = SHRINKAGE_MINUTES,
                    expected_raw_sha256: str | None = None,
-                   preloaded_worlds: Mapping[int, Any] | None = None) -> dict[str, Any]:
+                   preloaded_worlds: Mapping[int, Any] | None = None,
+                   code_sha: str | None = None) -> dict[str, Any]:
     """THE full PE-3 evaluation path.  READ ONLY — nothing is persisted."""
 
+    _verify_frozen_chain(conn, chain=chain, as_of=as_of, deadline=deadline,
+                         fetch_run_id=int(fetch_run_id))
     problems = mc.validate_input_run_coherence(
         conn, xpts_run_id=int(chain["xpts"]), minutes_run_id=int(chain["minutes"]),
         team_run_id=int(chain["team"]), rate_run_id=int(chain["rate"]))
     if problems:
         raise BackgroundAuthorityError(f"input chain is incoherent: {problems}")
+    if int(xpts_run_id) != int(chain["xpts"]):
+        raise BackgroundAuthorityError(
+            f"soft-baseline xpts run {int(xpts_run_id)} is not the chain's xpts run "
+            f"{int(chain['xpts'])}; one historical comparison cannot mix two xPts runs")
 
     evidence = verify_legacy_bootstrap_generation(
         conn, fetch_run_id=int(fetch_run_id), raw_dir=raw_dir, deadline=deadline,
@@ -841,6 +972,7 @@ def evaluate_event(conn: sqlite3.Connection, *, event: int, as_of: str, deadline
             "config_hash": config.config_hash(), "seed": int(config.seed),
             "simulations": int(config.simulations),
             "calibration_state_identity": _calibration_state_identity(config),
+            "code_sha": str(code_sha) if code_sha else "UNKNOWN",
         },
         "bps_rules": bps.ruleset_fingerprint(),
         "background_source_version": BPS_BACKGROUND_SOURCE_VERSION,
@@ -861,5 +993,9 @@ def evaluate_event(conn: sqlite3.Connection, *, event: int, as_of: str, deadline
             "RETROSPECTIVE: current MC and challenger code against frozen pre-deadline inputs. "
             "Not a historical frozen PE-3 forecast, and not a reproduction of the historical MC run.",
             "NO MODEL-SELECTION VERDICT: this is a tiny sample.",
+            "CONTINUOUS_PROXY_TIE_LIMITATION: The PE-3 structural proxy is continuous and "
+            "does not currently reproduce official integer-BPS tie frequency; "
+            "bonus-affecting ties were 0 in the GW4 replay despite ties existing in official "
+            "BPS outcomes. Recorded for later calibration/integration review; NOT tuned here.",
         ],
     }

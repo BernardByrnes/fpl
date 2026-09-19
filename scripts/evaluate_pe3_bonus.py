@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,6 +35,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-raw-sha-pin", action="store_true")
     args = parser.parse_args(argv)
 
+    code_sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                              cwd=str(Path(__file__).resolve().parents[1])).stdout.strip() or None
     config = load_config(args.config)
     conn = sqlite3.connect(f"file:{config_path(config, 'database')}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -44,6 +47,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_dir=args.raw_dir, target_event=GW4["event"],
             xpts_run_id=GW4["xpts_run_id"],
             expected_raw_sha256=None if args.skip_raw_sha_pin else be.GW4_LEGACY_RAW_SHA256,
+            code_sha=code_sha,
         )
     finally:
         conn.close()
