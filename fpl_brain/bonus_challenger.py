@@ -91,7 +91,7 @@ class PlayerWorldBps:
     """One player's structural BPS in one world, with the unsupported rows named."""
 
     player_id: int
-    bps: int
+    bps: float
     unsupported_rule_rows: tuple[str, ...]
     flags: tuple[str, ...] = ()
 
@@ -195,12 +195,12 @@ def centred_world_bps(background_expected_bps: float,
 class FixtureWorldBonus:
     """One world's joint allocation over every player in the fixture."""
 
-    bps_by_player: Mapping[int, int]
+    bps_by_player: Mapping[int, float]
     bonus_by_player: Mapping[int, int]
     total_bonus: int
 
 
-def allocate_fixture_world(bps_by_player: Mapping[int, int]) -> FixtureWorldBonus:
+def allocate_fixture_world(bps_by_player: Mapping[int, float]) -> FixtureWorldBonus:
     """Rank the WHOLE fixture and allocate — the canonical allocator, unchanged."""
 
     bonus = ba.allocate_fixture_bonus(bps_by_player)
@@ -239,7 +239,7 @@ class WorldBonusSummary:
         }
 
 
-def aggregate_worlds(per_world_bps: Sequence[Mapping[int, int]],
+def aggregate_worlds(per_world_bps: Sequence[Mapping[int, float]],
                      per_world_unsupported: Iterable[Iterable[str]] = (),
                      ) -> WorldBonusSummary:
     """Apply the fixture competition per world, then aggregate across worlds."""
@@ -262,7 +262,7 @@ def aggregate_worlds(per_world_bps: Sequence[Mapping[int, int]],
         allocation = allocate_fixture_world(world)
         world_totals.append(allocation.total_bonus)
         for player_id in players:
-            bps_value = int(world.get(player_id, 0))
+            bps_value = float(world.get(player_id, 0.0))
             bonus = int(allocation.bonus_by_player.get(player_id, 0))
             bps_totals[player_id] += bps_value
             bonus_totals[player_id] += bonus
@@ -272,7 +272,7 @@ def aggregate_worlds(per_world_bps: Sequence[Mapping[int, int]],
                 p_two[player_id] += 1.0
             if bonus == 3:
                 p_three[player_id] += 1.0
-        ranked = sorted(players, key=lambda pid: -int(world.get(pid, 0)))[:3]
+        ranked = sorted(players, key=lambda pid: -float(world.get(pid, 0.0)))[:3]
         top_orderings.add(tuple(ranked))
 
     for skipped_rows in per_world_unsupported:

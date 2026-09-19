@@ -285,3 +285,54 @@ def test_provisional_fixtures_are_excluded_from_the_replay():
             "SELECT COUNT(*) AS n FROM fixtures WHERE finished = 1").fetchone()["n"]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P1-01 — the proxy is a CONTINUOUS score; ranking must not truncate it
+# ---------------------------------------------------------------------------
+
+
+def test_case_a_fractional_bps_ranks_without_truncation():
+    """PREDECESSOR KILL: on 9b8a961, int() collapsed 30.9 and 30.1 to 30.
+
+    Correct ordering is 1 > 2 > 3, so the bonus is 3, 2, 1.  Truncating both to 30 would
+    make them share a tie and produce 3, 3, 1.
+    """
+
+    result = ba.allocate_fixture_bonus({1: 30.9, 2: 30.1, 3: 20.0})
+    assert result == {1: 3, 2: 2, 3: 1}
+    assert ba.allocate_fixture_bonus({1: 30.9, 2: 30.1, 3: 20.0}) != {1: 3, 2: 3, 3: 1}
+
+
+def test_case_b_exactly_equal_fractions_still_tie():
+    result = ba.allocate_fixture_bonus({1: 30.5, 2: 30.5, 3: 20.0})
+    assert result == {1: 3, 2: 3, 3: 1}
+
+
+def test_a_tie_requires_exact_equality_not_an_epsilon():
+    """No fuzzy ties: 30.5 and 30.5000001 are different ranks."""
+
+    close = ba.allocate_fixture_bonus({1: 30.5, 2: 30.5000001})
+    assert close == {1: 2, 2: 3}
+    assert ba.allocate_fixture_bonus({1: 30.5, 2: 30.5}) == {1: 3, 2: 3}
+
+
+def test_case_d_non_finite_bps_fails_closed():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ba.BonusAllocationError):
+            ba.allocate_fixture_bonus({1: bad})
+        with pytest.raises(ba.BonusAllocationError):
+            ba.allocate_fixture_bonus({1: 10, 2: bad})
+    with pytest.raises(ba.BonusAllocationError):
+        ba.allocate_fixture_bonus({1: "thirty"})
+
+
+def test_player_ids_are_still_integer_normalised():
+    assert ba.allocate_fixture_bonus({"7": 40, 8: 30}) == {7: 3, 8: 2}
+
+
+def test_the_allocator_order_is_invariant_to_input_order_with_floats():
+    values = {1: 30.9, 2: 30.1, 3: 20.0, 4: 30.1}
+    baseline = ba.allocate_fixture_bonus(values)
+    for permutation in itertools.permutations(values):
+        assert ba.allocate_fixture_bonus({k: values[k] for k in permutation}) == baseline

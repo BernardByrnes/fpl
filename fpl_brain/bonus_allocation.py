@@ -26,6 +26,7 @@ every eligible FINAL fixture.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 #: Identity of the allocation semantics.  Bump only if the OFFICIAL rule changes.
@@ -33,6 +34,29 @@ BONUS_ALLOCATOR_VERSION = "fpl_bonus_allocation_v1.0.0"
 
 #: The highest bonus a single player can receive.
 MAX_BONUS = 3
+
+
+class BonusAllocationError(ValueError):
+    """The supplied BPS totals cannot be ranked."""
+
+
+def _finite(value: Any, player_id: int) -> float:
+    """Normalise one BPS total to a finite float WITHOUT truncating or rounding.
+
+    Official BPS arrive as integers and must replay identically; a predictive proxy is a
+    CONTINUOUS score whose fractional part carries real ordering information, so
+    ``int(...)`` would invent ties (30.9 and 30.1 would both become 30) and change the
+    allocation.  Comparison is therefore numeric on the supplied value: equal values share
+    bonus, strictly greater ranks higher, and there is no epsilon anywhere.
+    """
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as failure:
+        raise BonusAllocationError(f"non-numeric BPS {value!r} for player {player_id}") from failure
+    if not math.isfinite(number):
+        raise BonusAllocationError(f"non-finite BPS {value!r} for player {player_id}")
+    return number
 
 
 def allocate_fixture_bonus(bps_by_player: Mapping[int, int]) -> dict[int, int]:
@@ -60,14 +84,16 @@ def allocate_fixture_bonus(bps_by_player: Mapping[int, int]) -> dict[int, int]:
     if not bps_by_player:
         return {}
 
-    # Descending BPS.  The sort key is the BPS value ALONE: players on equal BPS are
-    # grouped below, so their relative order in this sort can never affect the result.
-    ordered = sorted(((int(player_id), int(bps)) for player_id, bps in bps_by_player.items()),
-                     key=lambda item: -item[1])
+    values = {int(player_id): _finite(bps, int(player_id))
+              for player_id, bps in bps_by_player.items()}
 
-    # For each distinct BPS value, the index of its FIRST occurrence in the descending
-    # order is exactly the number of players with a strictly higher BPS.
-    first_index_by_value: dict[int, int] = {}
+    # Descending BPS.  The sort key is the VALUE ALONE: players on an exactly equal value
+    # are grouped below, so their relative order here can never affect the result.
+    ordered = sorted(values.items(), key=lambda item: -item[1])
+
+    # For each distinct value, the index of its FIRST occurrence in the descending order is
+    # exactly the number of players with a strictly greater BPS.
+    first_index_by_value: dict[float, int] = {}
     for index, (_player_id, bps) in enumerate(ordered):
         first_index_by_value.setdefault(bps, index)
 
