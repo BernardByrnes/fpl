@@ -59,37 +59,73 @@ def _capture(tmp_path, source: Path, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_a_source_cannot_commit_a_competing_write_during_capture(tmp_path):
+def test_a_source_cannot_commit_a_competing_write_during_capture(tmp_path, monkeypatch):
     src = tmp_path / "live.db"
     _build(src)
     outcome: dict = {}
+    lock_acquired = threading.Event()
+    writer_attempted = threading.Event()
+    lock_released = threading.Event()
+    instrumented = False
+
+    real_connect = es.sqlite3.connect
+
+    class _InstrumentedLocker:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, *parameters):
+            result = self._connection.execute(sql, *parameters)
+            statement = str(sql).strip().upper()
+            if statement == "BEGIN IMMEDIATE":
+                lock_acquired.set()
+                assert writer_attempted.wait(5), "competing writer did not attempt while lock was held"
+            elif statement == "ROLLBACK":
+                lock_released.set()
+            return result
+
+        def close(self):
+            return self._connection.close()
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+    def instrumented_connect(*args, **kwargs):
+        nonlocal instrumented
+        connection = real_connect(*args, **kwargs)
+        if not instrumented and str(args[0]) == str(src):
+            instrumented = True
+            return _InstrumentedLocker(connection)
+        return connection
+
+    # This is test-only synchronization around the existing BEGIN IMMEDIATE /
+    # ROLLBACK boundary.  It does not alter the production lock contract.
+    monkeypatch.setattr(es.sqlite3, "connect", instrumented_connect)
 
     def competing_write() -> None:
-        time.sleep(0.02)
+        assert lock_acquired.wait(5), "snapshot did not establish writer exclusion"
         conn = sqlite3.connect(src, timeout=30)
         try:
             conn.execute("PRAGMA busy_timeout=30000")
-            outcome["attempt_at"] = time.monotonic()
+            writer_attempted.set()
             conn.execute("DELETE FROM ownership")
             conn.execute("INSERT INTO ownership(player_id) VALUES (2)")
             conn.commit()
-            outcome["committed_at"] = time.monotonic()
+            outcome["committed_before_lock_release"] = not lock_released.is_set()
+            outcome["committed_at"] = True
         finally:
             conn.close()
 
     thread = threading.Thread(target=competing_write)
     thread.start()
     snap = _capture(tmp_path, src)
-    thread.join(timeout=30)
+    thread.join(timeout=5)
 
-    # The competing write must have BLOCKED on the writer-exclusion lock for a
-    # meaningful part of the capture, rather than committing immediately.
+    assert lock_acquired.is_set()
+    assert writer_attempted.is_set()
     assert outcome.get("committed_at"), "the competing write must eventually succeed"
-    waited = outcome["committed_at"] - outcome["attempt_at"]
-    assert waited > 0.0, "the competing write must have waited on the lock"
-    assert waited >= 0.5 * snap.snapshot_capture_seconds, (
-        f"the competing write waited only {waited:.4f}s of a "
-        f"{snap.snapshot_capture_seconds:.4f}s capture; it was not blocked"
+    assert outcome["committed_before_lock_release"] is False, (
+        "the competing writer committed before the snapshot released writer exclusion"
     )
     # Decisive: the snapshot holds the state from lock acquisition, and the live
     # database only takes the write afterwards.

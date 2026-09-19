@@ -223,14 +223,22 @@ class OwnedProcessTree:
     def register(self, pid: int, argv: tuple[str, ...] | list[str], *, popen=None, clock=None) -> OwnedChild:
         """Record a child as owned.  Only registered PIDs are ever signalled."""
 
+        pid = int(pid)
+        previous = self._children.get(pid)
+        # ExecutionController records a spawned child in its durable audit after
+        # OwnedProcessTree.spawn() has already registered the Popen handle.  A
+        # second registration must not discard that handle: POSIX reaping relies
+        # on the owner retaining it, and replacing it would leave only a PID
+        # whose zombie state cannot be observed accurately.
+        retained_popen = popen if popen is not None else (previous.popen if previous else None)
         child = OwnedChild(
-            pid=int(pid),
+            pid=pid,
             argv=tuple(str(a) for a in argv),
-            popen=popen,
-            registered_at=(clock or _utc_now)(),
+            popen=retained_popen,
+            registered_at=(previous.registered_at if previous else (clock or _utc_now)()),
         )
-        self._children[int(pid)] = child
-        self._job.assign(int(pid))
+        self._children[pid] = child
+        self._job.assign(pid)
         LOGGER.info("registered owned child pid=%s argv=%s", pid, list(child.argv))
         return child
 
@@ -277,6 +285,17 @@ class OwnedProcessTree:
             return False
         return True
 
+    @staticmethod
+    def _popen_alive(popen: subprocess.Popen) -> bool:
+        """Use the owned handle when available so POSIX poll() reaps zombies."""
+
+        return popen.poll() is None
+
+    def _child_alive(self, child: OwnedChild) -> bool:
+        if child.popen is not None:
+            return self._popen_alive(child.popen)
+        return self.is_alive(child.pid)
+
     # -- termination -------------------------------------------------------
     def request_stop(self) -> None:
         """Cooperative phase: ask owned children to stop without force."""
@@ -288,7 +307,7 @@ class OwnedProcessTree:
                     LOGGER.info("requested cooperative stop pid=%s", child.pid)
                 except Exception as exc:  # pragma: no cover - race dependent
                     LOGGER.debug("cooperative stop failed pid=%s: %s", child.pid, exc)
-            elif not IS_WINDOWS and self.is_alive(child.pid):
+            elif not IS_WINDOWS and self._child_alive(child):
                 try:
                     os.kill(child.pid, signal.SIGTERM)
                 except OSError as exc:  # pragma: no cover - race dependent
@@ -312,16 +331,17 @@ class OwnedProcessTree:
 
         deadline = _clock() + max(0.0, float(grace_seconds))
         while _clock() < deadline:
-            if not any(self.is_alive(child.pid) for child in self.owned()):
+            if not any(self._child_alive(child) for child in self.owned()):
                 break
             _sleep(0.05)
 
         for child in self.owned():
-            if not self.is_alive(child.pid):
+            if not self._child_alive(child):
                 child.terminated_at = child.terminated_at or now()
                 child.exit_status = child.exit_status or "exited"
                 continue
             self._force_kill(child)
+            self._reap_posix(child)
             child.terminated_at = now()
             child.exit_status = "terminated"
 
@@ -351,6 +371,18 @@ class OwnedProcessTree:
                 child.popen.kill()
             except Exception as exc:  # pragma: no cover - race dependent
                 LOGGER.debug("kill failed pid=%s: %s", child.pid, exc)
+
+    def _reap_posix(self, child: OwnedChild, timeout: float = 1.0) -> None:
+        """Reap an owned Popen child after forced termination, without hanging."""
+
+        if IS_WINDOWS or child.popen is None:
+            return
+        try:
+            child.popen.wait(timeout=max(0.0, float(timeout)))
+        except subprocess.TimeoutExpired:  # pragma: no cover - hostile child
+            LOGGER.warning("bounded reap timed out for owned pid=%s", child.pid)
+        except (ChildProcessError, OSError) as exc:  # pragma: no cover - race dependent
+            LOGGER.debug("reap failed pid=%s: %s", child.pid, exc)
 
     def close(self) -> None:
         """Close the job object; kill-on-close reaps anything still running."""

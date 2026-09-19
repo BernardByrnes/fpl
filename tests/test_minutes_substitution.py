@@ -320,14 +320,8 @@ def test_band_representatives_are_config_driven():
 
 
 def test_mc_consumes_the_same_substitution_profile():
-    import sqlite3
-
     import fpl_brain.monte_carlo as mc
 
-    conn = sqlite3.connect("file:K:/FPL/fpl.db?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    fixtures = mc.load_fixture_inputs(conn, event=4, xpts_run_id=33, minutes_run_id=27, team_run_id=28)
-    conn.close()
     # the frozen minutes run 27 predates v1.4, so no profile is attached there;
     # the alignment is exercised by building a side that carries one.
     side = {

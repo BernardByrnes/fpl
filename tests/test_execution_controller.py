@@ -19,7 +19,7 @@ import pytest
 
 import fpl_brain.database as database
 from fpl_brain import execution as ex
-from fpl_brain.process_control import OwnedProcessTree, spawn_sleep_child
+from fpl_brain.process_control import IS_WINDOWS, OwnedProcessTree, spawn_sleep_child
 
 PROJECTION_TABLES = (
     "projection_runs",
@@ -351,6 +351,47 @@ def test_e_child_audit_list_has_pid_and_argv(open_controllers, db_conn):
     assert audit and int(audit[0]["pid"]) == child.pid
     assert audit[0]["argv"], "argv must be recorded for auditability"
     controller.terminate_children(grace_seconds=0.5)
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="POSIX reap semantics are not used on Windows")
+def test_e_already_exited_owned_child_is_reaped_and_audited():
+    tree = OwnedProcessTree(label="already-exited")
+    child = tree.spawn([sys.executable, "-c", "pass"])
+    try:
+        child.wait(timeout=10)
+        audit = tree.terminate_all(grace_seconds=0)
+        record = next(entry for entry in audit if int(entry["pid"]) == child.pid)
+        assert record["exit_status"] == "exited"
+        assert not OwnedProcessTree.is_alive(child.pid)
+    finally:
+        tree.close()
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="POSIX forced-group-kill semantics are not used on Windows")
+def test_e_forced_kill_path_is_bounded_and_reaps_owned_child():
+    tree = OwnedProcessTree(label="forced-kill")
+    code = (
+        "import signal,sys,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('ready', flush=True); time.sleep(60)"
+    )
+    child = tree.spawn([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        started = time.monotonic()
+        audit = tree.terminate_all(grace_seconds=0.05)
+        elapsed = time.monotonic() - started
+        record = next(entry for entry in audit if int(entry["pid"]) == child.pid)
+        assert elapsed < 5.0
+        assert record["exit_status"] == "terminated"
+        assert child.poll() is not None
+        assert not OwnedProcessTree.is_alive(child.pid)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+        tree.close()
 
 
 # ---------------------------------------------------------------------------
