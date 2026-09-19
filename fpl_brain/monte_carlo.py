@@ -499,6 +499,12 @@ def load_fixture_inputs(
     }
     fixtures: dict[int, dict[str, Any]] = {}
     for record in analytics.xpts_projections(conn, int(xpts_run_id)):
+        # PE-4 §18: the EVENT is a filter, not a label.  A projection run MAY carry rows for
+        # more than one event (the schema permits it), and presenting another event's fixture
+        # as part of this event's worlds would aggregate a match the manager cannot score.
+        # The event recorded on the row itself is the certified identity that decides it.
+        if int(record["event"]) != int(event):
+            continue
         fixture_id = int(record["fixture_id"])
         fixture = fixtures.setdefault(
             fixture_id,
