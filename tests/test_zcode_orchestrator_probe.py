@@ -173,3 +173,25 @@ def test_infinite_discount_is_rejected():
 def test_overflowing_arithmetic_never_returns_a_non_finite_total():
     with pytest.raises(ValueError):
         calculate_total(1e308, 10, 0)
+
+
+# 20 ----------------------------------------------------------------
+
+
+def test_extremely_large_integer_price_is_rejected():
+    huge_price = 10**400
+    with pytest.raises(ValueError):
+        calculate_total(huge_price, 3, 10)
+    with pytest.raises(ValueError):
+        calculate_total(huge_price, 3, 0)
+
+
+# 21 ----------------------------------------------------------------
+
+
+def test_extremely_large_integer_quantity_is_rejected():
+    huge_quantity = 10**400
+    with pytest.raises(ValueError):
+        calculate_total(10.0, huge_quantity, 10)
+    with pytest.raises(ValueError):
+        calculate_total(10.0, huge_quantity, 0)

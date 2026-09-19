@@ -40,7 +40,14 @@ def calculate_total(price, quantity, discount_percent):
             f"discount_percent must be between 0 and 100 inclusive, got {discount_percent!r}"
         )
 
-    total = price * quantity * (1 - discount_percent / 100)
-    if not math.isfinite(total):
+    try:
+        total = price * quantity * (1 - discount_percent / 100)
+        is_finite = math.isfinite(total)
+    except OverflowError as exc:
+        # An exact integer product can be too large to convert to a float; that
+        # input has no representable total, so reject it like a non-finite one
+        # rather than letting OverflowError escape past the contract.
+        raise ValueError("total is too large to represent as a float") from exc
+    if not is_finite:
         raise ValueError(f"total must be finite, got {total!r}")
     return round(total, 2)
