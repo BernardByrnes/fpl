@@ -274,11 +274,12 @@ def verify_legacy_bootstrap_generation(conn: sqlite3.Connection, *, fetch_run_id
     if previous_teams:
         previous_ids = set(previous_teams)
         current_ids = set(elements)
+        current_teams = {pid: int(item["team"]) for pid, item in elements.items()}
         retained = len(previous_ids & current_ids) / len(previous_ids)
         absolute = len(previous_ids - current_ids)
-        whole_club_loss = _whole_club_loss(
-            {pid: team for pid, team in previous_teams.items() if pid not in current_ids},
-            {pid: int(item["team"]) for pid, item in elements.items()})
+        # Both maps are COMPLETE: the question is which club identities exist on each side,
+        # which cannot be answered from the removed subset alone.
+        whole_club_loss = _whole_club_loss(previous_teams, current_teams)
         # §4: these MUST gate, not merely be reported.
         if retained < LEGACY_RETAINED_FRACTION_MIN:
             raise BackgroundAuthorityError(
@@ -343,22 +344,24 @@ def _previous_legacy_population(conn: sqlite3.Connection, *, fetch_run_id: int,
     return None, {}
 
 
-def _whole_club_loss(removed_teams: Mapping[int, int],
-                     surviving_teams: Mapping[int, int]) -> bool:
-    """True when every player of some club disappeared between two LEGACY populations.
+def _whole_club_loss(previous_teams: Mapping[int, int],
+                     current_teams: Mapping[int, int]) -> bool:
+    """True when a club identity in the PREVIOUS population is absent from the CURRENT one.
+
+    The question is about CLUB IDENTITIES, not player ids, so it is answered by comparing the
+    two team-id sets.  Comparing a removed player-id set against a surviving player-id set
+    instead is a defect: those two sets are disjoint BY CONSTRUCTION (a removed player is
+    removed precisely because he is not in the current population), so the intersection is
+    always empty and ANY single player removal would be reported as a whole club vanishing.
 
     Club membership comes from the two historical raw bootstrap payloads themselves.  The
     CURRENT ``players.team_id`` is not historical authority and must never decide whether an
     old population lost a club.
     """
 
-    clubs: dict[int, set[int]] = {}
-    for player_id, team_id in removed_teams.items():
-        clubs.setdefault(int(team_id), set()).add(int(player_id))
-    for members in clubs.values():
-        if not (members & set(surviving_teams)):
-            return True
-    return False
+    previous_team_ids = {int(team) for team in previous_teams.values()}
+    current_team_ids = {int(team) for team in current_teams.values()}
+    return bool(previous_team_ids - current_team_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -659,15 +662,18 @@ def final_outcomes(conn: sqlite3.Connection, *, event: int) -> tuple[dict[tuple[
     genuine missing bonus.
     """
 
+    # EVERY row of the final checked event is retrieved and then classified through the ONE
+    # canonical predicate.  Pre-filtering in SQL first would silently DROP a scheduled
+    # placeholder whose ``minutes`` is NULL and whose performance columns are all NULL, so
+    # such a row could never be counted.  This changes no outcome membership: any row
+    # carrying a bonus necessarily satisfied the old predicate already.
     rows = conn.execute(
-        f"""
+        """
         SELECT pg.*, f.kickoff_time AS fixture_kickoff
         FROM player_gameweeks pg
         JOIN fixtures f ON f.id = pg.fixture_id
         JOIN events e ON e.id = f.event
         WHERE f.event = ? AND f.finished = 1 AND e.finished = 1 AND e.data_checked = 1
-          AND ({repositories.gameweek_has_performance_sql('pg')}
-               OR pg.minutes IS NOT NULL)
         """,
         (int(event),)).fetchall()
     outcomes: dict[tuple[int, int], dict] = {}
@@ -844,15 +850,35 @@ def _verify_frozen_chain(conn: sqlite3.Connection, *, chain: Mapping[str, int], 
             raise BackgroundAuthorityError(
                 f"chain {role} run {chain[role]} cutoff is not pre-deadline")
         # §10: the chain's own recorded official fetch must be the one supplying history.
+        # ABSENT provenance is not a licence to proceed: the whole point of this gate is to
+        # PROVE the pairing, so a missing/malformed record fails closed.
         recorded = row["official_run_ids"]
-        if recorded:
+        if not recorded:
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} records no official_run_ids, so it cannot be "
+                f"shown to have used the bootstrap history taken from fetch {int(fetch_run_id)}")
+        try:
             payload = json.loads(recorded)
-            fetch = payload.get("fetch") or {}
-            if fetch.get("run_id") is not None and int(fetch["run_id"]) != int(fetch_run_id):
-                raise BackgroundAuthorityError(
-                    f"chain {role} run {chain[role]} records official fetch "
-                    f"{int(fetch['run_id'])}, but bootstrap history is taken from fetch "
-                    f"{int(fetch_run_id)}; refusing to pair them")
+        except Exception as failure:  # noqa: BLE001 - an unreadable record cannot prove anything
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} official_run_ids is unparseable: "
+                f"{failure}") from failure
+        fetch = payload.get("fetch") if isinstance(payload, dict) else None
+        if not isinstance(fetch, dict) or fetch.get("run_id") is None:
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} records no fetch.run_id, so it cannot be "
+                f"shown to have used the bootstrap history taken from fetch {int(fetch_run_id)}")
+        try:
+            recorded_fetch = int(fetch["run_id"])
+        except (TypeError, ValueError) as failure:
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} fetch.run_id {fetch['run_id']!r} is not an "
+                f"integer") from failure
+        if recorded_fetch != int(fetch_run_id):
+            raise BackgroundAuthorityError(
+                f"chain {role} run {chain[role]} records official fetch "
+                f"{recorded_fetch}, but bootstrap history is taken from fetch "
+                f"{int(fetch_run_id)}; refusing to pair them")
 
 
 def _calibration_state_identity(config: "mc.MonteCarloConfig") -> str:

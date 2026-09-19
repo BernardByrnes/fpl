@@ -472,6 +472,55 @@ def test_historical_whole_club_loss_fails(tmp_path):
         _verify(conn, raw_dir)
 
 
+def test_partial_player_removal_is_not_a_whole_club_loss():
+    """§3 PREDECESSOR KILL (direct): a club that still has members has not disappeared.
+
+    On b4e8f996 the implementation intersected the removed player-id set with the surviving
+    player-id set — two sets that are disjoint BY CONSTRUCTION, so the intersection was always
+    empty and ANY single removal was reported as a lost club.  The discriminating case is the
+    last assertion, which is the call shape the old verifier actually made.
+    """
+
+    previous = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2}
+    current = {pid: team for pid, team in previous.items() if pid != 1}
+    assert be._whole_club_loss(previous, current) is False
+    assert be._whole_club_loss(previous, previous) is False, "no change is never a loss"
+    # Club 1 lost exactly one member and keeps four, so it did not vanish.  Written with the
+    # REMOVED player as the left map, this is the case b4e8f996 got wrong.
+    assert be._whole_club_loss({1: 1}, current) is False
+
+
+def test_a_vanished_club_identity_is_a_whole_club_loss():
+    previous = {1: 1, 2: 1, 3: 2, 4: 2}
+    current = {3: 2, 4: 2}                      # club 1 has no surviving member
+    assert be._whole_club_loss(previous, current) is True
+
+
+def test_a_new_club_is_not_a_whole_club_loss():
+    """The test is one-directional: a club APPEARING is not a club disappearing."""
+
+    previous = {1: 1, 2: 1}
+    current = {1: 1, 2: 1, 3: 2}
+    assert be._whole_club_loss(previous, current) is False
+
+
+def test_verifier_accepts_a_population_that_lost_exactly_one_player(tmp_path):
+    """§3 at the VERIFIER level: a one-player drop must not be rejected as a club loss.
+
+    The fixture is sized so the retention gate passes (199/200 = 0.995) and the absolute drop
+    is 1, leaving whole-club loss as the only gate that could reject it.
+    """
+
+    previous = _club_population(clubs=40, per_club=5)
+    current = [e for e in previous if int(e["id"]) != 1]
+    conn, raw_dir = _build(tmp_path, elements=current, previous_elements=previous)
+    evidence = _verify(conn, raw_dir)
+    assert evidence.whole_club_loss is False
+    assert evidence.retained_fraction == pytest.approx(199 / 200)
+    assert evidence.absolute_drop == 1
+    assert evidence.previous_population == 200
+
+
 def test_current_players_team_id_cannot_alter_historical_club_loss(tmp_path):
     """The CURRENT players table must not decide an old population's club loss.
 
@@ -593,6 +642,26 @@ def test_canonical_placeholder_is_excluded(tmp_path):
     _insert_gameweek(conn, 1, 100, placeholder_row(), source="element_summary")
     outcomes, excluded = be.final_outcomes(conn, event=TARGET_EVENT)
     assert outcomes == {} and excluded["placeholder"] == 1
+    assert excluded["missing_bonus"] == 0
+
+
+def test_null_minutes_placeholder_is_counted(tmp_path):
+    """A placeholder whose ``minutes`` is NULL must be COUNTED, not dropped by a pre-filter.
+
+    The old SQL pre-filter required ``minutes IS NOT NULL`` (or a non-NULL performance
+    column), so this row was removed before the canonical predicate could ever see it and the
+    placeholder count silently lost it.
+    """
+
+    conn, _raw = _build(tmp_path)
+    null_minutes = dict(placeholder_row()) | {"minutes": None}
+    assert all(value is None for value in null_minutes.values()), "truly no evidence at all"
+    assert repositories.row_is_scheduled_placeholder(
+        dict(null_minutes) | {"source": "element_summary"})
+    _insert_gameweek(conn, 1, 100, null_minutes, source="element_summary")
+    outcomes, excluded = be.final_outcomes(conn, event=TARGET_EVENT)
+    assert outcomes == {}
+    assert excluded["placeholder"] == 1
     assert excluded["missing_bonus"] == 0
 
 
@@ -855,17 +924,31 @@ def test_population_digest_distinguishes_different_populations():
 # ---------------------------------------------------------------------------
 
 
+_UNSET = object()
+
+
 def _add_chain(conn, *, as_of=CUTOFF, fetch_run_id=FETCH_ID, status="complete",
-               families=None, official_fetch=None):
+               families=None, official_fetch=None, official_run_ids=_UNSET,
+               without_provenance_for=None):
+    """Write the four frozen predictive runs, with per-role control over the provenance field.
+
+    ``official_run_ids`` overrides the record for EVERY role; ``without_provenance_for`` names
+    ONE role whose record is written as SQL NULL, which proves the per-role loop rather than a
+    single global check.
+    """
+
     families = families or _CHAIN_FAMILIES
+    default = json.dumps({"fetch": {"run_id": int(
+        fetch_run_id if official_fetch is None else official_fetch)}})
     for role, run_id in CHAIN.items():
+        recorded = default if official_run_ids is _UNSET else official_run_ids
+        if role == without_provenance_for:
+            recorded = None
         conn.execute(
             "INSERT OR REPLACE INTO projection_runs (id, model_family, model_version,"
             " generated_at, planning_event, data_cutoff, official_run_ids, status)"
             " VALUES (?,?,?,?,?,?,?,?)",
-            (run_id, families[role], "v1.0.0", as_of, TARGET_EVENT, as_of,
-             json.dumps({"fetch": {"run_id": int(
-                 fetch_run_id if official_fetch is None else official_fetch)}}), status))
+            (run_id, families[role], "v1.0.0", as_of, TARGET_EVENT, as_of, recorded, status))
     conn.commit()
 
 
@@ -932,6 +1015,56 @@ def test_wrong_chain_family_is_refused(tmp_path):
     conn, raw_dir = _build(tmp_path)
     _add_chain(conn, families=dict(_CHAIN_FAMILIES, minutes="xpts_v1"))
     with pytest.raises(be.BackgroundAuthorityError, match="expected 'minutes_v1'"):
+        be.evaluate_event(conn, event=TARGET_EVENT, as_of=CUTOFF, deadline=DEADLINE, chain=CHAIN,
+                          fetch_run_id=FETCH_ID, raw_dir=raw_dir, target_event=TARGET_EVENT,
+                          xpts_run_id=CHAIN["xpts"])
+
+
+@pytest.mark.parametrize("role", ["xpts", "minutes", "team", "rate"])
+def test_missing_official_run_ids_fails_closed(tmp_path, role):
+    """§4: a chain run with NO provenance record cannot be shown to have used this fetch."""
+
+    conn, raw_dir = _build(tmp_path)
+    _add_chain(conn, without_provenance_for=role)
+    with pytest.raises(be.BackgroundAuthorityError, match="records no official_run_ids"):
+        be.evaluate_event(conn, event=TARGET_EVENT, as_of=CUTOFF, deadline=DEADLINE, chain=CHAIN,
+                          fetch_run_id=FETCH_ID, raw_dir=raw_dir, target_event=TARGET_EVENT,
+                          xpts_run_id=CHAIN["xpts"])
+
+
+def test_official_run_ids_without_a_fetch_run_id_fails_closed(tmp_path):
+    """A record that exists but names no fetch proves nothing, so it must not pass."""
+
+    conn, raw_dir = _build(tmp_path)
+    _add_chain(conn, official_run_ids=json.dumps({"minutes": {"run_id": 127}}))
+    with pytest.raises(be.BackgroundAuthorityError, match="records no fetch.run_id"):
+        be.evaluate_event(conn, event=TARGET_EVENT, as_of=CUTOFF, deadline=DEADLINE, chain=CHAIN,
+                          fetch_run_id=FETCH_ID, raw_dir=raw_dir, target_event=TARGET_EVENT,
+                          xpts_run_id=CHAIN["xpts"])
+
+
+def test_official_run_ids_with_an_empty_fetch_fails_closed(tmp_path):
+    conn, raw_dir = _build(tmp_path)
+    _add_chain(conn, official_run_ids=json.dumps({"fetch": {}}))
+    with pytest.raises(be.BackgroundAuthorityError, match="records no fetch.run_id"):
+        be.evaluate_event(conn, event=TARGET_EVENT, as_of=CUTOFF, deadline=DEADLINE, chain=CHAIN,
+                          fetch_run_id=FETCH_ID, raw_dir=raw_dir, target_event=TARGET_EVENT,
+                          xpts_run_id=CHAIN["xpts"])
+
+
+def test_unparseable_official_run_ids_fails_closed(tmp_path):
+    conn, raw_dir = _build(tmp_path)
+    _add_chain(conn, official_run_ids="{not json")
+    with pytest.raises(be.BackgroundAuthorityError, match="official_run_ids is unparseable"):
+        be.evaluate_event(conn, event=TARGET_EVENT, as_of=CUTOFF, deadline=DEADLINE, chain=CHAIN,
+                          fetch_run_id=FETCH_ID, raw_dir=raw_dir, target_event=TARGET_EVENT,
+                          xpts_run_id=CHAIN["xpts"])
+
+
+def test_non_integer_fetch_run_id_fails_closed(tmp_path):
+    conn, raw_dir = _build(tmp_path)
+    _add_chain(conn, official_run_ids=json.dumps({"fetch": {"run_id": "thirty-six"}}))
+    with pytest.raises(be.BackgroundAuthorityError, match="is not an integer"):
         be.evaluate_event(conn, event=TARGET_EVENT, as_of=CUTOFF, deadline=DEADLINE, chain=CHAIN,
                           fetch_run_id=FETCH_ID, raw_dir=raw_dir, target_event=TARGET_EVENT,
                           xpts_run_id=CHAIN["xpts"])
