@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import random
 import statistics
+from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -306,9 +309,7 @@ def test_defcon_and_saves_are_classified_as_nonlinear():
 
 
 def test_no_named_player_is_hardcoded():
-    import io as _io
-
-    source = _io.open("K:/FPL/fpl_brain/monte_carlo.py", encoding="utf-8").read().lower()
+    source = Path(mc.__file__).read_text(encoding="utf-8").lower()
     for name in ("haaland", "bruno", "fernandes", "mbeumo", "de cuyper", "raya", "joao", "joão"):
         assert name not in source
 
@@ -381,10 +382,29 @@ def test_crn_identity_survives_the_substitution_timeline():
         assert b[key] == value
 
 
-def test_run_36_is_untouched():
-    import sqlite3
+def _authoritative_live_db() -> Path:
+    configured = os.environ.get("FPL_LIVE_DB")
+    if not configured:
+        pytest.skip("requires authoritative local FPL database; set FPL_LIVE_DB")
+    path = Path(configured).expanduser()
+    if not path.is_file():
+        pytest.skip(f"requires authoritative local FPL database; not available at {path}")
+    return path
 
-    conn = sqlite3.connect("file:K:/FPL/fpl.db?mode=ro", uri=True)
+
+def test_local_db_guard_does_not_skip_configured_failure(monkeypatch, tmp_path):
+    configured = tmp_path / "configured-but-invalid.db"
+    configured.write_text("not a SQLite database\n", encoding="utf-8")
+    monkeypatch.setenv("FPL_LIVE_DB", str(configured))
+
+    path = _authoritative_live_db()
+    with pytest.raises(sqlite3.DatabaseError):
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
+            conn.execute("SELECT status FROM projection_runs WHERE id=36").fetchone()
+
+
+def test_run_36_is_untouched():
+    conn = sqlite3.connect(f"file:{_authoritative_live_db()}?mode=ro", uri=True)
     row = conn.execute("SELECT status, model_version FROM projection_runs WHERE id=36").fetchone()
     assert row == ("complete", "mc_v1.0.0")
     count = conn.execute("SELECT COUNT(*) FROM monte_carlo_distributions WHERE projection_run_id=36").fetchone()[0]
