@@ -25,17 +25,28 @@ restated here.
 A NULL BPS on an otherwise-valid positive-minute historical row is UNKNOWN, not zero: it
 raises :class:`BackgroundEvidenceError`.  A genuine ``bps == 0`` is valid evidence.
 
-MEASURED LIMITATION — the causal background is EMPTY at any historical cutoff, and this is
-PE-1 working as designed rather than a defect here.  ``player_gameweeks`` is upserted in
-place, so it carries no write history: at the time of writing every GW1-GW3 row had
-``updated_at = 2026-09-18T13:53:05Z`` (the most recent fetch) and ZERO rows predated the GW4
-authoritative cutoff ``2026-09-12T10:40:04Z``.  The frozen reader therefore correctly
-returns no observable BPS evidence at that cutoff, and
-:func:`load_causal_backgrounds` raises ``BackgroundEvidenceError`` because neither the
-position nor the league pool has usable causal minutes.  Rebuilding a weaker predicate here
-would defeat the boundary PE-1 froze, so this module does NOT do that.  The machinery below
-is exercised with explicit synthetic backgrounds; applying it to a real historical cutoff
-needs a point-in-time capture of player_gameweeks that this repository does not have.
+MEASURED LIMITATION — TWO separate facts, and only the first is now fatal.
+
+1. FIXTURE-LEVEL player_gameweeks history is NOT recoverable point-in-time: the table is
+   upserted in place, so at the time of writing every GW1-GW3 row carried
+   ``updated_at = 2026-09-18T13:53:05Z`` and ZERO rows predated the GW4 authoritative
+   cutoff.  That alone is NOT fatal to PE-3: this module needs only AGGREGATE cumulative
+   minutes and BPS, which ``player_snapshots`` stores append-only per official fetch.
+
+2. FATAL HERE: the frozen GW4 chain's official fetch is run **36**
+   (2026-09-11T22:45:41Z, status success), but ``bootstrap_generations`` does not begin
+   until fetch run **38** (2026-09-13T12:34:57Z).  The generation-acceptance mechanism did
+   not exist when the GW4 chain was frozen, so for run 36 there is NO generation row and
+   therefore NO ``accepted`` flag and NO ``official_element_count`` / ``persisted_count``
+   to certify capture completeness.  656 snapshot rows exist for run 36, and without the
+   generation record there is no way to tell "that era's element set was 656" from "three
+   snapshots failed to persist" — which is exactly what the acceptance record exists to
+   decide.  The next generation (id 1, fetch run 38) post-dates the GW4 deadline and GW4
+   itself, so using it would leak target-event outcomes into the cumulative totals.
+
+   The evaluation is therefore BLOCKED, and the fix is a durable outcome/history capture
+   in the outcome-capture phase (PE-5), not a weaker binding here.
+
 """
 
 from __future__ import annotations
@@ -67,6 +78,10 @@ CURRENT_REPLAY_SIMULATIONS = 10_000
 
 class BackgroundEvidenceError(RuntimeError):
     """A historical BPS row that qualifies causally carries no BPS."""
+
+
+class CaptureContractError(RuntimeError):
+    """A captured world does not contain every player the fixture requires."""
 
 
 def position_by_player(conn: sqlite3.Connection,
@@ -271,21 +286,29 @@ def evaluate_fixture_bonus_worlds(*, fixture_id: int, captured_worlds: Sequence[
     structural: dict[int, list[float]] = {pid: [] for pid in players}
     minutes: dict[int, float] = {pid: 0.0 for pid in players}
     positions: dict[int, str | None] = {pid: None for pid in players}
-    unsupported: set[str] = set()
-    flags: set[str] = set()
+    # PER PLAYER: one goalkeeper's unsupported save-location row must not become every
+    # outfield player's limitation.
+    unsupported_by_player: dict[int, set[str]] = {pid: set() for pid in players}
+    flags_by_player: dict[int, set[str]] = {pid: set() for pid in players}
 
-    for world in captured_worlds:
+    for index, world in enumerate(captured_worlds):
         for player_id in players:
             record = world.get(player_id)
             if record is None:
-                structural[player_id].append(0.0)
-                continue
+                # The Step-1 capture guarantees the WHOLE fixture universe in every world,
+                # so an absent record means the capture is malformed.  Defaulting it to 0
+                # would silently invent a zero-BPS performance for a real player.
+                raise CaptureContractError(
+                    f"captured world {index} for fixture {fixture_id} has no record for "
+                    f"player {player_id}; the capture contract requires every simulated "
+                    "player in every world, so this is malformed capture, not a zero"
+                )
             positions[player_id] = record.get("position") or positions[player_id]
             minutes[player_id] += float(record["minutes"])
             proxy = bc.structural_world_bps(player_id, record["position"] or "MID", record, rules)
             structural[player_id].append(float(proxy.bps))
-            unsupported.update(proxy.unsupported_rule_rows)
-            flags.update(proxy.flags)
+            unsupported_by_player[player_id].update(proxy.unsupported_rule_rows)
+            flags_by_player[player_id].update(proxy.flags)
 
     worlds = len(captured_worlds)
     mean_minutes = {pid: minutes[pid] / worlds for pid in players}
@@ -317,12 +340,15 @@ def evaluate_fixture_bonus_worlds(*, fixture_id: int, captured_worlds: Sequence[
             p_bonus_2plus=summary.p_bonus_2plus[player_id],
             p_bonus_3=summary.p_bonus_3[player_id],
             mean_bps_proxy=summary.mean_bps_proxy[player_id],
-            unsupported_rule_rows=tuple(sorted(unsupported)),
-            limitation_flags=tuple(sorted(flags)),
+            unsupported_rule_rows=tuple(sorted(unsupported_by_player[player_id])),
+            limitation_flags=tuple(sorted(flags_by_player[player_id])),
             background=evidence.as_dict(),
         ))
     diagnostics = {
         "fixtures": 1, "worlds": worlds, "players": len(players),
+        # fixture-level UNION is diagnostics only; each player carries his own set
+        "unsupported_rule_rows_union": sorted({row for rows in unsupported_by_player.values() for row in rows}),
+        "limitation_flags_union": sorted({flag for rows in flags_by_player.values() for flag in rows}),
         "ranking_changed_across_worlds": summary.ranking_changed_across_worlds,
         "total_bonus_per_world": list(summary.total_bonus_per_world),
     }
@@ -377,12 +403,26 @@ def evaluate_event(conn: sqlite3.Connection, *, event: int, as_of: str, chain: M
             "config_hash": config.config_hash(),
             "seed": int(config.seed),
             "simulations": int(config.simulations),
-            "calibration_identity": mc.calibration_provenance(config).get("identity")
-            if hasattr(mc, "calibration_provenance") else None,
+            "calibration_state_identity": _calibration_state_identity(config),
         },
         "bps_rules": bps.ruleset_fingerprint(),
         "challenger_version": bc.BONUS_BPS_MODEL_VERSION,
     }
+
+
+def _calibration_state_identity(config: "mc.MonteCarloConfig") -> str:
+    """The ACTUAL calibration provenance field, never a silent None."""
+
+    if not hasattr(mc, "calibration_provenance"):
+        raise CaptureContractError("monte_carlo.calibration_provenance is unavailable")
+    provenance = mc.calibration_provenance(config)
+    identity = provenance.get("calibration_state_identity")
+    if not identity:
+        raise CaptureContractError(
+            "calibration provenance carries no calibration_state_identity; refusing to "
+            f"emit a silent None (keys: {sorted(provenance)})"
+        )
+    return str(identity)
 
 
 def _max_background_event(conn: sqlite3.Connection, *, as_of: str, planning_event: int) -> int | None:
