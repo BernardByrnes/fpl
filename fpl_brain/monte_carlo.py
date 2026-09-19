@@ -1133,6 +1133,7 @@ def simulate(
     rules: ScoringRules | None = None,
     *,
     capture_player_ids: Iterable[int] | None = None,
+    capture_bps_worlds: bool = False,
 ) -> dict[str, Any]:
     """Run the joint simulation and return per-player-fixture summaries.
 
@@ -1174,6 +1175,9 @@ def simulate(
     calibration_by_side: dict[tuple[int, int], dict[str, Any]] = {}
     calibration_by_player: dict[tuple[int, int], dict[str, Any]] = {}
     calibration_diagnostics: list[dict[str, Any]] = []
+    #: PE-3 optional side-channel: player x fixture x world raw events.  Allocated ONLY
+    #: when explicitly requested, so the default path allocates nothing.
+    bps_worlds: dict[int, list[dict[int, dict[str, Any]]]] = {}
 
     for fixture_id in sorted(fixtures):
         fixture = fixtures[fixture_id]
@@ -1253,6 +1257,7 @@ def simulate(
 
             # Goals / assists per side, using the opponent's goal times for
             # clean-sheet and concession exposure.
+            world_bps_players: dict[int, dict[str, Any]] = {}
             for side_index, entry in enumerate(per_side):
                 opponent = per_side[1 - side_index]
                 # BEFORE the scorer draw: what opportunity did this world's play expose?
@@ -1264,8 +1269,24 @@ def simulate(
                 _allocate_and_score(entry, rules, config, fixture_id, draw_components)
                 _score_personal_events(entry, opponent, rules, accumulators, config, fixture_id,
                                        draw_components, simulation_index)
+                if capture_bps_worlds:
+                    positions = {int(p["player_id"]): p["position"]
+                                 for p in entry["side"]["players"]}
+                    for captured_id, captured_bucket in draw_components.items():
+                        world_bps_players[int(captured_id)] = {
+                            "position": positions.get(int(captured_id)),
+                            "minutes": float(captured_bucket.get("minutes", 0.0)),
+                            "goals_scored": int(captured_bucket.get("goal_count", 0.0)),
+                            "assists": int(captured_bucket.get("assist_count", 0.0)),
+                            "clean_sheets": int(captured_bucket.get("cs_flag", 0.0)),
+                            "goals_conceded": int(captured_bucket.get("raw_goals_conceded", 0.0)),
+                            "saves": int(captured_bucket.get("raw_saves", 0.0)),
+                            "yellow_cards": int(captured_bucket.get("raw_yellow", 0.0)),
+                        }
                 _commit_draw(draw_components, accumulators, fixture_id, simulation_index,
                              world_core, world_minutes)
+            if capture_bps_worlds:
+                bps_worlds.setdefault(int(fixture_id), []).append(world_bps_players)
 
     summaries = _summarise(accumulators, analytic, config, player_meta, calibration_by_player,
                            rules, production_goal_expectation)
@@ -1293,6 +1314,9 @@ def simulate(
             if captured_players
             else None
         ),
+        # PE-3: raw football events for the whole fixture, per world.  ``None`` unless the
+        # caller opted in; it is a pure observation of draws that already happened.
+        "bps_worlds": bps_worlds if capture_bps_worlds else None,
     }
 
 
@@ -1532,12 +1556,25 @@ def probability_range_violations(summaries: Iterable[Mapping[str, Any]], toleran
     return violations
 
 
+#: Raw observational mirrors of already-sampled events, for the PE-3 BPS side-channel.
+#: They are NOT point components: nothing sums them, squares them, reconciles them or
+#: gates on them, so they cannot change any existing number.
+RAW_EVENT_FIELDS: dict[str, float] = {
+    "raw_goals_conceded": 0.0, "raw_saves": 0.0, "raw_yellow": 0.0,
+}
+
+
 def _draw_bucket(draw_components: dict[int, dict[str, float]], player_id: int) -> dict[str, float]:
     bucket = draw_components.get(player_id)
     if bucket is None:
         bucket = {name: 0.0 for name in POINT_COMPONENTS}
         bucket.update({"goal_count": 0.0, "assist_count": 0.0, "goal_flag": 0.0, "assist_flag": 0.0,
                        "cs_flag": 0.0, "defcon_flag": 0.0, "minutes": 0.0})
+        # PE-3 raw observational capture.  These mirror events ALREADY sampled above; they
+        # are never read by any POINT_COMPONENTS / accumulator / reconciliation path, so
+        # they cannot alter scoring.  They exist only so the optional BPS side-channel can
+        # expose the raw counts instead of the point deductions.
+        bucket.update(RAW_EVENT_FIELDS)
         draw_components[player_id] = bucket
     return bucket
 
@@ -1643,6 +1680,7 @@ def _score_personal_events(entry, opponent, rules, accumulators, config, fixture
         if minutes > 0:
             low, high = intervals.get(player_id, (0.0, 0.0))
             conceded_on_pitch = sum(1 for t in opponent_times if low <= t <= high)
+        bucket["raw_goals_conceded"] = float(conceded_on_pitch)
         if position in rules.goals_conceded_positions and conceded_on_pitch > 0:
             bucket["goals_conceded"] += -math.floor(
                 conceded_on_pitch / rules.goals_conceded_per_deduction
@@ -1689,6 +1727,7 @@ def _score_personal_events(entry, opponent, rules, accumulators, config, fixture
             pressure = float(save_model.get("pressure_multiplier") or 1.0)
             rng = _stream(config.seed, fixture_id, simulation_index, "saves", team_id, player_id)
             saves = _poisson(rng, max(0.0, saves_per90) * exposure / 90.0 * pressure)
+            bucket["raw_saves"] = float(saves)
             if saves > 0:
                 save_points = math.floor(saves / rules.saves_per_point)
                 if save_points:
@@ -1701,6 +1740,7 @@ def _score_personal_events(entry, opponent, rules, accumulators, config, fixture
             rng = _stream(config.seed, fixture_id, simulation_index, "cards", team_id, player_id)
             if rng.random() < probability:
                 bucket["yellow"] += rules.yellow_card_points
+                bucket["raw_yellow"] = 1.0
 
 
 def _commit_draw(draw_components, accumulators, fixture_id, simulation_index=None,
