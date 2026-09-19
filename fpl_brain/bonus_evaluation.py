@@ -1,52 +1,39 @@
-"""PE-3 — causal structural-bonus evaluation (read-only, deterministic).
+"""PE-3 — legacy-causal structural-bonus evaluation (read-only, deterministic).
 
 ONE canonical path from captured Monte Carlo worlds to PE-3 bonus predictions and metrics.
-A caller must not have to compose the structural proxy, the centring and the allocator by
-hand.
 
-CLAIM BOUNDARY — read this before quoting any number this module produces.
+CLAIM BOUNDARY.  ``evaluation_mode`` is
+RETROSPECTIVE_CURRENT_CODE_REPLAY_ON_FROZEN_PREDEADLINE_INPUTS: the PREDICTIVE INPUTS are
+genuinely frozen before the target deadline, while the SIMULATION AND CHALLENGER CODE IS
+CURRENT.  So it is legitimate to say PE-3 was retrospectively evaluated with current code
+against pre-deadline-frozen inputs, and NOT legitimate to say PE-3 predicted the event at
+the time, that a historical MC forecast was reproduced, or that the current MC version
+equals the historical one.
 
-    evaluation_mode = RETROSPECTIVE_CURRENT_CODE_REPLAY_ON_FROZEN_PREDEADLINE_INPUTS
+BACKGROUND AUTHORITY — two distinct modes, never conflated:
 
-The PREDICTIVE INPUTS are genuinely frozen before the target deadline (Minutes, Team,
-Player Rates, xPts, all PRE_DEADLINE and all at one authoritative cutoff).  The SIMULATION
-AND CHALLENGER CODE IS CURRENT.  So:
+  FORMAL_ACCEPTED_GENERATION     a ``bootstrap_generations`` row with accepted = 1 plus its
+                                 declared element and persisted counts.
+  LEGACY_RECONSTRUCTED_COMPLETE  a fetch that PREDATES the generation-acceptance mechanism,
+                                 proven complete by raw-payload <-> snapshot population
+                                 identity (see :func:`verify_legacy_bootstrap_generation`).
 
-  * allowed: "PE-3 was retrospectively evaluated using current challenger/current MC code
-    against predictive inputs that were genuinely frozen before the target-event deadline";
-  * NOT allowed: "PE-3 predicted GW4 at the time";
-  * NOT allowed: "the historical MC forecast was reproduced";
-  * NOT allowed: "current mc_v1.3.0 equals historical mc_v1.2.1".
+``LEGACY_RECONSTRUCTED_COMPLETE`` is a RETROSPECTIVE COMPLETENESS CLASSIFICATION, not
+``generation_accepted = true``: the acceptance code never ran for such a fetch.  Artefacts
+report ``formal_generation_record: NONE`` beside ``legacy_reconstruction`` and emit
+``generation_accepted: null`` — never ``true``.  No ``bootstrap_generations`` row is created
+or backfilled here.
 
-THE CAUSAL BACKGROUND comes only from ``fpl_brain.historical_observations``, the frozen
-PE-1 reader, with an explicit ``as_of`` and ``planning_event``.  No history predicate is
-restated here.
+WHY AGGREGATE HISTORY SUFFICES.  Point-in-time FIXTURE-LEVEL ``player_gameweeks`` history is
+unavailable for the GW4 era: the table is upserted in place, so every GW1-GW3 row carries
+the most recent fetch's ``updated_at`` and none predates the GW4 cutoff.  That does not
+prevent the background: PE-3 needs only cumulative minutes and BPS, which
+``player_snapshots`` stores append-only per official fetch, so a player's cumulative rate is
+``bps * 90 / minutes`` with no fixture decomposition.  The proof of completeness is the
+raw-bootstrap-to-snapshot population identity, which is reproducible and hash-pinned.
 
-A NULL BPS on an otherwise-valid positive-minute historical row is UNKNOWN, not zero: it
-raises :class:`BackgroundEvidenceError`.  A genuine ``bps == 0`` is valid evidence.
-
-MEASURED LIMITATION — TWO separate facts, and only the first is now fatal.
-
-1. FIXTURE-LEVEL player_gameweeks history is NOT recoverable point-in-time: the table is
-   upserted in place, so at the time of writing every GW1-GW3 row carried
-   ``updated_at = 2026-09-18T13:53:05Z`` and ZERO rows predated the GW4 authoritative
-   cutoff.  That alone is NOT fatal to PE-3: this module needs only AGGREGATE cumulative
-   minutes and BPS, which ``player_snapshots`` stores append-only per official fetch.
-
-2. FATAL HERE: the frozen GW4 chain's official fetch is run **36**
-   (2026-09-11T22:45:41Z, status success), but ``bootstrap_generations`` does not begin
-   until fetch run **38** (2026-09-13T12:34:57Z).  The generation-acceptance mechanism did
-   not exist when the GW4 chain was frozen, so for run 36 there is NO generation row and
-   therefore NO ``accepted`` flag and NO ``official_element_count`` / ``persisted_count``
-   to certify capture completeness.  656 snapshot rows exist for run 36, and without the
-   generation record there is no way to tell "that era's element set was 656" from "three
-   snapshots failed to persist" — which is exactly what the acceptance record exists to
-   decide.  The next generation (id 1, fetch run 38) post-dates the GW4 deadline and GW4
-   itself, so using it would leak target-event outcomes into the cumulative totals.
-
-   The evaluation is therefore BLOCKED, and the fix is a durable outcome/history capture
-   in the outcome-capture phase (PE-5), not a weaker binding here.
-
+DURABLE point-in-time outcome/history retention, and generation-certified provenance for
+every predictive freeze, remain deferred to the outcome-capture phase (PE-5).
 """
 
 from __future__ import annotations
@@ -55,12 +42,12 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import bonus_allocation as ba
 from . import bonus_challenger as bc
 from . import bps_rules as bps
-from . import historical_observations as ho
 from . import monte_carlo as mc
 from . import scoring_rules
 from . import walk_forward_metrics as wfm
@@ -69,11 +56,25 @@ PE3_EVALUATION_SCHEMA = "pe3_bonus_evaluation_v1.0.0"
 
 EVALUATION_MODE = "RETROSPECTIVE_CURRENT_CODE_REPLAY_ON_FROZEN_PREDEADLINE_INPUTS"
 
-#: The accepted shrinkage pseudo-count.  NOT tunable — do not adjust.
+#: Identifies HOW the background evidence was obtained.  Not a model version.
+BPS_BACKGROUND_SOURCE_VERSION = "official_bootstrap_cumulative_v1.0.0"
+
+FORMAL_ACCEPTED_GENERATION = "FORMAL_ACCEPTED_GENERATION"
+LEGACY_RECONSTRUCTED_COMPLETE = "LEGACY_RECONSTRUCTED_COMPLETE"
+
+#: The accepted shrinkage pseudo-count.  NOT tunable.
 SHRINKAGE_MINUTES = 900
 
 #: The declared CURRENT evaluation config.  Not tuned against any result.
 CURRENT_REPLAY_SIMULATIONS = 10_000
+CURRENT_REPLAY_OCCUPANCY_AUDIT = True
+
+#: Retrospective acceptance thresholds, applied diagnostically only.
+LEGACY_RETAINED_FRACTION_MIN = 0.97
+LEGACY_ABSOLUTE_DROP_MAX = 75
+
+#: The frozen GW4 raw bootstrap digest, so a later mutation becomes visible.
+GW4_LEGACY_RAW_SHA256 = "b2c2cfade784e8f67ae0dcc21db1d3dbed408df110eef662797705b67db21f3c"
 
 
 class BackgroundEvidenceError(RuntimeError):
@@ -84,35 +85,210 @@ class CaptureContractError(RuntimeError):
     """A captured world does not contain every player the fixture requires."""
 
 
-def position_by_player(conn: sqlite3.Connection,
-                       player_ids: Iterable[int] | None = None) -> dict[int, str]:
-    """Canonical player -> GKP/DEF/MID/FWD, from ``players.element_type``."""
-
-    sql = "SELECT id, element_type FROM players"
-    params: list[Any] = []
-    ids = sorted({int(p) for p in (player_ids or ())})
-    if ids:
-        sql += f" WHERE id IN ({','.join('?' for _ in ids)})"
-        params.extend(ids)
-    positions: dict[int, str] = {}
-    for row in conn.execute(sql, tuple(params)):
-        element_type = row["element_type"] if not isinstance(row, tuple) else row[1]
-        player_id = row["id"] if not isinstance(row, tuple) else row[0]
-        position = scoring_rules.POSITION_IDS.get(int(element_type)) if element_type is not None else None
-        if position:
-            positions[int(player_id)] = str(position)
-    return positions
+class BackgroundAuthorityError(RuntimeError):
+    """The background authority could not be established; fail closed."""
 
 
 # ---------------------------------------------------------------------------
-# Causal background
+# Legacy bootstrap reconstruction — reproducible, never a hard-coded verdict
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LegacyBootstrapEvidence:
+    fetch_run_id: int
+    status: str
+    raw_path: str
+    raw_sha256: str
+    raw_elements: int
+    snapshots: int
+    raw_id_digest: str
+    snapshot_id_digest: str
+    raw_json_compared: int
+    raw_json_matches: int
+    captured_at: str
+    fetch_finished_at: str
+    previous_fetch_run_id: int | None
+    previous_population: int | None
+    retained_fraction: float | None
+    absolute_drop: int | None
+    whole_club_loss: bool | None
+    authority_mode: str = LEGACY_RECONSTRUCTED_COMPLETE
+    formal_generation_record: str = "NONE"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "fetch_run_id": self.fetch_run_id, "status": self.status,
+            "raw_path": self.raw_path, "raw_sha256": self.raw_sha256,
+            "raw_elements": self.raw_elements, "snapshots": self.snapshots,
+            "raw_id_digest": self.raw_id_digest, "snapshot_id_digest": self.snapshot_id_digest,
+            "raw_json_compared": self.raw_json_compared,
+            "raw_json_matches": self.raw_json_matches,
+            "captured_at": self.captured_at, "fetch_finished_at": self.fetch_finished_at,
+            "previous_fetch_run_id": self.previous_fetch_run_id,
+            "previous_population": self.previous_population,
+            "retained_fraction": self.retained_fraction, "absolute_drop": self.absolute_drop,
+            "whole_club_loss": self.whole_club_loss,
+            "authority_mode": self.authority_mode,
+            "formal_generation_record": self.formal_generation_record,
+            "generation_accepted": None,
+        }
+
+
+def _id_digest(ids: Iterable[int]) -> str:
+    payload = ",".join(str(int(i)) for i in sorted({int(i) for i in ids}))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def verify_legacy_bootstrap_generation(conn: sqlite3.Connection, *, fetch_run_id: int,
+                                       raw_dir: str | Path, deadline: str, target_event: int,
+                                       expected_raw_sha256: str | None = None,
+                                       ) -> LegacyBootstrapEvidence:
+    """Prove a pre-generation-era fetch carried a COMPLETE bootstrap population.
+
+    Gates, all of which must pass (fail closed otherwise):
+
+      A. the fetch run exists
+      B. status == success
+      C. the run-scoped raw bootstrap exists
+      D. canonical parse + validation succeed
+      E. raw element count == snapshot count for that fetch run
+      F. raw element ID set == snapshot player ID set
+      G. every snapshot ``raw_json`` semantically equals its raw element
+      H. exactly one coherent snapshot ``captured_at``
+      I. the fetch finished before the target deadline
+      J. every target fixture kicked off after the fetch finished
+      K. the population diagnostic passes, or is explicitly recorded
+    """
+
+    run = conn.execute("SELECT * FROM fetch_runs WHERE id = ?", (int(fetch_run_id),)).fetchone()
+    if run is None:
+        raise BackgroundAuthorityError(f"fetch run {fetch_run_id} does not exist")
+    status = str(run["status"])
+    if status != "success":
+        raise BackgroundAuthorityError(f"fetch run {fetch_run_id} status is {status!r}, not success")
+    raw_path = Path(raw_dir) / str(int(fetch_run_id)) / "bootstrap_static.json"
+    if not raw_path.exists():
+        raise BackgroundAuthorityError(f"raw bootstrap missing at {raw_path}")
+    raw_bytes = raw_path.read_bytes()
+    raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if expected_raw_sha256 is not None and raw_sha256 != expected_raw_sha256:
+        raise BackgroundAuthorityError(
+            f"raw bootstrap sha256 {raw_sha256} does not match the frozen value "
+            f"{expected_raw_sha256}; the file changed since it was certified"
+        )
+
+    from . import parsers
+
+    payload = json.loads(raw_bytes.decode("utf-8"))
+    try:
+        parsers.validate_bootstrap_payload(payload)
+    except Exception as failure:  # noqa: BLE001 - any rejection is a hard stop
+        raise BackgroundAuthorityError(f"canonical bootstrap validation failed: {failure}") from failure
+    elements = {int(item["id"]): item for item in (payload.get("elements") or [])}
+
+    rows = list(conn.execute(
+        "SELECT player_id, captured_at, raw_json FROM player_snapshots WHERE fetch_run_id = ?",
+        (int(fetch_run_id),)))
+    if not rows:
+        raise BackgroundAuthorityError(f"no player_snapshots for fetch run {fetch_run_id}")
+    snapshot_ids = {int(r["player_id"]) for r in rows}
+    if len(elements) != len(rows):
+        raise BackgroundAuthorityError(
+            f"raw element count {len(elements)} != snapshot count {len(rows)}")
+    if set(elements) != snapshot_ids:
+        missing = sorted(set(elements) - snapshot_ids)[:10]
+        extra = sorted(snapshot_ids - set(elements))[:10]
+        raise BackgroundAuthorityError(
+            f"raw ID set != snapshot ID set (missing {missing}, extra {extra})")
+    compared = matches = 0
+    for row in rows:
+        player_id = int(row["player_id"])
+        compared += 1
+        if json.loads(row["raw_json"]) == elements[player_id]:
+            matches += 1
+    if matches != compared:
+        raise BackgroundAuthorityError(
+            f"{compared - matches} of {compared} snapshots differ from their raw bootstrap element")
+    captured = sorted({str(r["captured_at"]) for r in rows})
+    if len(captured) != 1:
+        raise BackgroundAuthorityError(
+            f"snapshot capture is not one coherent instant: {captured[:5]}")
+    finished_at = str(run["finished_at"])
+    if not (finished_at < str(deadline)):
+        raise BackgroundAuthorityError(
+            f"fetch finished {finished_at} is not before the deadline {deadline}")
+    kickoffs = [str(r[0]) for r in conn.execute(
+        "SELECT kickoff_time FROM fixtures WHERE event = ? AND kickoff_time IS NOT NULL",
+        (int(target_event),))]
+    late = [k for k in kickoffs if k <= finished_at]
+    if late:
+        raise BackgroundAuthorityError(
+            f"{len(late)} target fixture(s) kicked off before the fetch completed; earliest {min(late)}")
+
+    previous_id, previous_ids = _previous_legacy_population(
+        conn, fetch_run_id=int(fetch_run_id), raw_dir=raw_dir)
+    retained = absolute = None
+    whole_club_loss = None
+    if previous_ids:
+        retained = len(previous_ids & set(elements)) / len(previous_ids)
+        absolute = len(previous_ids - set(elements))
+        whole_club_loss = _whole_club_loss(conn, removed=previous_ids - set(elements),
+                                           surviving=set(elements))
+    return LegacyBootstrapEvidence(
+        fetch_run_id=int(fetch_run_id), status=status, raw_path=str(raw_path),
+        raw_sha256=raw_sha256, raw_elements=len(elements), snapshots=len(rows),
+        raw_id_digest=_id_digest(elements), snapshot_id_digest=_id_digest(snapshot_ids),
+        raw_json_compared=compared, raw_json_matches=matches, captured_at=captured[0],
+        fetch_finished_at=finished_at, previous_fetch_run_id=previous_id,
+        previous_population=len(previous_ids) if previous_ids else None,
+        retained_fraction=retained, absolute_drop=absolute, whole_club_loss=whole_club_loss)
+
+
+def _previous_legacy_population(conn: sqlite3.Connection, *, fetch_run_id: int,
+                                raw_dir: str | Path) -> tuple[int | None, set[int]]:
+    """Nearest EARLIER successful fetch proven to carry a complete raw<->snapshot population."""
+
+    for run in conn.execute(
+            "SELECT id FROM fetch_runs WHERE id < ? AND status = 'success' ORDER BY id DESC",
+            (int(fetch_run_id),)):
+        path = Path(raw_dir) / str(int(run["id"])) / "bootstrap_static.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - an unreadable legacy file is simply skipped
+            continue
+        element_ids = {int(item["id"]) for item in (payload.get("elements") or [])}
+        if not element_ids:
+            continue
+        snapshot_ids = {int(r[0]) for r in conn.execute(
+            "SELECT player_id FROM player_snapshots WHERE fetch_run_id = ?", (int(run["id"]),))}
+        if element_ids == snapshot_ids:
+            return int(run["id"]), element_ids
+    return None, set()
+
+
+def _whole_club_loss(conn: sqlite3.Connection, *, removed: set[int],
+                     surviving: set[int]) -> bool | None:
+    """True when every player of some club disappeared between two populations."""
+
+    clubs: dict[int, set[int]] = {}
+    for row in conn.execute("SELECT id, team_id FROM players"):
+        clubs.setdefault(int(row["team_id"]), set()).add(int(row["id"]))
+    for members in clubs.values():
+        if members & removed and not (members & surviving):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Causal background from ONE bootstrap snapshot generation
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class BackgroundEvidence:
-    """One player's causal BPS level, with the pool it was shrunk toward."""
-
     player_id: int
     position: str | None
     personal_minutes: int
@@ -126,107 +302,97 @@ class BackgroundEvidence:
     shrunk_per90: float
 
     def expected_bps(self, mean_predicted_minutes: float) -> float:
-        """The historical level for those PREDICTED minutes (never realised minutes)."""
+        """Historical level for those PREDICTED minutes (never realised minutes)."""
 
         return self.shrunk_per90 * float(mean_predicted_minutes) / 90.0
 
     def as_dict(self) -> dict[str, Any]:
-        return {
-            "player_id": self.player_id, "position": self.position,
-            "personal_minutes": self.personal_minutes, "personal_bps": self.personal_bps,
-            "raw_personal_per90": self.raw_personal_per90,
-            "fallback_scope": self.fallback_scope,
-            "fallback_population_players": self.fallback_population_players,
-            "fallback_population_minutes": self.fallback_population_minutes,
-            "fallback_per90": self.fallback_per90,
-            "shrinkage_minutes": self.shrinkage_minutes,
-            "shrunk_per90": self.shrunk_per90,
-        }
+        return dict(self.__dict__)
 
 
-def _summarise_pool(rows: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
-    minutes = 0
-    bps_total = 0
-    for row in rows:
-        row_minutes = int(row.get("minutes") or 0)
-        if row_minutes <= 0:
-            continue
-        value = row.get("bps")
-        if value is None:
-            raise BackgroundEvidenceError(
-                "a positive-minute historical observation carries no BPS; "
-                "'unknown' must never be read as zero"
-            )
-        minutes += row_minutes
-        bps_total += int(value)
-    return minutes, bps_total
+def _historical_position(snapshot_raw: Mapping[str, Any]) -> str | None:
+    """Position from THAT snapshot's own raw_json, never from the current players table."""
+
+    element_type = snapshot_raw.get("element_type")
+    if element_type is None:
+        return None
+    return scoring_rules.POSITION_IDS.get(int(element_type))
 
 
-def load_causal_backgrounds(conn: sqlite3.Connection, *, as_of: str, planning_event: int,
-                            player_ids: Sequence[int] | None = None,
-                            shrinkage_minutes: int = SHRINKAGE_MINUTES,
-                            ) -> tuple[dict[int, BackgroundEvidence], dict[str, Any]]:
-    """Per-player causal BPS level, built ONLY from the frozen PE-1 reader.
+def load_snapshot_backgrounds(conn: sqlite3.Connection, *, fetch_run_id: int,
+                              shrinkage_minutes: int = SHRINKAGE_MINUTES,
+                              ) -> tuple[dict[int, BackgroundEvidence], dict[str, Any]]:
+    """Per-player causal BPS level from ONE bootstrap generation.
 
-    ``planning_event`` makes the reader apply its own strictly-earlier-event clause, so the
-    TARGET EVENT CANNOT ENTER ITS OWN BACKGROUND — the exclusion is the reader's, not a
-    second predicate written here.
+    Every value comes from the SAME fetch run, so capture instants can never be mixed.  A
+    positive-minute row with NULL BPS fails closed.
     """
 
-    rows = ho.historical_player_fixtures(conn, as_of=as_of, planning_event=planning_event)
-    positions = position_by_player(conn)
+    rows = list(conn.execute(
+        "SELECT player_id, minutes, bps, raw_json FROM player_snapshots WHERE fetch_run_id = ?",
+        (int(fetch_run_id),)))
+    if not rows:
+        raise BackgroundAuthorityError(f"no snapshots for fetch run {fetch_run_id}")
 
-    personal: dict[int, list[Mapping[str, Any]]] = {}
+    personal: dict[int, tuple[int, int]] = {}
+    positions: dict[int, str] = {}
     for row in rows:
-        personal.setdefault(int(row["player_id"]), []).append(row)
+        player_id = int(row["player_id"])
+        snapshot = json.loads(row["raw_json"])
+        position = _historical_position(snapshot)
+        if position is None:
+            raise BackgroundAuthorityError(
+                f"snapshot for player {player_id} carries no usable historical element_type")
+        positions[player_id] = position
+        minutes = int(row["minutes"] or 0)
+        if minutes <= 0:
+            continue
+        value = row["bps"]
+        if value is None:
+            raise BackgroundEvidenceError(
+                f"player {player_id} has {minutes} minutes but no BPS; 'unknown' is not zero")
+        personal[player_id] = (minutes, int(value))
 
-    league_minutes, league_bps = _summarise_pool(rows)
-    by_position: dict[str, list[Mapping[str, Any]]] = {}
-    for row in rows:
-        position = positions.get(int(row["player_id"]))
-        if position:
-            by_position.setdefault(position, []).append(row)
-    position_totals = {position: _summarise_pool(group) for position, group in by_position.items()}
+    league_minutes = sum(m for m, _ in personal.values())
+    league_bps = sum(b for _, b in personal.values())
+    by_position: dict[str, list[tuple[int, int]]] = {}
+    for player_id, entry in personal.items():
+        by_position.setdefault(positions[player_id], []).append(entry)
+    position_totals = {p: (sum(m for m, _ in v), sum(b for _, b in v))
+                       for p, v in by_position.items()}
 
-    wanted = sorted({int(p) for p in player_ids}) if player_ids is not None else sorted(personal)
     evidence: dict[int, BackgroundEvidence] = {}
-    for player_id in wanted:
-        own_rows = personal.get(player_id, [])
-        personal_minutes, personal_bps = _summarise_pool(own_rows)
-        position = positions.get(player_id)
-        pool_minutes, pool_bps = position_totals.get(position, (0, 0)) if position else (0, 0)
+    for player_id, position in positions.items():
+        minutes, bps_value = personal.get(player_id, (0, 0))
+        pool_minutes, pool_bps = position_totals.get(position, (0, 0))
         if pool_minutes > 0:
-            scope, fallback_minutes, fallback_bps = "POSITION", pool_minutes, pool_bps
-            population = len({int(r["player_id"]) for r in by_position.get(position, [])})
+            scope, fb_minutes, fb_bps = "POSITION", pool_minutes, pool_bps
+            population = len(by_position[position])
         elif league_minutes > 0:
-            scope, fallback_minutes, fallback_bps = "LEAGUE", league_minutes, league_bps
+            scope, fb_minutes, fb_bps = "LEAGUE", league_minutes, league_bps
             population = len(personal)
         else:
-            raise BackgroundEvidenceError(
-                f"no causal historical pool exists at as_of={as_of} planning_event={planning_event}"
-            )
-        fallback_per90 = fallback_bps * 90.0 / fallback_minutes
-        if personal_minutes > 0:
-            raw_per90 = personal_bps * 90.0 / personal_minutes
-            weight = personal_minutes / (personal_minutes + float(shrinkage_minutes))
+            raise BackgroundAuthorityError(
+                "no causal league evidence: no positive-minute player carries BPS")
+        fallback_per90 = fb_bps * 90.0 / fb_minutes
+        if minutes > 0:
+            raw_per90 = bps_value * 90.0 / minutes
+            weight = minutes / (minutes + float(shrinkage_minutes))
             shrunk = weight * raw_per90 + (1.0 - weight) * fallback_per90
         else:
             raw_per90 = None
             shrunk = fallback_per90
         evidence[player_id] = BackgroundEvidence(
-            player_id=player_id, position=position, personal_minutes=personal_minutes,
-            personal_bps=personal_bps, raw_personal_per90=raw_per90, fallback_scope=scope,
-            fallback_population_players=population, fallback_population_minutes=fallback_minutes,
+            player_id=player_id, position=position, personal_minutes=minutes,
+            personal_bps=bps_value, raw_personal_per90=raw_per90, fallback_scope=scope,
+            fallback_population_players=population, fallback_population_minutes=fb_minutes,
             fallback_per90=fallback_per90, shrinkage_minutes=int(shrinkage_minutes),
-            shrunk_per90=shrunk,
-        )
+            shrunk_per90=shrunk)
     provenance = {
-        "reader": "historical_observations.historical_player_fixtures",
-        "as_of": as_of, "planning_event": int(planning_event),
-        "source_rows": len(rows),
-        "distinct_players_with_history": len(personal),
-        "league_pool_minutes": league_minutes,
-        "position_pool_minutes": {position: totals[0] for position, totals in sorted(position_totals.items())},
+        "source_version": BPS_BACKGROUND_SOURCE_VERSION, "fetch_run_id": int(fetch_run_id),
+        "snapshot_rows": len(rows), "players": len(evidence),
+        "players_with_personal_history": len(personal), "league_pool_minutes": league_minutes,
+        "position_pool_minutes": {p: t[0] for p, t in sorted(position_totals.items())},
         "shrinkage_minutes": int(shrinkage_minutes),
     }
     return evidence, provenance
@@ -264,30 +430,28 @@ class PlayerFixturePrediction:
             "p_bonus_2plus": self.p_bonus_2plus, "p_bonus_3": self.p_bonus_3,
             "mean_bps_proxy": self.mean_bps_proxy,
             "unsupported_rule_rows": list(self.unsupported_rule_rows),
-            "limitation_flags": list(self.limitation_flags),
-            "background": self.background,
+            "limitation_flags": list(self.limitation_flags), "background": self.background,
         }
 
 
-def evaluate_fixture_bonus_worlds(*, fixture_id: int, captured_worlds: Sequence[Mapping[int, Mapping[str, Any]]],
+def evaluate_fixture_bonus_worlds(*, fixture_id: int,
+                                  captured_worlds: Sequence[Mapping[int, Mapping[str, Any]]],
                                   backgrounds: Mapping[int, BackgroundEvidence],
                                   rules: Sequence[bps.BPSPrimitiveSpec] = bps.RULE_SPECS,
                                   ) -> tuple[list[PlayerFixturePrediction], dict[str, Any]]:
     """THE canonical PE-3 path for one fixture: captured worlds -> bonus predictions.
 
-    The WHOLE fixture competes in every world — no filtering to owned, active, minutes>0 or
-    outcome-bearing players.  BPS proxy ordering is exact numeric; no rounding, no epsilon.
+    The WHOLE fixture competes in every world.  Proxy ordering is exact numeric: no
+    rounding, no quantisation, no epsilon.
     """
 
     if not captured_worlds:
-        return [], {"fixtures": 0, "worlds": 0}
+        return [], {"fixtures": 0, "worlds": 0, "players": 0}
 
     players = sorted({int(pid) for world in captured_worlds for pid in world})
     structural: dict[int, list[float]] = {pid: [] for pid in players}
-    minutes: dict[int, float] = {pid: 0.0 for pid in players}
+    minutes = {pid: 0.0 for pid in players}
     positions: dict[int, str | None] = {pid: None for pid in players}
-    # PER PLAYER: one goalkeeper's unsupported save-location row must not become every
-    # outfield player's limitation.
     unsupported_by_player: dict[int, set[str]] = {pid: set() for pid in players}
     flags_by_player: dict[int, set[str]] = {pid: set() for pid in players}
 
@@ -295,14 +459,10 @@ def evaluate_fixture_bonus_worlds(*, fixture_id: int, captured_worlds: Sequence[
         for player_id in players:
             record = world.get(player_id)
             if record is None:
-                # The Step-1 capture guarantees the WHOLE fixture universe in every world,
-                # so an absent record means the capture is malformed.  Defaulting it to 0
-                # would silently invent a zero-BPS performance for a real player.
                 raise CaptureContractError(
                     f"captured world {index} for fixture {fixture_id} has no record for "
                     f"player {player_id}; the capture contract requires every simulated "
-                    "player in every world, so this is malformed capture, not a zero"
-                )
+                    "player in every world, so this is malformed capture, not a zero")
             positions[player_id] = record.get("position") or positions[player_id]
             minutes[player_id] += float(record["minutes"])
             proxy = bc.structural_world_bps(player_id, record["position"] or "MID", record, rules)
@@ -322,14 +482,13 @@ def evaluate_fixture_bonus_worlds(*, fixture_id: int, captured_worlds: Sequence[
         background_per90[player_id] = evidence.shrunk_per90
         expected = evidence.expected_bps(mean_minutes[player_id])
         background_expected[player_id] = expected
-        series = bc.centred_world_bps(expected, structural[player_id])
-        for index, value in enumerate(series):
-            proxy_by_world[index][player_id] = value
+        for position_index, value in enumerate(
+                bc.centred_world_bps(expected, structural[player_id])):
+            proxy_by_world[position_index][player_id] = value
 
     summary = bc.aggregate_worlds(proxy_by_world)
     predictions: list[PlayerFixturePrediction] = []
     for player_id in players:
-        evidence = backgrounds[player_id]
         predictions.append(PlayerFixturePrediction(
             player_id=player_id, fixture_id=int(fixture_id), position=positions[player_id],
             expected_minutes=mean_minutes[player_id],
@@ -342,95 +501,60 @@ def evaluate_fixture_bonus_worlds(*, fixture_id: int, captured_worlds: Sequence[
             mean_bps_proxy=summary.mean_bps_proxy[player_id],
             unsupported_rule_rows=tuple(sorted(unsupported_by_player[player_id])),
             limitation_flags=tuple(sorted(flags_by_player[player_id])),
-            background=evidence.as_dict(),
-        ))
-    diagnostics = {
-        "fixtures": 1, "worlds": worlds, "players": len(players),
-        # fixture-level UNION is diagnostics only; each player carries his own set
-        "unsupported_rule_rows_union": sorted({row for rows in unsupported_by_player.values() for row in rows}),
-        "limitation_flags_union": sorted({flag for rows in flags_by_player.values() for flag in rows}),
-        "ranking_changed_across_worlds": summary.ranking_changed_across_worlds,
-        "total_bonus_per_world": list(summary.total_bonus_per_world),
-    }
+            background=backgrounds[player_id].as_dict()))
+    diagnostics = _world_diagnostics(
+        fixture_id=int(fixture_id), proxy_by_world=proxy_by_world, players=players,
+        summary=summary)
+    diagnostics["unsupported_rule_rows_union"] = sorted(
+        {row for rows in unsupported_by_player.values() for row in rows})
+    diagnostics["limitation_flags_union"] = sorted(
+        {flag for rows in flags_by_player.values() for flag in rows})
     return predictions, diagnostics
 
 
-def evaluate_event(conn: sqlite3.Connection, *, event: int, as_of: str, chain: Mapping[str, int],
-                   mc_config: mc.MonteCarloConfig | None = None,
-                   rules: Sequence[bps.BPSPrimitiveSpec] = bps.RULE_SPECS,
-                   shrinkage_minutes: int = SHRINKAGE_MINUTES,
-                   preloaded_worlds: Mapping[int, Any] | None = None,
-                   ) -> dict[str, Any]:
-    """Full PE-3 evaluation for one final event from one frozen pre-deadline input chain.
+def _world_diagnostics(*, fixture_id: int, proxy_by_world: Sequence[Mapping[int, float]],
+                       players: Sequence[int], summary: Any) -> dict[str, Any]:
+    """Per-world tie structure plus one PROVEN rival-dependence example."""
 
-    READ ONLY: the simulation result is never persisted.
-    """
-
-    config = mc_config or mc.MonteCarloConfig(simulations=CURRENT_REPLAY_SIMULATIONS,
-                                              occupancy_audit=True)
-    if preloaded_worlds is None:
-        fixtures = mc.load_fixture_inputs(conn, event=int(event), xpts_run_id=int(chain["xpts"]),
-                                          minutes_run_id=int(chain["minutes"]),
-                                          team_run_id=int(chain["team"]))
-        result = mc.simulate(fixtures, config, scoring_rules.DEFAULT_SCORING_RULES,
-                             capture_bps_worlds=True)
-        captured = result["bps_worlds"]
-    else:
-        captured = preloaded_worlds
-
-    player_ids = sorted({int(pid) for worlds in captured.values() for world in worlds for pid in world})
-    backgrounds, background_provenance = load_causal_backgrounds(
-        conn, as_of=as_of, planning_event=int(event), player_ids=player_ids,
-        shrinkage_minutes=shrinkage_minutes)
-
-    predictions: list[PlayerFixturePrediction] = []
-    diagnostics: dict[str, Any] = {"fixtures": 0, "worlds": 0, "per_fixture": {}}
-    for fixture_id in sorted(captured):
-        rows, per_fixture = evaluate_fixture_bonus_worlds(
-            fixture_id=int(fixture_id), captured_worlds=captured[fixture_id],
-            backgrounds=backgrounds, rules=rules)
-        predictions.extend(rows)
-        diagnostics["fixtures"] += 1
-        diagnostics["worlds"] = max(diagnostics["worlds"], per_fixture["worlds"])
-        diagnostics["per_fixture"][str(fixture_id)] = per_fixture
-    diagnostics["max_source_event"] = _max_background_event(conn, as_of=as_of, planning_event=int(event))
+    any_tie = bonus_tie = over_six = 0
+    rival_example: dict[str, Any] | None = None
+    for world in proxy_by_world:
+        counts: dict[float, int] = {}
+        for value in world.values():
+            counts[value] = counts.get(value, 0) + 1
+        if any(count > 1 for count in counts.values()):
+            any_tie += 1
+        allocation = ba.allocate_fixture_bonus(world)
+        if sum(allocation.values()) > 6:
+            over_six += 1
+        if any(bonus > 0 and counts[world[pid]] > 1 for pid, bonus in allocation.items()):
+            bonus_tie += 1
+        if rival_example is None and len(players) >= 2:
+            me = players[0]
+            for other in players[1:]:
+                # MY proxy is untouched; only a rival's changes.
+                shifted = dict(world)
+                shifted[other] = shifted[other] + 1000.0
+                after = ba.allocate_fixture_bonus(shifted)[me]
+                if after != allocation[me]:
+                    rival_example = {
+                        "fixture_id": fixture_id, "player_id": int(me), "rival_id": int(other),
+                        "player_proxy_unchanged": world[me],
+                        "rival_proxy_before": world[other],
+                        "rival_proxy_after": shifted[other],
+                        "player_bonus_before": allocation[me], "player_bonus_after": after}
+                    break
+    worlds = len(proxy_by_world)
     return {
-        "predictions": predictions,
-        "diagnostics": diagnostics,
-        "background_provenance": background_provenance,
-        "current_replay_identity": {
-            "mc_version": mc.MONTE_CARLO_MODEL_VERSION,
-            "config_hash": config.config_hash(),
-            "seed": int(config.seed),
-            "simulations": int(config.simulations),
-            "calibration_state_identity": _calibration_state_identity(config),
-        },
-        "bps_rules": bps.ruleset_fingerprint(),
-        "challenger_version": bc.BONUS_BPS_MODEL_VERSION,
+        "fixtures": 1, "worlds": worlds, "players": len(players),
+        "any_proxy_tie_worlds": any_tie,
+        "any_proxy_tie_rate": any_tie / worlds if worlds else 0.0,
+        "bonus_affecting_tie_worlds": bonus_tie,
+        "bonus_affecting_tie_rate": bonus_tie / worlds if worlds else 0.0,
+        "worlds_over_six_bonus": over_six,
+        "ranking_changed_across_worlds": bool(summary.ranking_changed_across_worlds),
+        "rival_dependence_example": rival_example,
     }
-
-
-def _calibration_state_identity(config: "mc.MonteCarloConfig") -> str:
-    """The ACTUAL calibration provenance field, never a silent None."""
-
-    if not hasattr(mc, "calibration_provenance"):
-        raise CaptureContractError("monte_carlo.calibration_provenance is unavailable")
-    provenance = mc.calibration_provenance(config)
-    identity = provenance.get("calibration_state_identity")
-    if not identity:
-        raise CaptureContractError(
-            "calibration provenance carries no calibration_state_identity; refusing to "
-            f"emit a silent None (keys: {sorted(provenance)})"
-        )
-    return str(identity)
-
-
-def _max_background_event(conn: sqlite3.Connection, *, as_of: str, planning_event: int) -> int | None:
-    """Highest event that actually entered the background — must be < planning_event."""
-
-    rows = ho.historical_player_fixtures(conn, as_of=as_of, planning_event=planning_event)
-    events = [int(r["fixture_event"]) for r in rows if r.get("fixture_event") is not None]
-    return max(events) if events else None
 
 
 # ---------------------------------------------------------------------------
@@ -438,62 +562,82 @@ def _max_background_event(conn: sqlite3.Connection, *, as_of: str, planning_even
 # ---------------------------------------------------------------------------
 
 
-def final_outcomes(conn: sqlite3.Connection, *, event: int) -> dict[tuple[int, int], dict[str, Any]]:
-    """Final official player-fixture outcomes for one FINAL, CHECKED event."""
+def _is_placeholder(record: Mapping[str, Any]) -> bool:
+    """The repository's scheduled-placeholder signature: minutes only, nothing realised."""
+
+    if record.get("bonus") is not None or record.get("bps") is not None:
+        return False
+    return record.get("updated_at") is None or record.get("starts") is None
+
+
+def final_outcomes(conn: sqlite3.Connection, *, event: int) -> tuple[dict[tuple[int, int], dict], dict]:
+    """Final official outcomes for one FINAL, CHECKED event.
+
+    A scheduled placeholder is not a realised zero: it is EXCLUDED AND COUNTED, as is a
+    genuine missing bonus.
+    """
 
     rows = conn.execute(
         """
         SELECT pg.player_id AS player_id, pg.fixture_id AS fixture_id, pg.bonus AS bonus,
-               pg.minutes AS minutes, pg.bps AS bps
+               pg.minutes AS minutes, pg.bps AS bps, pg.starts AS starts,
+               pg.updated_at AS updated_at
         FROM player_gameweeks pg
         JOIN fixtures f ON f.id = pg.fixture_id
         JOIN events e ON e.id = f.event
         WHERE f.event = ? AND f.finished = 1 AND e.finished = 1 AND e.data_checked = 1
         """,
-        (int(event),),
-    ).fetchall()
-    return {(int(r["player_id"]), int(r["fixture_id"])): dict(r) for r in rows}
+        (int(event),)).fetchall()
+    outcomes: dict[tuple[int, int], dict] = {}
+    excluded = {"placeholder": 0, "missing_bonus": 0}
+    for row in rows:
+        record = dict(row)
+        if _is_placeholder(record):
+            excluded["placeholder"] += 1
+            continue
+        if record.get("bonus") is None:
+            excluded["missing_bonus"] += 1
+            continue
+        outcomes[(int(row["player_id"]), int(row["fixture_id"]))] = record
+    return outcomes, excluded
 
 
-def _metric_value(metric: Any) -> Any:
-    return getattr(metric, "value", metric)
+def _metric(metric: Any) -> dict[str, Any]:
+    """Preserve value/status/n/detail rather than collapsing to a naked float."""
+
+    if hasattr(metric, "as_dict"):
+        return metric.as_dict()
+    return {"value": getattr(metric, "value", metric), "status": "OK", "n": None, "detail": None}
 
 
 def score_predictions(predictions: Sequence[PlayerFixturePrediction],
                       outcomes: Mapping[tuple[int, int], Mapping[str, Any]],
                       ) -> dict[str, Any]:
-    """PE-2 metric functions over the eligible population.  No duplicate metric maths."""
+    """PE-2 metric functions over the eligible population."""
 
     eligible: list[tuple[PlayerFixturePrediction, int]] = []
-    excluded = {"missing_outcome": 0, "missing_bonus": 0}
+    excluded = {"missing_outcome": 0}
     for prediction in predictions:
         outcome = outcomes.get((prediction.player_id, prediction.fixture_id))
         if outcome is None:
             excluded["missing_outcome"] += 1
             continue
-        if outcome.get("bonus") is None:
-            excluded["missing_bonus"] += 1
-            continue
         eligible.append((prediction, int(outcome["bonus"])))
-
     if not eligible:
         return {"status": "NO_SAMPLE", "n": 0, "excluded": excluded}
 
+    keys = [(p.player_id, p.fixture_id) for p, _ in eligible]
     predicted = [p.expected_bonus for p, _ in eligible]
-    realised = [float(bonus) for _, bonus in eligible]
-    probabilities = [p.p_bonus_any for p, _ in eligible]
-    outcomes_any = [1.0 if bonus > 0 else 0.0 for _, bonus in eligible]
-
+    realised = [float(b) for _, b in eligible]
     report: dict[str, Any] = {
-        "status": "OK",
-        "n": len(eligible),
+        "status": "OK", "n": len(eligible), "population_digest": population_digest(keys),
         "mean_predicted_bonus": sum(predicted) / len(predicted),
         "mean_realised_bonus": sum(realised) / len(realised),
-        "bias": _metric_value(wfm.mean_bias(predicted, realised)),
-        "mae": _metric_value(wfm.mean_absolute_error(predicted, realised)),
-        "brier_p_any": _metric_value(wfm.brier_score(probabilities, outcomes_any)),
-        "excluded": excluded,
-        "by_position": {},
+        "bias": _metric(wfm.mean_bias(predicted, realised)),
+        "mae": _metric(wfm.mean_absolute_error(predicted, realised)),
+        "brier_p_any": _metric(wfm.brier_score(
+            [p.p_bonus_any for p, _ in eligible], [1.0 if b > 0 else 0.0 for _, b in eligible])),
+        "excluded": excluded, "by_position": {},
     }
     for position in ("GKP", "DEF", "MID", "FWD"):
         group = [(p, b) for p, b in eligible if p.position == position]
@@ -505,17 +649,15 @@ def score_predictions(predictions: Sequence[PlayerFixturePrediction],
         report["by_position"][position] = {
             "status": "OK", "n": len(group),
             "mean_predicted": sum(gp) / len(gp), "mean_realised": sum(gr) / len(gr),
-            "bias": _metric_value(wfm.mean_bias(gp, gr)),
-            "mae": _metric_value(wfm.mean_absolute_error(gp, gr)),
-            "brier_p_any": _metric_value(wfm.brier_score(
-                [p.p_bonus_any for p, _ in group],
-                [1.0 if b > 0 else 0.0 for _, b in group])),
+            "bias": _metric(wfm.mean_bias(gp, gr)),
+            "mae": _metric(wfm.mean_absolute_error(gp, gr)),
+            "brier_p_any": _metric(wfm.brier_score(
+                [p.p_bonus_any for p, _ in group], [1.0 if b > 0 else 0.0 for _, b in group])),
         }
     return report
 
 
-def soft_baseline(conn: sqlite3.Connection, *, xpts_run_id: int,
-                  keys: Iterable[tuple[int, int]],
+def soft_baseline(conn: sqlite3.Connection, *, xpts_run_id: int, keys: Iterable[tuple[int, int]],
                   outcomes: Mapping[tuple[int, int], Mapping[str, Any]]) -> dict[str, Any]:
     """The certified soft-bonus path on EXACTLY the same eligible key set."""
 
@@ -527,31 +669,197 @@ def soft_baseline(conn: sqlite3.Connection, *, xpts_run_id: int,
         row = conn.execute(
             "SELECT payload_json FROM player_fixture_xpts_projections "
             "WHERE projection_run_id = ? AND player_id = ? AND fixture_id = ?",
-            (int(xpts_run_id), player_id, fixture_id),
-        ).fetchone()
+            (int(xpts_run_id), player_id, fixture_id)).fetchone()
         if row is None or row["payload_json"] is None:
             return {"status": "INCOMPLETE_BASELINE", "n": 0,
                     "missing": {"player_id": player_id, "fixture_id": fixture_id}}
         payload = json.loads(row["payload_json"])
-        value = payload.get("bonus_xpts")
-        if value is None:
+        if payload.get("bonus_xpts") is None:
             return {"status": "INCOMPLETE_BASELINE", "n": 0,
                     "missing": {"player_id": player_id, "fixture_id": fixture_id}}
-        values[(player_id, fixture_id)] = float(value)
-
+        values[(player_id, fixture_id)] = float(payload["bonus_xpts"])
     predicted = [values[k] for k in key_list]
     realised = [float(outcomes[k]["bonus"]) for k in key_list]
     return {
-        "status": "OK", "n": len(key_list),
+        "status": "OK", "n": len(key_list), "population_digest": population_digest(key_list),
         "mean_predicted": sum(predicted) / len(predicted),
         "mean_realised": sum(realised) / len(realised),
-        "bias": _metric_value(wfm.mean_bias(predicted, realised)),
-        "mae": _metric_value(wfm.mean_absolute_error(predicted, realised)),
+        "bias": _metric(wfm.mean_bias(predicted, realised)),
+        "mae": _metric(wfm.mean_absolute_error(predicted, realised)),
         "brier": "NOT_APPLICABLE — expected points is not a probability",
-        "population_digest": population_digest(key_list),
     }
 
 
 def population_digest(keys: Iterable[tuple[int, int]]) -> str:
     payload = ",".join(f"{int(p)}:{int(f)}" for p, f in sorted({(int(a), int(b)) for a, b in keys}))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def snapshot_vs_gameweek_diagnostic(conn: sqlite3.Connection, *, fetch_run_id: int,
+                                    through_event: int = 3) -> dict[str, Any]:
+    """RETROSPECTIVE integrity diagnostic ONLY — never model input."""
+
+    snaps = {int(r["player_id"]): (int(r["minutes"] or 0), r["bps"])
+             for r in conn.execute(
+                 "SELECT player_id, minutes, bps FROM player_snapshots WHERE fetch_run_id = ?",
+                 (int(fetch_run_id),))}
+    sums: dict[int, list[int]] = {}
+    for row in conn.execute(
+            """SELECT pg.player_id AS player_id, SUM(pg.minutes) AS minutes, SUM(pg.bps) AS bps
+               FROM player_gameweeks pg JOIN fixtures f ON f.id = pg.fixture_id
+               WHERE f.event <= ? AND f.finished = 1 GROUP BY pg.player_id""",
+            (int(through_event),)):
+        sums[int(row["player_id"])] = [int(row["minutes"] or 0), int(row["bps"] or 0)]
+    comparable = minute_matches = bps_matches = 0
+    examples: list[dict[str, Any]] = []
+    for player_id, (snapshot_minutes, snapshot_bps) in snaps.items():
+        if player_id not in sums or snapshot_bps is None:
+            continue
+        comparable += 1
+        gw_minutes, gw_bps = sums[player_id]
+        if snapshot_minutes == gw_minutes:
+            minute_matches += 1
+        if snapshot_bps == gw_bps:
+            bps_matches += 1
+        elif len(examples) < 5:
+            examples.append({"player_id": player_id, "snapshot_minutes": snapshot_minutes,
+                             "gw_minutes": gw_minutes, "snapshot_bps": snapshot_bps,
+                             "gw_bps": gw_bps})
+    return {"label": "RETROSPECTIVE_INTEGRITY_DIAGNOSTIC_ONLY", "comparable_players": comparable,
+            "exact_minute_matches": minute_matches, "exact_bps_matches": bps_matches,
+            "minute_mismatches": comparable - minute_matches,
+            "bps_mismatches": comparable - bps_matches, "examples": examples}
+
+
+def _calibration_state_identity(config: "mc.MonteCarloConfig") -> str:
+    if not hasattr(mc, "calibration_provenance"):
+        raise CaptureContractError("monte_carlo.calibration_provenance is unavailable")
+    provenance = mc.calibration_provenance(config)
+    identity = provenance.get("calibration_state_identity")
+    if not identity:
+        raise CaptureContractError(
+            "calibration provenance carries no calibration_state_identity; refusing to "
+            f"emit a silent None (keys: {sorted(provenance)})")
+    return str(identity)
+
+
+def evaluate_event(conn: sqlite3.Connection, *, event: int, as_of: str, deadline: str,
+                   chain: Mapping[str, int], fetch_run_id: int, raw_dir: str | Path,
+                   target_event: int, xpts_run_id: int,
+                   mc_config: "mc.MonteCarloConfig | None" = None,
+                   rules: Sequence[bps.BPSPrimitiveSpec] = bps.RULE_SPECS,
+                   shrinkage_minutes: int = SHRINKAGE_MINUTES,
+                   expected_raw_sha256: str | None = None,
+                   preloaded_worlds: Mapping[int, Any] | None = None) -> dict[str, Any]:
+    """THE full PE-3 evaluation path.  READ ONLY — nothing is persisted."""
+
+    problems = mc.validate_input_run_coherence(
+        conn, xpts_run_id=int(chain["xpts"]), minutes_run_id=int(chain["minutes"]),
+        team_run_id=int(chain["team"]), rate_run_id=int(chain["rate"]))
+    if problems:
+        raise BackgroundAuthorityError(f"input chain is incoherent: {problems}")
+
+    evidence = verify_legacy_bootstrap_generation(
+        conn, fetch_run_id=int(fetch_run_id), raw_dir=raw_dir, deadline=deadline,
+        target_event=int(target_event), expected_raw_sha256=expected_raw_sha256)
+
+    config = mc_config or mc.MonteCarloConfig(
+        simulations=CURRENT_REPLAY_SIMULATIONS, occupancy_audit=CURRENT_REPLAY_OCCUPANCY_AUDIT)
+    if preloaded_worlds is None:
+        fixtures = mc.load_fixture_inputs(
+            conn, event=int(event), xpts_run_id=int(chain["xpts"]),
+            minutes_run_id=int(chain["minutes"]), team_run_id=int(chain["team"]))
+        result = mc.simulate(fixtures, config, scoring_rules.DEFAULT_SCORING_RULES,
+                             capture_bps_worlds=True)
+        captured = result["bps_worlds"]
+    else:
+        captured = preloaded_worlds
+
+    backgrounds, background_provenance = load_snapshot_backgrounds(
+        conn, fetch_run_id=int(fetch_run_id), shrinkage_minutes=int(shrinkage_minutes))
+
+    predictions: list[PlayerFixturePrediction] = []
+    per_fixture: dict[str, Any] = {}
+    for fixture_id in sorted(captured):
+        rows, diagnostics = evaluate_fixture_bonus_worlds(
+            fixture_id=int(fixture_id), captured_worlds=captured[fixture_id],
+            backgrounds=backgrounds, rules=rules)
+        predictions.extend(rows)
+        per_fixture[str(fixture_id)] = diagnostics
+
+    outcomes, outcome_exclusions = final_outcomes(conn, event=int(event))
+    structural = score_predictions(predictions, outcomes)
+    if structural.get("status") == "OK":
+        eligible_keys = [(p.player_id, p.fixture_id) for p in predictions
+                         if (p.player_id, p.fixture_id) in outcomes]
+        soft = soft_baseline(conn, xpts_run_id=int(xpts_run_id), keys=eligible_keys,
+                             outcomes=outcomes)
+    else:
+        soft = {"status": "NO_SAMPLE", "n": 0}
+    same_population = bool(
+        structural.get("status") == "OK" and soft.get("status") == "OK"
+        and structural["population_digest"] == soft["population_digest"])
+
+    world_diagnostics = {
+        "fixtures": len(per_fixture),
+        "worlds_per_fixture": {k: v["worlds"] for k, v in sorted(per_fixture.items())},
+        "player_fixture_predictions": len(predictions),
+        "any_proxy_tie_worlds": sum(v.get("any_proxy_tie_worlds", 0) for v in per_fixture.values()),
+        "bonus_affecting_tie_worlds": sum(
+            v.get("bonus_affecting_tie_worlds", 0) for v in per_fixture.values()),
+        "worlds_over_six_bonus": sum(v.get("worlds_over_six_bonus", 0) for v in per_fixture.values()),
+        "rival_dependence_examples": [v["rival_dependence_example"] for v in per_fixture.values()
+                                      if v.get("rival_dependence_example")][:3],
+        "highest_expected_bonus": sorted(
+            ({"player_id": p.player_id, "fixture_id": p.fixture_id, "expected_bonus": p.expected_bonus}
+             for p in predictions), key=lambda item: -item["expected_bonus"])[:3],
+        "lowest_non_zero_expected_bonus": sorted(
+            ({"player_id": p.player_id, "fixture_id": p.fixture_id, "expected_bonus": p.expected_bonus}
+             for p in predictions if p.expected_bonus > 0),
+            key=lambda item: item["expected_bonus"])[:3],
+        "limitation_flags_union": sorted(
+            {flag for v in per_fixture.values() for flag in v.get("limitation_flags_union", [])}),
+        "unsupported_rule_rows_union": sorted(
+            {row for v in per_fixture.values() for row in v.get("unsupported_rule_rows_union", [])}),
+    }
+
+    return {
+        "schema": PE3_EVALUATION_SCHEMA,
+        "evaluation_mode": EVALUATION_MODE,
+        "target_event": int(event),
+        "historical_input_identity": {
+            "cutoff": as_of, "deadline": deadline,
+            "xpts_run_id": int(chain["xpts"]), "minutes_run_id": int(chain["minutes"]),
+            "team_run_id": int(chain["team"]), "rate_run_id": int(chain["rate"]),
+            "official_fetch_run_id": int(fetch_run_id),
+            "background_authority": LEGACY_RECONSTRUCTED_COMPLETE,
+            "formal_generation_record": "NONE",
+            "legacy_reconstruction": evidence.as_dict(),
+        },
+        "current_replay_identity": {
+            "mc_version": mc.MONTE_CARLO_MODEL_VERSION,
+            "config_hash": config.config_hash(), "seed": int(config.seed),
+            "simulations": int(config.simulations),
+            "calibration_state_identity": _calibration_state_identity(config),
+        },
+        "bps_rules": bps.ruleset_fingerprint(),
+        "background_source_version": BPS_BACKGROUND_SOURCE_VERSION,
+        "challenger_version": bc.BONUS_BPS_MODEL_VERSION,
+        "background_provenance": background_provenance,
+        "structural": structural,
+        "soft_baseline": soft,
+        "same_population": same_population,
+        "outcome_exclusions": outcome_exclusions,
+        "world_diagnostics": world_diagnostics,
+        "snapshot_integrity_diagnostic": snapshot_vs_gameweek_diagnostic(
+            conn, fetch_run_id=int(fetch_run_id)),
+        "claim": "DESCRIPTIVE_ONLY",
+        "limitations": [
+            "STRUCTURAL APPROXIMATION: the proxy models only minutes, goals, assists, clean "
+            "sheets, goals conceded, saves and yellow cards; 28 rule rows are unsupported and "
+            "named per player.",
+            "RETROSPECTIVE: current MC and challenger code against frozen pre-deadline inputs. "
+            "Not a historical frozen PE-3 forecast, and not a reproduction of the historical MC run.",
+            "NO MODEL-SELECTION VERDICT: this is a tiny sample.",
+        ],
+    }
