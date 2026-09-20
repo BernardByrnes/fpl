@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -88,6 +89,14 @@ AS_OF = _t(5)
 EVENT = 4
 EVENT_PARTIAL = 5
 OTHER_EVENT = 3
+
+#: The official element ids the accepted generation certifies: every synthetic
+#: player that IS in the official pool.  ``INACTIVE_PLAYER`` is deliberately
+#: absent, which is the pinned statement of "he was not in the pool", as opposed
+#: to today's ``players.is_active`` flag.
+SYNTHETIC_POOL = (
+    DGW_PLAYER, SGW_A_PLAYER, SGW_B_PLAYER, BLANK_PLAYER, NO_OUTCOME_PLAYER, PLACEHOLDER_PLAYER,
+)
 
 FAMILY_POINTS = analytics.BASELINE_MODEL_FAMILY
 FAMILY_MINUTES = analytics.MINUTES_MODEL_FAMILY
@@ -163,6 +172,7 @@ def _freeze(
     config_hash: str | None = "cfg",
     random_seed: int | None = 7,
     fixture_of: dict[int, int] | None = None,
+    finish: bool = True,
 ) -> int:
     """Freeze one transparent claim per player, exactly as a model run would."""
 
@@ -190,8 +200,71 @@ def _freeze(
             payload={"value": value, "expected_minutes": value},
             model_version=version,
         )
-    analytics.finish_projection_run(conn, run_id, "complete")
+    if finish:
+        analytics.finish_projection_run(conn, run_id, "complete")
     return run_id
+
+
+def _archive(tmp_path, *, source, observed_at, payload, event=None, run_id=1, raw_dir=None):
+    """Archive one payload as the immutable evidence a historical read needs."""
+
+    from fpl_brain import raw_archive
+
+    root = Path(raw_dir) if raw_dir is not None else Path(tmp_path) / "raw"
+    body = json.dumps(payload, sort_keys=True).encode("utf-8")
+    record = raw_archive.archive_raw_capture(
+        root, source=source, observed_at=observed_at, body=body, event=event, run_id=run_id
+    )
+    return root, record
+
+
+def _archive_world(tmp_path, *, observed_at, fixture_events=(EVENT,), event_rows=None, raw_dir=None):
+    """The pinned world at ``observed_at``: the pool, the clubs and the fixtures.
+
+    Exactly the shapes the fetch layer archives: ``bootstrap_static`` carries the
+    elements (with their clubs), the events and the teams; ``fixtures`` carries
+    the event's schedule with its published status.
+    """
+
+    root = Path(raw_dir) if raw_dir is not None else None
+    root, _ = _archive(
+        tmp_path,
+        source="bootstrap_static",
+        observed_at=observed_at,
+        payload={
+            "elements": [
+                {"id": DGW_PLAYER, "team": TEAM_A, "status": "a"},
+                {"id": SGW_A_PLAYER, "team": TEAM_A, "status": "a"},
+                {"id": SGW_B_PLAYER, "team": TEAM_B, "status": "a"},
+                {"id": BLANK_PLAYER, "team": TEAM_D, "status": "a"},
+                {"id": NO_OUTCOME_PLAYER, "team": TEAM_B, "status": "a"},
+                {"id": PLACEHOLDER_PLAYER, "team": TEAM_B, "status": "a"},
+                {"id": INACTIVE_PLAYER, "team": TEAM_C, "status": "a"},
+            ],
+            "events": event_rows
+            if event_rows is not None
+            else [
+                {"id": OTHER_EVENT, "finished": 1, "data_checked": 1},
+                {"id": EVENT, "finished": 1, "data_checked": 1},
+            ],
+            "teams": [{"id": tid, "name": f"T{tid}"} for tid in (TEAM_A, TEAM_B, TEAM_C, TEAM_D)],
+        },
+        raw_dir=root,
+        run_id=1,
+    )
+    schedule = [
+        {"id": FIXTURE_1, "event": EVENT, "team_h": TEAM_A, "team_a": TEAM_B,
+         "kickoff_time": KICKOFF_1, "started": 1, "finished": 1},
+        {"id": FIXTURE_2, "event": EVENT, "team_h": TEAM_A, "team_a": TEAM_C,
+         "kickoff_time": KICKOFF_2, "started": 1, "finished": 1},
+    ]
+    for event in fixture_events:
+        rows = [row for row in schedule if row["event"] == event]
+        root, _ = _archive(
+            tmp_path, source="fixtures", observed_at=observed_at, payload=rows, event=event,
+            run_id=1, raw_dir=root,
+        )
+    return root
 
 
 def _generation(
@@ -200,7 +273,7 @@ def _generation(
     fetch_run_id: int | None,
     captured_at: str = GENERATION_CAPTURED,
     accepted: bool = True,
-    element_ids=(101, 102, 103),
+    element_ids=SYNTHETIC_POOL,
 ) -> int:
     return repo.record_bootstrap_generation(
         conn,
@@ -240,6 +313,8 @@ def _capture(
     source_identity: str | None = None,
     source_payload_sha256: str | None = None,
     archive_capture_id: str | None = None,
+    archive_root: object = None,
+    fetch_run_id: int | None = None,
     supersedes_capture_id: int | None = None,
     correction_reason: str | None = None,
     **extra,
@@ -283,6 +358,8 @@ def _capture(
         source_identity=source_identity,
         source_payload_sha256=source_payload_sha256,
         archive_capture_id=archive_capture_id,
+        archive_root=archive_root,
+        fetch_run_id=fetch_run_id,
         supersedes_capture_id=supersedes_capture_id,
         correction_reason=correction_reason,
     )
@@ -816,7 +893,8 @@ def test_21_newest_generation_cannot_replace_the_recorded_generation(tmp_path):
     recorded_first = ol.freeze_provenance(conn, certification.freeze_identity)["bootstrap_generation_id"]
     assert recorded_first is not None
     # A NEWER accepted generation arrives; the freeze's certificate must not move.
-    newer = _generation(conn, fetch_run_id=_fetch_run(conn), captured_at=_t(3), element_ids=(101, 102, 103, 104))
+    newer = _generation(conn, fetch_run_id=_fetch_run(conn), captured_at=_t(3),
+                        element_ids=(*SYNTHETIC_POOL, 61))
     assert int(newer) != int(recorded_first)
     assert repo.latest_accepted_bootstrap_generation(conn)["id"] == newer
     recorded_again = ol.freeze_provenance(conn, certification.freeze_identity)
@@ -860,13 +938,14 @@ def test_23_official_element_digest_is_retained_and_deterministic(tmp_path):
     first = _certified_freeze(conn)
     recorded = ol.freeze_provenance(conn, first.freeze_identity)
     retained = json.loads(recorded["bootstrap_element_ids_json"])
-    assert retained == [101, 102, 103]
+    assert retained == sorted(SYNTHETIC_POOL)
     assert retained == sorted(retained)
     assert element_id_sha256(retained) == recorded["bootstrap_element_ids_sha256"]
 
     # A second, independent generation over the SAME id set digests identically,
     # and the id set is order-insensitive by construction.
-    same = _generation(conn, fetch_run_id=_fetch_run(conn), captured_at=_t(10), element_ids=(103, 101, 102))
+    same = _generation(conn, fetch_run_id=_fetch_run(conn), captured_at=_t(10),
+                       element_ids=tuple(reversed(SYNTHETIC_POOL)))
     row = conn.execute("SELECT element_ids_sha256, element_ids_json FROM bootstrap_generations WHERE id=?",
                        (same,)).fetchone()
     assert row[0] == recorded["bootstrap_element_ids_sha256"]
@@ -1120,44 +1199,478 @@ def _ledger_from(conn, *, reverse: bool) -> tuple:
 
 
 def test_T_no_fake_backfill_without_an_archived_source(tmp_path):
-    """Theme 8: historical point-in-time history needs a proven archived source.
+    """Theme 8: historical point-in-time history needs a PROVEN archived source.
 
-    Absent that proof the honest answer is "unavailable", never a number
-    manufactured from today's current state.
+    Asserted identifiers are not proof.  The backfill must name the archive it
+    was read from, and the archive must hold that exact capture: the source, the
+    observation time, the fetch run and the payload digest must all agree, and
+    the archived bytes must still hash to the recorded digest.  Absent that proof
+    the honest answer is "unavailable", never a number manufactured from today's
+    current state.
+    """
+
+    from fpl_brain import raw_archive
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+
+    def _attempt(**overrides):
+        arguments = {
+            "player_id": DGW_PLAYER,
+            "fixture_id": FIXTURE_1,
+            "captured_at": _t(6),
+            "source_name": "archived_element_summary",
+            "source_identity": "element_summary",
+            "source_payload_sha256": "a" * 64,
+            "archive_capture_id": "capture-7",
+            "fetch_run_id": 7,
+            "backfill": True,
+        }
+        arguments.update(overrides)
+        return _capture(conn, **arguments)
+
+    # 1. no archive at all: the identifiers are asserted, so the capture is refused.
+    with pytest.raises(ol.BackfillEvidenceError, match="archive it was read from"):
+        _attempt()
+    # 2. no observation time: the real observable instant is missing.
+    with pytest.raises(ol.BackfillEvidenceError, match="actual observable time"):
+        _attempt(captured_at=None)
+
+    # 3. an archive that does not contain the claimed capture proves nothing.
+    root, record = _archive(
+        tmp_path, source="element_summary", observed_at=_t(6), payload={"history": []}, run_id=7,
+    )
+    with pytest.raises(ol.BackfillEvidenceError, match="not in the manifest"):
+        _attempt(archive_root=root)
+
+    # 4. a claimed digest that disagrees with the archived bytes is refused.
+    with pytest.raises(ol.BackfillEvidenceError, match="holds payload"):
+        _attempt(
+            archive_root=root,
+            archive_capture_id=record.capture_id,
+            source_payload_sha256="b" * 64,
+        )
+    # 5. a claimed source or observation time the archive contradicts is refused.
+    with pytest.raises(ol.BackfillEvidenceError, match="came from source"):
+        _attempt(
+            archive_root=root,
+            archive_capture_id=record.capture_id,
+            source_payload_sha256=record.payload_sha256,
+            source_identity="element_summary_v2",
+        )
+    with pytest.raises(ol.BackfillEvidenceError, match="was observed at"):
+        _attempt(
+            archive_root=root,
+            archive_capture_id=record.capture_id,
+            source_payload_sha256=record.payload_sha256,
+            captured_at=_t(6.5),
+        )
+    # 6. a fetch run the archive contradicts is refused.
+    with pytest.raises(ol.BackfillEvidenceError, match="records fetch run"):
+        _attempt(
+            archive_root=root,
+            archive_capture_id=record.capture_id,
+            source_payload_sha256=record.payload_sha256,
+            fetch_run_id=8,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 0
+
+    # 7. the SAME claim, backed by the archived blob, is admitted -- and it is the
+    #    archived evidence, not the caller's word, that made it admissible.
+    result = _attempt(
+        archive_root=root,
+        archive_capture_id=record.capture_id,
+        source_payload_sha256=record.payload_sha256,
+    )
+    assert result.inserted
+    stored = ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)[0]
+    assert stored["archive_capture_id"] == record.capture_id
+    assert stored["fetch_run_id"] == 7
+    assert json.loads(stored["backfill_evidence_json"])["archive_root"] == str(root)
+
+    # 8. once the archived bytes are gone, the same claim is refused again: the
+    #    archive record alone, with no intact blob, is not evidence.
+    blob = Path(root) / raw_archive.ARCHIVE_DIRNAME / record.relative_path
+    body = blob.read_bytes()
+    blob.unlink()
+    try:
+        with pytest.raises(ol.BackfillEvidenceError, match="no longer matches its recorded digest"):
+            _attempt(
+                player_id=SGW_B_PLAYER,
+                archive_root=root,
+                archive_capture_id=record.capture_id,
+                source_payload_sha256=record.payload_sha256,
+            )
+    finally:
+        blob.write_bytes(body)
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Hardening cases the review demonstrated
+# ---------------------------------------------------------------------------
+
+
+def test_H1_a_certified_freeze_refuses_new_frozen_predictions(tmp_path):
+    """The certified artifact is closed: no prediction may be added to it."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    certification = _certified_freeze(conn, values={DGW_PLAYER: 6.0})
+    run_id = certification.projection_run_ids[0]
+    before = conn.execute(
+        "SELECT COUNT(*) FROM frozen_predictions WHERE projection_run_id=?", (run_id,)
+    ).fetchone()[0]
+    with pytest.raises(sqlite3.IntegrityError, match="closed to new frozen predictions"):
+        analytics.freeze_prediction(
+            conn,
+            run_id,
+            kind=KIND_POINTS,
+            player_id=SGW_A_PLAYER,
+            event=EVENT,
+            payload={"value": 1.0},
+            model_version=analytics.BASELINE_MODEL_VERSION,
+        )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM frozen_predictions WHERE projection_run_id=?", (run_id,)
+    ).fetchone()[0] == before
+    conn.close()
+
+
+def test_H2_a_running_run_cannot_be_certified(tmp_path):
+    """An open run's frozen set can still grow, so it is not a closed artifact."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    running = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": fetch}}, finish=False,
+    )
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[running], bootstrap_generation_id=generation
+    )
+    assert certification.provenance_state == ol.NOT_CERTIFIABLE
+    assert any("not complete" in reason for reason in certification.reasons)
+    assert ol.freeze_provenance(conn, certification.freeze_identity) is not None
+    conn.close()
+
+
+def test_H3_a_ledger_verifies_the_certified_artifact_digest(tmp_path):
+    """Building a ledger re-derives the artifact digest instead of trusting it."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    certification = _certified_freeze(conn, values={DGW_PLAYER: 6.0})
+    ledger = ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    assert ledger.artifact_verified is True
+    assert ledger.prediction_artifact_sha256 == certification.prediction_artifact_sha256
+
+    # A store whose runs grew AFTER certification: reachable on a database
+    # written before the m017 trigger existed, so the trigger is dropped here to
+    # demonstrate exactly that case.
+    conn.execute("DROP TRIGGER frozen_predictions_no_insert_after_certification")
+    analytics.freeze_prediction(
+        conn,
+        certification.projection_run_ids[0],
+        kind=KIND_POINTS,
+        player_id=SGW_A_PLAYER,
+        event=EVENT,
+        payload={"value": 9.0},
+        model_version=analytics.BASELINE_MODEL_VERSION,
+    )
+    with pytest.raises(ol.OutcomeLedgerError, match="changed after certification"):
+        ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    conn.close()
+
+
+def test_H4_an_explicit_fetch_that_contradicts_every_run_is_rejected(tmp_path):
+    """A fetch the runs contradict is not this freeze's provenance."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    recorded = _fetch_run(conn)
+    declared = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=declared)
+    run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": recorded}},
+    )
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[run], bootstrap_generation_id=generation,
+        official_fetch_run_id=declared,
+    )
+    assert certification.provenance_state == ol.NOT_CERTIFIABLE
+    assert any("disagrees with every run's persisted provenance" in r for r in certification.reasons)
+    assert certification.official_fetch_run_id is None
+    # The same generation certifies when the declared fetch IS the recorded one.
+    again = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": declared}},
+    )
+    accepted = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[again], bootstrap_generation_id=generation,
+        official_fetch_run_id=declared,
+    )
+    assert accepted.provenance_state == ol.GENERATION_CERTIFIED, accepted.reasons
+    conn.close()
+
+
+def test_H5_one_run_per_model_family_is_enforced(tmp_path):
+    """Two runs of one family make two claims about one key, so they cannot certify."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    first = _freeze(
+        conn, family=FAMILY_POINTS, version="baseline_v1.0.0", kind=KIND_POINTS,
+        values={DGW_PLAYER: 6.0}, official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    second = _freeze(
+        conn, family=FAMILY_POINTS, version="baseline_v1.1.0", kind=KIND_POINTS,
+        values={SGW_A_PLAYER: 3.0}, official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[first, second], bootstrap_generation_id=generation
+    )
+    assert certification.provenance_state == ol.NOT_CERTIFIABLE
+    assert any("same model family twice" in reason for reason in certification.reasons)
+    conn.close()
+
+
+def test_H6_every_distinct_prediction_is_retained(tmp_path):
+    """Two families freezing the same kind are two claims, not one overwritten key."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    runs = [
+        _freeze(
+            conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+            kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+            official_run_ids={"fetch": {"run_id": fetch}},
+        ),
+        _freeze(
+            conn, family="xpts_v1", version="xpts_v1.0.0", kind=KIND_POINTS,
+            values={DGW_PLAYER: 4.0}, official_run_ids={"fetch": {"run_id": fetch}},
+        ),
+    ]
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=runs, bootstrap_generation_id=generation
+    )
+    assert certification.provenance_state == ol.GENERATION_CERTIFIED, certification.reasons
+    _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_1)
+    _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_2, total_points=3)
+    ledger = ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    rows = [row for row in ledger.rows if row["player_id"] == DGW_PLAYER]
+    assert len(rows) == 2
+    assert {row["model_family"] for row in rows} == {FAMILY_POINTS, "xpts_v1"}
+    assert {row["frozen_predicted_value"] for row in rows} == {6.0, 4.0}
+    assert all(row["evaluation_state"] == ol.EVALUATED for row in rows)
+    conn.close()
+
+
+def test_H7_certification_does_not_commit_the_callers_transaction(tmp_path):
+    """The connection's transaction belongs to the caller, not to a certificate."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    assert conn.in_transaction, "the caller's own work is in flight"
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[run], bootstrap_generation_id=generation
+    )
+    assert certification.provenance_state == ol.GENERATION_CERTIFIED
+    assert conn.in_transaction, "certification must not close the caller's transaction"
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_runs").fetchone()[0] == 1
+    # Rolling the caller's transaction back discards the certificate with it: had
+    # certification committed, this row would survive as an orphan.
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_provenance").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_runs").fetchone()[0] == 0
+    conn.close()
+
+
+def test_H8_an_explicitly_provisional_capture_is_never_promoted(tmp_path):
+    """A capture that says PROVISIONAL stays provisional, whatever arrived since."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    certification = _certified_freeze(conn, values={SGW_B_PLAYER: 5.0})
+    result = ol.capture_observation(
+        conn,
+        grain=ol.GRAIN_PLAYER_FIXTURE,
+        event=EVENT,
+        player_id=SGW_B_PLAYER,
+        fixture_id=FIXTURE_1,
+        fields={"minutes": 90, "starts": 1, "total_points": 6, "bonus": 1, "bps": 30},
+        source_name="event_live_pre_review",
+        captured_at=CAPTURE_1,
+        observation_state=ol.OBSERVATION_PROVISIONAL,
+    )
+    assert result.observation_state == ol.OBSERVATION_PROVISIONAL
+    stored = ol.observation_captures(conn, event=EVENT, player_id=SGW_B_PLAYER)[0]
+    # The event IS officially final and the capture time is after finalisation...
+    assert ol.event_finality(conn, EVENT) == planning.EVENT_STATE_FINAL
+    assert stored["official_final_at"] is None
+    # ...and it is STILL provisional, so it cannot enter final evaluation.
+    assert stored["observation_state"] == ol.OBSERVATION_PROVISIONAL
+    ledger = ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    row = next(entry for entry in ledger.rows if entry["player_id"] == SGW_B_PLAYER)
+    assert row["exclusion_reason"] == ol.OUTCOME_NOT_FINALISED
+    assert row["evaluation_state"] == ol.EXCLUDED
+    assert row["observation_state"] == ol.OBSERVATION_PROVISIONAL
+    conn.close()
+
+
+def test_H12_a_ledger_refuses_a_run_that_is_no_longer_complete(tmp_path):
+    """A reopenable run is not a closed artifact, so its ledger is refused too."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    certification = _certified_freeze(conn, values={DGW_PLAYER: 6.0})
+    run_id = certification.projection_run_ids[0]
+    # A store that recorded a certificate while its run was still open -- only
+    # reachable before m006/m017, so the completed-run lock is dropped here to
+    # show the case the ledger must refuse rather than read.
+    conn.execute("DROP TRIGGER projection_runs_completed_immutable")
+    conn.execute("UPDATE projection_runs SET status='running' WHERE id=?", (run_id,))
+    with pytest.raises(ol.OutcomeLedgerError, match="not complete"):
+        ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    conn.close()
+
+
+def test_H9_a_historical_read_resolves_from_pinned_evidence(tmp_path):
+    """Pool, club, fixtures and finality at a cutoff come from pinned evidence.
+
+    The demonstrated case: a ledger read at a cutoff, then the mutable tables
+    move on -- a fixture is un-finished, an event is un-finalised, a player is
+    deactivated and transferred, a placeholder row appears.  The same historical
+    read must be byte-identical afterwards, and must not have seen any of it.
     """
 
     conn = connect_database(tmp_path / "fpl.db")
     _world(conn)
-    with pytest.raises(ol.BackfillEvidenceError):
-        _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_1, captured_at=_t(6), backfill=True)
-    assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 0
-    # With the archive proof present the same capture is admitted...
-    result = _capture(
-        conn,
-        player_id=DGW_PLAYER,
-        fixture_id=FIXTURE_1,
-        captured_at=_t(6),
-        source_name="archived_player_gameweeks",
-        source_identity="fetch:7:player_gameweeks",
-        source_payload_sha256="a" * 64,
-        archive_capture_id="capture-7",
-        backfill=True,
+    certification = _certified_freeze(conn, values={DGW_PLAYER: 6.0, BLANK_PLAYER: 4.0})
+    _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_1, captured_at=CAPTURE_1, minutes=90,
+             total_points=6, bonus=1, bps=30)
+    _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_2, captured_at=CAPTURE_1, minutes=62,
+             total_points=3, bonus=0, bps=19)
+    archive = _archive_world(tmp_path, observed_at=AS_OF)
+
+    before = ol.build_reality_ledger(
+        conn, freeze_identity=certification.freeze_identity, as_of=AS_OF, archive_root=archive
     )
-    assert result.inserted
-    # ...while a capture claiming no observable time at all is still refused.
-    with pytest.raises(ol.BackfillEvidenceError):
-        _capture(
-            conn,
-            player_id=DGW_PLAYER,
-            fixture_id=FIXTURE_2,
-            captured_at=None,
-            source_name="archived_player_gameweeks",
-            source_identity="fetch:7:player_gameweeks",
-            source_payload_sha256="b" * 64,
-            archive_capture_id="capture-8",
-            backfill=True,
-        )
+    assert before.world_source == ol.WORLD_PINNED
+    assert before.world_unavailable == ()
+    scored = next(row for row in before.rows if row["player_id"] == DGW_PLAYER)
+    assert scored["evaluation_state"] == ol.EVALUATED
+    assert scored["official_outcome"]["total_points"] == 9
+    assert scored["team_id"] == TEAM_A
+
+    # Everything the mutable tables can get wrong about that instant, moved on.
+    conn.execute("UPDATE fixtures SET finished=0, started=0 WHERE id IN (?,?)",
+                 (FIXTURE_1, FIXTURE_2))
+    conn.execute("UPDATE events SET finished=0, data_checked=0 WHERE id=?", (EVENT,))
+    conn.execute("UPDATE players SET is_active=0, team_id=? WHERE id=?", (TEAM_C, DGW_PLAYER))
+    conn.execute(
+        """INSERT INTO player_gameweeks(player_id, event, fixture_id, minutes, source, raw_json, updated_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (DGW_PLAYER, EVENT, FIXTURE_1, 0, "element_summary", "{}", _t(1)),
+    )
+
+    after = ol.build_reality_ledger(
+        conn, freeze_identity=certification.freeze_identity, as_of=AS_OF, archive_root=archive
+    )
+    assert after.rows == before.rows
+    assert after.ledger_digest == before.ledger_digest
+    assert after.population_digest == before.population_digest
+    assert after.world_source == ol.WORLD_PINNED
+    # The read is not merely stable: it never saw the mutations.
+    scored_after = next(row for row in after.rows if row["player_id"] == DGW_PLAYER)
+    assert scored_after["evaluation_state"] == ol.EVALUATED
+    assert scored_after["team_id"] == TEAM_A
+    assert scored_after["world_evidence"] != []
+    blank = next(row for row in after.rows if row["player_id"] == BLANK_PLAYER)
+    assert blank["outcome_state"] == "BLANK"
+
+    # The control: the SAME store read at "now" is a different, current-state
+    # ledger, which is what makes the pinned read above meaningful rather than
+    # an artefact of the mutations being invisible.
+    current = ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    assert current.world_source == ol.WORLD_CURRENT
+    current_row = next(row for row in current.rows if row["player_id"] == DGW_PLAYER)
+    assert current_row["evaluation_state"] == ol.EXCLUDED
+    assert current_row["exclusion_reason"] in {
+        ol.TARGET_FIXTURE_NOT_PLAYED, ol.OUTCOME_NOT_FINALISED, ol.PLAYER_NOT_IN_OFFICIAL_POOL,
+    }
     conn.close()
+
+
+def test_H10_a_historical_read_without_pinned_evidence_is_unavailable(tmp_path):
+    """No archive at the cutoff means unavailable, never today's value."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    certification = _certified_freeze(conn, values={DGW_PLAYER: 6.0})
+    _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_1, captured_at=CAPTURE_1)
+    _capture(conn, player_id=DGW_PLAYER, fixture_id=FIXTURE_2, captured_at=CAPTURE_1, total_points=3)
+
+    historical = ol.build_reality_ledger(
+        conn, freeze_identity=certification.freeze_identity, as_of=AS_OF
+    )
+    # The fixtures ARE finished today, and the event IS final today; neither is
+    # evidence about the cutoff, so the read reports the gap instead of a number.
+    assert ol.event_finality(conn, EVENT) == planning.EVENT_STATE_FINAL
+    assert historical.world_source == ol.WORLD_UNAVAILABLE
+    assert historical.world_unavailable
+    assert {row["exclusion_reason"] for row in historical.rows} == {ol.INPUT_EVIDENCE_UNAVAILABLE}
+    assert all(row["official_outcome"] is None for row in historical.rows)
+    assert historical.evaluated() == ()
+
+    # The present-tense read is the one that may answer from the live tables.
+    current = ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    assert current.world_source == ol.WORLD_CURRENT
+    assert current.evaluated()
+    conn.close()
+
+
+def test_H11_the_reads_finality_rule_is_the_canonical_rule(tmp_path):
+    """The pinned resolution applies the accepted definition, not a second one."""
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    certification = _certified_freeze(conn, values={DGW_PLAYER: 6.0})
+    provenance = ol.freeze_provenance(conn, certification.freeze_identity)
+    assert provenance is not None
+    events = (EVENT, EVENT_PARTIAL, OTHER_EVENT)
+    world = ol.resolve_world_evidence(conn, provenance=provenance, as_of=None, events=events)
+    for event in events:
+        assert world.event_state(event) == planning.event_data_state(conn, event)[0]
+    # ...and the same rule applied to pinned rows reports the pinned state.
+    archive = _archive_world(
+        tmp_path,
+        observed_at=AS_OF,
+        event_rows=[{"id": EVENT, "finished": 0, "data_checked": 0}],
+    )
+    pinned = ol.resolve_world_evidence(
+        conn, provenance=provenance, as_of=AS_OF, archive_root=archive, events=[EVENT]
+    )
+    assert pinned.event_state(EVENT) == planning.EVENT_STATE_PROVISIONAL
+    conn.close()
+
 
 
 def test_T_pe1_causal_boundary_is_reused_and_not_weakened(tmp_path):

@@ -44,7 +44,21 @@ REUSE, NOT REINVENTION
 * the scheduled-placeholder signature is ``repositories``' single definition;
 * the evaluation reason codes are :mod:`fpl_brain.walk_forward`'s canonical
   vocabulary, so a ledger exclusion and a scoreboard exclusion mean the same
-  thing.
+  thing;
+* the event-finality rule is :mod:`fpl_brain.planning`'s; what changes is which
+  evidence answers it, never the rule.
+
+PINNED EVIDENCE, NOT CURRENT TABLES
+-----------------------------------
+``players``, ``fixtures``, ``events`` and ``player_gameweeks`` are refreshed in
+place, so they describe NOW and nothing else.  A read that names a cutoff
+therefore resolves the pool, the clubs, the fixtures and the event finality from
+pinned or versioned evidence -- the generation the freeze proved, the accepted
+generation observable at that cutoff, and the raw archive's verified captures --
+and when that evidence does not exist it says so.  Substituting today's row for a
+past instant is the same mistake as substituting zero for a missing outcome, one
+table over.  A read that claims no cutoff is the present-tense read and may
+answer from the live tables, which it then records as its evidence source.
 
 WHAT THIS MODULE DOES NOT DO
 ----------------------------
@@ -61,8 +75,10 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from . import planning as planning_state
 from . import repositories as repo
 from .ingest_provenance import element_id_sha256
 from .utils import parse_utc, utc_now
@@ -357,19 +373,24 @@ def capture_digest_for(
 def _assert_backfill_evidence(
     *,
     backfill: bool,
+    archive_root: Any,
     captured_at: str | None,
     source_identity: str | None,
     source_payload_sha256: str | None,
     archive_capture_id: str | None,
+    fetch_run_id: int | None,
 ) -> None:
     """No fake backfill: point-in-time history needs a proven archived source.
 
-    The rule is deliberately narrow.  A capture made now needs nothing beyond
-    its own provenance; a capture that claims a PAST observation time must name
-    the archived source it was read from -- exact payload identity, the real
-    capture identity, and the actual observable time.  Without all three the
-    historical evidence is simply unavailable, and "unavailable" is the honest
-    answer rather than a number manufactured from current state.
+    The rule is deliberately narrow, and asserted identifiers are not proof.
+    A capture made now needs nothing beyond its own provenance; a capture that
+    claims a PAST observation time must name the archived source it was read
+    from -- exact payload identity, the real capture/fetch identity, and the
+    actual observable time -- AND that source must be present in the archive
+    with those bytes, which is checked in
+    :func:`_verify_archive_capture`.  Without the archive itself the historical
+    evidence is simply unavailable, and "unavailable" is the honest answer
+    rather than a number manufactured from current state.
     """
 
     if not backfill:
@@ -377,12 +398,14 @@ def _assert_backfill_evidence(
     missing = [
         label
         for label, value in (
+            ("the archive it was read from (archive_root)", archive_root),
             ("captured_at (the actual observable time)", captured_at),
             ("source_identity", source_identity),
             ("source_payload_sha256", source_payload_sha256),
             ("archive_capture_id", archive_capture_id),
+            ("fetch_run_id (the real capture identity)", fetch_run_id),
         )
-        if not str(value or "").strip()
+        if value is None or not str(value).strip()
     ]
     if missing:
         raise BackfillEvidenceError(
@@ -396,24 +419,54 @@ def _verify_archive_capture(
     *,
     archive_capture_id: str,
     source_payload_sha256: str,
+    source_identity: str,
+    captured_at: str,
+    fetch_run_id: int,
 ) -> None:
-    """Confirm the named capture really is in the archive, with that payload."""
+    """Confirm the named capture really is in the archive, with those bytes.
+
+    The manifest record is the identity: its source, its observation time, its
+    payload digest and its blob must all agree with what the caller asserted.
+    A digest that matches while the blob does not hash to it is refused, and an
+    identifier that is merely asserted -- present in the arguments but absent
+    from the archive -- proves nothing, so it is refused too.
+    """
 
     from . import raw_archive
 
     records = {str(item.get("capture_id")): item for item in raw_archive.load_manifest(archive_root)}
     record = records.get(str(archive_capture_id))
     if record is None:
-        raise BackfillEvidenceError(f"archive capture {archive_capture_id!r} is not in the manifest")
+        raise BackfillEvidenceError(
+            f"archive capture {archive_capture_id!r} is not in the manifest; an asserted identifier is "
+            "not archived evidence"
+        )
     recorded = str(record.get("payload_sha256") or "")
     if recorded != str(source_payload_sha256):
         raise BackfillEvidenceError(
             f"archive capture {archive_capture_id!r} holds payload {recorded[:12]!r}, "
             f"not the claimed {str(source_payload_sha256)[:12]!r}"
         )
+    if str(record.get("source") or "") != str(source_identity):
+        raise BackfillEvidenceError(
+            f"archive capture {archive_capture_id!r} came from source {str(record.get('source'))!r}, "
+            f"not the claimed {str(source_identity)!r}"
+        )
+    if str(record.get("observed_at") or "") != str(captured_at):
+        raise BackfillEvidenceError(
+            f"archive capture {archive_capture_id!r} was observed at {str(record.get('observed_at'))!r}, "
+            f"not the claimed observation time {str(captured_at)!r}"
+        )
+    recorded_run = record.get("run_id")
+    if recorded_run is None or str(recorded_run) != str(int(fetch_run_id)):
+        raise BackfillEvidenceError(
+            f"archive capture {archive_capture_id!r} records fetch run {recorded_run!r}, "
+            f"not the claimed {int(fetch_run_id)}"
+        )
     if not raw_archive.verify_archived_blob(archive_root, record):
         raise BackfillEvidenceError(
-            f"archive capture {archive_capture_id!r} no longer matches its recorded digest"
+            f"archive capture {archive_capture_id!r} no longer matches its recorded digest; the archived "
+            "blob is required to prove the observation, so a claim with no intact bytes is refused"
         )
 
 
@@ -450,6 +503,8 @@ def capture_observation(
     * a capture may not claim ``FINAL`` before the event is officially final;
     * a capture that reads an event whose official finality is not yet
       observable is downgraded to ``PROVISIONAL`` and stays provisional;
+    * an explicitly ``PROVISIONAL`` capture is never promoted, whatever the
+      event's finality looks like by the time the row is written;
     * a claimed past observation time requires the archived source that proves it.
     """
 
@@ -495,17 +550,24 @@ def capture_observation(
 
     _assert_backfill_evidence(
         backfill=backfill,
+        archive_root=archive_root,
         captured_at=captured_at,
         source_identity=source_identity,
         source_payload_sha256=source_payload_sha256,
         archive_capture_id=archive_capture_id,
+        fetch_run_id=fetch_run_id,
     )
-    if backfill and archive_root is not None:
+    if backfill:
+        # An asserted identifier is not evidence: the archived blob itself must be
+        # present and must still hash to the claimed digest.
         _verify_archive_capture(
             conn,
             archive_root,
             archive_capture_id=str(archive_capture_id),
             source_payload_sha256=str(source_payload_sha256),
+            source_identity=str(source_identity),
+            captured_at=str(captured_at),
+            fetch_run_id=int(fetch_run_id),
         )
 
     moment = str(captured_at).strip() if captured_at else utc_now()
@@ -613,6 +675,13 @@ def _resolve_observation_state(
 
     if requested is not None and str(requested) not in (OBSERVATION_FINAL, OBSERVATION_PROVISIONAL):
         raise OutcomeLedgerError(f"unknown observation state {requested!r}")
+    if requested == OBSERVATION_PROVISIONAL:
+        # The caller's own statement about what it read is evidence too.  A
+        # capture that says "provisional" is NEVER promoted later by the arrival
+        # of an official finality it did not observe: that silent upgrade is
+        # exactly the false finality this module exists to refuse.  A later,
+        # genuinely final read is a NEW observation, not a rewrite of this one.
+        return OBSERVATION_PROVISIONAL
     if str(event_finality) != "FINAL":
         if requested == OBSERVATION_FINAL:
             raise OutcomeLedgerError(
@@ -842,10 +911,13 @@ def _declared_official_fetch_run_id(
     freeze's fetch identity is read out of it rather than invented.  Runs that
     name DIFFERENT fetches leave the freeze with no single recorded identity --
     one is not chosen for them, because doing so would manufacture agreement.
+
+    An explicitly supplied fetch identity is checked against that channel rather
+    than trusted: a fetch that disagrees with EVERY run's persisted provenance is
+    not evidence about this freeze, and accepting it would let a caller attach a
+    provenance the runs themselves contradict.
     """
 
-    if explicit is not None:
-        return int(explicit), None
     seen: set[int] = set()
     for run in runs:
         raw = run.get("official_run_ids")
@@ -858,6 +930,17 @@ def _declared_official_fetch_run_id(
         fetch = payload.get("fetch") if isinstance(payload, Mapping) else None
         if isinstance(fetch, Mapping) and fetch.get("run_id") is not None:
             seen.add(int(fetch["run_id"]))
+    if explicit is not None:
+        if seen and int(explicit) not in seen:
+            return None, (
+                f"the declared official fetch run {int(explicit)} disagrees with every run's persisted "
+                f"provenance ({sorted(seen)}); a fetch the runs contradict is not their provenance"
+            )
+        if len(seen) > 1:
+            # Agreeing with ONE of several recorded fetches is not a single
+            # recorded identity, and choosing one would manufacture agreement.
+            return None, f"the freeze's runs record different official fetch runs: {sorted(seen)}"
+        return int(explicit), None
     if len(seen) == 1:
         return seen.pop(), None
     if len(seen) > 1:
@@ -925,6 +1008,16 @@ def certify_prediction_freeze(
     6. the official element-set identity and digest are retained and the digest
        recomputes from the retained id set.
 
+    Two properties of the RUNS themselves are required as well, because a
+    certificate describes a closed artifact:
+
+    * every referenced run is ``complete``.  A ``running`` run's frozen set can
+      still grow, so certifying it would certify a prediction artifact that is
+      not yet what it will be;
+    * at most one run per model family.  One family makes one claim per key, so
+      two runs of the same family cannot both belong to one freeze, and the
+      contract's ledger resolves a key's claims per family.
+
     Missing, malformed or disagreeing provenance is NOT CERTIFIABLE.  A freeze
     that declares no generation and no official fetch at all is honestly
     LEGACY_PROVENANCE: pre-PE-5 runs are never rewritten to manufacture
@@ -952,9 +1045,19 @@ def certify_prediction_freeze(
         reasons.append(f"the freeze's runs disagree on the planning event: {events}")
     if len(cutoffs) > 1:
         reasons.append(f"the freeze's runs disagree on the data cutoff: {cutoffs}")
-    families = sorted((str(run["model_family"]), str(run["model_version"])) for run in runs)
-    if len(set(families)) != len(families):
-        reasons.append(f"the freeze names the same model family twice: {families}")
+    incomplete = sorted(str(int(run["id"])) for run in runs if str(run.get("status")) != "complete")
+    if incomplete:
+        reasons.append(
+            f"projection run(s) {incomplete} are not complete; a run that is still running can add frozen "
+            "predictions, so its artifact is not yet the artifact a certificate would describe"
+        )
+    families = [str(run["model_family"]) for run in runs]
+    duplicated = sorted({family for family in families if families.count(family) > 1})
+    if duplicated:
+        reasons.append(
+            f"the freeze names the same model family twice: {duplicated}; one model family makes one claim "
+            "per key, so a second run of it cannot belong to the same freeze"
+        )
 
     planning_event = events[0] if len(events) == 1 else min(events)
     planning_cutoff = cutoffs[0] if len(cutoffs) == 1 else ""
@@ -1150,11 +1253,13 @@ def _record_freeze(
             for run in sorted(runs, key=lambda item: int(item["id"]))
         ]
     )
-    # The provenance row and its run membership are ONE fact.  Written
-    # together because both tables refuse UPDATE and DELETE: a half-written
-    # certificate could never be completed, and a freeze whose certificate
-    # cannot be finished is worse than a freeze with none.
-    with conn:
+    # The provenance row and its run membership are ONE fact, so they are written
+    # under one savepoint: both tables refuse UPDATE and DELETE, and a
+    # half-written certificate could never be completed.  A SAVEPOINT, not a
+    # transaction: the connection's transaction belongs to the CALLER, and
+    # committing it here would publish whatever else the caller had in flight.
+    conn.execute("SAVEPOINT pe5_record_freeze")
+    try:
         cursor = conn.execute(
             """INSERT INTO prediction_freeze_provenance(
                  freeze_identity, provenance_state, planning_event, planning_cutoff,
@@ -1204,6 +1309,11 @@ def _record_freeze(
                     None if run.get("random_seed") is None else int(run["random_seed"]),
                 ),
             )
+    except BaseException:
+        conn.execute("ROLLBACK TO pe5_record_freeze")
+        conn.execute("RELEASE pe5_record_freeze")
+        raise
+    conn.execute("RELEASE pe5_record_freeze")
 
     return FreezeCertification(
         freeze_identity=freeze_identity,
@@ -1266,6 +1376,379 @@ def _freeze_identity_of(conn: sqlite3.Connection, freeze_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The football world a read is resolved against
+# ---------------------------------------------------------------------------
+
+#: How a ledger resolved the pool, the clubs, the fixtures and the event
+#: finality.  ``PINNED_EVIDENCE`` means every one of them came from versioned or
+#: immutable evidence (the freeze's certified generation, the accepted
+#: generation observable at the read, the raw archive).  ``CURRENT_STATE`` means
+#: at least one of them came from a table that is refreshed in place, which a
+#: read may only do when it claims no cutoff.  ``UNAVAILABLE`` means the pinned
+#: evidence a historical read needs does not exist, and the honest answer is
+#: that the evidence is unavailable rather than the current value of a mutable
+#: table.
+WORLD_PINNED = "PINNED_EVIDENCE"
+WORLD_CURRENT = "CURRENT_STATE"
+WORLD_UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class WorldEvidence:
+    """The football world a ledger read was resolved against, and from where."""
+
+    source: str
+    as_of: str | None
+    moment: str
+    pool_ids: frozenset[int] | None
+    pool_basis: str
+    clubs: Mapping[int, int]
+    fixtures: Mapping[int, Mapping[str, Any]]
+    fixture_events: frozenset[int]
+    event_rows: Mapping[int, Mapping[str, Any]]
+    evidence: tuple[str, ...]
+    unavailable: tuple[str, ...]
+
+    @property
+    def historical(self) -> bool:
+        return self.as_of is not None
+
+    def club_of(self, player_id: int) -> int | None:
+        value = self.clubs.get(int(player_id))
+        return None if value is None else int(value)
+
+    def fixtures_of(self, event: int) -> tuple[int, ...] | None:
+        """The event's fixtures, or ``None`` when that schedule is unavailable."""
+
+        if int(event) not in self.fixture_events:
+            return None
+        return tuple(
+            sorted(
+                int(fixture_id)
+                for fixture_id, row in self.fixtures.items()
+                if int(row.get("event") or 0) == int(event)
+            )
+        )
+
+    def fixture_row(self, fixture_id: int) -> Mapping[str, Any] | None:
+        return self.fixtures.get(int(fixture_id))
+
+    def event_state(self, event: int) -> str:
+        """The canonical finality, applied to THIS read's evidence.
+
+        The rule is :func:`fpl_brain.planning.event_data_state`'s, unchanged --
+        ``finished`` and ``data_checked`` on the event, plus the fixtures' own
+        finished/started counts -- but the rows it is applied to are the pinned
+        ones when the read has them.  A second policy is not invented here; the
+        only difference is which evidence answers.
+        """
+
+        row = self.event_rows.get(int(event))
+        if row is None:
+            return planning_state.EVENT_STATE_UNKNOWN
+        fixtures = [
+            item for item in self.fixtures.values() if int(item.get("event") or 0) == int(event)
+        ]
+        finished = row.get("finished")
+        data_checked = row.get("data_checked")
+        if finished == 1 and data_checked == 1:
+            return planning_state.EVENT_STATE_FINAL
+        if any(int(item.get("started") or 0) == 1 and item.get("finished") != 1 for item in fixtures):
+            return planning_state.EVENT_STATE_IN_PROGRESS
+        if fixtures and all(item.get("finished") == 1 for item in fixtures):
+            return planning_state.EVENT_STATE_PROVISIONAL
+        return planning_state.EVENT_STATE_SCHEDULED
+
+
+def _archive_records(archive_root: Any, *, moment: str) -> list[dict[str, Any]]:
+    """Every archived capture observable at or before ``moment``."""
+
+    from . import raw_archive
+
+    records = [
+        dict(record)
+        for record in raw_archive.load_manifest(archive_root)
+        if _observed_at_or_before(str(record.get("observed_at") or ""), moment)
+    ]
+    records.sort(key=lambda item: (str(item.get("observed_at") or ""), str(item.get("capture_id") or "")))
+    return records
+
+
+def _observed_at_or_before(observed_at: str, moment: str) -> bool:
+    left, right = parse_utc(observed_at), parse_utc(moment)
+    if left is not None and right is not None:
+        return left <= right
+    return str(observed_at) <= str(moment)
+
+
+def _archive_record_for(
+    records: Sequence[Mapping[str, Any]], source: str, *, event: int | None = None
+) -> Mapping[str, Any] | None:
+    """The latest archived capture of ``source`` at/before the moment, for the event."""
+
+    matching = [
+        record
+        for record in records
+        if str(record.get("source")) == str(source)
+        and (event is None or record.get("event") is None or int(record["event"]) == int(event))
+    ]
+    if not matching:
+        return None
+    return max(matching, key=lambda item: (str(item.get("observed_at") or ""), str(item.get("capture_id") or "")))
+
+
+def _archived_payload(archive_root: Any, record: Mapping[str, Any]) -> Any | None:
+    """The archived bytes, verified against their recorded digest before use.
+
+    An archive record whose blob is missing or no longer hashes to its recorded
+    digest is not evidence, so it resolves to ``None`` (unavailable) rather than
+    being parsed as if the bytes were intact.
+    """
+
+    from . import raw_archive
+
+    if not raw_archive.verify_archived_blob(archive_root, record):
+        return None
+    root = Path(str(archive_root))
+    base = root if root.name == raw_archive.ARCHIVE_DIRNAME else root / raw_archive.ARCHIVE_DIRNAME
+    try:
+        return json.loads((base / str(record["relative_path"])).read_bytes())
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _pinned_items(payload: Any, key: str) -> list[Any]:
+    """The named array from an archived payload, in either documented shape."""
+
+    if isinstance(payload, Mapping):
+        value = payload.get(key)
+        return list(value) if isinstance(value, list) else []
+    if key == "fixtures" and isinstance(payload, list):
+        return list(payload)
+    return []
+
+
+def _pinned_evidence(
+    archive_root: Any, *, moment: str, events: Sequence[int]
+) -> dict[str, Any]:
+    """The pinned world from the raw archive: pool, clubs, fixtures, finality."""
+
+    records = _archive_records(archive_root, moment=moment)
+    pooled: dict[str, Any] = {
+        "elements": {},
+        "event_rows": {},
+        "fixtures": {},
+        "fixture_events": set(),
+        "evidence": [],
+        "unavailable": [],
+    }
+    bootstrap = _archive_record_for(records, "bootstrap_static")
+    if bootstrap is None:
+        pooled["unavailable"].append(
+            f"no archived bootstrap_static capture at or before {moment}: the official pool and the "
+            "official club membership are unavailable as of that instant"
+        )
+    else:
+        payload = _archived_payload(archive_root, bootstrap)
+        if payload is None:
+            pooled["unavailable"].append(
+                f"archived bootstrap_static capture {bootstrap.get('capture_id')} has no intact bytes, "
+                "so it is not evidence"
+            )
+        else:
+            for element in _pinned_items(payload, "elements"):
+                if isinstance(element, Mapping) and element.get("id") is not None:
+                    pooled["elements"][int(element["id"])] = dict(element)
+            for row in _pinned_items(payload, "events"):
+                if isinstance(row, Mapping) and row.get("id") is not None:
+                    pooled["event_rows"][int(row["id"])] = dict(row)
+            pooled["evidence"].append(str(bootstrap.get("capture_id")))
+    for event in sorted({int(value) for value in events}):
+        record = _archive_record_for(records, "fixtures", event=event)
+        if record is None:
+            pooled["unavailable"].append(
+                f"no archived fixtures capture at or before {moment} for event {event}: the fixture "
+                "schedule is unavailable as of that instant"
+            )
+            continue
+        payload = _archived_payload(archive_root, record)
+        if payload is None:
+            pooled["unavailable"].append(
+                f"archived fixtures capture {record.get('capture_id')} has no intact bytes, so it is "
+                "not evidence"
+            )
+            continue
+        rows = [
+            dict(row)
+            for row in _pinned_items(payload, "fixtures")
+            if isinstance(row, Mapping) and row.get("id") is not None
+        ]
+        for row in rows:
+            if int(row.get("event") or 0) == int(event):
+                pooled["fixtures"][int(row["id"])] = row
+        pooled["fixture_events"].add(int(event))
+        pooled["evidence"].append(str(record.get("capture_id")))
+    return pooled
+
+
+def resolve_world_evidence(
+    conn: sqlite3.Connection,
+    *,
+    provenance: Mapping[str, Any],
+    as_of: str | None = None,
+    archive_root: Any = None,
+    events: Sequence[int] = (),
+) -> WorldEvidence:
+    """Resolve pool, club, fixtures and event finality for one ledger read.
+
+    Three rules, in order:
+
+    1. **Pinned first.**  The freeze's certified generation is pinned ON the
+       freeze, so it always wins for the pool; an accepted generation observable
+       at the read's moment is pinned by its own capture time; and the raw
+       archive supplies the pool, the clubs, the fixtures and the events as they
+       were at or before the read's moment.
+    2. **Mutable tables only for a read that claims no cutoff.**  ``as_of=None``
+       asks "what is true now", and now is exactly what those tables hold.  A
+       read that names a cutoff may NOT consult them: a fixture that finished
+       today was not finished at a historical cutoff, and a player who is
+       inactive today was not inactive then.
+    3. **Otherwise unavailable.**  A historical read with no pinned evidence
+       reports that the evidence is unavailable -- never the current value of a
+       mutable table, which is precisely the substitution "missing history is
+       not zero" forbids.
+    """
+
+    historical = as_of is not None
+    moment = str(as_of) if historical else utc_now()
+    event_ids = sorted({int(value) for value in events})
+    evidence: list[str] = []
+    unavailable: list[str] = []
+    current_used = False
+
+    pinned = (
+        _pinned_evidence(archive_root, moment=moment, events=event_ids)
+        if archive_root is not None
+        else {"elements": {}, "event_rows": {}, "fixtures": {}, "fixture_events": set(),
+              "evidence": [], "unavailable": []}
+    )
+    if archive_root is None and historical:
+        unavailable.append(
+            f"no raw archive was supplied for the read at {moment}: pool, club, fixture and finality "
+            "evidence for a historical read must come from archived captures"
+        )
+    evidence.extend(pinned["evidence"])
+    unavailable.extend(pinned["unavailable"])
+
+    # -- pool ---------------------------------------------------------------
+    pool_ids: frozenset[int] | None = None
+    pool_basis = ""
+    if provenance.get("provenance_state") == GENERATION_CERTIFIED and provenance.get(
+        "bootstrap_element_ids"
+    ):
+        pool_ids = frozenset(int(pid) for pid in provenance["bootstrap_element_ids"])
+        pool_basis = (
+            f"the freeze's certified bootstrap generation {provenance.get('bootstrap_generation_id')}"
+        )
+    if pool_ids is None:
+        generation = accepted_generation_at(conn, observed_at=moment)
+        if generation is not None:
+            try:
+                ids = sorted({int(pid) for pid in json.loads(generation.get("element_ids_json") or "[]")})
+            except (TypeError, ValueError):
+                ids = []
+            if ids:
+                pool_ids = frozenset(ids)
+                pool_basis = (
+                    f"accepted bootstrap generation {generation.get('id')} observable at {moment}"
+                )
+                evidence.append(f"bootstrap_generation:{int(generation['id'])}")
+    if pool_ids is None and pinned["elements"]:
+        pool_ids = frozenset(int(pid) for pid in pinned["elements"])
+        pool_basis = f"the archived bootstrap_static element set observable at {moment}"
+    if pool_ids is None and not historical:
+        ids = sorted(int(pid) for pid in repo.active_player_ids(conn))
+        pool_ids = frozenset(ids)
+        pool_basis = "the current active official pool"
+        current_used = True
+    if pool_ids is None:
+        unavailable.append(
+            f"no accepted official-player generation and no archived bootstrap capture is observable at "
+            f"{moment}, so the pool that supplied this freeze cannot be read from evidence"
+        )
+
+    # -- clubs --------------------------------------------------------------
+    clubs: dict[int, int] = {}
+    for player_id, element in pinned["elements"].items():
+        team = element.get("team")
+        if team is not None:
+            clubs[int(player_id)] = int(team)
+    if not historical:
+        for row in conn.execute(
+            "SELECT id, team_id FROM players WHERE team_id IS NOT NULL ORDER BY id"
+        ).fetchall():
+            if int(row["id"]) not in clubs:
+                clubs[int(row["id"])] = int(row["team_id"])
+                current_used = True
+
+    # -- fixtures and event rows -------------------------------------------
+    fixtures: dict[int, dict[str, Any]] = dict(pinned["fixtures"])
+    fixture_events: set[int] = set(pinned["fixture_events"])
+    event_rows: dict[int, dict[str, Any]] = dict(pinned["event_rows"])
+    if not historical:
+        for event in event_ids:
+            if event in fixture_events:
+                continue
+            found = False
+            for row in conn.execute(
+                "SELECT * FROM fixtures WHERE event=? AND id > 0 ORDER BY id", (int(event),)
+            ).fetchall():
+                fixtures[int(row["id"])] = dict(row)
+                found = True
+            if found:
+                fixture_events.add(int(event))
+                current_used = True
+        for event in event_ids:
+            if event in event_rows:
+                continue
+            row = conn.execute("SELECT * FROM events WHERE id=?", (int(event),)).fetchone()
+            if row is not None:
+                event_rows[int(event)] = dict(row)
+                current_used = True
+
+    if not event_rows and event_ids:
+        unavailable.append(
+            f"the official event rows at {moment} are unavailable, so no event's finality can be judged "
+            "from evidence"
+        )
+
+    pinned_complete = bool(fixtures) and bool(event_rows) and all(
+        event in fixture_events and event in event_rows for event in event_ids
+    )
+    if current_used:
+        source = WORLD_CURRENT
+    elif historical and not pinned_complete:
+        source = WORLD_UNAVAILABLE
+    elif pool_ids is None and not pinned_complete:
+        source = WORLD_UNAVAILABLE
+    else:
+        source = WORLD_PINNED
+    return WorldEvidence(
+        source=source,
+        as_of=as_of,
+        moment=moment,
+        pool_ids=pool_ids,
+        pool_basis=pool_basis,
+        clubs=clubs,
+        fixtures=fixtures,
+        fixture_events=frozenset(fixture_events),
+        event_rows=event_rows,
+        evidence=tuple(dict.fromkeys(evidence)),
+        unavailable=tuple(dict.fromkeys(unavailable)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # The prediction-to-reality ledger
 # ---------------------------------------------------------------------------
 
@@ -1288,6 +1771,12 @@ class RealityLedger:
     population_digest: str = ""
     ledger_digest: str = ""
     state_counts: tuple[tuple[str, int], ...] = field(default_factory=tuple)
+    prediction_artifact_sha256: str = ""
+    artifact_verified: bool = False
+    world_source: str = ""
+    world_pool_basis: str = ""
+    world_evidence: tuple[str, ...] = field(default_factory=tuple)
+    world_unavailable: tuple[str, ...] = field(default_factory=tuple)
 
     def evaluated(self) -> tuple[dict[str, Any], ...]:
         return tuple(row for row in self.rows if row["evaluation_state"] == EVALUATED)
@@ -1307,6 +1796,12 @@ class RealityLedger:
             "supersession_policy_version": self.supersession_policy_version,
             "bootstrap_generation_id": self.bootstrap_generation_id,
             "bootstrap_element_ids_sha256": self.bootstrap_element_ids_sha256,
+            "prediction_artifact_sha256": self.prediction_artifact_sha256,
+            "artifact_verified": bool(self.artifact_verified),
+            "world_source": self.world_source,
+            "world_pool_basis": self.world_pool_basis,
+            "world_evidence": list(self.world_evidence),
+            "world_unavailable": list(self.world_unavailable),
             "row_count": len(self.rows),
             "population_digest": self.population_digest,
             "ledger_digest": self.ledger_digest,
@@ -1326,6 +1821,7 @@ _DIGEST_ROW_FIELDS = (
     "model_version",
     "prediction_kind",
     "prediction_state",
+    "prediction_artifact_sha256",
     "grain",
     "event",
     "player_id",
@@ -1338,6 +1834,8 @@ _DIGEST_ROW_FIELDS = (
     "observation_state",
     "observation_capture_digests",
     "observation_sources",
+    "world_source",
+    "world_evidence",
     "event_finality",
     "outcome_evidence",
     "outcome_state",
@@ -1355,6 +1853,7 @@ def build_reality_ledger(
     freeze_identity: str,
     grain: str = GRAIN_PLAYER_EVENT,
     as_of: str | None = None,
+    archive_root: Any = None,
 ) -> RealityLedger:
     """Relate one frozen prediction generation to the official reality.
 
@@ -1365,9 +1864,19 @@ def build_reality_ledger(
     two stores whose rows were written in different orders, yields identical
     rows, identical counts and identical digests.
 
-    Nothing is dropped.  An excluded key is RETURNED with its reason code, so
-    coverage is visible instead of implied, and a missing value is never
-    converted into a zero.
+    Three things are proven rather than assumed:
+
+    * the frozen artifact still digests to the digest the freeze was certified
+      with.  A store whose runs grew after certification is a different artifact
+      wearing a certificate for the old one, so the ledger refuses to build
+      instead of reporting a prediction set nobody certified;
+    * the pool, the clubs, the fixtures and the event finality come from pinned
+      evidence -- the freeze's certified generation, the accepted generation
+      observable at the read, or the raw archive -- and a read that names a
+      cutoff never falls back to a table that is refreshed in place;
+    * nothing is dropped.  An excluded key is RETURNED with its reason code, so
+      coverage is visible instead of implied, and a missing value is never
+      converted into a zero.
     """
 
     if str(grain) not in GRAINS:
@@ -1385,9 +1894,37 @@ def build_reality_ledger(
             (freeze_id,),
         ).fetchall()
     }
+    if not runs:
+        raise OutcomeLedgerError(f"freeze {freeze_identity} has no recorded runs")
+    incomplete = sorted(
+        str(int(row["id"]))
+        for row in conn.execute(
+            "SELECT id, status FROM projection_runs WHERE id IN ("
+            + ",".join("?" for _ in runs)
+            + ")",
+            tuple(sorted(runs)),
+        ).fetchall()
+        if str(row["status"]) != "complete"
+    )
+    if incomplete:
+        raise OutcomeLedgerError(
+            f"freeze {freeze_identity} includes projection run(s) {incomplete} that are not complete; a "
+            "certified freeze is readable only while every run it certifies is closed"
+        )
+    artifact_sha = prediction_artifact_digest(conn, sorted(runs))
+    recorded_artifact = str(provenance.get("prediction_artifact_sha256") or "")
+    if artifact_sha != recorded_artifact:
+        raise OutcomeLedgerError(
+            f"freeze {freeze_identity} was certified over artifact {recorded_artifact}, but its frozen "
+            f"predictions now digest to {artifact_sha}; the frozen artifact changed after certification, so "
+            "this freeze no longer certifies what is stored"
+        )
     predictions = _freeze_predictions(conn, sorted(runs), grain)
-    target_events = _target_events(conn, provenance, predictions)
-    captures = observation_captures(conn, events=target_events, as_of=as_of)
+    events = _target_events(conn, provenance, predictions)
+    world = resolve_world_evidence(
+        conn, provenance=provenance, as_of=as_of, archive_root=archive_root, events=events
+    )
+    captures = observation_captures(conn, events=events, as_of=as_of)
 
     keys: set[tuple[int, int, int | None]] = set()
     for row in predictions:
@@ -1415,6 +1952,8 @@ def build_reality_ledger(
             predictions=predictions,
             captures=captures,
             provenance=provenance,
+            world=world,
+            artifact_sha=artifact_sha,
         ):
             rows.append(row)
 
@@ -1446,6 +1985,12 @@ def build_reality_ledger(
             f"{OUTCOME_LEDGER_VERSION}:{grain}:{SUPERSESSION_POLICY_VERSION}", digest_rows
         ),
         state_counts=tuple(sorted(counts.items())),
+        prediction_artifact_sha256=artifact_sha,
+        artifact_verified=True,
+        world_source=world.source,
+        world_pool_basis=world.pool_basis,
+        world_evidence=world.evidence,
+        world_unavailable=world.unavailable,
     )
 
 
@@ -1506,6 +2051,8 @@ def _ledger_rows_for_key(
     predictions: Sequence[Mapping[str, Any]],
     captures: Sequence[Mapping[str, Any]],
     provenance: Mapping[str, Any],
+    world: WorldEvidence,
+    artifact_sha: str,
 ) -> list[dict[str, Any]]:
     if grain == GRAIN_PLAYER_FIXTURE:
         matching = [
@@ -1524,17 +2071,24 @@ def _ledger_rows_for_key(
             for row in predictions
             if int(row["event"]) == event and int(row["player_id"]) == player_id
         ]
-    matching = sorted(
-        ({str(row["kind"]): row for row in matching}.values()),
-        key=lambda row: (
+    # Every distinct prediction is retained.  De-duplicating on the kind alone
+    # would silently drop one family's claim whenever two families freeze the
+    # same kind for the same key, so the identity is the whole claim: the kind
+    # AND the run that issued it.
+    distinct: dict[tuple, Mapping[str, Any]] = {}
+    for row in matching:
+        run = runs[int(row["projection_run_id"])]
+        key = (
             str(row["kind"]),
-            str(runs[int(row["projection_run_id"])]["model_family"]),
-            str(runs[int(row["projection_run_id"])]["model_version"]),
-        ),
-    )
+            str(run["model_family"]),
+            str(run["model_version"]),
+            int(row["projection_run_id"]),
+        )
+        distinct.setdefault(key, row)
+    matching = [distinct[key] for key in sorted(distinct)]
     context = _KeyContext(
         conn=conn, grain=grain, event=event, player_id=player_id, fixture_id=fixture_id,
-        runs=runs, captures=captures, provenance=provenance,
+        runs=runs, captures=captures, provenance=provenance, world=world, artifact_sha=artifact_sha,
     )
     outcome = context.resolve_outcome(has_prediction=bool(matching))
     if not matching:
@@ -1574,6 +2128,8 @@ class _KeyContext:
         runs: Mapping[int, Mapping[str, Any]],
         captures: Sequence[Mapping[str, Any]],
         provenance: Mapping[str, Any],
+        world: WorldEvidence,
+        artifact_sha: str,
     ) -> None:
         self.conn = conn
         self.grain = grain
@@ -1583,12 +2139,32 @@ class _KeyContext:
         self.runs = runs
         self.provenance = provenance
         self.captures = captures
-        self._fixtures = _event_fixtures(conn, event)
-        self._player = _player_record(conn, player_id)
-        # Resolved ONCE per key, from the accepted finality definition, and
-        # reported on every row the key emits: the ledger must state the
-        # finalization the outcome was judged under, not only the verdict.
-        self.event_state = event_finality(conn, event)
+        self.world = world
+        self.artifact_sha = artifact_sha
+        # The club is pinned evidence too.  The observation's own recorded club
+        # is the strongest source (it is what the source stated when it was
+        # read) and the archived element payload is the other one; today's
+        # players table is consulted only by a read that claims no cutoff.
+        recorded_clubs = {
+            int(row["team_id"])
+            for row in captures
+            if int(row["player_id"]) == player_id
+            and int(row["event"]) == event
+            and row.get("team_id") is not None
+        }
+        if len(recorded_clubs) == 1:
+            self.team_id = recorded_clubs.pop()
+        elif len(recorded_clubs) > 1:
+            # Two retained observations disagree about the club.  That is an
+            # ambiguity, not a number to pick a winner from.
+            self.team_id = None
+        else:
+            self.team_id = world.club_of(player_id)
+        # Resolved ONCE per key, from the accepted finality definition applied to
+        # THIS read's evidence, and reported on every row the key emits: the
+        # ledger must state the finalization the outcome was judged under, not
+        # only the verdict.
+        self.event_state = world.event_state(event)
 
     # -- prediction side ----------------------------------------------------
 
@@ -1623,17 +2199,46 @@ class _KeyContext:
     def _resolve_official_outcome(self) -> dict[str, Any]:
         """The official-outcome half: event/fixture truth and the retained evidence."""
 
-        if self._player is None or not int(self._player.get("is_active") or 0):
-            return _outcome(PLAYER_NOT_IN_OFFICIAL_POOL, "player is not in the stored official pool")
+        pool = self.world.pool_ids
+        if pool is None:
+            return _outcome(
+                INPUT_EVIDENCE_UNAVAILABLE,
+                "the official-player pool this freeze is judged against is unavailable in the evidence "
+                f"read at {self.world.moment}; the current pool is not evidence about a past cutoff",
+            )
+        if int(self.player_id) not in pool:
+            return _outcome(
+                PLAYER_NOT_IN_OFFICIAL_POOL,
+                f"player {self.player_id} is not in {(self.world.pool_basis or 'the official pool')}",
+            )
         state = self.event_state
+        if str(state) == planning_state.EVENT_STATE_UNKNOWN:
+            return _outcome(
+                INPUT_EVIDENCE_UNAVAILABLE,
+                f"the official state of event {self.event} is unavailable in the evidence read at "
+                f"{self.world.moment}, so its finality cannot be judged",
+            )
         if str(state) != "FINAL":
             return _outcome(OUTCOME_NOT_FINALISED, f"event {self.event} is {state}")
 
+        schedule = self.world.fixtures_of(self.event)
+        if schedule is None:
+            return _outcome(
+                INPUT_EVIDENCE_UNAVAILABLE,
+                f"the fixture schedule of event {self.event} is unavailable in the evidence read at "
+                f"{self.world.moment}, so no club's fixtures can be resolved",
+            )
+        if self.team_id is None:
+            return _outcome(
+                INPUT_EVIDENCE_UNAVAILABLE,
+                f"the club player {self.player_id} belonged to at {self.world.moment} is unavailable in "
+                "the evidence read, and a club is what a fixture is joined through",
+            )
         fixtures = sorted(
-            fid
-            for fid, row in self._fixtures.items()
-            if int(row.get("team_h") or 0) == int(self._player["team_id"] or 0)
-            or int(row.get("team_a") or 0) == int(self._player["team_id"] or 0)
+            fixture_id
+            for fixture_id in schedule
+            if int((self.world.fixture_row(fixture_id) or {}).get("team_h") or 0) == int(self.team_id)
+            or int((self.world.fixture_row(fixture_id) or {}).get("team_a") or 0) == int(self.team_id)
         )
         if self.grain == GRAIN_PLAYER_FIXTURE:
             if self.fixture_id is None or int(self.fixture_id) not in fixtures:
@@ -1647,7 +2252,11 @@ class _KeyContext:
                 TARGET_NO_FIXTURE, f"the player's club has no fixture in event {self.event}"
             )
 
-        unplayed = [fid for fid in fixtures if int(self._fixtures[fid].get("finished") or 0) != 1]
+        unplayed = [
+            fid
+            for fid in fixtures
+            if int((self.world.fixture_row(fid) or {}).get("finished") or 0) != 1
+        ]
         if unplayed:
             return _outcome(TARGET_FIXTURE_NOT_PLAYED, f"fixture(s) not played: {sorted(unplayed)}")
         if self.grain == GRAIN_PLAYER_EVENT:
@@ -1668,6 +2277,12 @@ class _KeyContext:
         )
 
     def _is_placeholder(self, fixture_id: int) -> bool:
+        if self.world.historical:
+            # A row in today's player_gameweeks is not evidence about what was
+            # observable before the read's cutoff: the schedule rows are
+            # refreshed in place.  A historical read therefore has no placeholder
+            # evidence and says so, instead of reading today's table backwards.
+            return False
         rows = [
             dict(row)
             for row in self.conn.execute(
@@ -1810,11 +2425,12 @@ class _KeyContext:
             "random_seed": None if run is None else run.get("random_seed"),
             "prediction_kind": None if prediction is None else str(prediction["kind"]),
             "prediction_state": prediction_state,
+            "prediction_artifact_sha256": str(self.artifact_sha),
             "grain": self.grain,
             "event": self.event,
             "player_id": self.player_id,
             "fixture_id": self.fixture_id,
-            "team_id": None if self._player is None else self._player.get("team_id"),
+            "team_id": self.team_id,
             "opponent_team_id": None if capture is None else capture.get("opponent_team_id"),
             "event_time": None if capture is None else capture.get("event_time"),
             "official_final_at": None if capture is None else capture.get("official_final_at"),
@@ -1822,6 +2438,8 @@ class _KeyContext:
             "observation_state": None if capture is None else capture.get("observation_state"),
             "observation_capture_digests": list(outcome.get("digests") or ()),
             "observation_sources": [dict(row) for row in outcome.get("sources") or ()],
+            "world_source": str(self.world.source),
+            "world_evidence": list(self.world.evidence),
             "event_finality": str(self.event_state),
             "outcome_evidence": str(outcome["evidence"]),
             "outcome_state": str(outcome["outcome_state"]),
@@ -1938,15 +2556,8 @@ def _aggregate_fixture_values(
     return values, tuple(str(row["capture_digest"]) for row in ordered)
 
 
-def _event_fixtures(conn: sqlite3.Connection, event: int) -> dict[int, dict[str, Any]]:
-    return {
-        int(row["id"]): dict(row)
-        for row in conn.execute(
-            "SELECT * FROM fixtures WHERE event=? AND id > 0 ORDER BY id", (int(event),)
-        ).fetchall()
-    }
-
-
 def _player_record(conn: sqlite3.Connection, player_id: int) -> dict[str, Any] | None:
+    """The player row as the CAPTURE path reads it: at capture time, now is the truth."""
+
     row = conn.execute("SELECT * FROM players WHERE id=?", (int(player_id),)).fetchone()
     return dict(row) if row is not None else None

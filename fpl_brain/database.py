@@ -10,7 +10,7 @@ from typing import Callable
 
 from .utils import utc_now
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Model families the analytics spine may record.  ``baseline`` / ``minutes_v1``
 # predate this list; the team and player-rate families were added in m007 and
@@ -1340,6 +1340,38 @@ def m016_outcome_ledger(conn: sqlite3.Connection) -> None:
     )
 
 
+def m017_certified_freeze_is_closed(conn: sqlite3.Connection) -> None:
+    """A certified freeze's prediction artifact is closed at the storage level.
+
+    ``projection_runs`` already freezes a COMPLETE run (m006) and
+    ``frozen_predictions`` already refuses UPDATE and DELETE (m005), so the rows
+    a certified run holds cannot change or disappear.  What was still possible
+    was APPENDING to them: a run could be marked complete, certified into a
+    freeze, and then extended with another frozen prediction.  The certificate's
+    recorded artifact digest would then describe only part of the stored
+    artifact -- a certificate for a prediction set nobody issued.
+
+    This one additive trigger closes that hole: once a projection run belongs to
+    a recorded freeze, inserting into it aborts.  Strictly additive -- no table,
+    column, constraint or row is touched, and a store without certified freezes
+    is unaffected.
+    """
+
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS frozen_predictions_no_insert_after_certification
+          BEFORE INSERT ON frozen_predictions
+          WHEN EXISTS (
+            SELECT 1 FROM prediction_freeze_runs
+             WHERE prediction_freeze_runs.projection_run_id = NEW.projection_run_id
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'a certified prediction freeze is closed to new frozen predictions');
+          END;
+        """
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_initial,
     m002_manual_manager_state,
@@ -1357,6 +1389,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m014_execution_control,
     m015_bootstrap_generation_identity,
     m016_outcome_ledger,
+    m017_certified_freeze_is_closed,
 ]
 
 
