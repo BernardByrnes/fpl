@@ -491,6 +491,29 @@ def _parse_live_explanation_stats(value: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def parse_live_event_totals(value: dict[str, Any]) -> dict[str, Any]:
+    """The EVENT totals one ``event/live`` element states at its top level.
+
+    ``stats`` is the endpoint's own statement of the player's total for the
+    event, which is exactly the number that must not be duplicated once per
+    double-gameweek fixture; the ``explain`` legs below it are the per-fixture
+    shares of that same total.  Only fields the payload actually states are
+    returned, so an absent field stays absent and a reader is left to treat it
+    as missing rather than read a zero into it.
+    """
+
+    stats = _read(value, "stats", default={})
+    stats_map = stats if isinstance(stats, dict) else {}
+    totals: dict[str, Any] = {}
+    for name in sorted(_LIVE_INT_FIELDS):
+        if name in stats_map:
+            totals[name] = to_int(stats_map[name])
+    for name in sorted(_LIVE_FLOAT_FIELDS):
+        if name in stats_map:
+            totals[name] = to_float(stats_map[name])
+    return totals
+
+
 def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweekRecord]:
     records: list[PlayerGameweekRecord] = []
     for value in _items(payload, "elements"):

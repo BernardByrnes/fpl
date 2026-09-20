@@ -513,7 +513,7 @@ def _row_raw(row: Any) -> Mapping[str, Any]:
     return raw if isinstance(raw, Mapping) else {}
 
 
-def _row_stated_element(row: Any) -> int | None:
+def _row_stated_element(row: Any, *, kind: str) -> int | None:
     """The player identity an archived row states about ITSELF, if it states one.
 
     "About itself" is the whole point: a row that never names an element is not
@@ -521,10 +521,18 @@ def _row_stated_element(row: Any) -> int | None:
     summary it was reading -- has labelled it.  The parsers retain the element id
     they actually read for both sources, so this is a statement the payload
     made, never the claim that was being checked.
+
+    WHICH KEY STATES IT IS SOURCE-AWARE.  An ``id`` is the player in an
+    ``event/live`` element and the FIXTURE in an ``element-summary`` ``fixtures``
+    entry, so reading that key there would let a fixture number stand in for a
+    footballer -- and would match silently whenever the fixture id happened to
+    equal the player id being claimed.  An element summary names its player only
+    under ``element``; the live payload's element names him under both.
     """
 
-    for key in ("element", "id"):
-        value = _row_raw(row).get(key)
+    raw = _row_raw(row)
+    for key in ("element", "id") if kind == "event_live" else ("element",):
+        value = raw.get(key)
         if value is None:
             continue
         try:
@@ -575,15 +583,30 @@ def _archived_row_identity(row: Any) -> dict[str, Any]:
     }
 
 
-def _archived_observation_values(rows: Sequence[Any], *, grain: str) -> dict[str, Any]:
+def _archived_observation_values(
+    rows: Sequence[Any], *, grain: str, kind: str
+) -> dict[str, Any]:
     """The official values the archived rows state, at the grain being captured.
 
-    Fixture grain takes the one archived row.  Event grain takes the canonical
-    event aggregation of its rows -- summing ONCE, and leaving a field missing
-    when any contributing fixture left it missing -- which is the same rule the
-    ledger applies in reverse, so the two cannot disagree about a total.
+    FIXTURE grain takes the one archived row.  For a live payload that row is one
+    ``explain`` leg, so it states the fields that leg's own stat list states and
+    nothing else: a rule that did not fire for this fixture is absent from the
+    leg, and the event total above it is not this fixture's share.
+
+    EVENT grain is where the two sources differ, because they state an event
+    total in different places.  A live response states it ONCE, at the element's
+    top level, so that is what an event-grain claim is validated against;
+    reading the total out of the legs instead would report it as missing
+    wherever a leg happens to omit a rule, and would present a sum of leg
+    evidence as the endpoint's own total.  An element summary has no such
+    top-level total, so its rows ARE the event's fixtures and are summed once --
+    leaving a field missing when any contributing fixture left it missing --
+    which is the same rule the ledger applies in reverse, so the two cannot
+    disagree about a total.
     """
 
+    if grain == GRAIN_PLAYER_EVENT and kind == "event_live":
+        return _live_event_totals(rows[0])
     per_row = [
         {name: getattr(row, name, None) for name in OFFICIAL_OUTCOME_FIELDS} for row in rows
     ]
@@ -591,6 +614,15 @@ def _archived_observation_values(rows: Sequence[Any], *, grain: str) -> dict[str
         values, _ = _aggregate_fixture_values(per_row)
         return values
     return per_row[0]
+
+
+def _live_event_totals(row: Any) -> dict[str, Any]:
+    """The event totals the live element states, with unstated fields missing."""
+
+    from . import parsers
+
+    stated = parsers.parse_live_event_totals(_row_raw(row))
+    return {name: stated.get(name) for name in OFFICIAL_OUTCOME_FIELDS}
 
 
 def _bind_backfilled_observation(
@@ -620,6 +652,14 @@ def _bind_backfilled_observation(
     same additional source fields.  Anything the archive does not state is
     refused, never stored, and identity the caller left unstated is filled from
     the archive rather than from a table that is refreshed in place.
+
+    Which evidence a grain is read from is the SOURCE's business, because the
+    sources state an event total in different places: a live response states it
+    once at the element's top level with each fixture's share on its ``explain``
+    leg, while an element summary states per-fixture rows that have to be summed
+    for the headline.  The claim is therefore checked against what that source
+    actually says at that grain, and a field it does not state is MISSING rather
+    than a zero or the value of some neighbouring grain.
     """
 
     from . import parsers
@@ -660,7 +700,7 @@ def _bind_backfilled_observation(
     # same.  The element a row states about itself is therefore what selects
     # rows, and rows naming nobody are not evidence about anybody.
     in_event = [row for row in parsed if int(row.event) == int(event)]
-    with_element = [(row, _row_stated_element(row)) for row in in_event]
+    with_element = [(row, _row_stated_element(row, kind=kind)) for row in in_event]
     named = {identity for _, identity in with_element if identity is not None}
     # A bulk payload legitimately carries other players -- an event-live response
     # serves the whole pool -- so those rows are simply not this claim's.  The
@@ -701,14 +741,26 @@ def _bind_backfilled_observation(
             "fixture cannot witness which fixture was played"
         )
 
-    archived = _archived_observation_values(matched, grain=grain)
+    archived = _archived_observation_values(matched, grain=grain, kind=kind)
     for name in OFFICIAL_OUTCOME_FIELDS:
-        if _observed_value(claimed.get(name)) != _observed_value(archived[name]):
+        archived_value = _observed_value(archived[name])
+        claimed_value = _observed_value(claimed.get(name))
+        if archived_value == claimed_value:
+            continue
+        if archived_value is None:
+            # The field is MISSING in this evidence, which is not a zero and not
+            # a value: a claim of one is an assertion the archive does not support.
             raise BackfillEvidenceError(
-                f"archived capture {capture_id!r} states {name}={archived[name]!r} for player "
-                f"{int(player_id)} event {int(event)}, not the claimed {claimed.get(name)!r}; a backfilled "
-                "observation is what the archive says, not what the caller asserts"
+                f"archived capture {capture_id!r} states no {name} for player {int(player_id)} event "
+                f"{int(event)}"
+                + ("" if fixture_id is None else f" fixture {int(fixture_id)}")
+                + f", so the claimed {claimed.get(name)!r} is an assertion rather than archived evidence"
             )
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} states {name}={archived[name]!r} for player "
+            f"{int(player_id)} event {int(event)}, not the claimed {claimed.get(name)!r}; a backfilled "
+            "observation is what the archive says, not what the caller asserts"
+        )
     for name in claimed:
         if name in OFFICIAL_OUTCOME_FIELDS:
             continue
@@ -721,14 +773,16 @@ def _bind_backfilled_observation(
                     "states it"
                 )
 
-    # Identity, at the grain being captured.  FIXTURE grain has exactly one row,
-    # so that row's club, opponent and kickoff ARE the observation's.  EVENT
-    # grain may span two fixtures, and a double gameweek has no single club,
-    # opponent or kickoff: taking one row's identity would file fixture 1's
-    # opponent on a row that also sums fixture 2, which is a fabrication dressed
-    # as a fact.  So the event grain keeps a field only when every contributing
-    # row agrees on it, and otherwise leaves it NULL -- "not applicable at this
-    # grain" rather than an arbitrary member of a set.
+    # Identity, at the grain being captured.  A field is kept when the archived
+    # rows that contributed to this observation AGREE on it, and left NULL when
+    # they do not.  With ONE contributing fixture that is simply that fixture's
+    # club, opponent and kickoff -- whether the row is a player's fixture-grain
+    # observation or the single fixture whose event he played, so a one-fixture
+    # event capture keeps the kickoff the archive states instead of discarding
+    # it.  A double gameweek is where the rule earns its keep: two fixtures have
+    # no single opponent or kickoff, so the headline row states neither rather
+    # than one leg's fact dressed as the event's, and a caller who asserts one
+    # is refused above rather than silently dropped.
     stated = [_archived_row_identity(row) for row in matched]
     agreed: dict[str, Any] = {}
     for field in ("team_id", "opponent_team_id", "event_time"):
@@ -768,23 +822,22 @@ def _bind_backfilled_observation(
                 f"archived capture {capture_id!r} was played at {sorted(stated_kickoffs)}, not at the "
                 f"claimed {event_time}"
             )
-    if grain == GRAIN_PLAYER_FIXTURE:
-        return {
-            "team_id": agreed["team_id"] if team_id is None else team_id,
-            "opponent_team_id": (
-                agreed["opponent_team_id"] if opponent_team_id is None else opponent_team_id
-            ),
-            "event_time": agreed["event_time"] if event_time is None else str(event_time),
-        }
-    # Event grain: a club may be carried (one player belongs to one club for a
-    # whole event, so agreement is the rule), but a per-fixture identity may
-    # not.  A kickoff time belongs to a fixture rather than to an event, so the
-    # headline row keeps none: filling it from one of two legs would state a
-    # per-fixture fact on an aggregate that spans both.
+        if agreed["event_time"] is None:
+            # The kickoff is stated, but not for the WHOLE observation: the
+            # contributing fixtures played at different times (or one of them is
+            # silent), so no single kickoff is this row's.  Refusing the claim
+            # keeps it from being quietly dropped in favour of NULL.
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} played player {int(player_id)}'s event across fixtures "
+                f"kicking off at {sorted(stated_kickoffs)}, so the claimed {event_time} is one fixture's "
+                "fact and not one this observation can state"
+            )
     return {
-        "team_id": agreed["team_id"],
-        "opponent_team_id": agreed["opponent_team_id"],
-        "event_time": None,
+        "team_id": agreed["team_id"] if team_id is None else int(team_id),
+        "opponent_team_id": (
+            agreed["opponent_team_id"] if opponent_team_id is None else int(opponent_team_id)
+        ),
+        "event_time": agreed["event_time"] if event_time is None else str(event_time),
     }
 
 
@@ -1398,8 +1451,9 @@ def certify_prediction_freeze(
     3. that generation is accepted;
     4. its ``fetch_run_id`` is the freeze's recorded official fetch identity;
     5. it was observable at or before the prediction cutoff;
-    6. the official element-set identity and digest are retained and the digest
-       recomputes from the retained id set.
+    6. the official element-set identity is retained, its digest recomputes from
+       the retained id set, and the generation's own ``official_element_count``
+       equals the number of elements that set canonically holds.
 
     Two properties of the RUNS themselves are required as well, because a
     certificate describes a closed artifact:
@@ -1663,38 +1717,64 @@ def _retained_element_identity(
 ) -> tuple[list[int], str | None, int | None, list[str]]:
     """Condition 6: the official element-set identity is retained AND deterministic.
 
-    A digest that does not recompute from the id set it claims to describe is
-    NOT recorded as if it verified: the id set is kept for audit and the digest
-    is withheld, because storing an unverified digest is exactly the false
-    certificate this contract exists to prevent.
+    Two claims are checked against the id set they claim to describe, and each
+    is recorded ONLY once it has been: a digest that does not recompute from
+    that set, and a stated ``official_element_count`` that does not equal the
+    number of elements the set canonically holds.  An accepted pool whose own
+    count disagrees with the ids it kept is exactly the generation that must not
+    certify a freeze, because the certificate would then name a pool size that
+    no evidence supports.  What fails is withheld rather than stored -- the id
+    set itself is kept either way, for audit -- since recording an unverified
+    claim is the false certificate this contract exists to prevent.
     """
 
     reasons: list[str] = []
+    generation_id = generation.get("id")
     raw = generation.get("element_ids_json")
     try:
         element_ids = sorted({int(pid) for pid in json.loads(raw)}) if raw else []
     except (TypeError, ValueError):
         return [], None, None, [
-            f"bootstrap generation {generation.get('id')} retains a malformed official element id set"
+            f"bootstrap generation {generation_id} retains a malformed official element id set"
         ]
     if not element_ids:
         return [], None, None, [
-            f"bootstrap generation {generation.get('id')} retains no official element id set"
+            f"bootstrap generation {generation_id} retains no official element id set"
         ]
+    stated = generation.get("official_element_count")
+    try:
+        stated_count = None if stated is None or str(stated).strip() == "" else int(stated)
+    except (TypeError, ValueError):
+        stated_count = None
+    if stated_count is None:
+        reasons.append(
+            f"bootstrap generation {generation_id} states no official element count, so the "
+            f"{len(element_ids)} elements it retains cannot be shown to be the pool it was accepted over"
+        )
+        verified_count = None
+    elif stated_count != len(element_ids):
+        reasons.append(
+            f"bootstrap generation {generation_id} states {stated_count} official elements but retains "
+            f"{len(element_ids)}: an accepted pool whose own count disagrees with the id set it kept "
+            "cannot certify a freeze"
+        )
+        verified_count = None
+    else:
+        verified_count = stated_count
     recorded = str(generation.get("element_ids_sha256") or "")
     recomputed = element_id_sha256(element_ids)
     if not recorded:
         reasons.append(
-            f"bootstrap generation {generation.get('id')} retains no official element digest"
+            f"bootstrap generation {generation_id} retains no official element digest"
         )
-        return element_ids, None, len(element_ids), reasons
+        return element_ids, None, verified_count, reasons
     if recorded != recomputed:
         reasons.append(
-            f"bootstrap generation {generation.get('id')} records element digest {recorded[:12]} but its "
+            f"bootstrap generation {generation_id} records element digest {recorded[:12]} but its "
             f"retained id set hashes to {recomputed[:12]}"
         )
-        return element_ids, None, len(element_ids), reasons
-    return element_ids, recorded, len(element_ids), reasons
+        return element_ids, None, verified_count, reasons
+    return element_ids, recorded, verified_count, reasons
 
 
 def _record_freeze(

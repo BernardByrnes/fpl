@@ -274,16 +274,20 @@ def _generation(
     captured_at: str = GENERATION_CAPTURED,
     accepted: bool = True,
     element_ids=SYNTHETIC_POOL,
+    official_element_count: int | None = None,
 ) -> int:
+    """One persisted generation, whose stated pool size defaults to its id set."""
+
+    ids = [int(pid) for pid in element_ids]
     return repo.record_bootstrap_generation(
         conn,
         captured_at=captured_at,
         accepted=accepted,
-        official_element_count=len(element_ids),
-        parsed_count=len(element_ids),
-        persisted_count=len(element_ids),
-        element_ids=list(element_ids),
-        element_ids_sha256=element_id_sha256(list(element_ids)),
+        official_element_count=len(ids) if official_element_count is None else int(official_element_count),
+        parsed_count=len(ids),
+        persisted_count=len(ids),
+        element_ids=ids,
+        element_ids_sha256=element_id_sha256(ids),
         acceptance_rule="pe5-test",
         acceptance_rule_version="BOOTSTRAP_GENERATION_ACCEPTANCE v1",
         fetch_run_id=fetch_run_id,
@@ -509,12 +513,14 @@ def _live_element(
     stats: dict | None = None,
     explain: list | None = None,
 ) -> dict:
-    """One element of an ``event/live`` response: stats totals plus explain legs.
+    """One element of an ``event/live`` response: event totals plus explain legs.
 
-    The live endpoint nests each fixture's own numbers under ``explain``, which
-    is the only fixture-specific part of the payload -- the top-level ``stats``
-    object is the player's EVENT total.  A double gameweek therefore has to be
-    read out of the explain legs, or one fixture's numbers get copied onto both.
+    A production element states the player's EVENT total ONCE at its top level
+    and nests each fixture's own numbers under ``explain``, whose stat lists
+    carry only the rules that fired in that fixture.  The top-level total is
+    therefore the only place the event grain can be read from, and a leg is the
+    only place a fixture's share can be -- a double gameweek has no other
+    reading that does not score one afternoon twice.
     """
 
     return {
@@ -537,42 +543,29 @@ def _live_leg(
     fixture_id: int = FIXTURE_1,
     opponent_team: int = TEAM_B,
     was_home: bool = True,
-    kickoff_time: str = KICKOFF_1,
-    minutes: int = 90,
-    total_points: int = 6,
-    bonus: int | None = 1,
-    bps: int | None = 30,
-    **extra,
+    kickoff_time: str | None = None,
+    rules=(("minutes", 90, 2),),
 ) -> dict:
-    """One ``explain`` entry: a fixture's own stat list, exactly as it is served."""
+    """One ``explain`` entry: the rules that FIRED in that fixture, as served.
 
-    stats = [
-        {"identifier": "minutes", "points": 0, "value": minutes},
-        {"identifier": "starts", "points": 0, "value": 1 if minutes else 0},
-        {"identifier": "total_points", "points": total_points, "value": total_points},
-        {"identifier": "goals_scored", "points": 0, "value": 1},
-        {"identifier": "assists", "points": 0, "value": 0},
-        {"identifier": "clean_sheets", "points": 0, "value": 0},
-        {"identifier": "goals_conceded", "points": 0, "value": 1},
-        {"identifier": "saves", "points": 0, "value": 0},
-        {"identifier": "bonus", "points": 0, "value": bonus},
-        {"identifier": "bps", "points": 0, "value": bps},
-        {"identifier": "yellow_cards", "points": 0, "value": 0},
-        {"identifier": "red_cards", "points": 0, "value": 0},
-        {"identifier": "penalties_saved", "points": 0, "value": 0},
-        {"identifier": "penalties_missed", "points": 0, "value": 0},
-        {"identifier": "own_goals", "points": 0, "value": 0},
-        {"identifier": "defensive_contribution", "points": 0, "value": 0},
-    ]
-    for name in extra:
-        stats.append({"identifier": name, "points": 0, "value": extra[name]})
-    return {
+    Each entry lists stat identifiers with the points they awarded, so a rule
+    that did not fire is simply absent from the list.  That is why a leg is not
+    a complete row: the numbers it does not state are MISSING at fixture grain
+    however completely the element's event total above it states them.
+    """
+
+    entry = {
         "fixture": fixture_id,
         "opponent_team": opponent_team,
-        "was_home": was_home,
-        "kickoff_time": kickoff_time,
-        "stats": stats,
+        "was_home": 1 if was_home else 0,
+        "stats": [
+            {"identifier": str(identifier), "points": int(points), "value": value}
+            for identifier, value, points in rules
+        ],
     }
+    if kickoff_time is not None:
+        entry["kickoff_time"] = kickoff_time
+    return entry
 
 
 def _archived_live(
@@ -2222,6 +2215,30 @@ def test_H18_a_backfill_is_bound_to_the_player_the_archive_names(tmp_path):
     with pytest.raises(ol.BackfillEvidenceError, match="none of which is the claimed player"):
         _backfill(conn, root=summary_root, record=summary_record, player_id=DGW_PLAYER)
 
+    # WHICH KEY NAMES THE PLAYER IS SOURCE-AWARE.  An element summary's
+    # ``fixtures`` leg states its FIXTURE under ``id`` and never names the player,
+    # and the parser keeps that row as it was served -- so reading ``id`` as a
+    # player id here would let the fixture number stand in for a footballer and
+    # file this row as player 400's observation precisely because the two numbers
+    # coincided.  The row names nobody, so it is evidence about nobody.
+    fixture_leg = _archived_element_row()
+    fixture_leg.pop("element")
+    fixture_leg["id"] = FIXTURE_1
+    leg_root, leg_record = _archive(
+        tmp_path,
+        source="element_summary",
+        observed_at=_t(5),
+        payload={"fixtures": [fixture_leg]},
+        run_id=7,
+        raw_dir=tmp_path / "fixture_leg",
+    )
+    before = conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0]
+    with pytest.raises(ol.BackfillEvidenceError, match="states no player identity"):
+        _backfill(
+            conn, root=leg_root, record=leg_record, captured_at=_t(5), player_id=int(FIXTURE_1)
+        )
+    assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == before
+
     # A payload that states the claimant at a DIFFERENT event is no evidence for
     # THIS event, so the archive offers nothing to bind the claim to.
     elsewhere_root, elsewhere_record = _archived_observation(
@@ -2307,35 +2324,68 @@ def test_H19_a_claim_the_archive_never_states_is_refused(tmp_path):
 
 
 def test_H20_a_nested_event_live_backfill_reads_the_explain_legs(tmp_path):
-    """A real live payload backfills from its explain legs, not its event totals.
+    """A production-shaped live payload: event totals on top, explain legs below.
 
-    ``event/live`` serves the whole pool in one response, with each player's
-    EVENT totals at the top level and the fixture-specific numbers nested under
-    ``explain``.  A double gameweek therefore has exactly one correct reading --
-    one row per explain leg -- and copying the top-level totals onto a fixture
-    row would score the same afternoon twice.
+    ``event/live`` states each player's EVENT total ONCE, in the element's
+    top-level ``stats``, and each fixture's share as an ``explain`` leg whose
+    stat list holds only the rules that fired in that fixture.  The two grains
+    therefore read DIFFERENT evidence: the headline event row is what the
+    top-level total states -- exactly the number that must not be duplicated
+    once per double-gameweek fixture -- and a fixture row is the fields its own
+    leg states, with every field the leg is silent about left MISSING rather
+    than filled from the event total above it or from a zero.
     """
 
     conn = connect_database(tmp_path / "fpl.db")
     _world(conn)
+    # The element states, in its own top level, the totals of the two legs below:
+    # 90 + 62 minutes and 7 + 2 points.  It states assists as a real 0 while no
+    # leg mentions assists at all, and it never states defensive_contribution,
+    # which is thereby missing in this evidence at either grain.
     root, record = _archived_live(
         tmp_path,
         elements=[
             _live_element(
                 player_id=DGW_PLAYER,
-                # The event totals: what the two legs below add up to.  Nothing
-                # may be read from these.
-                stats={"fixture": FIXTURE_1, "minutes": 152, "total_points": 9, "bonus": 1, "bps": 49},
+                stats={
+                    "minutes": 152, "starts": 2, "total_points": 9, "goals_scored": 1,
+                    "assists": 0, "clean_sheets": 0, "goals_conceded": 2, "saves": 0,
+                    "bonus": 1, "bps": 49, "yellow_cards": 0, "red_cards": 0,
+                    "penalties_saved": 0, "penalties_missed": 0, "own_goals": 0,
+                },
                 explain=[
-                    _live_leg(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1),
+                    # Leg 1: the rules that fired in THIS fixture.  No starts, no
+                    # bonus, no bps -- what the element states above is the event's,
+                    # not this fixture's share of it.
                     _live_leg(
-                        fixture_id=FIXTURE_2, opponent_team=TEAM_C, kickoff_time=KICKOFF_2,
-                        minutes=62, total_points=3, bonus=0, bps=19,
+                        fixture_id=FIXTURE_1, opponent_team=TEAM_B, was_home=True,
+                        rules=(("minutes", 90, 2), ("goals_scored", 1, 5)),
+                    ),
+                    _live_leg(
+                        fixture_id=FIXTURE_2, opponent_team=TEAM_C, was_home=False,
+                        rules=(("minutes", 62, 2),),
                     ),
                 ],
             )
         ],
     )
+
+    #: One leg's own facts and nothing else: the fields it never stated are
+    #: claimed as MISSING, which is the only claim its evidence supports.
+    leg_one = {
+        "minutes": 90, "starts": None, "total_points": 7, "goals_scored": 1, "assists": None,
+        "clean_sheets": None, "goals_conceded": None, "saves": None, "bonus": None, "bps": None,
+        "yellow_cards": None, "red_cards": None, "penalties_saved": None, "penalties_missed": None,
+        "own_goals": None, "defensive_contribution": None,
+    }
+    #: The element's own event totals, with the field it never states claimed as
+    #: missing, since the top-level object is where this grain is read from.
+    event_totals = {
+        "minutes": 152, "starts": 2, "total_points": 9, "goals_scored": 1, "assists": 0,
+        "clean_sheets": 0, "goals_conceded": 2, "saves": 0, "bonus": 1, "bps": 49,
+        "yellow_cards": 0, "red_cards": 0, "penalties_saved": 0, "penalties_missed": 0,
+        "own_goals": 0, "defensive_contribution": None,
+    }
 
     def _live_claim(**overrides):
         arguments = {
@@ -2350,22 +2400,50 @@ def test_H20_a_nested_event_live_backfill_reads_the_explain_legs(tmp_path):
             "backfill": True,
             "archive_root": root,
         }
+        arguments.update(leg_one)
         arguments.update(overrides)
         return _capture(conn, **arguments)
 
-    # The FIRST leg's explain entry is the fixture-grain fact: 90 minutes, 6
-    # points, 30 bps -- not the event totals that also cover the second leg.
+    def _event_grain_claim(**overrides):
+        arguments = {
+            "grain": ol.GRAIN_PLAYER_EVENT,
+            "player_id": DGW_PLAYER,
+            "fixture_id": None,
+            "captured_at": _t(6),
+            "source_name": "archived_event_live",
+            "source_identity": "event_live_4",
+            "source_payload_sha256": record.payload_sha256,
+            "archive_capture_id": record.capture_id,
+            "fetch_run_id": 7,
+            "backfill": True,
+            "archive_root": root,
+        }
+        arguments.update(event_totals)
+        arguments.update(overrides)
+        return _capture(conn, **arguments)
+
+    # The first leg's explain entry is the fixture-grain fact: 90 minutes, a goal,
+    # and the 7 points its own rules awarded -- not the event totals that also
+    # cover the second leg.
     assert _live_claim().inserted
-    # The second leg is its own row, with its own numbers.  The live payload
-    # states the OPPONENT of each leg (it carries no home/away team pair), so
-    # that is what a claim may name.
-    assert _live_claim(
-        fixture_id=FIXTURE_2, opponent_team_id=TEAM_C,
-        minutes=62, total_points=3, bonus=0, bps=19, event_time=KICKOFF_2,
-    ).inserted
-    # ...and the event totals cannot be pinned onto either leg.
     with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
-        _live_claim(fixture_id=FIXTURE_2, minutes=152)
+        _live_claim(minutes=152)
+    with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
+        _live_claim(total_points=9)
+    # A field the leg never states is MISSING at this grain, so pinning the event
+    # total the element states above it -- or a zero -- onto the leg is an
+    # assertion its evidence does not support.
+    for name, value in (("starts", 2), ("bonus", 1), ("bps", 49), ("assists", 0)):
+        with pytest.raises(ol.BackfillEvidenceError, match=f"states no {name}"):
+            _live_claim(**{name: value})
+    # The second leg is its own row, with its own numbers.
+    assert _live_claim(
+        fixture_id=FIXTURE_2, minutes=62, total_points=2, goals_scored=None,
+        opponent_team_id=TEAM_C,
+    ).inserted
+    # ...and one leg's share cannot be pinned onto the other.
+    with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
+        _live_claim(fixture_id=FIXTURE_2, total_points=7)
 
     stored = {
         int(row["fixture_id"]): row
@@ -2373,78 +2451,45 @@ def test_H20_a_nested_event_live_backfill_reads_the_explain_legs(tmp_path):
         if row["archive_capture_id"] == record.capture_id
     }
     assert sorted(stored) == [FIXTURE_1, FIXTURE_2]
-    assert (stored[FIXTURE_1]["minutes"], stored[FIXTURE_1]["total_points"]) == (90, 6)
-    assert (stored[FIXTURE_2]["minutes"], stored[FIXTURE_2]["total_points"]) == (62, 3)
+    assert (stored[FIXTURE_1]["minutes"], stored[FIXTURE_1]["total_points"]) == (90, 7)
+    assert (stored[FIXTURE_2]["minutes"], stored[FIXTURE_2]["total_points"]) == (62, 2)
+    # Those two rows kept the fields their legs never stated MISSING, rather than
+    # inheriting the event's numbers or a zero.
+    for fixture_id in (FIXTURE_1, FIXTURE_2):
+        assert stored[fixture_id]["starts"] is None
+        assert stored[fixture_id]["bonus"] is None
+        assert stored[fixture_id]["bps"] is None
+        assert stored[fixture_id]["assists"] is None
 
-    # Event grain sums the legs ONCE, and carries no per-fixture identity: the
-    # headline row spans two fixtures whose opponents and kickoffs differ, so
-    # stating either leg's would be asserting a fixture fact about an event.
-    event_root, event_record = _archived_live(
-        tmp_path,
-        elements=[
-            _live_element(
-                player_id=DGW_PLAYER,
-                stats={},
-                explain=[
-                    _live_leg(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1),
-                    _live_leg(
-                        fixture_id=FIXTURE_2, opponent_team=TEAM_C, kickoff_time=KICKOFF_2,
-                        minutes=62, total_points=3, bonus=0, bps=19,
-                    ),
-                ],
-            )
-        ],
-        observed_at=_t(4),
-        raw_dir=tmp_path / "live_event",
-    )
-    assert _capture(
-        conn,
-        grain=ol.GRAIN_PLAYER_EVENT,
-        player_id=DGW_PLAYER,
-        fixture_id=None,
-        minutes=152, starts=2, total_points=9, goals_scored=2, assists=0, clean_sheets=0,
-        goals_conceded=2, saves=0, bonus=1, bps=49, yellow_cards=0, red_cards=0,
-        penalties_saved=0, penalties_missed=0, own_goals=0, defensive_contribution=0,
-        captured_at=_t(4),
-        source_name="archived_event_live",
-        source_identity="event_live_4",
-        source_payload_sha256=event_record.payload_sha256,
-        archive_capture_id=event_record.capture_id,
-        fetch_run_id=7,
-        backfill=True,
-        archive_root=event_root,
-    ).inserted
+    # EVENT grain: the headline row is the element's own top-level total, stated
+    # once -- the legs' own points sum to it rather than being a second copy of
+    # it -- and it is not a fixture.
+    assert _event_grain_claim().inserted
     headline = next(
         row
         for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
         if row["grain"] == ol.GRAIN_PLAYER_EVENT
+        and row["archive_capture_id"] == record.capture_id
     )
     assert headline["total_points"] == 9
-    # The legs disagree about the opponent and the kickoff, so the headline row
-    # states neither: an event total is not a fixture.
-    assert headline["event_time"] is None
+    assert (headline["minutes"], headline["starts"]) == (152, 2)
+    assert headline["bonus"] == 1
+    # A single leg's share is not the event total...
+    with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
+        _event_grain_claim(total_points=7)
+    with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
+        _event_grain_claim(minutes=90)
+    # ...and a field the element never states is missing at this grain too, so
+    # even a zero is an assertion rather than evidence.
+    with pytest.raises(ol.BackfillEvidenceError, match="states no defensive_contribution"):
+        _event_grain_claim(defensive_contribution=0)
+    # The legs disagree about the opponent, so the headline row states none: an
+    # event total is not a fixture, and a per-fixture identity cannot be attached
+    # to it at all.
     assert headline["opponent_team_id"] is None
     assert headline["team_id"] is None
-    # A per-fixture identity cannot be attached to the headline row at all.
     with pytest.raises(ol.BackfillEvidenceError, match="not archived evidence"):
-        _capture(
-            conn,
-            grain=ol.GRAIN_PLAYER_EVENT,
-            player_id=DGW_PLAYER,
-            fixture_id=None,
-            minutes=152, starts=2, total_points=9, goals_scored=2, assists=0, clean_sheets=0,
-            goals_conceded=2, saves=0, bonus=1, bps=49, yellow_cards=0, red_cards=0,
-            penalties_saved=0, penalties_missed=0, own_goals=0, defensive_contribution=0,
-            captured_at=_t(4),
-            source_name="archived_event_live",
-            source_identity="event_live_4",
-            source_payload_sha256=event_record.payload_sha256,
-            archive_capture_id=event_record.capture_id,
-            fetch_run_id=7,
-            backfill=True,
-            archive_root=event_root,
-            opponent_team_id=TEAM_B,
-        )
+        _event_grain_claim(opponent_team_id=TEAM_B)
     conn.close()
 
 
@@ -2583,6 +2628,220 @@ def test_H22_the_closure_reread_catches_a_generation_the_caller_cached(tmp_path,
     assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_provenance").fetchone()[0] == 0
     conn.close()
     other.close()
+
+
+def test_H23_an_inconsistent_accepted_generation_cannot_certify(tmp_path):
+    """An accepted pool whose own count disagrees with its id set certifies nothing.
+
+    ``official_element_count`` is the pool size the generation states it was
+    accepted over; the id set is what it retained.  A certificate names both, so
+    a generation whose stated count is not the number of elements that set
+    canonically holds describes a pool no evidence supports, and a freeze built
+    from it is NOT_CERTIFIABLE -- even though it is accepted, and even when its
+    digest recomputes from the ids it kept.  The count is likewise recorded only
+    once it has been checked: an inconsistent one is withheld rather than
+    persisted as if it had been verified.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    pool = len(SYNTHETIC_POOL)
+    # An accepted generation whose only defect is its own count: the digest
+    # recomputes from the retained ids, so nothing else can refuse it.
+    overcounted = _generation(conn, fetch_run_id=fetch, official_element_count=pool + 1)
+    overcounted_run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    over = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[overcounted_run], bootstrap_generation_id=overcounted
+    )
+    assert over.provenance_state == ol.NOT_CERTIFIABLE
+    assert any(
+        f"states {pool + 1} official elements but retains {pool}" in reason for reason in over.reasons
+    ), over.reasons
+    recorded = ol.freeze_provenance(conn, over.freeze_identity)
+    # The generation it examined is kept for audit, the id set is kept for audit,
+    # and the count it could not verify is NOT recorded.
+    assert recorded["bootstrap_generation_id"] == overcounted
+    assert json.loads(recorded["bootstrap_element_ids_json"]) == sorted(SYNTHETIC_POOL)
+    assert recorded["bootstrap_element_count"] is None
+
+    # The same defect in the other direction, on a freeze of its own (a freeze is
+    # certified once, and its runs make its identity).
+    undercounted = _generation(conn, fetch_run_id=fetch, official_element_count=pool - 1)
+    undercounted_run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={SGW_A_PLAYER: 4.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    under = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[undercounted_run], bootstrap_generation_id=undercounted
+    )
+    assert under.provenance_state == ol.NOT_CERTIFIABLE
+    assert any("disagrees with the id set it kept" in reason for reason in under.reasons), under.reasons
+
+    # A consistent generation certifies the same kind of freeze, and what the
+    # certificate records is its OWN stated count.
+    consistent = _generation(conn, fetch_run_id=fetch)
+    consistent_run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={SGW_B_PLAYER: 9.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    certified = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[consistent_run], bootstrap_generation_id=consistent
+    )
+    assert certified.provenance_state == ol.GENERATION_CERTIFIED, certified.reasons
+    kept = ol.freeze_provenance(conn, certified.freeze_identity)
+    assert kept["bootstrap_element_count"] == pool
+    assert json.loads(kept["bootstrap_element_ids_json"]) == sorted(SYNTHETIC_POOL)
+    conn.close()
+
+
+def test_H24_a_single_fixture_event_capture_keeps_its_kickoff(tmp_path):
+    """An event-grain row keeps a kickoff when ONE fixture contributed it.
+
+    A kickoff belongs to a fixture, so an event total spanning two fixtures has
+    no single one -- but a player-event capture whose whole event was one
+    fixture is not ambiguous, and dropping the archived kickoff there discards a
+    fact the archive states.  The rule is AGREEMENT among the contributing
+    fixtures: one fixture keeps its kickoff, fixtures that state different
+    kickoffs leave it NULL, and a caller who asserts one leg's time for such an
+    event is refused rather than quietly ignored.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    event_fields = {
+        "starts": 1, "goals_scored": 1, "assists": 0, "clean_sheets": 0,
+        "goals_conceded": 1, "saves": 0, "yellow_cards": 0, "red_cards": 0,
+        "penalties_saved": 0, "penalties_missed": 0, "own_goals": 0,
+        "defensive_contribution": 0,
+    }
+
+    # ONE archived fixture: its kickoff, club and opponent ARE the event's.
+    single_root, single_record = _archived_observation(
+        tmp_path,
+        rows=[_archived_element_row(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1)],
+        source="element_summary_10",
+    )
+
+    def _event_claim(root, record, **overrides):
+        arguments = {
+            "grain": ol.GRAIN_PLAYER_EVENT,
+            "player_id": DGW_PLAYER,
+            "fixture_id": None,
+            "captured_at": _t(6),
+            "source_name": "archived_element_summary",
+            "source_identity": "element_summary_10",
+            "source_payload_sha256": record.payload_sha256,
+            "archive_capture_id": record.capture_id,
+            "fetch_run_id": 7,
+            "backfill": True,
+            "archive_root": root,
+            "minutes": 90, "total_points": 6, "bonus": 1, "bps": 30,
+            **event_fields,
+        }
+        arguments.update(overrides)
+        return _capture(conn, **arguments)
+
+    assert _event_claim(single_root, single_record).inserted
+    headline = next(
+        row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+        if row["grain"] == ol.GRAIN_PLAYER_EVENT
+    )
+    assert headline["event_time"] == KICKOFF_1
+    assert (headline["team_id"], headline["opponent_team_id"]) == (TEAM_A, TEAM_B)
+    # The archived kickoff may also be claimed, because the archive states it --
+    # and a later observation of the same fixture is a capture of its own.
+    later_root, later_record = _archived_observation(
+        tmp_path,
+        rows=[_archived_element_row(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1)],
+        source="element_summary_10",
+        observed_at=_t(5),
+        raw_dir=tmp_path / "single_later",
+    )
+    assert _event_claim(later_root, later_record, captured_at=_t(5), event_time=KICKOFF_1).inserted
+    with pytest.raises(ol.BackfillEvidenceError, match="was played at"):
+        _event_claim(later_root, later_record, captured_at=_t(5), event_time=KICKOFF_2)
+
+    # TWO archived fixtures that disagree: the event has no single kickoff, so the
+    # headline row states none, and a claim of either leg's time is refused
+    # instead of being dropped in favour of NULL.
+    dgw_root, dgw_record = _archived_observation(
+        tmp_path,
+        rows=[
+            _archived_element_row(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1),
+            _archived_element_row(
+                fixture_id=FIXTURE_2, kickoff_time=KICKOFF_2, opponent_team=TEAM_C, team_a=TEAM_C,
+            ),
+        ],
+        source="element_summary_10",
+        observed_at=_t(4),
+        raw_dir=tmp_path / "dgw",
+    )
+    dgw_claim = {
+        "minutes": 180, "total_points": 12, "goals_scored": 2, "assists": 0,
+        "clean_sheets": 0, "goals_conceded": 2, "saves": 0, "bonus": 2, "bps": 60,
+        "starts": 2, "yellow_cards": 0, "red_cards": 0, "penalties_saved": 0,
+        "penalties_missed": 0, "own_goals": 0, "defensive_contribution": 0,
+    }
+    with pytest.raises(ol.BackfillEvidenceError, match="not one this observation can state"):
+        _event_claim(dgw_root, dgw_record, captured_at=_t(4), event_time=KICKOFF_1, **dgw_claim)
+    assert _event_claim(dgw_root, dgw_record, captured_at=_t(4), **dgw_claim).inserted
+    split = next(
+        row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+        if row["archive_capture_id"] == dgw_record.capture_id
+    )
+    assert split["event_time"] is None
+    assert split["total_points"] == 12
+
+    # The live path states the same fact on the leg that describes the fixture,
+    # and a one-fixture event capture keeps it there too.
+    live_root, live_record = _archived_live(
+        tmp_path,
+        elements=[
+            _live_element(
+                player_id=SGW_B_PLAYER,
+                explain=[
+                    _live_leg(
+                        fixture_id=FIXTURE_1, opponent_team=TEAM_A, was_home=False,
+                        kickoff_time=KICKOFF_1, rules=(("minutes", 90, 2),),
+                    )
+                ],
+            )
+        ],
+        raw_dir=tmp_path / "live_sgw",
+    )
+    assert _capture(
+        conn,
+        grain=ol.GRAIN_PLAYER_EVENT,
+        player_id=SGW_B_PLAYER,
+        fixture_id=None,
+        minutes=90, total_points=6, bonus=1, bps=30,
+        captured_at=_t(6),
+        source_name="archived_event_live",
+        source_identity="event_live_4",
+        source_payload_sha256=live_record.payload_sha256,
+        archive_capture_id=live_record.capture_id,
+        fetch_run_id=7,
+        backfill=True,
+        archive_root=live_root,
+        **event_fields,
+    ).inserted
+    live_headline = next(
+        row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=SGW_B_PLAYER)
+        if row["grain"] == ol.GRAIN_PLAYER_EVENT
+    )
+    assert live_headline["event_time"] == KICKOFF_1
+    assert live_headline["opponent_team_id"] == TEAM_A
+    conn.close()
 
 
 def test_H9_a_historical_read_resolves_from_pinned_evidence(tmp_path):
