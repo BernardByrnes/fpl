@@ -93,7 +93,11 @@ def test_m015_migration_creates_the_generation_table(tmp_path):
     conn = _temp_db(tmp_path)
     try:
         row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
-        assert int(row[0]) == db.SCHEMA_VERSION == 15
+        # The migrated store is at the code's schema version, and at least at the
+        # one m015 introduced.  The lower bound is deliberate: this test is about
+        # m015's table existing, so a later additive migration must not have to
+        # edit it again.
+        assert int(row[0]) == db.SCHEMA_VERSION >= 15
         cols = {r[1] for r in conn.execute("PRAGMA table_info(bootstrap_generations)")}
         for column in ("id", "fetch_run_id", "captured_at", "accepted", "official_element_count",
                        "parsed_count", "persisted_count", "element_ids_sha256", "element_ids_json",

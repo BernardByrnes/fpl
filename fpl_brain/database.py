@@ -10,7 +10,7 @@ from typing import Callable
 
 from .utils import utc_now
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Model families the analytics spine may record.  ``baseline`` / ``minutes_v1``
 # predate this list; the team and player-rate families were added in m007 and
@@ -1181,6 +1181,165 @@ def m015_bootstrap_generation_identity(conn: sqlite3.Connection) -> None:
     )
 
 
+def m016_outcome_ledger(conn: sqlite3.Connection) -> None:
+    """PE-5 append-only outcome history and generation-certified freeze provenance.
+
+    ``player_gameweeks`` is CURRENT / LATEST-STATE storage: the same logical
+    player/event/fixture row is refreshed in place, so what an earlier read
+    observed is silently replaced.  ``outcome_observations`` (m005) is keyed
+    ``UNIQUE(event, player_id, fixture_id)`` and upserts in place for the same
+    reason -- it answers "what is the outcome now", never "what did we know
+    then".  PE-5 needs the second question answered, so this migration adds the
+    durable point-in-time history rather than a second current-state table.
+
+    Three additive tables, no row movement and no existing table, constraint or
+    foreign key touched:
+
+    * ``outcome_observation_captures`` -- append-only observation history.  A
+      capture is immutable at the storage level (UPDATE and DELETE both abort),
+      so a correction is necessarily a NEW capture naming what it supersedes.
+      ``capture_digest`` is the idempotency key: re-ingesting the SAME
+      observation (same identity, same source identity, same capture time, same
+      payload) is a no-op, while the same observation captured at a different
+      time is a second retained row.  ``event_time``, ``official_final_at`` and
+      ``captured_at`` are three separate columns because the football event, the
+      official finalisation and the repository's read are three different
+      moments that must not be collapsed into one timestamp.
+    * ``prediction_freeze_provenance`` -- the generation certificate for one
+      prediction freeze.  ``bootstrap_generation_id`` pins the accepted official
+      generation AT CERTIFICATION TIME: a later accepted generation does not
+      retroactively certify an earlier freeze, so the recorded id is never
+      re-resolved from "the newest accepted row".  It is authoritative only when
+      ``provenance_state = 'GENERATION_CERTIFIED'``; a ``NOT_CERTIFIABLE`` record
+      keeps the generation it examined, plus the reasons it was refused.
+    * ``prediction_freeze_runs`` -- the exact projection runs belonging to that
+      freeze, with the partial-unique index making "one run, one freeze" a
+      database fact rather than a convention.
+
+    Nothing here is destructive and nothing is backfilled: a pre-PE-5 run simply
+    has no provenance row, which reads as the truthful not-fully-certified
+    state rather than a manufactured certificate.
+    """
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS outcome_observation_captures (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          capture_digest TEXT NOT NULL UNIQUE,
+          grain TEXT NOT NULL CHECK (grain IN ('player_event','player_fixture')),
+          event INTEGER NOT NULL,
+          player_id INTEGER NOT NULL,
+          fixture_id INTEGER,
+          team_id INTEGER,
+          opponent_team_id INTEGER,
+          event_time TEXT,
+          official_final_at TEXT,
+          captured_at TEXT NOT NULL,
+          observation_state TEXT NOT NULL CHECK (observation_state IN ('FINAL','PROVISIONAL')),
+          supersedes_capture_id INTEGER REFERENCES outcome_observation_captures(id),
+          correction_reason TEXT,
+          source_name TEXT NOT NULL,
+          source_identity TEXT,
+          source_payload_sha256 TEXT,
+          fetch_run_id INTEGER,
+          archive_capture_id TEXT,
+          backfill_evidence_json TEXT,
+          payload_json TEXT NOT NULL,
+          minutes INTEGER,
+          starts INTEGER,
+          total_points INTEGER,
+          goals_scored INTEGER,
+          assists INTEGER,
+          clean_sheets INTEGER,
+          goals_conceded INTEGER,
+          saves INTEGER,
+          bonus INTEGER,
+          bps INTEGER,
+          yellow_cards INTEGER,
+          red_cards INTEGER,
+          penalties_saved INTEGER,
+          penalties_missed INTEGER,
+          own_goals INTEGER,
+          defensive_contribution INTEGER,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outcome_captures_key
+          ON outcome_observation_captures(grain, event, player_id, fixture_id, captured_at, id);
+        CREATE INDEX IF NOT EXISTS idx_outcome_captures_event
+          ON outcome_observation_captures(event, captured_at);
+        CREATE INDEX IF NOT EXISTS idx_outcome_captures_captured
+          ON outcome_observation_captures(captured_at);
+
+        CREATE TRIGGER IF NOT EXISTS outcome_observation_captures_no_update
+          BEFORE UPDATE ON outcome_observation_captures
+          BEGIN SELECT RAISE(ABORT, 'outcome observation captures are append-only history'); END;
+        CREATE TRIGGER IF NOT EXISTS outcome_observation_captures_no_delete
+          BEFORE DELETE ON outcome_observation_captures
+          BEGIN SELECT RAISE(ABORT, 'outcome observation captures are append-only history'); END;
+
+        CREATE TABLE IF NOT EXISTS prediction_freeze_provenance (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          freeze_identity TEXT NOT NULL UNIQUE,
+          provenance_state TEXT NOT NULL CHECK (provenance_state IN (
+            'GENERATION_CERTIFIED','LEGACY_PROVENANCE','NOT_CERTIFIABLE')),
+          planning_event INTEGER NOT NULL,
+          planning_cutoff TEXT NOT NULL,
+          model_version TEXT,
+          config_hash TEXT,
+          random_seed INTEGER,
+          source_snapshot_sha256 TEXT,
+          code_revision TEXT,
+          official_fetch_run_id INTEGER,
+          bootstrap_generation_id INTEGER,
+          bootstrap_captured_at TEXT,
+          bootstrap_element_count INTEGER,
+          bootstrap_element_ids_sha256 TEXT,
+          bootstrap_element_ids_json TEXT,
+          bootstrap_acceptance_rule_version TEXT,
+          runs_json TEXT NOT NULL,
+          prediction_artifact_identity TEXT NOT NULL,
+          prediction_artifact_sha256 TEXT NOT NULL,
+          reasons_json TEXT NOT NULL,
+          certification_version TEXT NOT NULL,
+          certified_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_freeze_provenance_event
+          ON prediction_freeze_provenance(planning_event, provenance_state);
+        CREATE INDEX IF NOT EXISTS idx_freeze_provenance_generation
+          ON prediction_freeze_provenance(bootstrap_generation_id);
+
+        CREATE TRIGGER IF NOT EXISTS prediction_freeze_provenance_no_update
+          BEFORE UPDATE ON prediction_freeze_provenance
+          BEGIN SELECT RAISE(ABORT, 'prediction freeze provenance is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS prediction_freeze_provenance_no_delete
+          BEFORE DELETE ON prediction_freeze_provenance
+          BEGIN SELECT RAISE(ABORT, 'prediction freeze provenance is immutable'); END;
+
+        CREATE TABLE IF NOT EXISTS prediction_freeze_runs (
+          freeze_id INTEGER NOT NULL REFERENCES prediction_freeze_provenance(id),
+          projection_run_id INTEGER NOT NULL REFERENCES projection_runs(id),
+          model_family TEXT NOT NULL,
+          model_version TEXT NOT NULL,
+          config_hash TEXT,
+          random_seed INTEGER,
+          PRIMARY KEY (freeze_id, projection_run_id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_prediction_freeze_runs_run
+          ON prediction_freeze_runs(projection_run_id);
+
+        CREATE TRIGGER IF NOT EXISTS prediction_freeze_runs_no_update
+          BEFORE UPDATE ON prediction_freeze_runs
+          BEGIN SELECT RAISE(ABORT, 'prediction freeze run membership is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS prediction_freeze_runs_no_delete
+          BEFORE DELETE ON prediction_freeze_runs
+          BEGIN SELECT RAISE(ABORT, 'prediction freeze run membership is immutable'); END;
+        """
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_initial,
     m002_manual_manager_state,
@@ -1197,6 +1356,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m013_event_start_free_transfers,
     m014_execution_control,
     m015_bootstrap_generation_identity,
+    m016_outcome_ledger,
 ]
 
 
