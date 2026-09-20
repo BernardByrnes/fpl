@@ -518,6 +518,11 @@ def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweek
                         context[key] = explanation[key]
                 if "was_home" not in context and "is_home" in context:
                     context["was_home"] = context["is_home"]
+                # The element kept in raw_json is the id this row was actually
+                # read for, so downstream readers can tell whose row it is from
+                # the payload rather than from what they asked the parser for.
+                context["element"] = player_id
+                context["id"] = player_id
                 explanation_rows.append((explanation_fixture, context, _parse_live_explanation_stats(explanation)))
         if explanation_rows:
             for fixture_id, context, fixture_stats in explanation_rows:
@@ -555,7 +560,7 @@ def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweek
             stats_value=stats_map if stats_map else None,
         )
         if record is not None:
-            record.raw_json = dict(value)
+            record.raw_json = {**dict(value), "element": player_id, "id": player_id}
             records.append(record)
     return records
 

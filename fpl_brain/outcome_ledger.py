@@ -514,7 +514,14 @@ def _row_raw(row: Any) -> Mapping[str, Any]:
 
 
 def _row_stated_element(row: Any) -> int | None:
-    """The player identity an archived row states about ITSELF, if it states one."""
+    """The player identity an archived row states about ITSELF, if it states one.
+
+    "About itself" is the whole point: a row that never names an element is not
+    evidence about anybody, however confidently a parser -- which was told whose
+    summary it was reading -- has labelled it.  The parsers retain the element id
+    they actually read for both sources, so this is a statement the payload
+    made, never the claim that was being checked.
+    """
 
     for key in ("element", "id"):
         value = _row_raw(row).get(key)
@@ -527,22 +534,40 @@ def _row_stated_element(row: Any) -> int | None:
     return None
 
 
-def _archived_row_identity(row: Any) -> dict[str, Any]:
-    """The football identity one archived row states: club, opponent, kickoff."""
+def _row_stated_field(row: Any, *keys: str) -> Any:
+    """One archived value, from the raw payload or the row it was parsed into."""
 
     raw = _row_raw(row)
-    was_home = raw.get("was_home")
-    if was_home is None:
-        was_home = raw.get("is_home")
-    home, away = raw.get("team_h"), raw.get("team_a")
+    for key in keys:
+        if key in raw:
+            return raw[key]
+    for key in keys:
+        value = getattr(row, key, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _archived_row_identity(row: Any) -> dict[str, Any]:
+    """The football identity one archived row states: club, opponent, kickoff.
+
+    Read from the raw payload when it states these, and otherwise from the row
+    the canonical parser normalised them into -- the live endpoint keeps the
+    club pair and the kickoff on its ``explain`` leg rather than on the element,
+    so the parsed record is where that identity survives.
+    """
+
+    was_home = _row_stated_field(row, "was_home", "is_home")
+    home = _row_stated_field(row, "team_h")
+    away = _row_stated_field(row, "team_a")
     team: int | None = None
     opponent: int | None = None
     if was_home is not None and home is not None and away is not None:
         team, opponent = (int(home), int(away)) if int(bool(was_home)) else (int(away), int(home))
-    stated_opponent = raw.get("opponent_team")
+    stated_opponent = _row_stated_field(row, "opponent_team")
     if stated_opponent is not None:
         opponent = int(stated_opponent)
-    kickoff = raw.get("kickoff_time")
+    kickoff = _row_stated_field(row, "kickoff_time")
     return {
         "team_id": team,
         "opponent_team_id": opponent,
@@ -628,29 +653,52 @@ def _bind_backfilled_observation(
             )
         parsed = parsers.parse_element_summary(payload, int(player_id))
 
-    matched = [
-        row
-        for row in parsed
-        if int(row.event) == int(event) and (fixture_id is None or row.fixture_id == int(fixture_id))
-    ]
+    # PLAYER identity comes first, from the rows themselves.  A parser is TOLD
+    # which player it is reading, so its records carry the caller's id whatever
+    # the payload says; taking that at face value would file one player's
+    # numbers under another player's id whenever the two happened to score the
+    # same.  The element a row states about itself is therefore what selects
+    # rows, and rows naming nobody are not evidence about anybody.
+    in_event = [row for row in parsed if int(row.event) == int(event)]
+    with_element = [(row, _row_stated_element(row)) for row in in_event]
+    named = {identity for _, identity in with_element if identity is not None}
+    # A bulk payload legitimately carries other players -- an event-live response
+    # serves the whole pool -- so those rows are simply not this claim's.  The
+    # question of WHOSE the payload is comes before the question of which of his
+    # fixtures it holds.
+    ours = [row for row, identity in with_element if identity == int(player_id)]
+    if not ours and named:
+        # The payload names players, but not this one: it is not evidence about
+        # the claimant at all.
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} states player identities {sorted(named)} at event "
+            f"{int(event)}, none of which is the claimed player {int(player_id)}; an archived payload "
+            "is evidence only for the players it names"
+        )
+    if not ours and in_event:
+        # Rows exist for this event and none of them says whose they are, so
+        # there is nothing in the bytes that can bind the claim to a player.
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} states no player identity for the claimed player "
+            f"{int(player_id)} at event {int(event)}, so the claim cannot be bound to its content"
+        )
+    matched = [row for row in ours if fixture_id is None or row.fixture_id == int(fixture_id)]
     if not matched:
         raise BackfillEvidenceError(
             f"archived capture {capture_id!r} holds no observation for player {int(player_id)}, event "
             f"{int(event)}" + ("" if fixture_id is None else f", fixture {int(fixture_id)}")
         )
-    if kind == "element_summary" and not suffix.isdigit():
-        stated = {
-            identity for identity in (_row_stated_element(row) for row in matched) if identity is not None
-        }
-        if stated != {int(player_id)}:
-            raise BackfillEvidenceError(
-                f"archived capture {capture_id!r} states no player identity for the claimed player "
-                f"{int(player_id)} at event {int(event)}, so the claim cannot be bound to its content"
-            )
     if fixture_id is not None and len(matched) > 1:
         raise BackfillEvidenceError(
             f"archived capture {capture_id!r} holds {len(matched)} rows for fixture {int(fixture_id)}; a "
             "fixture-grain observation must resolve to exactly one archived row"
+        )
+    stated_fixtures = {int(row.fixture_id) for row in matched}
+    if len(stated_fixtures) != len(matched):
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} holds {len(matched)} rows for player {int(player_id)} at "
+            f"event {int(event)} but only {len(stated_fixtures)} distinct fixtures; a row that names no "
+            "fixture cannot witness which fixture was played"
         )
 
     archived = _archived_observation_values(matched, grain=grain)
@@ -673,10 +721,23 @@ def _bind_backfilled_observation(
                     "states it"
                 )
 
-    identity = _archived_row_identity(matched[0])
+    # Identity, at the grain being captured.  FIXTURE grain has exactly one row,
+    # so that row's club, opponent and kickoff ARE the observation's.  EVENT
+    # grain may span two fixtures, and a double gameweek has no single club,
+    # opponent or kickoff: taking one row's identity would file fixture 1's
+    # opponent on a row that also sums fixture 2, which is a fabrication dressed
+    # as a fact.  So the event grain keeps a field only when every contributing
+    # row agrees on it, and otherwise leaves it NULL -- "not applicable at this
+    # grain" rather than an arbitrary member of a set.
+    stated = [_archived_row_identity(row) for row in matched]
+    agreed: dict[str, Any] = {}
+    for field in ("team_id", "opponent_team_id", "event_time"):
+        values = {_observed_value(item[field]) for item in stated}
+        agreed[field] = values.pop() if len(values) == 1 else None
+
     for label, claimed_value, archived_value in (
-        ("club/team", team_id, identity["team_id"]),
-        ("opponent", opponent_team_id, identity["opponent_team_id"]),
+        ("club/team", team_id, agreed["team_id"]),
+        ("opponent", opponent_team_id, agreed["opponent_team_id"]),
     ):
         if claimed_value is None:
             continue
@@ -690,18 +751,40 @@ def _bind_backfilled_observation(
                 f"archived capture {capture_id!r} states the {label} as {archived_value!r} for player "
                 f"{int(player_id)} event {int(event)}, not the claimed {claimed_value!r}"
             )
-    if event_time is not None and identity["event_time"] is not None:
-        if parse_utc(str(event_time)) != parse_utc(str(identity["event_time"])):
+    if event_time is not None:
+        claimed_kickoff = parse_utc(str(event_time))
+        stated_kickoffs = {str(item["event_time"]) for item in stated if item["event_time"] is not None}
+        if not stated_kickoffs:
+            # No archived row says when this was played, so nothing in the
+            # evidence supports the claim -- and the contract's rule is that a
+            # caller-supplied value is not evidence just because no row
+            # contradicts it.
             raise BackfillEvidenceError(
-                f"archived capture {capture_id!r} was played at {identity['event_time']}, not at the "
+                f"archived capture {capture_id!r} states no kickoff time for player {int(player_id)} "
+                f"event {int(event)}, so the claimed {event_time} is not archived evidence"
+            )
+        if claimed_kickoff not in {parse_utc(value) for value in stated_kickoffs}:
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} was played at {sorted(stated_kickoffs)}, not at the "
                 f"claimed {event_time}"
             )
+    if grain == GRAIN_PLAYER_FIXTURE:
+        return {
+            "team_id": agreed["team_id"] if team_id is None else team_id,
+            "opponent_team_id": (
+                agreed["opponent_team_id"] if opponent_team_id is None else opponent_team_id
+            ),
+            "event_time": agreed["event_time"] if event_time is None else str(event_time),
+        }
+    # Event grain: a club may be carried (one player belongs to one club for a
+    # whole event, so agreement is the rule), but a per-fixture identity may
+    # not.  A kickoff time belongs to a fixture rather than to an event, so the
+    # headline row keeps none: filling it from one of two legs would state a
+    # per-fixture fact on an aggregate that spans both.
     return {
-        "team_id": identity["team_id"] if team_id is None else team_id,
-        "opponent_team_id": (
-            identity["opponent_team_id"] if opponent_team_id is None else opponent_team_id
-        ),
-        "event_time": identity["event_time"] if event_time is None else str(event_time),
+        "team_id": agreed["team_id"],
+        "opponent_team_id": agreed["opponent_team_id"],
+        "event_time": None,
     }
 
 
@@ -1427,6 +1510,7 @@ def certify_prediction_freeze(
                 generation=None, element_ids=[], element_digest=None, element_count=None,
                 certified_at=certified_at or utc_now(),
                 closure=_closure_evidence(conn, ordered, None),
+                decided_generation=None,
             )
         reasons.append(
             "the freeze records an official fetch but no bootstrap generation, so the accepted "
@@ -1475,12 +1559,48 @@ def certify_prediction_freeze(
         official_fetch_run_id=fetch_run_id, generation=generation, element_ids=element_ids,
         element_digest=element_digest, element_count=element_count,
         certified_at=certified_at or utc_now(),
-        closure=_closure_evidence(conn, ordered, generation),
+        closure=_closure_evidence(conn, ordered, generation_id),
+        decided_generation=generation,
     )
 
 
+#: The ``bootstrap_generations`` columns a certificate's every claim is read
+#: from.  The fingerprint is the whole set, so a row edited between the decision
+#: and the write cannot pass the closure check by moving a field the certificate
+#: does not itself echo -- ``official_element_count`` and
+#: ``acceptance_rule_version`` are recorded on the certificate and therefore
+#: must be part of what has to hold still.
+_GENERATION_CLOSURE_FIELDS = (
+    "id",
+    "accepted",
+    "fetch_run_id",
+    "captured_at",
+    "official_element_count",
+    "element_ids_sha256",
+    "element_ids_json",
+    "acceptance_rule_version",
+)
+
+
+def _generation_fingerprint(generation: Mapping[str, Any] | None) -> tuple[Any, ...] | None:
+    """One generation's certification-relevant identity, in canonical form."""
+
+    if generation is None:
+        return None
+    values: list[Any] = []
+    for name in _GENERATION_CLOSURE_FIELDS:
+        value = generation.get(name)
+        if name in ("official_element_count",):
+            values.append(None if value is None else int(value))
+        elif name in ("id", "fetch_run_id", "accepted"):
+            values.append(None if value is None else int(value))
+        else:
+            values.append(None if value is None else str(value))
+    return tuple(values)
+
+
 def _closure_evidence(
-    conn: sqlite3.Connection, ordered: Sequence[int], generation: Mapping[str, Any] | None
+    conn: sqlite3.Connection, ordered: Sequence[int], generation_id: int | None
 ) -> tuple[Any, ...]:
     """Everything a certificate's claims are read from, as ONE observation.
 
@@ -1491,9 +1611,11 @@ def _closure_evidence(
     describes is the artifact that existed at the instant it was written, not
     the one a decision read saw a moment earlier.
 
-    The generation's identity is part of the observation for the same reason --
-    a certificate records the generation that certified it, so a row that moves
-    while the certificate is being written is not the row being recorded.
+    The generation is re-read BY ID here rather than fingerprinted from whatever
+    dictionary the decision happened to hold.  A certificate records the
+    generation that certified it, so the row that has to be still is the row in
+    the table; a fingerprint taken from a stale copy would happily certify a
+    generation that had since been edited underneath it.
     """
 
     runs: list[tuple[Any, ...]] = []
@@ -1513,21 +1635,10 @@ def _closure_evidence(
                 str(row["data_cutoff"]),
             )
         )
-    generation_fingerprint = (
-        None
-        if generation is None
-        else (
-            int(generation["id"]),
-            int(generation.get("accepted") or 0),
-            None if generation.get("fetch_run_id") is None else int(generation["fetch_run_id"]),
-            str(generation.get("captured_at") or ""),
-            str(generation.get("element_ids_sha256") or ""),
-            str(generation.get("element_ids_json") or ""),
-        )
-    )
+    generation = None if generation_id is None else _bootstrap_generation(conn, int(generation_id))
     return (
         tuple(runs),
-        generation_fingerprint,
+        _generation_fingerprint(generation),
         prediction_artifact_digest(conn, ordered),
     )
 
@@ -1605,6 +1716,7 @@ def _record_freeze(
     element_count: int | None,
     certified_at: str,
     closure: tuple[Any, ...],
+    decided_generation: Mapping[str, Any] | None,
 ) -> FreezeCertification:
     existing = conn.execute(
         "SELECT id FROM prediction_freeze_provenance WHERE freeze_identity=?", (freeze_identity,)
@@ -1646,7 +1758,23 @@ def _record_freeze(
         # status or a generation row in between the decision and this write is
         # caught here and the closure is refused, because the artifact it would
         # describe is not the artifact that existed when the decision was made.
-        observed = _closure_evidence(conn, ordered, generation)
+        observed = _closure_evidence(
+            conn, ordered, None if decided_generation is None else int(decided_generation["id"])
+        )
+        # The certificate is decided FROM a generation read and records THAT
+        # generation.  Comparing the decision's own reading with the row that
+        # exists now is what makes the two the same fact: a row retracted,
+        # rejected or rebuilt in between would otherwise be certified from a
+        # truth that has already been withdrawn.  The closure's own read alone
+        # cannot see this, because by then it reads whatever the row says.
+        decided_generation_fingerprint = _generation_fingerprint(decided_generation)
+        if decided_generation_fingerprint != observed[1]:
+            raise OutcomeLedgerError(
+                f"freeze {freeze_identity} cannot be certified: the bootstrap generation it was decided "
+                f"from ({decided_generation_fingerprint}) is not the generation that exists now "
+                f"({observed[1]}); a certificate records the row that supplied the pool, so a row that "
+                "moved is refused and nothing was recorded"
+            )
         if observed[2] != artifact_sha:
             raise OutcomeLedgerError(
                 f"freeze {freeze_identity} cannot be certified: its frozen artifact digested to "

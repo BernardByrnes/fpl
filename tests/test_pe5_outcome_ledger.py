@@ -502,6 +502,101 @@ def _archived_observation(
     )
 
 
+def _live_element(
+    *,
+    player_id: int = DGW_PLAYER,
+    fixture_id: int = FIXTURE_1,
+    stats: dict | None = None,
+    explain: list | None = None,
+) -> dict:
+    """One element of an ``event/live`` response: stats totals plus explain legs.
+
+    The live endpoint nests each fixture's own numbers under ``explain``, which
+    is the only fixture-specific part of the payload -- the top-level ``stats``
+    object is the player's EVENT total.  A double gameweek therefore has to be
+    read out of the explain legs, or one fixture's numbers get copied onto both.
+    """
+
+    return {
+        "id": player_id,
+        "stats": stats
+        if stats is not None
+        else {
+            "minutes": 90, "starts": 1, "total_points": 6, "goals_scored": 1,
+            "assists": 0, "clean_sheets": 0, "goals_conceded": 1, "saves": 0,
+            "bonus": 1, "bps": 30, "yellow_cards": 0, "red_cards": 0,
+            "penalties_saved": 0, "penalties_missed": 0, "own_goals": 0,
+            "defensive_contribution": 0, "fixture": fixture_id,
+        },
+        "explain": explain if explain is not None else [],
+    }
+
+
+def _live_leg(
+    *,
+    fixture_id: int = FIXTURE_1,
+    opponent_team: int = TEAM_B,
+    was_home: bool = True,
+    kickoff_time: str = KICKOFF_1,
+    minutes: int = 90,
+    total_points: int = 6,
+    bonus: int | None = 1,
+    bps: int | None = 30,
+    **extra,
+) -> dict:
+    """One ``explain`` entry: a fixture's own stat list, exactly as it is served."""
+
+    stats = [
+        {"identifier": "minutes", "points": 0, "value": minutes},
+        {"identifier": "starts", "points": 0, "value": 1 if minutes else 0},
+        {"identifier": "total_points", "points": total_points, "value": total_points},
+        {"identifier": "goals_scored", "points": 0, "value": 1},
+        {"identifier": "assists", "points": 0, "value": 0},
+        {"identifier": "clean_sheets", "points": 0, "value": 0},
+        {"identifier": "goals_conceded", "points": 0, "value": 1},
+        {"identifier": "saves", "points": 0, "value": 0},
+        {"identifier": "bonus", "points": 0, "value": bonus},
+        {"identifier": "bps", "points": 0, "value": bps},
+        {"identifier": "yellow_cards", "points": 0, "value": 0},
+        {"identifier": "red_cards", "points": 0, "value": 0},
+        {"identifier": "penalties_saved", "points": 0, "value": 0},
+        {"identifier": "penalties_missed", "points": 0, "value": 0},
+        {"identifier": "own_goals", "points": 0, "value": 0},
+        {"identifier": "defensive_contribution", "points": 0, "value": 0},
+    ]
+    for name in extra:
+        stats.append({"identifier": name, "points": 0, "value": extra[name]})
+    return {
+        "fixture": fixture_id,
+        "opponent_team": opponent_team,
+        "was_home": was_home,
+        "kickoff_time": kickoff_time,
+        "stats": stats,
+    }
+
+
+def _archived_live(
+    tmp_path,
+    *,
+    elements,
+    event: int = EVENT,
+    observed_at: str | None = None,
+    run_id: int = 7,
+    raw_dir=None,
+):
+    """Archive one ``event/live`` response, returning ``(root, record)``."""
+
+    return _archive(
+        tmp_path,
+        source=f"event_live_{int(event)}",
+        observed_at=observed_at or _t(6),
+        payload={"elements": list(elements)},
+        event=int(event),
+        run_id=run_id,
+        raw_dir=raw_dir,
+    )
+
+
 def _backfill(conn, *, root, record, source_identity: str | None = None, **overrides):
     """The backfill claim for one archived capture, carrying the archive's own values."""
 
@@ -2090,6 +2185,404 @@ def test_H17_a_backfill_is_bound_to_the_archived_content(tmp_path):
     with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
         _event_claim(total_points=6)
     conn.close()
+
+
+def test_H18_a_backfill_is_bound_to_the_player_the_archive_names(tmp_path):
+    """The rows must belong to the claimed player, whatever the payload is called.
+
+    A parser is TOLD which player it is reading, so its records carry the
+    caller's id no matter whose numbers they contain: the ``element`` a row
+    states about itself is therefore the only thing that can bind a claim to a
+    player.  Without that check the live endpoint -- which serves every player
+    in one response -- would let one player's afternoon be filed as another's,
+    and the file would look perfectly well formed while being about the wrong
+    footballer.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+
+    # The live payload belongs to SGW_B_PLAYER, who scored nine.  Claiming it for
+    # the DGW player is claiming another footballer's fact.
+    root, record = _archived_live(
+        tmp_path, elements=[_live_element(player_id=SGW_B_PLAYER)], raw_dir=tmp_path / "live1"
+    )
+    with pytest.raises(ol.BackfillEvidenceError, match="none of which is the claimed player"):
+        _backfill(conn, root=root, record=record, player_id=DGW_PLAYER)
+    assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 0
+
+    # The same rule for an element summary: a payload named for one player whose
+    # rows state another is not that player's evidence either.
+    summary_root, summary_record = _archived_observation(
+        tmp_path,
+        rows=[_archived_element_row(player_id=SGW_B_PLAYER, total_points=9, bonus=3, bps=41)],
+        source="element_summary_10",
+        raw_dir=tmp_path / "summary1",
+    )
+    with pytest.raises(ol.BackfillEvidenceError, match="none of which is the claimed player"):
+        _backfill(conn, root=summary_root, record=summary_record, player_id=DGW_PLAYER)
+
+    # A payload that states the claimant at a DIFFERENT event is no evidence for
+    # THIS event, so the archive offers nothing to bind the claim to.
+    elsewhere_root, elsewhere_record = _archived_observation(
+        tmp_path,
+        rows=[_archived_element_row(event=OTHER_EVENT, fixture_id=FIXTURE_OTHER)],
+        source="element_summary_10",
+        observed_at=_t(12),
+        raw_dir=tmp_path / "summary2",
+    )
+    with pytest.raises(ol.BackfillEvidenceError, match="holds no observation"):
+        _backfill(conn, root=elsewhere_root, record=elsewhere_record, captured_at=_t(12))
+
+    # The player's own rows are still exactly the evidence that binds, including
+    # when the same response carries other players alongside him.
+    both_root, both_record = _archived_live(
+        tmp_path,
+        elements=[
+            _live_element(player_id=SGW_B_PLAYER, stats={"fixture": FIXTURE_1}),
+            _live_element(player_id=DGW_PLAYER),
+        ],
+        observed_at=_t(5),
+        raw_dir=tmp_path / "live2",
+    )
+    assert _backfill(
+        conn, root=both_root, record=both_record, captured_at=_t(5),
+        source_identity="event_live_4", fetch_run_id=7,
+    ).inserted
+    conn.close()
+
+
+def test_H19_a_claim_the_archive_never_states_is_refused(tmp_path):
+    """Silence in the archive is not evidence, for identity of any kind.
+
+    A caller may name a real archived capture and then supply the parts it does
+    not state -- a kickoff time, a club -- and the manifest will agree with every
+    word, because the manifest knows which bytes were read and never what they
+    say.  Identity the archive does not state is therefore refused rather than
+    stored, which is the same rule that already governs the official fields.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    silent = _archived_element_row()
+    silent.pop("kickoff_time")
+    root, record = _archived_observation(
+        tmp_path, rows=[silent], source="element_summary_10", raw_dir=tmp_path / "silent"
+    )
+
+    # The archived row states no kickoff, so a claimed event_time is an assertion.
+    with pytest.raises(ol.BackfillEvidenceError, match="states no kickoff time"):
+        _backfill(conn, root=root, record=record, event_time=KICKOFF_1)
+    # ...and one that happens to equal the fixture's CURRENT kickoff is refused
+    # too: the live fixture table is not the archive.
+    with pytest.raises(ol.BackfillEvidenceError, match="states no kickoff time"):
+        _backfill(conn, root=root, record=record, event_time=_fixture_kickoff(conn, FIXTURE_1))
+
+    # A club the archived row never states is refused for the same reason.
+    clubless = _archived_element_row()
+    for key in ("team_h", "team_a", "opponent_team", "was_home"):
+        clubless.pop(key)
+    club_root, club_record = _archived_observation(
+        tmp_path, rows=[clubless], source="element_summary_10",
+        observed_at=_t(5), raw_dir=tmp_path / "clubless",
+    )
+    with pytest.raises(ol.BackfillEvidenceError, match="states no club/team"):
+        _backfill(conn, root=club_root, record=club_record, captured_at=_t(5), team_id=TEAM_A)
+    with pytest.raises(ol.BackfillEvidenceError, match="states no opponent"):
+        _backfill(
+            conn, root=club_root, record=club_record, captured_at=_t(5), opponent_team_id=TEAM_B
+        )
+
+    # Stating none of it is still a faithful copy of what the archive says.
+    stored = _backfill(conn, root=root, record=record)
+    assert stored.inserted
+    kept = next(
+        row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+        if row["archive_capture_id"] == record.capture_id
+    )
+    assert kept["event_time"] is None
+    assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 1
+    conn.close()
+
+
+def test_H20_a_nested_event_live_backfill_reads_the_explain_legs(tmp_path):
+    """A real live payload backfills from its explain legs, not its event totals.
+
+    ``event/live`` serves the whole pool in one response, with each player's
+    EVENT totals at the top level and the fixture-specific numbers nested under
+    ``explain``.  A double gameweek therefore has exactly one correct reading --
+    one row per explain leg -- and copying the top-level totals onto a fixture
+    row would score the same afternoon twice.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    root, record = _archived_live(
+        tmp_path,
+        elements=[
+            _live_element(
+                player_id=DGW_PLAYER,
+                # The event totals: what the two legs below add up to.  Nothing
+                # may be read from these.
+                stats={"fixture": FIXTURE_1, "minutes": 152, "total_points": 9, "bonus": 1, "bps": 49},
+                explain=[
+                    _live_leg(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1),
+                    _live_leg(
+                        fixture_id=FIXTURE_2, opponent_team=TEAM_C, kickoff_time=KICKOFF_2,
+                        minutes=62, total_points=3, bonus=0, bps=19,
+                    ),
+                ],
+            )
+        ],
+    )
+
+    def _live_claim(**overrides):
+        arguments = {
+            "player_id": DGW_PLAYER,
+            "fixture_id": FIXTURE_1,
+            "captured_at": _t(6),
+            "source_name": "archived_event_live",
+            "source_identity": "event_live_4",
+            "source_payload_sha256": record.payload_sha256,
+            "archive_capture_id": record.capture_id,
+            "fetch_run_id": 7,
+            "backfill": True,
+            "archive_root": root,
+        }
+        arguments.update(overrides)
+        return _capture(conn, **arguments)
+
+    # The FIRST leg's explain entry is the fixture-grain fact: 90 minutes, 6
+    # points, 30 bps -- not the event totals that also cover the second leg.
+    assert _live_claim().inserted
+    # The second leg is its own row, with its own numbers.  The live payload
+    # states the OPPONENT of each leg (it carries no home/away team pair), so
+    # that is what a claim may name.
+    assert _live_claim(
+        fixture_id=FIXTURE_2, opponent_team_id=TEAM_C,
+        minutes=62, total_points=3, bonus=0, bps=19, event_time=KICKOFF_2,
+    ).inserted
+    # ...and the event totals cannot be pinned onto either leg.
+    with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
+        _live_claim(fixture_id=FIXTURE_2, minutes=152)
+
+    stored = {
+        int(row["fixture_id"]): row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+        if row["archive_capture_id"] == record.capture_id
+    }
+    assert sorted(stored) == [FIXTURE_1, FIXTURE_2]
+    assert (stored[FIXTURE_1]["minutes"], stored[FIXTURE_1]["total_points"]) == (90, 6)
+    assert (stored[FIXTURE_2]["minutes"], stored[FIXTURE_2]["total_points"]) == (62, 3)
+
+    # Event grain sums the legs ONCE, and carries no per-fixture identity: the
+    # headline row spans two fixtures whose opponents and kickoffs differ, so
+    # stating either leg's would be asserting a fixture fact about an event.
+    event_root, event_record = _archived_live(
+        tmp_path,
+        elements=[
+            _live_element(
+                player_id=DGW_PLAYER,
+                stats={},
+                explain=[
+                    _live_leg(fixture_id=FIXTURE_1, kickoff_time=KICKOFF_1),
+                    _live_leg(
+                        fixture_id=FIXTURE_2, opponent_team=TEAM_C, kickoff_time=KICKOFF_2,
+                        minutes=62, total_points=3, bonus=0, bps=19,
+                    ),
+                ],
+            )
+        ],
+        observed_at=_t(4),
+        raw_dir=tmp_path / "live_event",
+    )
+    assert _capture(
+        conn,
+        grain=ol.GRAIN_PLAYER_EVENT,
+        player_id=DGW_PLAYER,
+        fixture_id=None,
+        minutes=152, starts=2, total_points=9, goals_scored=2, assists=0, clean_sheets=0,
+        goals_conceded=2, saves=0, bonus=1, bps=49, yellow_cards=0, red_cards=0,
+        penalties_saved=0, penalties_missed=0, own_goals=0, defensive_contribution=0,
+        captured_at=_t(4),
+        source_name="archived_event_live",
+        source_identity="event_live_4",
+        source_payload_sha256=event_record.payload_sha256,
+        archive_capture_id=event_record.capture_id,
+        fetch_run_id=7,
+        backfill=True,
+        archive_root=event_root,
+    ).inserted
+    headline = next(
+        row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+        if row["grain"] == ol.GRAIN_PLAYER_EVENT
+    )
+    assert headline["total_points"] == 9
+    # The legs disagree about the opponent and the kickoff, so the headline row
+    # states neither: an event total is not a fixture.
+    assert headline["event_time"] is None
+    assert headline["opponent_team_id"] is None
+    assert headline["team_id"] is None
+    # A per-fixture identity cannot be attached to the headline row at all.
+    with pytest.raises(ol.BackfillEvidenceError, match="not archived evidence"):
+        _capture(
+            conn,
+            grain=ol.GRAIN_PLAYER_EVENT,
+            player_id=DGW_PLAYER,
+            fixture_id=None,
+            minutes=152, starts=2, total_points=9, goals_scored=2, assists=0, clean_sheets=0,
+            goals_conceded=2, saves=0, bonus=1, bps=49, yellow_cards=0, red_cards=0,
+            penalties_saved=0, penalties_missed=0, own_goals=0, defensive_contribution=0,
+            captured_at=_t(4),
+            source_name="archived_event_live",
+            source_identity="event_live_4",
+            source_payload_sha256=event_record.payload_sha256,
+            archive_capture_id=event_record.capture_id,
+            fetch_run_id=7,
+            backfill=True,
+            archive_root=event_root,
+            opponent_team_id=TEAM_B,
+        )
+    conn.close()
+
+
+def test_H21_a_generation_that_moves_under_the_certificate_is_refused(tmp_path, monkeypatch):
+    """The closure re-reads the generation BY ID, not from its own decision copy.
+
+    A certificate records which accepted official-player generation supplied a
+    freeze, so the row that has to hold still while the certificate is written is
+    the row in the table.  Storing the decision's own dictionary and comparing it
+    with itself would prove nothing: a generation edited in between -- its
+    element set, its count, its acceptance -- would be certified from a truth
+    that no longer exists anywhere.  Each case below moves exactly one field of
+    that row in the window between the decision read and the closure's own, and
+    every one of them is refused with nothing written.
+    """
+
+    cases = {
+        "element ids": ("element_ids_json", json.dumps([DGW_PLAYER, SGW_B_PLAYER])),
+        "element digest": ("element_ids_sha256", element_id_sha256([DGW_PLAYER, SGW_B_PLAYER])),
+        "official element count": ("official_element_count", 2),
+        "acceptance": ("accepted", 0),
+        "acceptance rule": ("acceptance_rule_version", "BOOTSTRAP_GENERATION_ACCEPTANCE v2"),
+    }
+    for label, (column, moved) in cases.items():
+        # One database per case: a certificate is recorded once per freeze, so a
+        # shared world would turn the later cases into duplicate-provenance
+        # refusals instead of the race this test is about.
+        path = tmp_path / str(column) / "fpl.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = connect_database(path)
+        other = connect_database(path)
+        _world(conn)
+        fetch = _fetch_run(conn)
+        generation = _generation(conn, fetch_run_id=fetch)
+        run = _freeze(
+            conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+            kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+            official_run_ids={"fetch": {"run_id": fetch}},
+        )
+        conn.commit()
+
+        real = ol._bootstrap_generation
+        reads = {"count": 0}
+
+        def _moving(target, generation_id, _column=column, _moved=moved, _real=real):
+            record = _real(target, generation_id)
+            reads["count"] += 1
+            if reads["count"] == 2:
+                # The second read is the closure's own, so the row moves after
+                # the certificate was decided from it and before it is written.
+                other.execute(
+                    f"UPDATE bootstrap_generations SET {_column}=? WHERE id=?",
+                    (_moved, int(generation_id)),
+                )
+                other.commit()
+            return record
+
+        monkeypatch.setattr(ol, "_bootstrap_generation", _moving)
+        with pytest.raises(ol.OutcomeLedgerError, match="bootstrap generation"):
+            ol.certify_prediction_freeze(
+                conn, projection_run_ids=[run], bootstrap_generation_id=generation
+            )
+        monkeypatch.undo()
+        assert reads["count"] >= 2, f"the {label} mutation never ran"
+        assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_provenance").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_runs").fetchone()[0] == 0
+        # The row that moved is the row that was examined; restoring it lets the
+        # very same freeze certify, which shows the refusal was about the change.
+        other.execute(
+            f"UPDATE bootstrap_generations SET {column}=? WHERE id=?",
+            (
+                json.dumps(list(SYNTHETIC_POOL)) if column == "element_ids_json"
+                else element_id_sha256(list(SYNTHETIC_POOL)) if column == "element_ids_sha256"
+                else len(SYNTHETIC_POOL) if column == "official_element_count"
+                else 1 if column == "accepted"
+                else "BOOTSTRAP_GENERATION_ACCEPTANCE v1",
+                int(generation),
+            ),
+        )
+        other.commit()
+        certification = ol.certify_prediction_freeze(
+            conn, projection_run_ids=[run], bootstrap_generation_id=generation
+        )
+        assert certification.provenance_state == ol.GENERATION_CERTIFIED, certification.reasons
+        conn.close()
+        other.close()
+
+
+def test_H22_the_closure_reread_catches_a_generation_the_caller_cached(tmp_path, monkeypatch):
+    """A dictionary the caller already holds is not evidence about the table.
+
+    The same race seen from the other side: the row is moved first, and the
+    certificate is then requested with a generation id whose row no longer says
+    what it said when the decision was made.  The closure's own read is what
+    notices, because the value it would record came from the table.
+    """
+
+    path = tmp_path / "fpl.db"
+    conn = connect_database(path)
+    other = connect_database(path)
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    conn.commit()
+
+    # The generation is read once to decide the certificate and once more inside
+    # the closure, and the SECOND connection retires the row after the decision
+    # was taken from it.  The certificate must be refused, because the generation
+    # it would record is not the generation that exists.
+    real = ol._bootstrap_generation
+    reads = {"count": 0}
+
+    def _moving_between_the_decision_and_the_closure(target, generation_id):
+        record = real(target, generation_id)
+        reads["count"] += 1
+        if reads["count"] == 2:
+            # The second read is the closure's own; the row moves after the
+            # decision read it and before the certificate is written.
+            other.execute(
+                "UPDATE bootstrap_generations SET accepted=0 WHERE id=?", (int(generation_id),)
+            )
+            other.commit()
+        return record
+
+    monkeypatch.setattr(ol, "_bootstrap_generation", _moving_between_the_decision_and_the_closure)
+    with pytest.raises(ol.OutcomeLedgerError, match="bootstrap generation"):
+        ol.certify_prediction_freeze(
+            conn, projection_run_ids=[run], bootstrap_generation_id=generation
+        )
+    assert reads["count"] >= 2, "the closure re-read the generation it was certified with"
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_provenance").fetchone()[0] == 0
+    conn.close()
+    other.close()
 
 
 def test_H9_a_historical_read_resolves_from_pinned_evidence(tmp_path):
