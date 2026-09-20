@@ -46,7 +46,10 @@ REUSE, NOT REINVENTION
   vocabulary, so a ledger exclusion and a scoreboard exclusion mean the same
   thing;
 * the event-finality rule is :mod:`fpl_brain.planning`'s; what changes is which
-  evidence answers it, never the rule.
+  evidence answers it, never the rule;
+* an archived payload is parsed by :mod:`fpl_brain.parsers`' own canonical
+  readers, so a backfilled observation says what the archive CONTAINS rather
+  than what the caller asserted about it.
 
 PINNED EVIDENCE, NOT CURRENT TABLES
 -----------------------------------
@@ -422,7 +425,7 @@ def _verify_archive_capture(
     source_identity: str,
     captured_at: str,
     fetch_run_id: int,
-) -> None:
+) -> tuple[dict[str, Any], Any]:
     """Confirm the named capture really is in the archive, with those bytes.
 
     The manifest record is the identity: its source, its observation time, its
@@ -430,6 +433,10 @@ def _verify_archive_capture(
     A digest that matches while the blob does not hash to it is refused, and an
     identifier that is merely asserted -- present in the arguments but absent
     from the archive -- proves nothing, so it is refused too.
+
+    What the record CANNOT prove is what the bytes say, so the verified payload
+    is returned for the caller to bind the observation to.  Manifest metadata is
+    identity, never content.
     """
 
     from . import raw_archive
@@ -468,6 +475,234 @@ def _verify_archive_capture(
             f"archive capture {archive_capture_id!r} no longer matches its recorded digest; the archived "
             "blob is required to prove the observation, so a claim with no intact bytes is refused"
         )
+    payload = _archived_payload(archive_root, record)
+    if payload is None:
+        raise BackfillEvidenceError(
+            f"archive capture {archive_capture_id!r} holds no readable JSON payload, so there is no "
+            "archived content the observation can be bound to"
+        )
+    return dict(record), payload
+
+
+#: The archived sources that carry per-player, per-fixture observation rows.
+#: A backfilled observation is bound to the rows one of these parses; a source
+#: with no such rows -- a schedule, a bootstrap pool, a manager's picks -- cannot
+#: witness an observation at all, so it is refused rather than trusted.
+_OBSERVATION_ARCHIVE_SOURCES = ("element_summary", "event_live")
+
+
+def _archive_source_kind(source: str) -> tuple[str, str]:
+    """``(kind, suffix)`` for one archive source slug.
+
+    The fetch layer names a per-player capture ``element_summary_<player_id>``
+    and a per-event capture ``event_live_<event>``; the bare source name is
+    accepted too, and the identity then has to come out of the archived rows.
+    """
+
+    text = str(source)
+    for kind in _OBSERVATION_ARCHIVE_SOURCES:
+        if text == kind:
+            return kind, ""
+        if text.startswith(kind + "_"):
+            return kind, text[len(kind) + 1 :]
+    return "", ""
+
+
+def _row_raw(row: Any) -> Mapping[str, Any]:
+    raw = getattr(row, "raw_json", None)
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _row_stated_element(row: Any) -> int | None:
+    """The player identity an archived row states about ITSELF, if it states one."""
+
+    for key in ("element", "id"):
+        value = _row_raw(row).get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _archived_row_identity(row: Any) -> dict[str, Any]:
+    """The football identity one archived row states: club, opponent, kickoff."""
+
+    raw = _row_raw(row)
+    was_home = raw.get("was_home")
+    if was_home is None:
+        was_home = raw.get("is_home")
+    home, away = raw.get("team_h"), raw.get("team_a")
+    team: int | None = None
+    opponent: int | None = None
+    if was_home is not None and home is not None and away is not None:
+        team, opponent = (int(home), int(away)) if int(bool(was_home)) else (int(away), int(home))
+    stated_opponent = raw.get("opponent_team")
+    if stated_opponent is not None:
+        opponent = int(stated_opponent)
+    kickoff = raw.get("kickoff_time")
+    return {
+        "team_id": team,
+        "opponent_team_id": opponent,
+        "event_time": None if kickoff is None else str(kickoff),
+    }
+
+
+def _archived_observation_values(rows: Sequence[Any], *, grain: str) -> dict[str, Any]:
+    """The official values the archived rows state, at the grain being captured.
+
+    Fixture grain takes the one archived row.  Event grain takes the canonical
+    event aggregation of its rows -- summing ONCE, and leaving a field missing
+    when any contributing fixture left it missing -- which is the same rule the
+    ledger applies in reverse, so the two cannot disagree about a total.
+    """
+
+    per_row = [
+        {name: getattr(row, name, None) for name in OFFICIAL_OUTCOME_FIELDS} for row in rows
+    ]
+    if grain == GRAIN_PLAYER_EVENT:
+        values, _ = _aggregate_fixture_values(per_row)
+        return values
+    return per_row[0]
+
+
+def _bind_backfilled_observation(
+    *,
+    record: Mapping[str, Any],
+    payload: Any,
+    grain: str,
+    event: int,
+    player_id: int,
+    fixture_id: int | None,
+    claimed: Mapping[str, Any],
+    team_id: int | None,
+    opponent_team_id: int | None,
+    event_time: str | None,
+) -> dict[str, Any]:
+    """Bind a backfilled observation to the ARCHIVED content, not the manifest.
+
+    The manifest record proves WHICH bytes were read and when; it says nothing
+    about what those bytes contain.  A caller could otherwise name a real
+    archived capture, keep its identity and its digest, and then attach whatever
+    fields, player, fixture or club it liked: every one of those claims would
+    agree with the manifest while the observation itself was fabricated.
+
+    So the archived payload is parsed with the canonical parser for its source
+    and the claim must be exactly what that parsed content states -- the same
+    player, event, fixture and club identity, the same official fields, and the
+    same additional source fields.  Anything the archive does not state is
+    refused, never stored, and identity the caller left unstated is filled from
+    the archive rather than from a table that is refreshed in place.
+    """
+
+    from . import parsers
+
+    capture_id = str(record.get("capture_id"))
+    kind, suffix = _archive_source_kind(str(record.get("source")))
+    if not kind:
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} comes from source {str(record.get('source'))!r}, which "
+            "carries no per-player observation rows; an observation cannot be bound to its content"
+        )
+    if kind == "event_live":
+        recorded_event = record.get("event")
+        archived_event = (
+            int(recorded_event)
+            if recorded_event is not None
+            else (int(suffix) if suffix.isdigit() else None)
+        )
+        if archived_event is None or archived_event != int(event):
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} does not state the claimed event {int(event)}; an "
+                "event-live capture is evidence only for the event it was taken for"
+            )
+        parsed = parsers.parse_event_live(payload, int(event))
+    else:
+        archived_player = int(suffix) if suffix.isdigit() else None
+        if archived_player is not None and archived_player != int(player_id):
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} is the element summary of player {archived_player}, "
+                f"not of the claimed player {int(player_id)}"
+            )
+        parsed = parsers.parse_element_summary(payload, int(player_id))
+
+    matched = [
+        row
+        for row in parsed
+        if int(row.event) == int(event) and (fixture_id is None or row.fixture_id == int(fixture_id))
+    ]
+    if not matched:
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} holds no observation for player {int(player_id)}, event "
+            f"{int(event)}" + ("" if fixture_id is None else f", fixture {int(fixture_id)}")
+        )
+    if kind == "element_summary" and not suffix.isdigit():
+        stated = {
+            identity for identity in (_row_stated_element(row) for row in matched) if identity is not None
+        }
+        if stated != {int(player_id)}:
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} states no player identity for the claimed player "
+                f"{int(player_id)} at event {int(event)}, so the claim cannot be bound to its content"
+            )
+    if fixture_id is not None and len(matched) > 1:
+        raise BackfillEvidenceError(
+            f"archived capture {capture_id!r} holds {len(matched)} rows for fixture {int(fixture_id)}; a "
+            "fixture-grain observation must resolve to exactly one archived row"
+        )
+
+    archived = _archived_observation_values(matched, grain=grain)
+    for name in OFFICIAL_OUTCOME_FIELDS:
+        if _observed_value(claimed.get(name)) != _observed_value(archived[name]):
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} states {name}={archived[name]!r} for player "
+                f"{int(player_id)} event {int(event)}, not the claimed {claimed.get(name)!r}; a backfilled "
+                "observation is what the archive says, not what the caller asserts"
+            )
+    for name in claimed:
+        if name in OFFICIAL_OUTCOME_FIELDS:
+            continue
+        for row in matched:
+            raw = _row_raw(row)
+            if name not in raw or _observed_value(raw.get(name)) != _observed_value(claimed[name]):
+                raise BackfillEvidenceError(
+                    f"archived capture {capture_id!r} does not state {str(name)!r} with the claimed value "
+                    f"{claimed[name]!r}; an additional field is archived evidence only when the archive "
+                    "states it"
+                )
+
+    identity = _archived_row_identity(matched[0])
+    for label, claimed_value, archived_value in (
+        ("club/team", team_id, identity["team_id"]),
+        ("opponent", opponent_team_id, identity["opponent_team_id"]),
+    ):
+        if claimed_value is None:
+            continue
+        if archived_value is None:
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} states no {label} for player {int(player_id)} event "
+                f"{int(event)}, so the claimed {claimed_value!r} is not archived evidence"
+            )
+        if _observed_value(claimed_value) != _observed_value(archived_value):
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} states the {label} as {archived_value!r} for player "
+                f"{int(player_id)} event {int(event)}, not the claimed {claimed_value!r}"
+            )
+    if event_time is not None and identity["event_time"] is not None:
+        if parse_utc(str(event_time)) != parse_utc(str(identity["event_time"])):
+            raise BackfillEvidenceError(
+                f"archived capture {capture_id!r} was played at {identity['event_time']}, not at the "
+                f"claimed {event_time}"
+            )
+    return {
+        "team_id": identity["team_id"] if team_id is None else team_id,
+        "opponent_team_id": (
+            identity["opponent_team_id"] if opponent_team_id is None else opponent_team_id
+        ),
+        "event_time": identity["event_time"] if event_time is None else str(event_time),
+    }
 
 
 def capture_observation(
@@ -537,7 +772,10 @@ def capture_observation(
             "rather than an observation; PE-5 does not record it as a zero"
         )
 
-    if fixture is not None:
+    if fixture is not None and not backfill:
+        # A capture made NOW may read the fixture and the player from the live
+        # tables: now is exactly what those tables hold.  A backfill may not --
+        # see below, where its identity comes from the archived row instead.
         fixture_row = _fixture_row(conn, fixture)
         player = _player_record(conn, player_id)
         if team_id is None and player is not None:
@@ -559,8 +797,10 @@ def capture_observation(
     )
     if backfill:
         # An asserted identifier is not evidence: the archived blob itself must be
-        # present and must still hash to the claimed digest.
-        _verify_archive_capture(
+        # present and must still hash to the claimed digest, and the observation
+        # must be bound to what those bytes SAY -- the same player, event,
+        # fixture, club and fields -- rather than to the manifest that names them.
+        record, archived_payload = _verify_archive_capture(
             conn,
             archive_root,
             archive_capture_id=str(archive_capture_id),
@@ -569,6 +809,21 @@ def capture_observation(
             captured_at=str(captured_at),
             fetch_run_id=int(fetch_run_id),
         )
+        bound = _bind_backfilled_observation(
+            record=record,
+            payload=archived_payload,
+            grain=grain,
+            event=event,
+            player_id=player_id,
+            fixture_id=fixture,
+            claimed=payload,
+            team_id=team_id,
+            opponent_team_id=opponent_team_id,
+            event_time=event_time,
+        )
+        team_id = bound["team_id"]
+        opponent_team_id = bound["opponent_team_id"]
+        event_time = bound["event_time"]
 
     moment = str(captured_at).strip() if captured_at else utc_now()
     finality = event_finality(conn, event)
@@ -902,50 +1157,105 @@ def prediction_artifact_digest(conn: sqlite3.Connection, run_ids: Sequence[int])
     return _digest(FREEZE_CERTIFICATION_VERSION, lines)
 
 
+#: The one key ``projection_runs.official_run_ids`` records an official fetch
+#: under.  This is the existing provenance channel; PE-5 reads it, never invents it.
+PROVENANCE_FETCH_KEY = "fetch"
+
+#: How one run's persisted provenance read out: a fetch run id, or why there is
+#: none.  ``None`` means the record is intact and names a fetch; ``"absent"``
+#: means the run records nothing about an official fetch -- which is the
+#: truthful pre-PE-5 state; anything else describes a record that EXISTS and
+#: cannot be read, which is a broken claim rather than an absence.
+_PROVENANCE_ABSENT = "absent"
+
+
+def _persisted_fetch_run_id(run: Mapping[str, Any]) -> tuple[int | None, str | None]:
+    """The official fetch ONE run recorded, or why its record does not answer.
+
+    Absence and malformation are deliberately different answers: a pre-PE-5 run
+    that records nothing is honestly legacy, while a record that is present and
+    unreadable must not be read as if the run had recorded nothing either.
+    """
+
+    raw = run.get("official_run_ids")
+    if raw is None or not str(raw).strip():
+        return None, _PROVENANCE_ABSENT
+    try:
+        payload = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else dict(raw)
+    except (TypeError, ValueError):
+        return None, "records an official_run_ids value that is not readable JSON"
+    if not isinstance(payload, Mapping):
+        return None, "records an official_run_ids value that is not an object"
+    fetch = payload.get(PROVENANCE_FETCH_KEY)
+    if fetch is None:
+        return None, _PROVENANCE_ABSENT
+    if not isinstance(fetch, Mapping):
+        return None, f"records an official {PROVENANCE_FETCH_KEY} provenance that is not an object"
+    value = fetch.get("run_id")
+    if value is None:
+        return None, "records an official fetch provenance with no run_id"
+    try:
+        return int(value), None
+    except (TypeError, ValueError):
+        return None, f"records a non-integer official fetch run_id {value!r}"
+
+
 def _declared_official_fetch_run_id(
     runs: Sequence[Mapping[str, Any]], explicit: int | None
-) -> tuple[int | None, str | None]:
+) -> tuple[int | None, list[str]]:
     """The official fetch identity a freeze recorded, from the runs themselves.
 
     ``projection_runs.official_run_ids`` is the existing provenance channel; the
-    freeze's fetch identity is read out of it rather than invented.  Runs that
-    name DIFFERENT fetches leave the freeze with no single recorded identity --
-    one is not chosen for them, because doing so would manufacture agreement.
+    freeze's fetch identity is read out of it rather than invented.  The identity
+    must be recorded by EVERY run of the freeze and every recorded identity must
+    agree: a fetch only some of the runs state is not the freeze's provenance,
+    and choosing one of several recorded fetches would manufacture agreement
+    the runs do not have.
 
-    An explicitly supplied fetch identity is checked against that channel rather
-    than trusted: a fetch that disagrees with EVERY run's persisted provenance is
-    not evidence about this freeze, and accepting it would let a caller attach a
-    provenance the runs themselves contradict.
+    An explicitly supplied fetch identity is an ASSERTION against that channel,
+    never a substitute for it.  It is accepted only when every run's persisted
+    provenance names exactly that fetch; a fetch the runs contradict -- or a
+    fetch no run records at all -- is not evidence about this freeze, and
+    accepting it would let a caller attach a provenance the runs never carried.
+
+    A freeze whose runs ALL record nothing (and which declares nothing) keeps the
+    truthful legacy answer: no fetch identity, and no fabricated generation.
     """
 
-    seen: set[int] = set()
+    recorded: dict[int, list[int]] = {}
+    absent: list[int] = []
+    unreadable: list[str] = []
     for run in runs:
-        raw = run.get("official_run_ids")
-        if not raw:
-            continue
-        try:
-            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
-        except (TypeError, ValueError):
-            continue
-        fetch = payload.get("fetch") if isinstance(payload, Mapping) else None
-        if isinstance(fetch, Mapping) and fetch.get("run_id") is not None:
-            seen.add(int(fetch["run_id"]))
-    if explicit is not None:
-        if seen and int(explicit) not in seen:
-            return None, (
-                f"the declared official fetch run {int(explicit)} disagrees with every run's persisted "
-                f"provenance ({sorted(seen)}); a fetch the runs contradict is not their provenance"
-            )
-        if len(seen) > 1:
-            # Agreeing with ONE of several recorded fetches is not a single
-            # recorded identity, and choosing one would manufacture agreement.
-            return None, f"the freeze's runs record different official fetch runs: {sorted(seen)}"
-        return int(explicit), None
-    if len(seen) == 1:
-        return seen.pop(), None
-    if len(seen) > 1:
-        return None, f"the freeze's runs record different official fetch runs: {sorted(seen)}"
-    return None, None
+        run_id = int(run["id"])
+        fetch, pathology = _persisted_fetch_run_id(run)
+        if pathology is None:
+            recorded.setdefault(int(fetch), []).append(run_id)
+        elif pathology == _PROVENANCE_ABSENT:
+            absent.append(run_id)
+        else:
+            unreadable.append(f"projection run {run_id} {pathology}")
+
+    reasons: list[str] = list(unreadable)
+    if absent and (recorded or explicit is not None):
+        reasons.append(
+            f"projection run(s) {absent} record no official fetch provenance while the freeze is certified "
+            "from one; a fetch identity only some of the runs state is not this freeze's provenance"
+        )
+    if len(recorded) > 1:
+        reasons.append(f"the freeze's runs record different official fetch runs: {sorted(recorded)}")
+    if reasons:
+        return None, reasons
+    if not recorded:
+        # Every run is honestly pre-PE-5: no official fetch was ever recorded, and
+        # no generation may be manufactured for it.
+        return None, []
+    fetch_run_id = next(iter(recorded))
+    if explicit is not None and int(explicit) != int(fetch_run_id):
+        return None, [
+            f"the declared official fetch run {int(explicit)} disagrees with every run's persisted "
+            f"provenance ({[int(fetch_run_id)]}); a fetch the runs contradict is not their provenance"
+        ]
+    return int(fetch_run_id), []
 
 
 def _bootstrap_generation(conn: sqlite3.Connection, generation_id: int) -> dict[str, Any] | None:
@@ -1079,9 +1389,8 @@ def certify_prediction_freeze(
         ),
     )
 
-    fetch_run_id, fetch_reason = _declared_official_fetch_run_id(runs, official_fetch_run_id)
-    if fetch_reason:
-        reasons.append(fetch_reason)
+    fetch_run_id, fetch_reasons = _declared_official_fetch_run_id(runs, official_fetch_run_id)
+    reasons.extend(fetch_reasons)
     generation = (
         None if bootstrap_generation_id is None else _bootstrap_generation(conn, int(bootstrap_generation_id))
     )
@@ -1104,14 +1413,20 @@ def certify_prediction_freeze(
     if generation_id is None:
         if fetch_run_id is None:
             # No generation and no official fetch was ever recorded.  That is the
-            # truthful legacy state, not a failed certification.
+            # truthful legacy state -- but ONLY when nothing else about the runs
+            # is wrong.  Legacy is a statement about missing provenance, not a
+            # blanket that hides a run that is still open or a freeze that names
+            # one model family twice; those are refusals, and a refusal the
+            # legacy branch swallowed would never reach a reviewer.
+            state = NOT_CERTIFIABLE if reasons else LEGACY_PROVENANCE
             return _record_freeze(
                 conn, runs=runs, ordered=ordered, freeze_identity=freeze_identity,
-                provenance_state=LEGACY_PROVENANCE, planning_event=planning_event,
+                provenance_state=state, planning_event=planning_event,
                 planning_cutoff=planning_cutoff, artifact_identity=artifact_identity,
                 artifact_sha=artifact_sha, reasons=reasons, official_fetch_run_id=None,
                 generation=None, element_ids=[], element_digest=None, element_count=None,
                 certified_at=certified_at or utc_now(),
+                closure=_closure_evidence(conn, ordered, None),
             )
         reasons.append(
             "the freeze records an official fetch but no bootstrap generation, so the accepted "
@@ -1160,7 +1475,71 @@ def certify_prediction_freeze(
         official_fetch_run_id=fetch_run_id, generation=generation, element_ids=element_ids,
         element_digest=element_digest, element_count=element_count,
         certified_at=certified_at or utc_now(),
+        closure=_closure_evidence(conn, ordered, generation),
     )
+
+
+def _closure_evidence(
+    conn: sqlite3.Connection, ordered: Sequence[int], generation: Mapping[str, Any] | None
+) -> tuple[Any, ...]:
+    """Everything a certificate's claims are read from, as ONE observation.
+
+    The digest of the frozen artifact and the run evidence it is certified with
+    are read here as a single unit, and then read AGAIN inside the closure's own
+    transaction.  A certificate may only be written when both reads agree, which
+    is what makes hashing and closure atomic: the artifact the certificate
+    describes is the artifact that existed at the instant it was written, not
+    the one a decision read saw a moment earlier.
+
+    The generation's identity is part of the observation for the same reason --
+    a certificate records the generation that certified it, so a row that moves
+    while the certificate is being written is not the row being recorded.
+    """
+
+    runs: list[tuple[Any, ...]] = []
+    for run_id in sorted({int(value) for value in ordered}):
+        row = conn.execute(
+            "SELECT id, status, model_family, planning_event, data_cutoff FROM projection_runs WHERE id=?",
+            (int(run_id),),
+        ).fetchone()
+        runs.append(
+            (int(run_id), None)
+            if row is None
+            else (
+                int(row["id"]),
+                str(row["status"]),
+                str(row["model_family"]),
+                int(row["planning_event"]),
+                str(row["data_cutoff"]),
+            )
+        )
+    generation_fingerprint = (
+        None
+        if generation is None
+        else (
+            int(generation["id"]),
+            int(generation.get("accepted") or 0),
+            None if generation.get("fetch_run_id") is None else int(generation["fetch_run_id"]),
+            str(generation.get("captured_at") or ""),
+            str(generation.get("element_ids_sha256") or ""),
+            str(generation.get("element_ids_json") or ""),
+        )
+    )
+    return (
+        tuple(runs),
+        generation_fingerprint,
+        prediction_artifact_digest(conn, ordered),
+    )
+
+
+def _closure_difference(before: tuple[Any, ...], after: tuple[Any, ...]) -> str:
+    """Which part of the certificate's evidence moved, in plain words."""
+
+    labels = ("run evidence", "bootstrap generation", "frozen artifact digest")
+    changed = [
+        label for label, left, right in zip(labels, before, after) if left != right
+    ]
+    return "changed: " + ", ".join(changed) if changed else "no observable difference"
 
 
 def _fetch_run_exists(conn: sqlite3.Connection, fetch_run_id: int) -> bool:
@@ -1225,6 +1604,7 @@ def _record_freeze(
     element_digest: str | None,
     element_count: int | None,
     certified_at: str,
+    closure: tuple[Any, ...],
 ) -> FreezeCertification:
     existing = conn.execute(
         "SELECT id FROM prediction_freeze_provenance WHERE freeze_identity=?", (freeze_identity,)
@@ -1260,6 +1640,26 @@ def _record_freeze(
     # committing it here would publish whatever else the caller had in flight.
     conn.execute("SAVEPOINT pe5_record_freeze")
     try:
+        # Re-read the evidence INSIDE the closure's own transaction, so the
+        # recorded artifact digest, the run evidence and the certificate are one
+        # atomic fact.  Another connection that put a frozen prediction, a run
+        # status or a generation row in between the decision and this write is
+        # caught here and the closure is refused, because the artifact it would
+        # describe is not the artifact that existed when the decision was made.
+        observed = _closure_evidence(conn, ordered, generation)
+        if observed[2] != artifact_sha:
+            raise OutcomeLedgerError(
+                f"freeze {freeze_identity} cannot be certified: its frozen artifact digested to "
+                f"{artifact_sha} when the certificate was decided and to {observed[2]} when it would have "
+                "been written; a freeze whose artifact is still moving is not closed, so nothing was recorded"
+            )
+        if observed != closure:
+            raise OutcomeLedgerError(
+                f"freeze {freeze_identity} cannot be certified: its evidence changed while the "
+                "certificate was being written ("
+                + _closure_difference(closure, observed)
+                + "); hashing and closure are one atomic step, so nothing was recorded"
+            )
         cursor = conn.execute(
             """INSERT INTO prediction_freeze_provenance(
                  freeze_identity, provenance_state, planning_event, planning_cutoff,
@@ -2545,7 +2945,7 @@ def _aggregate_fixture_values(
     grain down.  Blank and zero are therefore kept distinct.
     """
 
-    ordered = sorted(captures, key=lambda row: str(row["capture_digest"]))
+    ordered = sorted(captures, key=lambda row: str(row.get("capture_digest") or ""))
     values: dict[str, Any] = {}
     for name in SUNNABLE_OUTCOME_FIELDS:
         stated = [row.get(name) for row in ordered]
@@ -2553,7 +2953,7 @@ def _aggregate_fixture_values(
             values[name] = None
         else:
             values[name] = sum(int(value) for value in stated)
-    return values, tuple(str(row["capture_digest"]) for row in ordered)
+    return values, tuple(str(row.get("capture_digest") or "") for row in ordered)
 
 
 def _player_record(conn: sqlite3.Connection, player_id: int) -> dict[str, Any] | None:

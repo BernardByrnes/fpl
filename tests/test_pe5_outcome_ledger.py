@@ -317,6 +317,9 @@ def _capture(
     fetch_run_id: int | None = None,
     supersedes_capture_id: int | None = None,
     correction_reason: str | None = None,
+    team_id: int | None = None,
+    opponent_team_id: int | None = None,
+    event_time: str | None = None,
     **extra,
 ):
     """One official player-fixture observation, with every required field stated.
@@ -362,6 +365,9 @@ def _capture(
         fetch_run_id=fetch_run_id,
         supersedes_capture_id=supersedes_capture_id,
         correction_reason=correction_reason,
+        team_id=team_id,
+        opponent_team_id=opponent_team_id,
+        event_time=event_time,
     )
 
 
@@ -419,6 +425,100 @@ def _certified_freeze(conn, *, values=None, with_minutes_run: bool = True):
     )
     assert certification.provenance_state == ol.GENERATION_CERTIFIED, certification.reasons
     return certification
+
+
+def _archived_element_row(
+    *,
+    player_id: int = DGW_PLAYER,
+    event: int = EVENT,
+    fixture_id: int = FIXTURE_1,
+    was_home: int = 1,
+    team_h: int = TEAM_A,
+    team_a: int = TEAM_B,
+    kickoff_time: str = KICKOFF_1,
+    minutes: int = 90,
+    starts: int = 1,
+    total_points: int = 6,
+    bonus: int | None = 1,
+    bps: int | None = 30,
+    **extra,
+) -> dict:
+    """One ``element-summary`` history row, exactly as the official source states it.
+
+    Its values are the same official facts ``_capture`` stores, so a backfill of
+    this row is a faithful copy -- the only kind of backfill an archive witnesses.
+    """
+
+    row = {
+        "element": player_id,
+        "event": event,
+        "fixture": fixture_id,
+        "opponent_team": team_a if was_home else team_h,
+        "was_home": was_home,
+        "team_h": team_h,
+        "team_a": team_a,
+        "kickoff_time": kickoff_time,
+        "minutes": minutes,
+        "starts": starts,
+        "total_points": total_points,
+        "goals_scored": 1,
+        "assists": 0,
+        "clean_sheets": 0,
+        "goals_conceded": 1,
+        "saves": 0,
+        "bonus": bonus,
+        "bps": bps,
+        "yellow_cards": 0,
+        "red_cards": 0,
+        "penalties_saved": 0,
+        "penalties_missed": 0,
+        "own_goals": 0,
+        "defensive_contribution": 0,
+    }
+    row.update(extra)
+    return row
+
+
+def _archived_observation(
+    tmp_path,
+    *,
+    rows,
+    source: str = "element_summary",
+    observed_at: str | None = None,
+    event: int | None = None,
+    run_id: int = 7,
+    raw_dir=None,
+):
+    """Archive one observation payload, returning ``(root, record)``."""
+
+    return _archive(
+        tmp_path,
+        source=source,
+        observed_at=observed_at or _t(6),
+        payload={"history": list(rows)},
+        event=event,
+        run_id=run_id,
+        raw_dir=raw_dir,
+    )
+
+
+def _backfill(conn, *, root, record, source_identity: str | None = None, **overrides):
+    """The backfill claim for one archived capture, carrying the archive's own values."""
+
+    arguments = {
+        "player_id": DGW_PLAYER,
+        "fixture_id": FIXTURE_1,
+        "captured_at": _t(6),
+        "source_name": "archived_element_summary",
+        "source_identity": source_identity or str(record.source),
+        "source_payload_sha256": record.payload_sha256,
+        "archive_capture_id": record.capture_id,
+        "fetch_run_id": 7,
+        "backfill": True,
+        "archive_root": root,
+    }
+    arguments.update(overrides)
+    return _capture(conn, **arguments)
 
 
 # ---------------------------------------------------------------------------
@@ -1206,7 +1306,8 @@ def test_T_no_fake_backfill_without_an_archived_source(tmp_path):
     observation time, the fetch run and the payload digest must all agree, and
     the archived bytes must still hash to the recorded digest.  Absent that proof
     the honest answer is "unavailable", never a number manufactured from today's
-    current state.
+    current state.  What the manifest cannot settle -- what the bytes SAY -- is
+    bound separately, by parsing the archived payload.
     """
 
     from fpl_brain import raw_archive
@@ -1237,9 +1338,7 @@ def test_T_no_fake_backfill_without_an_archived_source(tmp_path):
         _attempt(captured_at=None)
 
     # 3. an archive that does not contain the claimed capture proves nothing.
-    root, record = _archive(
-        tmp_path, source="element_summary", observed_at=_t(6), payload={"history": []}, run_id=7,
-    )
+    root, record = _archived_observation(tmp_path, rows=[_archived_element_row()])
     with pytest.raises(ol.BackfillEvidenceError, match="not in the manifest"):
         _attempt(archive_root=root)
 
@@ -1276,7 +1375,11 @@ def test_T_no_fake_backfill_without_an_archived_source(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 0
 
     # 7. the SAME claim, backed by the archived blob, is admitted -- and it is the
-    #    archived evidence, not the caller's word, that made it admissible.
+    #    archived evidence, not the caller's word, that made it admissible.  The
+    #    club identity is the archive's too: the live player table is moved to
+    #    another club first, and the stored observation still names the club the
+    #    archived row was played for.
+    conn.execute("UPDATE players SET team_id=? WHERE id=?", (TEAM_C, DGW_PLAYER))
     result = _attempt(
         archive_root=root,
         archive_capture_id=record.capture_id,
@@ -1286,6 +1389,10 @@ def test_T_no_fake_backfill_without_an_archived_source(tmp_path):
     stored = ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)[0]
     assert stored["archive_capture_id"] == record.capture_id
     assert stored["fetch_run_id"] == 7
+    assert stored["team_id"] == TEAM_A
+    assert stored["opponent_team_id"] == TEAM_B
+    assert stored["event_time"] == KICKOFF_1
+    assert stored["total_points"] == 6
     assert json.loads(stored["backfill_evidence_json"])["archive_root"] == str(root)
 
     # 8. once the archived bytes are gone, the same claim is refused again: the
@@ -1549,6 +1656,439 @@ def test_H12_a_ledger_refuses_a_run_that_is_no_longer_complete(tmp_path):
     conn.execute("UPDATE projection_runs SET status='running' WHERE id=?", (run_id,))
     with pytest.raises(ol.OutcomeLedgerError, match="not complete"):
         ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    conn.close()
+
+
+def test_H13_every_run_must_record_a_readable_agreeing_fetch(tmp_path):
+    """The freeze's fetch identity is required from EVERY run, and read out of it.
+
+    A fetch only some of the runs recorded is not the freeze's provenance; a
+    record that exists and cannot be read is not the same thing as an absence;
+    and an explicitly declared fetch is only ever an ASSERTION against what the
+    runs persisted -- with nothing persisted there is nothing to assert against,
+    so a caller cannot attach a provenance the runs never carried.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+
+    def _run(*, family: str, version: str, run_ids, finish: bool = True) -> int:
+        return _freeze(
+            conn, family=family, version=version,
+            kind=KIND_POINTS if family == FAMILY_POINTS else KIND_MINUTES,
+            values={DGW_PLAYER: 6.0}, official_run_ids=run_ids, finish=finish,
+        )
+
+    def _run_recording(raw: str) -> int:
+        """A complete run whose persisted provenance was written as ``raw``."""
+
+        run_id = _run(family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION, run_ids={}, finish=False)
+        conn.execute("UPDATE projection_runs SET official_run_ids=? WHERE id=?", (raw, run_id))
+        analytics.finish_projection_run(conn, run_id, "complete")
+        return run_id
+
+    # PARTIAL: one run records the fetch, the other records nothing at all.
+    partial = ol.certify_prediction_freeze(
+        conn,
+        projection_run_ids=[
+            _run(
+                family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+                run_ids={"fetch": {"run_id": fetch}},
+            ),
+            _run(family=FAMILY_MINUTES, version="minutes_v1.4.0", run_ids={}),
+        ],
+        bootstrap_generation_id=generation,
+    )
+    assert partial.provenance_state == ol.NOT_CERTIFIABLE
+    assert partial.official_fetch_run_id is None
+    assert any("record no official fetch provenance" in reason for reason in partial.reasons)
+
+    # An explicit fetch cannot stand in for the provenance no run recorded: it is
+    # an assertion ABOUT persisted provenance, not a substitute for it.
+    declared = ol.certify_prediction_freeze(
+        conn,
+        projection_run_ids=[
+            _run(family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION, run_ids={})
+        ],
+        official_fetch_run_id=fetch,
+    )
+    assert declared.provenance_state == ol.NOT_CERTIFIABLE
+    assert declared.official_fetch_run_id is None
+    assert any("only some of the runs state" in reason for reason in declared.reasons)
+
+    # MALFORMED: a record that exists and cannot be read is not an absence, so it
+    # is refused rather than quietly read as "this run recorded nothing".
+    for raw, expected in (
+        ('{"fetch": "not-an-object"}', "is not an object"),
+        ('{"fetch": {"run_id":', "not readable JSON"),
+        ('{"fetch": {}}', "no run_id"),
+        ('{"fetch": {"run_id": "seven"}}', "non-integer"),
+        ("[]", "not an object"),
+    ):
+        broken = ol.certify_prediction_freeze(
+            conn, projection_run_ids=[_run_recording(raw)], bootstrap_generation_id=generation
+        )
+        assert broken.provenance_state == ol.NOT_CERTIFIABLE
+        assert broken.official_fetch_run_id is None
+        assert any(expected in reason for reason in broken.reasons), (raw, broken.reasons)
+
+    # ABSENT: not one run recorded a fetch, and the freeze claims certification
+    # from a generation anyway.  A generation cannot supply a provenance the runs
+    # never carried, so the claim is refused rather than read as a freeze that
+    # happened to record nothing yet was certified regardless.
+    nothing_recorded = ol.certify_prediction_freeze(
+        conn,
+        projection_run_ids=[
+            _run(family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION, run_ids={})
+        ],
+        bootstrap_generation_id=generation,
+    )
+    assert nothing_recorded.provenance_state == ol.NOT_CERTIFIABLE
+    assert nothing_recorded.official_fetch_run_id is None
+    assert any("no official fetch identity to match" in reason for reason in nothing_recorded.reasons)
+    assert ol.freeze_provenance(conn, nothing_recorded.freeze_identity)["provenance_state"] == (
+        ol.NOT_CERTIFIABLE
+    )
+
+    # DISAGREEING: every run recorded a fetch, but not the same one, so there is
+    # no single recorded identity to certify from -- and the refusal stands even
+    # with no generation to compare against, because the legacy branch answers
+    # for MISSING provenance and this is provenance the runs contradict.
+    other_fetch = _fetch_run(conn)
+    disagreeing = ol.certify_prediction_freeze(
+        conn,
+        projection_run_ids=[
+            _run(
+                family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+                run_ids={"fetch": {"run_id": fetch}},
+            ),
+            _run(
+                family=FAMILY_MINUTES, version="minutes_v1.4.0",
+                run_ids={"fetch": {"run_id": other_fetch}},
+            ),
+        ],
+    )
+    assert disagreeing.provenance_state == ol.NOT_CERTIFIABLE
+    assert disagreeing.official_fetch_run_id is None
+    assert any("record different official fetch runs" in reason for reason in disagreeing.reasons)
+
+    # The intact case still certifies: every run records the same fetch.
+    good = ol.certify_prediction_freeze(
+        conn,
+        projection_run_ids=[
+            _run(
+                family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+                run_ids={"fetch": {"run_id": fetch}},
+            )
+        ],
+        bootstrap_generation_id=generation,
+    )
+    assert good.provenance_state == ol.GENERATION_CERTIFIED, good.reasons
+    assert good.official_fetch_run_id == fetch
+    conn.close()
+
+
+def test_H14_a_provenance_free_running_run_is_refused_not_legacied(tmp_path):
+    """The legacy branch may not swallow an incomplete-run or duplicate-family refusal.
+
+    Legacy is a statement about MISSING PROVENANCE, not a blanket over every run
+    that happens to record none.  A run that is still open, or a freeze that
+    names one model family twice, is a refusal -- and a refusal the legacy branch
+    hid would never reach a reviewer.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    running = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0}, official_run_ids={}, finish=False,
+    )
+    certification = ol.certify_prediction_freeze(conn, projection_run_ids=[running])
+    assert certification.provenance_state == ol.NOT_CERTIFIABLE
+    assert any("not complete" in reason for reason in certification.reasons)
+    assert ol.freeze_provenance(conn, certification.freeze_identity)["provenance_state"] == (
+        ol.NOT_CERTIFIABLE
+    )
+
+    first = _freeze(
+        conn, family=FAMILY_POINTS, version="baseline_v1.0.0", kind=KIND_POINTS,
+        values={DGW_PLAYER: 6.0}, official_run_ids={},
+    )
+    second = _freeze(
+        conn, family=FAMILY_POINTS, version="baseline_v1.1.0", kind=KIND_POINTS,
+        values={SGW_A_PLAYER: 3.0}, official_run_ids={},
+    )
+    duplicated = ol.certify_prediction_freeze(conn, projection_run_ids=[first, second])
+    assert duplicated.provenance_state == ol.NOT_CERTIFIABLE
+    assert any("same model family twice" in reason for reason in duplicated.reasons)
+    # ...while a provenance-free freeze that is genuinely sound stays legacy.
+    legacy = _freeze(
+        conn, family=FAMILY_MINUTES, version="minutes_v1.4.0", kind=KIND_MINUTES,
+        values={DGW_PLAYER: 6.0}, official_run_ids={},
+    )
+    assert ol.certify_prediction_freeze(
+        conn, projection_run_ids=[legacy]
+    ).provenance_state == ol.LEGACY_PROVENANCE
+    conn.close()
+
+
+def test_H15_a_concurrent_insertion_during_certification_is_refused(tmp_path, monkeypatch):
+    """Hashing and closure are ONE atomic step, proved with two connections.
+
+    The first connection decides the certificate from the artifact it read.  A
+    second connection then appends to that very artifact -- in the window
+    between the decision read and the write -- and commits.  The certificate
+    must be refused rather than written with a digest that stopped describing
+    the artifact the moment the other connection touched it; once the artifact
+    has settled, certifying it again is fine, which is what shows the refusal is
+    about the race and not about the extra row.
+    """
+
+    path = tmp_path / "fpl.db"
+    conn = connect_database(path)
+    other = connect_database(path)
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+    conn.commit()
+
+    real = ol.prediction_artifact_digest
+    racing = {"inserted": False}
+
+    def _digest_racing_with_a_second_connection(target, run_ids):
+        result = real(target, run_ids)
+        if not racing["inserted"]:
+            racing["inserted"] = True
+            analytics.freeze_prediction(
+                other,
+                run,
+                kind=KIND_POINTS,
+                player_id=SGW_A_PLAYER,
+                event=EVENT,
+                payload={"value": 9.0},
+                model_version=analytics.BASELINE_MODEL_VERSION,
+            )
+            other.commit()
+        return result
+
+    monkeypatch.setattr(ol, "prediction_artifact_digest", _digest_racing_with_a_second_connection)
+    with pytest.raises(ol.OutcomeLedgerError, match="still moving"):
+        ol.certify_prediction_freeze(
+            conn, projection_run_ids=[run], bootstrap_generation_id=generation
+        )
+    assert racing["inserted"] is True
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_provenance").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_runs").fetchone()[0] == 0
+
+    # The settled artifact certifies cleanly, and the ledger can verify it.
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[run], bootstrap_generation_id=generation
+    )
+    assert certification.provenance_state == ol.GENERATION_CERTIFIED, certification.reasons
+    ledger = ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity)
+    assert ledger.artifact_verified is True
+    other.close()
+    conn.close()
+
+
+def test_H16_a_second_connection_cannot_write_inside_the_closure(tmp_path, monkeypatch):
+    """The closure re-reads its evidence inside its own transaction.
+
+    The first connection certifies inside a transaction the CALLER owns.  While
+    the closure re-reads what it is certifying, a second connection tries to
+    append to the same artifact: the database refuses the interleave, so the
+    certificate can only ever be written from the state its own transaction
+    observed.  The caller's transaction is preserved throughout -- it is still
+    the caller's to commit or discard, certificate included.
+    """
+
+    path = tmp_path / "fpl.db"
+    conn = connect_database(path)
+    other = connect_database(path)
+    other.execute("PRAGMA busy_timeout=0")
+    _world(conn)
+    fetch = _fetch_run(conn)
+    generation = _generation(conn, fetch_run_id=fetch)
+    run = _freeze(
+        conn, family=FAMILY_POINTS, version=analytics.BASELINE_MODEL_VERSION,
+        kind=KIND_POINTS, values={DGW_PLAYER: 6.0},
+        official_run_ids={"fetch": {"run_id": fetch}},
+    )
+
+    real = ol.prediction_artifact_digest
+    calls = {"count": 0}
+    refused: list[str] = []
+
+    def _digest_with_a_second_connection_writing(target, run_ids):
+        calls["count"] += 1
+        if calls["count"] == 3:
+            # The third read is the closure's own, inside its savepoint.
+            try:
+                analytics.freeze_prediction(
+                    other,
+                    run,
+                    kind=KIND_POINTS,
+                    player_id=SGW_A_PLAYER,
+                    event=EVENT,
+                    payload={"value": 9.0},
+                    model_version=analytics.BASELINE_MODEL_VERSION,
+                )
+                other.commit()
+            except sqlite3.OperationalError as failure:
+                refused.append(str(failure))
+        return real(target, run_ids)
+
+    monkeypatch.setattr(ol, "prediction_artifact_digest", _digest_with_a_second_connection_writing)
+    certification = ol.certify_prediction_freeze(
+        conn, projection_run_ids=[run], bootstrap_generation_id=generation
+    )
+    assert calls["count"] == 3, "the closure re-reads the evidence it is certifying"
+    assert refused and "database is locked" in refused[0], refused
+    assert certification.provenance_state == ol.GENERATION_CERTIFIED, certification.reasons
+    assert conn.execute(
+        "SELECT COUNT(*) FROM frozen_predictions WHERE projection_run_id=?", (run,)
+    ).fetchone()[0] == 1
+    # The caller's transaction is still open, and still owns the certificate.
+    assert conn.in_transaction
+    assert ol.build_reality_ledger(conn, freeze_identity=certification.freeze_identity).artifact_verified
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM prediction_freeze_provenance").fetchone()[0] == 0
+    other.close()
+    conn.close()
+
+
+def test_H17_a_backfill_is_bound_to_the_archived_content(tmp_path):
+    """A valid archive capture proves identity and BYTES, never the claim.
+
+    A manifest record can be satisfied perfectly while the observation attached
+    to it is invented, because the manifest says which bytes were read and never
+    what they say.  So every part of the claim is bound to the parsed archived
+    content: each official field, each additional source field, the player, the
+    fixture, the event and the club identity all have to be what the archive
+    states, and the headline event total has to be that content's aggregation.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    row = _archived_element_row()
+    root, record = _archived_observation(tmp_path, rows=[row], source="element_summary_10")
+    assert _backfill(conn, root=root, record=record).inserted
+    # An archive that states MORE than PE-5's minimum is exactly the case the
+    # additional-field rule has to bind, so it gets its own capture.
+    rich_root, rich_record = _archived_observation(
+        tmp_path,
+        rows=[_archived_element_row(influence=12.5, ict_index=8.1)],
+        source="element_summary_10",
+        observed_at=_t(5),
+        raw_dir=tmp_path / "raw5",
+    )
+
+    def _refused(match: str, *, capture=None, **overrides):
+        target_root, target_record = capture or (root, record)
+        before = conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0]
+        with pytest.raises(ol.BackfillEvidenceError, match=match):
+            _backfill(conn, root=target_root, record=target_record, **overrides)
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == before
+
+    # An official field the archive states differently is not the archive's fact,
+    # and neither is one the archive leaves missing.
+    _refused("not the claimed", total_points=9)
+    _refused("not the claimed", bps=99)
+    _refused("not the claimed", bonus=None)
+    # An additional field the archive never states cannot be attached to it...
+    _refused("does not state 'creates'", creates=3, capture=(rich_root, rich_record), captured_at=_t(5))
+    # ...and one it does state cannot be re-valued.
+    _refused(
+        "does not state 'influence'", influence=7.0, capture=(rich_root, rich_record), captured_at=_t(5)
+    )
+    # A fixture the archived capture holds no row for.
+    _refused("holds no observation", fixture_id=FIXTURE_2)
+    # A club identity the archived row contradicts.
+    _refused("states the club/team", team_id=TEAM_C)
+    _refused("states the opponent", opponent_team_id=TEAM_A)
+    _refused("was played at", event_time=KICKOFF_2)
+    # A player the archived capture never mentions: the source slug is another
+    # element's summary, so the claim is not about the bytes being offered.
+    _refused("is the element summary of player", player_id=SGW_A_PLAYER)
+    # The additional fields the archive DOES state are carried through verbatim.
+    stored = _backfill(
+        conn, root=rich_root, record=rich_record, captured_at=_t(5), influence=12.5, ict_index=8.1
+    )
+    assert stored.inserted
+    kept = next(
+        row
+        for row in ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+        if row["archive_capture_id"] == rich_record.capture_id
+    )
+    assert kept["payload"]["influence"] == 12.5
+    assert kept["payload"]["ict_index"] == 8.1
+
+    # Without the player in the source slug, the ROW's identity is what binds the
+    # claim -- and a payload whose rows state no player at all cannot prove whose
+    # observation it is.
+    other_root, other_record = _archived_observation(
+        tmp_path, rows=[_archived_element_row(player_id=SGW_A_PLAYER)], raw_dir=tmp_path / "raw2",
+    )
+    assert _backfill(
+        conn, root=other_root, record=other_record, player_id=SGW_A_PLAYER
+    ).inserted
+    anonymous = _archived_element_row()
+    anonymous.pop("element")
+    anon_root, anon_record = _archived_observation(
+        tmp_path, rows=[anonymous], source="element_summary", observed_at=_t(5), raw_dir=tmp_path / "raw3",
+    )
+    with pytest.raises(ol.BackfillEvidenceError, match="states no player identity"):
+        _backfill(conn, root=anon_root, record=anon_record, captured_at=_t(5))
+
+    # Event grain: the archived double gameweek is summed ONCE, so the headline
+    # total cannot be one fixture's value copied into the event row.
+    dgw_root, dgw_record = _archived_observation(
+        tmp_path,
+        rows=[
+            _archived_element_row(fixture_id=FIXTURE_1),
+            _archived_element_row(
+                fixture_id=FIXTURE_2, kickoff_time=KICKOFF_2, team_a=TEAM_C, opponent_team=TEAM_C,
+            ),
+        ],
+        source="element_summary_10",
+        observed_at=_t(4),
+        raw_dir=tmp_path / "raw4",
+    )
+    event_claim = {
+        "minutes": 180, "starts": 2, "total_points": 12, "goals_scored": 2, "assists": 0,
+        "clean_sheets": 0, "goals_conceded": 2, "saves": 0, "bonus": 2, "bps": 60,
+        "yellow_cards": 0, "red_cards": 0, "penalties_saved": 0, "penalties_missed": 0,
+        "own_goals": 0, "defensive_contribution": 0,
+    }
+
+    def _event_claim(**overrides):
+        arguments = {
+            "player_id": DGW_PLAYER,
+            "fixture_id": None,
+            "grain": ol.GRAIN_PLAYER_EVENT,
+            "captured_at": _t(4),
+            "source_name": "archived_element_summary",
+            "source_identity": "element_summary_10",
+            "source_payload_sha256": dgw_record.payload_sha256,
+            "archive_capture_id": dgw_record.capture_id,
+            "fetch_run_id": 7,
+            "backfill": True,
+            "archive_root": dgw_root,
+        }
+        arguments.update(event_claim)
+        arguments.update(overrides)
+        return _capture(conn, **arguments)
+
+    assert _event_claim().inserted
+    with pytest.raises(ol.BackfillEvidenceError, match="not the claimed"):
+        _event_claim(total_points=6)
     conn.close()
 
 
