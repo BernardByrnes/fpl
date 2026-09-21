@@ -491,6 +491,29 @@ def _parse_live_explanation_stats(value: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def parse_live_event_totals(value: dict[str, Any]) -> dict[str, Any]:
+    """The EVENT totals one ``event/live`` element states at its top level.
+
+    ``stats`` is the endpoint's own statement of the player's total for the
+    event, which is exactly the number that must not be duplicated once per
+    double-gameweek fixture; the ``explain`` legs below it are the per-fixture
+    shares of that same total.  Only fields the payload actually states are
+    returned, so an absent field stays absent and a reader is left to treat it
+    as missing rather than read a zero into it.
+    """
+
+    stats = _read(value, "stats", default={})
+    stats_map = stats if isinstance(stats, dict) else {}
+    totals: dict[str, Any] = {}
+    for name in sorted(_LIVE_INT_FIELDS):
+        if name in stats_map:
+            totals[name] = to_int(stats_map[name])
+    for name in sorted(_LIVE_FLOAT_FIELDS):
+        if name in stats_map:
+            totals[name] = to_float(stats_map[name])
+    return totals
+
+
 def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweekRecord]:
     records: list[PlayerGameweekRecord] = []
     for value in _items(payload, "elements"):
@@ -518,23 +541,27 @@ def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweek
                         context[key] = explanation[key]
                 if "was_home" not in context and "is_home" in context:
                     context["was_home"] = context["is_home"]
+                # The element kept in raw_json is the id this row was actually
+                # read for, so downstream readers can tell whose row it is from
+                # the payload rather than from what they asked the parser for.
+                context["element"] = player_id
+                context["id"] = player_id
                 explanation_rows.append((explanation_fixture, context, _parse_live_explanation_stats(explanation)))
         if explanation_rows:
             for fixture_id, context, fixture_stats in explanation_rows:
-                # An empty explain.stats for a single fixture can safely use
-                # the live stats object.  With multiple fixtures it must stay
-                # empty, otherwise event totals would be duplicated.
-                if not fixture_stats and len(explanation_rows) > 1:
-                    stats_value: dict[str, Any] | None = {}
-                else:
-                    stats_value = fixture_stats or (stats_map if stats_map else None)
+                # When the payload HAS explain legs, each leg's record is built
+                # from that leg's own parsed stats and from nothing else.  The
+                # element's top-level stats are its EVENT total -- the other
+                # grain -- so a leg whose stat list is empty states no fixture
+                # facts at all, and its fields stay MISSING rather than being
+                # filled from the event total standing above it.
                 record = _gameweek_record(
                     player_id,
                     context,
                     event,
                     fixture_id,
                     "event_live",
-                    stats_value=stats_value,
+                    stats_value=fixture_stats,
                 )
                 if record is not None:
                     record.raw_json = dict(value)
@@ -555,7 +582,7 @@ def parse_event_live(payload: dict[str, Any], event: int) -> list[PlayerGameweek
             stats_value=stats_map if stats_map else None,
         )
         if record is not None:
-            record.raw_json = dict(value)
+            record.raw_json = {**dict(value), "element": player_id, "id": player_id}
             records.append(record)
     return records
 
