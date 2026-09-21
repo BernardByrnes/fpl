@@ -72,6 +72,34 @@ EVENT-SPECIFIC status (``availability_basis == "event_context"``).  A row whose
 status was only assumed from a trail that never varied proves nothing about that
 row, so it is counted and excluded rather than used.
 
+PLAYER IDENTITY IS RESOLVED AS OF THE CUTOFF
+--------------------------------------------
+``players.team_id`` / ``players.element_type`` / ``players.is_active`` are
+CURRENT state: the store keeps one row per player and overwrites it, so a
+post-cutoff transfer, position change or retirement would silently rewrite which
+fixtures an earlier cutoff is projecting.  PE-6 therefore resolves every
+candidate's membership, club and position from the OFFICIAL ELEMENT CAPTURE at or
+before the cutoff (``player_snapshots.raw_json``, the payload the official
+bootstrap returned), never from the current row:
+
+* the club and position come from the capture's own ``team`` / ``element_type``;
+* membership comes from being present in that capture at all;
+* the candidate set is the UNION of the captures at the cutoff and the persisted
+  pool, so a player who was in the official pool then and is inactive today is
+  still projected for that cutoff;
+* when a candidate has no cutoff capture at all, the current row is used ONLY as
+  a DECLARED fallback whose basis is recorded per row and counted in the
+  artifact (``identity_basis_counts``), so the un-resolvable share of a
+  population is visible rather than implied;
+* a row whose capture is not the newest one visible at the cutoff is REPORTED as
+  such rather than dropped: the freshest official list may not name him, and that
+  is doubt rather than evidence.
+
+The read is the bulk form of ``analytics.snapshot_as_of`` -- the same predicate
+and the same ordering, so no second causal reader exists -- and the suite pins
+the two against each other player by player.  The incumbent's own pooled priors
+(``league_pools``) are the incumbent's frozen read and are not restated here.
+
 WHERE THE NUMBERS COME FROM
 ---------------------------
 A row on which no refinement moves a chain input REPUBLISHES the base
@@ -94,6 +122,7 @@ not wired into any production decision path.
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from dataclasses import dataclass, field, fields, replace
@@ -104,7 +133,13 @@ from . import minutes_model as incumbent
 from . import repositories as repo
 from .utils import utc_now
 
-AVAILABILITY_MINUTES_CHALLENGER_VERSION = "availability_minutes_challenger_v0.1.0"
+AVAILABILITY_MINUTES_CHALLENGER_VERSION = "availability_minutes_challenger_v0.1.1"
+# v0.1.1: review pass.  Player membership, club and position are now resolved AS
+# OF THE CUTOFF from the official element captures that were observable then,
+# instead of being read from the current ``players`` row; a player the cutoff
+# can place in the official pool stays a candidate even if he is no longer
+# active today, and a post-cutoff club/position change can no longer move an
+# earlier projection.
 # v0.1.0: the first PE-6 challenger.  A challenger identity, not an incumbent
 # bump: nothing here is promoted, and the incumbent's own version strings are
 # read-only in this module.
@@ -307,6 +342,407 @@ def challenger_identity(
         "incumbent_identity": frozen_incumbent_identity(),
         "incumbent_config_hash": incumbent_config.config_hash(),
         "promotion": "NOT_PERFORMED_CHALLENGER_ONLY",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cutoff-safe player identity (membership, club, position).
+# ---------------------------------------------------------------------------
+
+#: Where a candidate's identity came from, in the order of preference.
+IDENTITY_BASIS_CUTOFF_CAPTURE = "CUTOFF_OFFICIAL_ELEMENT_CAPTURE"
+IDENTITY_BASIS_LIVE_FALLBACK = "CURRENT_PLAYER_ROW_FALLBACK_NOT_CUTOFF_SAFE"
+IDENTITY_BASIS_UNRESOLVED = "NO_IDENTITY_EVIDENCE"
+
+IDENTITY_BASES: tuple[str, ...] = (
+    IDENTITY_BASIS_CUTOFF_CAPTURE,
+    IDENTITY_BASIS_LIVE_FALLBACK,
+    IDENTITY_BASIS_UNRESOLVED,
+)
+
+#: The official bootstrap element-payload fields the identity is read from.
+OFFICIAL_ELEMENT_CLUB_FIELD = "team"
+OFFICIAL_ELEMENT_POSITION_FIELD = "element_type"
+
+#: The bulk form of ``analytics.snapshot_as_of``: the same predicate and the same
+#: ordering, so the population can be resolved in one read without a second
+#: causal definition existing anywhere in PE-6.  ``?`` order: cutoff.
+CUTOFF_CAPTURE_SQL = (
+    "SELECT player_id, captured_at, id, raw_json FROM player_snapshots "
+    "WHERE captured_at <= ? ORDER BY player_id, captured_at DESC, id DESC"
+)
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _official_element_payload(capture: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The official element payload a capture row carries, or an empty mapping.
+
+    ``raw_json`` is the bootstrap element the capture was parsed from, stored as
+    text by the repository layer.  Anything unparseable yields no fields rather
+    than a guess: a missing identity is missing, never zero.
+    """
+
+    raw = (capture or {}).get("raw_json")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+@dataclass(frozen=True)
+class PlayerIdentityAsOf:
+    """One player's membership, club and position as known at one cutoff."""
+
+    player_id: int
+    team_id: int | None
+    element_type: int | None
+    in_official_pool: bool
+    basis: str
+    snapshot_captured_at: str | None
+    #: True only when every resolved field came from the cutoff capture, so a
+    #: later change to the current row cannot move this identity.
+    cutoff_safe: bool
+    live_row_disagreement: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "player_id": int(self.player_id),
+            "team_id": None if self.team_id is None else int(self.team_id),
+            "element_type": None if self.element_type is None else int(self.element_type),
+            "in_official_pool": bool(self.in_official_pool),
+            "basis": str(self.basis),
+            "snapshot_captured_at": self.snapshot_captured_at,
+            "cutoff_safe": bool(self.cutoff_safe),
+            "live_row_disagreement": list(self.live_row_disagreement),
+            "notes": list(self.notes),
+        }
+
+
+def _identity_from(
+    capture: Mapping[str, Any] | None,
+    live_row: Mapping[str, Any] | None,
+    *,
+    allow_live_fallback: bool,
+    in_persisted_pool: bool | None = None,
+) -> PlayerIdentityAsOf:
+    """Resolve one identity, preferring the cutoff capture over the current row.
+
+    ``in_persisted_pool`` says whether the caller's enumeration still lists the
+    player.  A candidate the cutoff places in the pool but the persisted pool no
+    longer lists is a divergence worth recording, so it is reported even though
+    there is no current row to compare field by field.
+    """
+
+    if in_persisted_pool is None:
+        in_persisted_pool = live_row is not None
+    raw_id = (capture or {}).get("player_id")
+    if raw_id is None:
+        raw_id = (live_row or {}).get("player_id")
+    player_id = -1 if raw_id is None else int(raw_id)
+    captured_at = None if capture is None else (capture.get("captured_at") or None)
+    live_team = _int_or_none((live_row or {}).get("team_id"))
+    live_position = _int_or_none((live_row or {}).get("element_type"))
+
+    if capture is None:
+        if live_row is None or not allow_live_fallback:
+            return PlayerIdentityAsOf(
+                player_id=player_id,
+                team_id=None,
+                element_type=None,
+                in_official_pool=False,
+                basis=IDENTITY_BASIS_UNRESOLVED,
+                snapshot_captured_at=None,
+                cutoff_safe=False,
+                notes=(
+                    "NO_CUTOFF_CAPTURE_AND_LIVE_FALLBACK_REFUSED"
+                    if live_row is not None
+                    else "NO_CUTOFF_CAPTURE_AND_NO_CURRENT_ROW",
+                ),
+            )
+        notes = ["LIVE_FALLBACK: no cutoff capture places this player in the official pool"]
+        if live_team is None or live_position is None:
+            notes.append("LIVE_ROW_CARRIES_NO_CLUB_OR_POSITION")
+        return PlayerIdentityAsOf(
+            player_id=player_id,
+            team_id=live_team,
+            element_type=live_position,
+            in_official_pool=bool(live_row.get("is_active")),
+            basis=IDENTITY_BASIS_LIVE_FALLBACK,
+            snapshot_captured_at=None,
+            cutoff_safe=False,
+            notes=tuple(notes),
+        )
+
+    payload = _official_element_payload(capture)
+    team = _int_or_none(payload.get(OFFICIAL_ELEMENT_CLUB_FIELD))
+    position = _int_or_none(payload.get(OFFICIAL_ELEMENT_POSITION_FIELD))
+    notes: list[str] = []
+    if team is None:
+        notes.append("CAPTURE_CARRIES_NO_CLUB_FIELD")
+    if position is None:
+        notes.append("CAPTURE_CARRIES_NO_POSITION_FIELD")
+    disagreement: list[str] = []
+    if not in_persisted_pool:
+        disagreement.append("membership:in_pool->absent_from_persisted_pool")
+    if live_row is not None:
+        if live_team is not None and team is not None and live_team != team:
+            disagreement.append(f"club:{team}->{live_team}")
+        if live_position is not None and position is not None and live_position != position:
+            disagreement.append(f"position:{position}->{live_position}")
+        if not live_row.get("is_active"):
+            # The cutoff evidence places him in the pool; the current row says he
+            # is gone.  The cutoff wins, and the disagreement is recorded.
+            disagreement.append("membership:in_pool->inactive")
+    cutoff_safe = team is not None and position is not None
+    if not cutoff_safe and allow_live_fallback and live_row is not None:
+        if (team is None and live_team is not None) or (position is None and live_position is not None):
+            notes.append("PARTIAL_FIELDS_FILLED_FROM_CURRENT_ROW")
+            team = team if team is not None else live_team
+            position = position if position is not None else live_position
+    return PlayerIdentityAsOf(
+        player_id=player_id,
+        team_id=team,
+        element_type=position,
+        in_official_pool=True,
+        basis=IDENTITY_BASIS_CUTOFF_CAPTURE,
+        snapshot_captured_at=None if captured_at is None else str(captured_at),
+        cutoff_safe=cutoff_safe,
+        live_row_disagreement=tuple(disagreement),
+        notes=tuple(notes),
+    )
+
+
+def cutoff_official_captures(
+    conn: sqlite3.Connection, cutoff: str
+) -> dict[int, dict[str, Any]]:
+    """The freshest official element capture at or before ``cutoff``, per player.
+
+    Built from :data:`CUTOFF_CAPTURE_SQL`, which is the bulk form of
+    ``analytics.snapshot_as_of``: identical predicate (``captured_at <= cutoff``)
+    and identical ordering (``captured_at DESC, id DESC``), so a caller gets the
+    same row it would get one player at a time.  The suite pins the two against
+    each other, so this cannot silently become a second definition.
+    """
+
+    captures: dict[int, dict[str, Any]] = {}
+    for row in conn.execute(CUTOFF_CAPTURE_SQL, (str(cutoff),)).fetchall():
+        player_id = int(row["player_id"])
+        if player_id in captures:  # the first row per player is the as-of winner
+            continue
+        captures[player_id] = {
+            "player_id": player_id,
+            "captured_at": row["captured_at"],
+            "id": row["id"],
+            "raw_json": row["raw_json"],
+        }
+    return captures
+
+
+def resolve_player_identity_as_of(
+    conn: sqlite3.Connection,
+    player_id: int,
+    cutoff: str,
+    *,
+    live_row: Mapping[str, Any] | None = None,
+    allow_live_fallback: bool = True,
+) -> PlayerIdentityAsOf:
+    """One player's identity at ``cutoff``, from the capture visible then.
+
+    ``live_row`` is the CURRENT ``players`` row, supplied explicitly by a caller
+    that has one.  It is used only when the cutoff has no capture for the player,
+    and that fallback is always recorded (``basis`` /
+    ``IDENTITY_BASIS_LIVE_FALLBACK``) rather than passed off as cutoff evidence.
+    """
+
+    capture = analytics.snapshot_as_of(conn, int(player_id), str(cutoff))
+    return _identity_from(capture, live_row, allow_live_fallback=allow_live_fallback)
+
+
+def resolve_candidate_pool(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    *,
+    live_rows: Sequence[Mapping[str, Any]] | None = None,
+    captures: Mapping[int, Mapping[str, Any]] | None = None,
+    allow_live_fallback: bool = True,
+) -> dict[str, Any]:
+    """One pass: the resolved pool, the unresolved candidates and the summary.
+
+    The candidate set is the UNION of the players the cutoff captures place in
+    the official pool and the persisted pool (``analytics.projectable_players``,
+    the incumbent's own candidate rule).  The union matters in both directions: a
+    player who was in the pool at the cutoff and has since been marked inactive
+    is still a candidate for that cutoff, and a player the persisted pool lists
+    is still a candidate when the cutoff holds no capture for him (with the
+    declared live fallback recorded).
+
+    A candidate whose club or position cannot be resolved at all is returned in
+    ``unresolved`` rather than dropped, so a caller can classify it instead of
+    losing it silently.
+    """
+
+    live = {
+        int(row["player_id"]): dict(row)
+        for row in (live_rows if live_rows is not None else analytics.projectable_players(conn))
+    }
+    capture_map = (
+        dict(captures) if captures is not None else cutoff_official_captures(conn, cutoff)
+    )
+    moments = sorted(
+        {
+            str(row.get("captured_at"))
+            for row in capture_map.values()
+            if row.get("captured_at")
+        }
+    )
+    newest_capture = moments[-1] if moments else None
+    players: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    for player_id in sorted(set(live) | set(int(pid) for pid in capture_map)):
+        identity = _identity_from(
+            capture_map.get(player_id),
+            live.get(player_id),
+            allow_live_fallback=allow_live_fallback,
+            in_persisted_pool=player_id in live,
+        )
+        if not identity.in_official_pool or identity.team_id is None or identity.element_type is None:
+            unresolved.append(identity.as_dict())
+            continue
+        captured_at = identity.snapshot_captured_at
+        players.append(
+            {
+                "player_id": int(player_id),
+                "team_id": int(identity.team_id),
+                "element_type": int(identity.element_type),
+                "is_active": 1,
+                "identity": identity.as_dict(),
+                "identity_basis": identity.basis,
+                "identity_cutoff_safe": bool(identity.cutoff_safe),
+                "identity_snapshot_captured_at": captured_at,
+                # Not the newest capture visible at the cutoff: the official list
+                # that was freshest then may not have named this player at all.
+                # Reported, never silently dropped.
+                "identity_capture_is_newest": (
+                    None
+                    if captured_at is None or newest_capture is None
+                    else str(captured_at) == newest_capture
+                ),
+            }
+        )
+    return {
+        "cutoff": str(cutoff),
+        "players": players,
+        "unresolved": unresolved,
+        "summary": {
+            **identity_resolution_summary(players),
+            "unresolved_candidates": len(unresolved),
+        },
+    }
+
+
+def projectable_players_as_of(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    *,
+    live_rows: Sequence[Mapping[str, Any]] | None = None,
+    captures: Mapping[int, Mapping[str, Any]] | None = None,
+    allow_live_fallback: bool = True,
+) -> list[dict[str, Any]]:
+    """The candidate pool with every identity resolved as of ``cutoff``."""
+
+    return resolve_candidate_pool(
+        conn,
+        cutoff,
+        live_rows=live_rows,
+        captures=captures,
+        allow_live_fallback=allow_live_fallback,
+    )["players"]
+
+
+def unresolved_candidates_as_of(
+    conn: sqlite3.Connection,
+    cutoff: str,
+    *,
+    live_rows: Sequence[Mapping[str, Any]] | None = None,
+    captures: Mapping[int, Mapping[str, Any]] | None = None,
+    allow_live_fallback: bool = True,
+) -> list[dict[str, Any]]:
+    """Candidates the cutoff cannot place in the official pool, with their reasons."""
+
+    return resolve_candidate_pool(
+        conn,
+        cutoff,
+        live_rows=live_rows,
+        captures=captures,
+        allow_live_fallback=allow_live_fallback,
+    )["unresolved"]
+
+
+def identity_basis_counts(players: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    """How many candidates were resolved from each identity basis."""
+
+    counts: dict[str, int] = {}
+    for player in players:
+        basis = str(player.get("identity_basis") or IDENTITY_BASIS_UNRESOLVED)
+        counts[basis] = counts.get(basis, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def identity_resolution_summary(players: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The identity provenance of one candidate pool, for the artifact."""
+
+    rows = list(players)
+    safe = [row for row in rows if row.get("identity_cutoff_safe")]
+    moments = sorted(
+        {
+            str(row["identity_snapshot_captured_at"])
+            for row in rows
+            if row.get("identity_snapshot_captured_at")
+        }
+    )
+    newest = moments[-1] if moments else None
+    from_newest = (
+        sum(
+            1
+            for row in rows
+            if newest is not None and str(row.get("identity_snapshot_captured_at") or "") == newest
+        )
+        if newest is not None
+        else 0
+    )
+    return {
+        "basis_counts": identity_basis_counts(rows),
+        "rows": len(rows),
+        "cutoff_safe_rows": len(safe),
+        "cutoff_safe_share": (
+            round(len(safe) / len(rows), 6) if rows else None
+        ),
+        "capture_moments": moments,
+        "rows_from_newest_capture": from_newest,
+        "rows_from_older_captures": len(rows) - from_newest,
+        "stale_capture_rule": (
+            "a row whose capture is not the newest one visible at the cutoff is REPORTED, not "
+            "dropped: the freshest official list may not name him, and a stale capture is "
+            "doubt rather than evidence"
+        ),
+        "rule": (
+            "membership, club and position come from the official element capture at or before "
+            "the cutoff; the current players row is used only as a recorded fallback"
+        ),
     }
 
 
@@ -706,6 +1142,7 @@ def refine_row(
     challenger_config: AvailabilityMinutesChallengerConfig,
     enabled_families: Iterable[str],
     position_id: int = 0,
+    player_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply the enabled refinements to one incumbent row and re-derive it.
 
@@ -900,6 +1337,10 @@ def refine_row(
         "availability_basis": evidence.availability_basis,
         "status_at_cutoff": evidence.status_at_cutoff,
         "position_id": int(position_id),
+        # Provenance: where this row's membership, club and position came from.
+        # The resolved identity is what the projection used, so a later change to
+        # the current row cannot have moved this row.
+        "player_identity": dict(player_identity or {}),
         # Provenance: which incumbent artifact and which projection config this
         # row's marginals came from.  Never a claim that the incumbent's version
         # identifier is the challenger's.
@@ -945,6 +1386,11 @@ class ChallengerArms:
     arms: dict[str, dict[tuple[int, int], dict[str, Any]]] = field(default_factory=dict)
     evidence: dict[tuple[int, int], ChallengerEvidence] = field(default_factory=dict)
     identity: dict[str, Any] = field(default_factory=dict)
+    #: The cutoff-resolved candidate pool every arm was projected from, so the
+    #: evaluation classifies exactly the population the arms cover.
+    players: list[dict[str, Any]] = field(default_factory=list)
+    #: Candidates the cutoff could not place in the official pool, with reasons.
+    unresolved: list[dict[str, Any]] = field(default_factory=list)
 
     def keys(self) -> list[tuple[int, int]]:
         return sorted(self.incumbent_rows)
@@ -973,14 +1419,20 @@ def build_challenger_arms(
     incumbent_config: "incumbent.MinutesModelConfig | None" = None,
     challenger_config: AvailabilityMinutesChallengerConfig | None = None,
     arm_definitions: Mapping[str, frozenset[str]] | None = None,
+    players: Sequence[Mapping[str, Any]] | None = None,
+    unresolved: Sequence[Mapping[str, Any]] | None = None,
 ) -> ChallengerArms:
     """Project every player-fixture of the event for the incumbent and the arms.
 
-    The incumbent projection function is called unchanged.  The only deviation
-    is the ``include_conditionals=True`` flag (the coherent layer needs the same
-    conditionals) and, where the return-ramp refinement is in play, a per-player
-    ``MinutesModelConfig`` carrying the attenuated ramp factors -- both recorded
-    in the row's provenance block.
+    The incumbent projection function is called unchanged.  The three deviations
+    are all recorded per row: ``include_conditionals=True`` (the coherent layer
+    needs the same conditionals), the CUTOFF-RESOLVED player identity (membership,
+    club and position as they stood at the cutoff rather than as they stand now),
+    and -- where the return-ramp refinement is in play -- a per-player
+    ``MinutesModelConfig`` carrying the attenuated ramp factors.
+
+    ``players`` lets a caller supply a pool it has already resolved, so the
+    evaluation's classification and its arms cannot disagree about who is who.
     """
 
     config = incumbent_config or incumbent.MinutesModelConfig()
@@ -989,17 +1441,30 @@ def build_challenger_arms(
     requested_families = frozenset().union(*definitions.values()) if definitions else frozenset()
     ramp_needed = FAMILY_RETURN_FROM_INJURY_RAMP in requested_families
 
+    if players is None:
+        resolution = resolve_candidate_pool(conn, cutoff)
+        pool = resolution["players"]
+        refused = resolution["unresolved"]
+    else:
+        pool = [dict(row) for row in players]
+        refused = [dict(row) for row in (unresolved or ())]
+
     pools = incumbent.league_pools(conn, int(planning_event), cutoff)
     fixtures_by_team = analytics.event_fixture_map(conn, int(planning_event))
+    identity = challenger_identity(challenger_config, config)
+    identity["player_identity"] = identity_resolution_summary(pool)
+    identity["player_identity"]["unresolved_candidates"] = len(refused)
     result = ChallengerArms(
         planning_event=int(planning_event),
         cutoff=cutoff,
-        identity=challenger_identity(challenger_config, config),
+        identity=identity,
+        players=pool,
+        unresolved=refused,
     )
     for arm in definitions:
         result.arms[arm] = {}
 
-    for player in sorted(analytics.projectable_players(conn), key=lambda row: int(row["player_id"])):
+    for player in sorted(pool, key=lambda row: int(row["player_id"])):
         team_fixtures = fixtures_by_team.get(int(player["team_id"]))
         if not team_fixtures:
             continue
@@ -1087,6 +1552,7 @@ def build_challenger_arms(
                     challenger_config=challenger_config,
                     enabled_families=families,
                     position_id=position,
+                    player_identity=player.get("identity"),
                 )
 
     result.verify_same_population()

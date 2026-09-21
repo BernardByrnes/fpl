@@ -3,9 +3,13 @@
     python scripts/evaluate_pe6_availability_minutes.py --config <config.json> \
         --events 2 3 4 --json-out <path>
 
-The artifact this prints is evidence for senior review.  It does not promote the
-challenger, does not re-point an incumbent version identifier, and does not
-touch the Monte Carlo RNG.
+Minutes are scored at PE-2's player-fixture component grain, so every fixture of
+a double gameweek is its own observation and is retained.
+
+The artifact this prints is evidence for senior review.  It MEASURES; it does not
+accept or promote an arm, does not re-point an incumbent version identifier, and
+does not touch the Monte Carlo RNG.  Repeated event ids are normalized by the
+evaluation itself, so passing them is harmless.
 """
 
 from __future__ import annotations
@@ -35,12 +39,13 @@ def main(argv: list[str] | None = None) -> int:
     conn = sqlite3.connect(f"file:{config_path(config, 'database')}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        artifact = ev.evaluate_events(conn, sorted(set(args.events)))
+        artifact = ev.evaluate_events(conn, args.events)
     finally:
         conn.close()
 
     identity = artifact["identity"]
     print("schema          :", artifact["schema"])
+    print("grain           :", artifact["grain"], "|", artifact["grain_note"])
     print("challenger      :", identity["challenger"]["challenger_version"],
           "cfg", identity["challenger"]["challenger_config_hash"][:24] + "…")
     print("incumbent       :", identity["incumbent"]["minutes_model_version"],
@@ -49,11 +54,15 @@ def main(argv: list[str] | None = None) -> int:
     print("promotion       :", identity["challenger"]["promotion"])
     population = artifact["population"]
     print(f"\npopulation      : scored={population['scored']} excluded={population['excluded']} "
-          f"coverage={population['coverage_share']}")
+          f"candidates={population['candidates']} coverage={population['coverage_share']}")
     print("                  exclusions:", json.dumps(population["excluded_by_status"]))
+    print("                  accounting:", json.dumps(population["accounting"]["identity"]),
+          "->", population["accounting"]["reconciles"])
+    print("                  identity  :", json.dumps(population["identity"]["scored_rows_by_basis"]),
+          f"cutoff-safe={population['identity']['scored_rows_cutoff_safe']}")
     sample = artifact["sample"]
     print(f"sample          : events={sample['target_events_with_observations']}/"
-          f"{sample['target_events']} observations={sample['player_event_observations']} "
+          f"{sample['target_events']} observations={sample['player_fixture_observations']} "
           f"-> {sample['sample_interpretation']}")
     print("\nincumbent metrics")
     for name in ("brier_p_start", "brier_p_60", "expected_minutes_mae",
@@ -66,12 +75,15 @@ def main(argv: list[str] | None = None) -> int:
         for name, entry in sorted(payload["comparison"]["metrics"].items()):
             print(f"  {name:22} inc={entry['incumbent']} chal={entry['challenger']} "
                   f"delta={entry['delta']} -> {entry['preferred']}")
-        print("  outcome:", payload["outcome"]["token"], payload["outcome"]["basis"])
-    print("\nrecommendation  :", artifact["recommendation"]["token"],
-          artifact["recommendation"]["basis"])
-    if artifact["recommendation"]["accepted_refinement_families"]:
-        print("  accepted families:", artifact["recommendation"]["accepted_refinement_families"])
-    print("  review required:", artifact["recommendation"]["review_required"])
+        print("  measurement:", payload["measurement"]["token"], payload["measurement"]["basis"])
+    subsets = artifact["multi_family_subset_policy"]
+    print("\nmulti-family subsets:", json.dumps(
+        {name: block["status"] for name, block in subsets["declared_subsets"].items()}
+    ))
+    summary = artifact["measurement_summary"]
+    print("measurement     :", summary["token"], summary["basis"])
+    print("  model selection:", summary["model_selection"])
+    print("  review required:", summary["review_required"])
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
