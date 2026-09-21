@@ -30,6 +30,7 @@ import pytest
 from fpl_brain import analytics
 from fpl_brain import historical_observations as historical
 from fpl_brain import outcome_ledger as ol
+from fpl_brain import parsers
 from fpl_brain import planning
 from fpl_brain import repositories as repo
 from fpl_brain.database import connect_database
@@ -2841,6 +2842,104 @@ def test_H24_a_single_fixture_event_capture_keeps_its_kickoff(tmp_path):
     )
     assert live_headline["event_time"] == KICKOFF_1
     assert live_headline["opponent_team_id"] == TEAM_A
+    conn.close()
+
+
+def test_H25_an_empty_explain_leg_states_no_fixture_facts(tmp_path):
+    """A leg that lists no rule states no fixture facts, whatever stands above it.
+
+    ``event/live`` states a player's EVENT total once, in the element's own top
+    level, and nests each fixture's share in an ``explain`` leg.  So a leg whose
+    stat list is EMPTY -- the endpoint's way of saying that no rule fired in
+    that fixture -- is evidence of nothing at that grain: its fixture row keeps
+    every official field MISSING.  Filling them from the event total above it
+    would file a whole afternoon's numbers as one fixture's share, which is the
+    double-count the two grains exist to prevent.  The top-level object stays
+    exactly what it is, the event grain's own evidence.
+    """
+
+    conn = connect_database(tmp_path / "fpl.db")
+    _world(conn)
+    #: The element's own event total: a complete afternoon, stated ONCE.
+    totals = {
+        "minutes": 90, "starts": 1, "total_points": 6, "goals_scored": 1, "assists": 0,
+        "clean_sheets": 0, "goals_conceded": 1, "saves": 0, "bonus": 1, "bps": 30,
+        "yellow_cards": 0, "red_cards": 0, "penalties_saved": 0, "penalties_missed": 0,
+        "own_goals": 0,
+    }
+    element = _live_element(
+        player_id=DGW_PLAYER,
+        stats={**totals, "fixture": FIXTURE_1},
+        explain=[_live_leg(fixture_id=FIXTURE_1, opponent_team=TEAM_B, rules=())],
+    )
+    root, record = _archived_live(tmp_path, elements=[element])
+
+    # What the canonical parser makes of those bytes: the one leg stated no rule,
+    # so its fixture row states no field at all, and only the identity that leg
+    # does state -- which fixture, which club, home or away -- survives.
+    rows = parsers.parse_event_live({"elements": [element]}, EVENT)
+    assert [row.fixture_id for row in rows] == [FIXTURE_1]
+    leg = rows[0]
+    for name in ol.OFFICIAL_OUTCOME_FIELDS:
+        assert getattr(leg, name) is None, name
+    assert (leg.opponent_team, leg.was_home) == (TEAM_B, 1)
+    # The element's top level still states the event total, so that evidence is
+    # reserved for the event grain rather than read into the fixture's row.
+    assert parsers.parse_live_event_totals(element) == totals
+
+    def _fixture_claim(**overrides):
+        arguments = {
+            "player_id": DGW_PLAYER,
+            "fixture_id": FIXTURE_1,
+            "captured_at": _t(6),
+            "source_name": "archived_event_live",
+            "source_identity": "event_live_4",
+            "source_payload_sha256": record.payload_sha256,
+            "archive_capture_id": record.capture_id,
+            "fetch_run_id": 7,
+            "backfill": True,
+            "archive_root": root,
+        }
+        arguments.update(overrides)
+        return _capture(conn, **arguments)
+
+    # A fixture-grain claim cannot be built out of the event total the element
+    # states above the leg: every field pinned that way is one this evidence
+    # never states at this grain, and each is refused by its own name.
+    for name, value in sorted(totals.items()):
+        claim = {field: None for field in ol.OFFICIAL_OUTCOME_FIELDS}
+        claim[name] = value
+        with pytest.raises(ol.BackfillEvidenceError, match=f"states no {name}"):
+            _fixture_claim(**claim)
+    # Nor is there a row to store with nothing stated: an empty leg is not an
+    # observation of a fixture, and the ledger already refuses that signature
+    # rather than recording "no evidence" as a value.
+    with pytest.raises(ol.PlaceholderObservationError, match="scheduled placeholder"):
+        _fixture_claim(**{field: None for field in ol.OFFICIAL_OUTCOME_FIELDS})
+    assert ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER) == []
+
+    # The same bytes DO support the headline row, because the element states the
+    # event total itself: top-level stats are the event grain's evidence.
+    assert _capture(
+        conn,
+        grain=ol.GRAIN_PLAYER_EVENT,
+        player_id=DGW_PLAYER,
+        fixture_id=None,
+        captured_at=_t(6),
+        source_name="archived_event_live",
+        source_identity="event_live_4",
+        source_payload_sha256=record.payload_sha256,
+        archive_capture_id=record.capture_id,
+        fetch_run_id=7,
+        backfill=True,
+        archive_root=root,
+        **totals,
+        defensive_contribution=None,
+    ).inserted
+    stored = ol.observation_captures(conn, event=EVENT, player_id=DGW_PLAYER)
+    assert [row["grain"] for row in stored] == [ol.GRAIN_PLAYER_EVENT]
+    assert (stored[0]["minutes"], stored[0]["total_points"]) == (90, 6)
+    assert (stored[0]["bonus"], stored[0]["bps"]) == (1, 30)
     conn.close()
 
 
