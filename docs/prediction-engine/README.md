@@ -1,4 +1,4 @@
-# Prediction Engine V1 roadmap — post-PE-4 authority
+# Prediction Engine V1 roadmap — post-PE-5 authority
 
 This document is product and engineering authority for the Prediction Engine V1
 phase sequence. Each phase is finite and is completed only at its stated review
@@ -87,15 +87,10 @@ The contract is present; PE-6 implementation has not started.
 
 ## Carry-forward items
 
-### PE-5
-
-- append-only / point-in-time outcome history
-- generation-certified prediction-freeze provenance
-
 ### PE-8 / PE-9
 
 - `CONTINUOUS_PROXY_TIE_LIMITATION` from PE-3
 
-These accepted contracts are unchanged by the post-PE-4 readiness repairs.
+These accepted contracts remain unchanged by the post-PE-5 authority rollover.
 PE-4's frozen aggregation contract is defined in
 [PE-4-DGW-BLANK-WORLD-AGGREGATION.md](PE-4-DGW-BLANK-WORLD-AGGREGATION.md).
