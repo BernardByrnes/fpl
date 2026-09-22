@@ -1,4 +1,4 @@
-# Prediction Engine V1 roadmap — post-PE-6 authority
+# Prediction Engine V1 roadmap — post-PE-7 authority
 
 This document is product and engineering authority for the Prediction Engine V1
 phase sequence. Each phase is finite and is completed only at its stated review
@@ -58,15 +58,24 @@ The PE-6 contract is defined in
 
 ### PE-7 — Team Attack/Defence + Player Attack Refinement
 
-**STATUS: NEXT**
+**STATUS: FROZEN**
+
+reviewed source: `79f75a23cad3004a5029cca13e45ea653e000fd7`
+
+merge: `8e5a9d6c6bf0bc9c26e60043d49f0fa57c65db9d`
+
+human outcome: **NO PROMOTION** — the incumbent team attack/defence and player
+attack models remain authoritative; the PE-7 challengers were not promoted.
 
 The PE-7 contract is defined in
 [PE-7-TEAM-PLAYER-ATTACK-REFINEMENT.md](PE-7-TEAM-PLAYER-ATTACK-REFINEMENT.md).
-The contract is present; PE-7 implementation has not started.
 
 ### PE-8 — Calibration
 
-**STATUS: BLOCKED on PE-7**
+**STATUS: NEXT**
+
+The PE-8 contract is defined in
+[PE-8-CALIBRATION.md](PE-8-CALIBRATION.md).
 
 ### PE-9 — Certification Integration
 
@@ -102,6 +111,6 @@ The contract is present; PE-7 implementation has not started.
 
 - `CONTINUOUS_PROXY_TIE_LIMITATION` from PE-3
 
-These accepted contracts remain unchanged by the post-PE-6 authority rollover.
+These accepted contracts remain unchanged by the post-PE-7 authority rollover.
 PE-4's frozen aggregation contract is defined in
 [PE-4-DGW-BLANK-WORLD-AGGREGATION.md](PE-4-DGW-BLANK-WORLD-AGGREGATION.md).
