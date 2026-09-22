@@ -157,6 +157,17 @@ The declared bias convention is
 `mean(predicted - actual); positive means overprediction`. PE-8 must reuse it
 rather than define a second convention.
 
+Two pieces of machinery PE-8 needs **do not exist yet** and must be built, not
+assumed:
+
+- **reliability binning.** The metric layer provides Brier and a Brier reference
+  score, but no binning or observed-frequency utility. A reliability view is new
+  work.
+- **causal fitting.** The frozen tree contains no fitting routine for a
+  probability calibration — `defcon_platt_v1.0.0`'s intercept and slope are frozen
+  constants that were fitted offline and are only ever *read* from a spec. PE-8's
+  causal fit is new work and must produce a versioned spec of the same shape.
+
 PE-8 must also reuse the existing calibration-transform precedent rather than
 invent a new one. `fpl_brain/defcon_calibration.py` already establishes the
 pattern: a versioned spec with a validated method, a canonical identity hash, a
