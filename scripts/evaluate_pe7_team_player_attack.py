@@ -64,6 +64,8 @@ def main(argv: list[str] | None = None) -> int:
           "cfg", identity["team_challenger"]["challenger_config_hash"][:24] + "…")
     print("player challenger:", identity["player_challenger"]["challenger_version"],
           "cfg", identity["player_challenger"]["challenger_config_hash"][:24] + "…")
+    print("player incumbent arm:", identity["player_incumbent_arm_construction"],
+          "|", identity["player_incumbent_arm_boundary"])
     print("promotion       :", identity["promotion"])
 
     population = artifact["population"]

@@ -43,10 +43,13 @@ CUTOFF AND CAUSALITY
 The cutoff for a target event is its official deadline — the last moment a manager
 could have acted — and the predictor's inputs are read under the PE-1 canonical
 boundary by the models themselves.  Candidate identity (membership, club,
-position) comes from the cutoff's accepted official bootstrap generation.  Every
-outcome this module reads is used ONLY as evaluation evidence: it is never fed
-back to a model, and a fixture that has not been played, or that carries no
-official xG, is excluded with its own status rather than scored as zero.
+position) comes from the cutoff's accepted official bootstrap generation.  This
+applies to BOTH arms: the frozen incumbent player-rate arm is built by the
+cutoff-safe adapter, so the baseline a challenger is scored against reads the same
+observable evidence rather than the mutable persisted rows.  Every outcome this
+module reads is used ONLY as evaluation evidence: it is never fed back to a model,
+and a fixture that has not been played, or that carries no official xG, is excluded
+with its own status rather than scored as zero.
 """
 
 from __future__ import annotations
@@ -287,8 +290,9 @@ CAUSALITY_AUDIT: tuple[dict[str, str], ...] = (
         "surface": "players.element_type",
         "used_for": "candidate position, position pools and position strata",
         "resolution": (
-            "the position comes from the cutoff generation; the challenger's pools are built from "
-            "cutoff-resolved identity, and the incumbent's persisted-row pooling is not on its path"
+            "the position comes from the cutoff generation on BOTH arms: the challenger's pools and "
+            "the incumbent comparison arm's pools are the same cutoff-stable pools, and neither the "
+            "challenger nor the incumbent arm is built from the incumbent's persisted-row pooling"
         ),
     },
     {
@@ -304,7 +308,20 @@ CAUSALITY_AUDIT: tuple[dict[str, str], ...] = (
         "used_for": "pooled league and position priors",
         "resolution": (
             "cutoff_stable_rate_pools attributes every pooled prior-season row by the identity the "
-            "cutoff resolves, over rows observable at the cutoff"
+            "cutoff resolves, over rows observable at the cutoff, and BOTH arms read those pools: "
+            "the incumbent comparison arm is built by the cutoff-safe adapter, so the incumbent's "
+            "own persisted-row pooling is not on either arm's path"
+        ),
+    },
+    {
+        "surface": "frozen incumbent player-rate arm (the comparison)",
+        "used_for": "the arm every challenger is scored against",
+        "resolution": (
+            "incumbent_player_rate_rows rebuilds the incumbent arm from cutoff-observable season "
+            "history and the cutoff-stable pools, with the incumbent's own arithmetic, field "
+            "contract and model version; player_rates is not modified and no identity is "
+            "re-pointed, so a post-cutoff season write or a later position change cannot move the "
+            "ARM the delta is measured against"
         ),
     },
     {
@@ -343,6 +360,14 @@ CAUSALITY_DISCIPLINE: dict[str, Any] = {
         "repo.scouting_current_rows_as_of",
         "repo.player_season_histories (as-of filtered by this module's prior reader)",
     ],
+    "incumbent_arm": (
+        "the frozen incumbent player-rate comparison arm is built by "
+        "player_attack_challenger.incumbent_player_rate_rows, which reads the same "
+        "cutoff-observable season history and the same cutoff-stable pools as the challenger and "
+        "keeps the incumbent's own arithmetic, field contract and model version; the incumbent's "
+        "own prior and pool readers take no observation time and join the PERSISTED players row, so "
+        "they are deliberately NOT the comparison path"
+    ),
     "realised_outcomes": (
         "read for SCORING only, through team_model.realised_fixture_side_xg and a direct "
         "player_gameweeks lookup on the target fixture; no realised value is ever an input to a "
@@ -1283,6 +1308,7 @@ def build_event_records(
         block["player_arms"] = list(player_arms.arm_names())
         block["player_identity"] = player_arms.identity
         block["pool_disclosure"] = dict(player_arms.pool_disclosure)
+        block["incumbent_arm"] = dict(player_arms.incumbent_arm)
         block["ess_estimates"] = dict(player_arms.ess_estimates)
         block["candidate_players"] = len(players)
 
@@ -1932,6 +1958,8 @@ def evaluate_events(
             "coherence_version": coherence.COHERENCE_VERSION,
             "team_incumbent_config_hash": team_incumbent_config.config_hash(),
             "player_incumbent_config_hash": player_incumbent_config.config_hash(),
+            "player_incumbent_arm_construction": player_challenger.INCUMBENT_ARM_CONSTRUCTION,
+            "player_incumbent_arm_boundary": player_challenger.INCUMBENT_ARM_BOUNDARY,
             "promotion": "NOT_PERFORMED_THIS_ARTIFACT_MEASURES_ONLY",
             "comparator_note": team_challenger.COMPARATOR_NOTE,
         },
@@ -1946,6 +1974,7 @@ def evaluate_events(
                 "ess_estimates": block.get("ess_estimates"),
                 "team_arms": block["team_arms"],
                 "player_arms": block["player_arms"],
+                "incumbent_arm": block.get("incumbent_arm"),
                 "team_undecided_projection_counts": block["team_undecided_projection_counts"],
                 "player_undecided_projection_counts": block["player_undecided_projection_counts"],
                 "excluded_by_status": {
@@ -2060,6 +2089,16 @@ def evaluate_events(
                 "so PE-6 minutes uncertainty cannot dominate the rate comparison"
             ),
             "penalties": "embedded in xG; no NPxG separation and none fabricated",
+            "incumbent_arm": {
+                "construction": player_challenger.INCUMBENT_ARM_CONSTRUCTION,
+                "boundary": player_challenger.INCUMBENT_ARM_BOUNDARY,
+                "equivalence": player_challenger.INCUMBENT_ARM_EQUIVALENCE,
+                "note": (
+                    "the arm every challenger is scored against is the frozen incumbent's own "
+                    "arithmetic over the CUTOFF'S OWN evidence, so a post-cutoff season write or a "
+                    "later identity change cannot move the baseline the delta is measured against"
+                ),
+            },
             "incumbent_metrics": player_incumbent,
             "arms": player_payloads,
             "strata": stratum_blocks(

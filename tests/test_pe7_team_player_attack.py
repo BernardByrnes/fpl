@@ -9,9 +9,9 @@ points, and each challenger is checked *against* it rather than in place of it.
 Contract hard-test map
 ----------------------
 1  post-cutoff team xG cannot enter an earlier prediction      -> test_1
-2  post-cutoff player xG/xA cannot enter an earlier rate       -> test_2, test_2b
+2  post-cutoff player xG/xA cannot enter an earlier rate       -> test_2, test_2b, test_2c
 3  a later team transfer cannot reattribute a fixture          -> test_3, test_3b
-4  a later player transfer cannot alter an earlier prior       -> test_4
+4  a later player transfer cannot alter an earlier prior       -> test_4, test_4b
 5  a later position change cannot alter a population/prior     -> test_5
 6  a later active/inactive state cannot alter a candidate      -> test_6
 7  scheduled placeholders are excluded                         -> test_7
@@ -20,7 +20,7 @@ Contract hard-test map
 10 the no-history fallback stays finite and explicit           -> test_10
 11 non-xG-bearing prior seasons are not read as zero xG/xA     -> test_11
 12 home/away evidence remains causal                           -> test_12
-13 role-change evidence is cutoff-safe                         -> test_13, test_13b
+13 role-change evidence is cutoff-safe                         -> test_13, test_13b, test_13c
 14 team and player outputs are finite and non-negative         -> test_14
 15 team -> player attacking-mass coherence                     -> test_15..15c
 16 identical-population incumbent/challenger evaluation        -> test_16, test_16b
@@ -30,10 +30,11 @@ Contract hard-test map
 20 xPts / MC / scoring / bonus / calibration paths unchanged   -> test_20
 
 Beyond the contract: challenger identity and provenance (21, 22), the empty-family
-equivalence with the incumbent (23, 24, 25), the derived estimators in both
-directions and at their fail-closed edges (26, 27, 28), the evaluation
-artifact's own limits (29-36), the declared disclosure vocabulary firing (15d,
-15e, 37), and a season-opening cutoff with no team evidence (32b).
+equivalence with the incumbent (23, 24, 25), the incumbent COMPARISON arm's own
+cutoff safety and fidelity (2c, 4b, 25b), the derived estimators in both directions,
+at their fail-closed edges and on their numerical scale (26, 26b, 27, 27b, 28), the
+evaluation artifact's own limits (29-36), the declared disclosure vocabulary firing
+(15d, 15e, 37), and a season-opening cutoff with no team evidence (32b).
 """
 
 from __future__ import annotations
@@ -661,6 +662,84 @@ def test_2b_post_cutoff_prior_season_write_cannot_enter_an_earlier_player_rate()
     assert refreshed[key]["posterior_mean"] != baseline[key]["posterior_mean"]
 
 
+def test_2c_a_post_cutoff_season_write_cannot_move_the_incumbent_comparison_arm():
+    """The arm a challenger is scored against reads the cutoff as well.
+
+    The baseline of every PE-7 delta is the incumbent's own prediction, so a
+    comparison arm built by reaching straight for ``player_rates.player_prior``
+    would leak here: that read carries no observation time at all, so the row below
+    would enter the earlier arm and move the baseline — corrupting every comparison
+    without touching a single challenger number.
+
+    The control is the SAME row observed BEFORE the cutoff, where it must move the
+    arm; without it this test would pass on an arm that ignored prior-season
+    evidence entirely.
+    """
+
+    def arms(conn):
+        resolution = _pool(conn)
+        return player_ch.build_challenger_player_arms(
+            conn,
+            PLANNING_EVENT,
+            CUTOFF,
+            players=resolution["players"],
+            identities=_identities(resolution),
+        )
+
+    key = (NO_PRIOR_PLAYER, player_rates.COMPONENT_XG)
+    extra_row = PlayerSeasonHistoryRecord(
+        player_id=NO_PRIOR_PLAYER,
+        season_name="2024/25",
+        minutes=2100,
+        raw_json={"expected_goals": 12.0, "expected_assists": 6.0},
+    )
+
+    baseline_conn = connect_database(":memory:")
+    _world(baseline_conn, history_omit=(NO_PRIOR_PLAYER,))
+    baseline = arms(baseline_conn)
+    assert baseline.incumbent_rows[key]["prior_source"] == "position_pooled"
+
+    # (a) the same row, written AFTER the cutoff: invisible to the arm.
+    late_conn = connect_database(":memory:")
+    _world(late_conn, history_omit=(NO_PRIOR_PLAYER,))
+    with late_conn:
+        repo.upsert_player_season_histories(late_conn, [extra_row], LATE_OBSERVED_AT)
+    late = arms(late_conn)
+    assert late.incumbent_rows[key]["prior_source"] == "position_pooled"
+    assert (
+        late.incumbent_rows[key]["posterior_mean"]
+        == baseline.incumbent_rows[key]["posterior_mean"]
+    )
+    assert (
+        late.incumbent_rows[key]["prior_ess"] == baseline.incumbent_rows[key]["prior_ess"]
+    )
+    assert player_ch.FLAG_POST_CUTOFF_HISTORY_EXCLUDED in late.incumbent_rows[key]["risk_flags"]
+    assert late.incumbent_arm["history_rows_excluded_post_cutoff"] == 1
+    assert late.incumbent_arm["construction"] == player_ch.INCUMBENT_ARM_CONSTRUCTION
+    for arm in late.arm_names():
+        assert late.row(arm, key)["posterior_mean"] == baseline.row(arm, key)["posterior_mean"]
+
+    # The frozen incumbent's OWN read does take the row: that is exactly why the
+    # comparison arm may not be built through it.
+    published_late = _player_rows_by_key(
+        player_rates.build_player_rate_projections(late_conn, PLANNING_EVENT, CUTOFF)
+    )
+    assert published_late[key]["prior_source"] == "multi_season_same_player"
+    assert published_late[key]["prior_mean"] != late.incumbent_rows[key]["prior_mean"]
+
+    # (b) control: the same row, observable at the cutoff, DOES move both the arm and
+    # every challenger, so the assertion above is not vacuous.
+    early_conn = connect_database(":memory:")
+    _world(early_conn, history_omit=(NO_PRIOR_PLAYER,), history_extra=(extra_row,))
+    early = arms(early_conn)
+    assert early.incumbent_rows[key]["prior_source"] == "multi_season_same_player"
+    assert (
+        early.incumbent_rows[key]["posterior_mean"] != baseline.incumbent_rows[key]["posterior_mean"]
+    )
+    for arm in early.arm_names():
+        assert early.row(arm, key)["posterior_mean"] != baseline.row(arm, key)["posterior_mean"]
+
+
 # ===========================================================================
 # 3. a later team transfer cannot reattribute a historical fixture
 # ===========================================================================
@@ -717,6 +796,73 @@ def test_4_a_later_player_transfer_cannot_alter_an_earlier_player_rate_prior():
     for key in sorted(before):
         assert before[key]["posterior_mean"] == after[key]["posterior_mean"]
         assert before[key]["prior_mean"] == after[key]["prior_mean"]
+
+
+def test_4b_a_later_identity_change_cannot_move_the_incumbent_comparison_arm():
+    """The same five mutations, measured on the ARM the delta is taken against.
+
+    A mutation that moved only the incumbent arm would corrupt every PE-7
+    comparison while leaving every challenger number untouched, so the guard has to
+    be stated on that arm specifically.  The control is the incumbent's own
+    persisted-row read (``pooled_rates``): it DOES move — that is its frozen
+    behaviour and the reason this arm is built by an adapter.
+    """
+
+    key = (NO_PRIOR_PLAYER, player_rates.COMPONENT_XG)
+
+    def arms(conn, resolution):
+        return player_ch.build_challenger_player_arms(
+            conn,
+            PLANNING_EVENT,
+            CUTOFF,
+            players=resolution["players"],
+            identities=_identities(resolution),
+        )
+
+    conn = connect_database(":memory:")
+    _world(conn, history_omit=(NO_PRIOR_PLAYER,))
+    resolution = _pool(conn)
+    before = arms(conn, resolution)
+    published_before = _player_rows_by_key(
+        player_rates.build_player_rate_projections(conn, PLANNING_EVENT, CUTOFF)
+    )
+    assert before.incumbent_rows[key]["prior_source"] == "position_pooled"
+
+    # A transfer AND a position change, both persisted after the cutoff.  The
+    # position write lands in the pooled bucket the mutating player's own prior rows
+    # sit in, so the incumbent's persisted-row pooling really does move.
+    with conn:
+        conn.execute("UPDATE players SET team_id=5 WHERE id=?", (ROLE_CHANGE_PLAYER,))
+        conn.execute("UPDATE players SET element_type=4 WHERE id=?", (ROLE_CHANGE_PLAYER,))
+    after = arms(conn, resolution)
+    published_after = _player_rows_by_key(
+        player_rates.build_player_rate_projections(conn, PLANNING_EVENT, CUTOFF)
+    )
+    assert (
+        published_before[key]["prior_mean"] != published_after[key]["prior_mean"]
+    ), "the persisted-row read must move, or this test proves nothing"
+    assert sorted(before.incumbent_rows) == sorted(after.incumbent_rows)
+    for row_key in sorted(before.incumbent_rows):
+        assert before.incumbent_rows[row_key]["posterior_mean"] == after.incumbent_rows[row_key]["posterior_mean"]
+        assert before.incumbent_rows[row_key]["prior_mean"] == after.incumbent_rows[row_key]["prior_mean"]
+        assert before.incumbent_rows[row_key]["prior_ess"] == after.incumbent_rows[row_key]["prior_ess"]
+    for arm in before.arm_names():
+        assert before.arm_keys(arm) == after.arm_keys(arm)
+        for row_key in before.arm_keys(arm):
+            assert before.row(arm, row_key)["posterior_mean"] == after.row(arm, row_key)["posterior_mean"]
+
+    # And the activation write: the arm keeps projecting the candidate the cutoff's
+    # accepted generation placed in the pool.
+    with conn:
+        conn.execute("UPDATE players SET is_active=0 WHERE id=?", (NO_PRIOR_PLAYER,))
+    deactivated = arms(conn, resolution)
+    assert sorted(deactivated.incumbent_rows) == sorted(before.incumbent_rows)
+    for row_key in sorted(before.incumbent_rows):
+        assert (
+            deactivated.incumbent_rows[row_key]["posterior_mean"]
+            == before.incumbent_rows[row_key]["posterior_mean"]
+        )
+    assert key in deactivated.incumbent_rows
 
 
 # ===========================================================================
@@ -1085,6 +1231,57 @@ def test_13_role_change_evidence_is_cutoff_safe():
     assert later["role_modifier_applied"] is False
     assert later["role_segmentation"]["applied"] is False
     assert later["role_segmentation"]["boundary_observed_at"] is None
+
+
+def test_13c_a_post_cutoff_role_note_cannot_move_either_arm():
+    """The role evidence is an as-of read on BOTH sides of the comparison.
+
+    The incumbent's own eligibility rule is called by both arms, so a note written
+    after the cutoff has to be refused for the incumbent arm as well: an arm that
+    discounted its prior on a post-cutoff note would have been projected on evidence
+    the cutoff could not see.  The control is the same note observed BEFORE the
+    cutoff, which must move both.
+    """
+
+    key = (ROLE_CHANGE_PLAYER, player_rates.COMPONENT_XG)
+
+    def arms(conn):
+        resolution = _pool(conn)
+        return player_ch.build_challenger_player_arms(
+            conn,
+            PLANNING_EVENT,
+            CUTOFF,
+            players=resolution["players"],
+            identities=_identities(resolution),
+        )
+
+    none_conn = connect_database(":memory:")
+    _world(none_conn, notes=())
+    none = arms(none_conn)
+
+    late_conn = connect_database(":memory:")
+    _world(
+        late_conn,
+        notes=(
+            (ROLE_CHANGE_PLAYER, "role_change", "confirmed", "2026-09-14T08:00:00Z"),
+        ),
+    )
+    late = arms(late_conn)
+    assert late.incumbent_rows[key]["prior_ess"] == none.incumbent_rows[key]["prior_ess"]
+    assert late.incumbent_rows[key]["posterior_mean"] == none.incumbent_rows[key]["posterior_mean"]
+    assert late.incumbent_rows[key]["role_modifier_applied"] is False
+    for arm in late.arm_names():
+        assert late.row(arm, key)["posterior_mean"] == none.row(arm, key)["posterior_mean"]
+
+    early_conn = connect_database(":memory:")
+    _world(
+        early_conn,
+        notes=((ROLE_CHANGE_PLAYER, "role_change", "confirmed", ROLE_SIGNAL_OBSERVED_AT),),
+    )
+    early = arms(early_conn)
+    assert early.incumbent_rows[key]["role_modifier_applied"] is True
+    assert early.incumbent_rows[key]["prior_ess"] < none.incumbent_rows[key]["prior_ess"]
+    assert early.incumbent_rows[key]["posterior_mean"] != none.incumbent_rows[key]["posterior_mean"]
 
 
 def test_13b_role_signal_never_moves_the_rate_of_a_player_without_one():
@@ -1756,6 +1953,72 @@ def test_25_the_incumbent_arm_is_the_incumbents_own_projection_code():
         assert published[key]["prior_source"] == arm.incumbent_rows[key]["prior_source"]
 
 
+def test_25b_the_incumbent_arm_is_the_incumbents_own_numbers_field_by_field():
+    """The adapter is the incumbent, not a look-alike.
+
+    On a store whose prior-season rows were all observable at the cutoff and whose
+    cutoff identity agrees with the persisted row, the arm must equal the
+    incumbent's OWN published projection for every field the incumbent publishes —
+    the whole hierarchy, not just the posterior — with exactly two declared
+    differences: the pooled-prior flag is renamed (the arm attributes the pool by
+    the cutoff's identity, so it may not claim the incumbent's persisted-squad
+    wording) and the adapter's own construction block is added.
+    """
+
+    conn = connect_database(":memory:")
+    # Two players carry no prior-season row of their own, so the pooled prior — and
+    # with it the renamed flag — is exercised rather than assumed away.
+    _world(conn, history_omit=(NO_PRIOR_PLAYER, ROLE_CHANGE_PLAYER))
+    resolution = _pool(conn)
+    arm = player_ch.build_challenger_player_arms(
+        conn,
+        PLANNING_EVENT,
+        CUTOFF,
+        players=resolution["players"],
+        identities=_identities(resolution),
+    )
+    pool_ids = {int(player["player_id"]) for player in resolution["players"]}
+    published = {
+        (int(row["player_id"]), str(row["component"])): row
+        for row in player_rates.build_player_rate_projections(conn, PLANNING_EVENT, CUTOFF)
+        if int(row["player_id"]) in pool_ids
+    }
+    assert set(published) == set(arm.incumbent_rows)
+
+    renamed = 0
+    for key in sorted(published):
+        expected = published[key]
+        actual = arm.incumbent_rows[key]
+        for field in expected:
+            if field in {"risk_flags", "provenance"}:
+                continue
+            assert actual[field] == expected[field], (key, field)
+        # Every published provenance entry is the incumbent's, unchanged.
+        for name, value in expected["provenance"].items():
+            assert actual["provenance"][name] == value, (key, name)
+        # The flags differ ONLY by the declared renaming.
+        added = set(actual["risk_flags"]) - set(expected["risk_flags"])
+        removed = set(expected["risk_flags"]) - set(actual["risk_flags"])
+        allowed_additions = set(player_ch.INCUMBENT_ARM_FLAG_ADDITIONS) | set(
+            player_ch.INCUMBENT_ARM_FLAG_SUBSTITUTIONS.values()
+        )
+        assert added <= allowed_additions, (key, added)
+        assert removed <= set(player_ch.INCUMBENT_ARM_FLAG_SUBSTITUTIONS), (key, removed)
+        if "POSITION_FROM_CURRENT_SQUAD" in expected["risk_flags"]:
+            # The incumbent publishes this flag as a bare literal, so the test pins
+            # the literal rather than a constant that does not exist.
+            assert player_ch.POSITION_BASIS in actual["risk_flags"]
+            renamed += 1
+        # The arm carries its identity and its own construction, not a rename of the
+        # incumbent's version string.
+        assert actual["model_version"] == player_rates.PLAYER_RATE_MODEL_VERSION
+        assert actual["arm"] == player_ch.ARM_INCUMBENT
+        assert actual["arm_construction"]["construction"] == player_ch.INCUMBENT_ARM_CONSTRUCTION
+        assert actual["arm_construction"]["incumbent_module_modified"] is False
+        assert actual["arm_construction"]["incumbent_pooled_rates_read_used"] is False
+    assert renamed, "the pooled-prior path must be exercised for the renaming to mean anything"
+
+
 # ===========================================================================
 # The derived estimators, in both directions and at their fail-closed edges
 # ===========================================================================
@@ -1772,6 +2035,146 @@ def _synthetic_population(between_spread: float, noise: float, players: int = 30
             {"minutes": 90.0, "value": round(base * (1.0 + noise), 5)},
         ]
     return rows
+
+
+def _designed_population(
+    players: int = 40, rows_per_player: int = 20, spread: float = 0.00866, noise: float = 0.147
+):
+    """A population whose between-player spread and per-match noise are DECLARED.
+
+    Each player has ``rows_per_player`` rows of ninety minutes, alternating
+    ``base * (1 - noise)`` and ``base * (1 + noise)``, so:
+
+    * his pooled per-90 rate is exactly ``base`` (the alternation cancels);
+    * his split-half difference is exactly ``2 * base * noise`` over two halves of
+      ``rows_per_player / 2 * 90`` minutes, which fixes his per-minute variance at
+      ``2 * base^2 * noise^2 / (rows_per_player * 90)``;
+    * ``base`` runs over an arithmetic sequence, so the between-player variance of
+      the true rates is the closed form below.
+
+    The design is what makes a NUMERICAL assertion possible rather than a
+    direction-only one: every quantity the estimator estimates is known in advance.
+    """
+
+    rows: dict[int, list[dict[str, float]]] = {}
+    for index in range(players):
+        base = 0.30 + spread * index
+        rows[2000 + index] = [
+            {"minutes": 90.0, "value": base * (1.0 + (noise if step % 2 else -noise))}
+            for step in range(rows_per_player)
+        ]
+    return rows
+
+
+def _designed_expectations(population, rows_per_player: int = 20):
+    """The same quantities re-derived independently, in the DECLARED units."""
+
+    sigma: list[float] = []
+    rates: dict[int, tuple[float, float]] = {}
+    for player_id, rows in population.items():
+        first, second = rows[0::2], rows[1::2]
+        minutes_first = sum(row["minutes"] for row in first)
+        minutes_second = sum(row["minutes"] for row in second)
+        rate_first = sum(row["value"] for row in first) / minutes_first * 90.0
+        rate_second = sum(row["value"] for row in second) / minutes_second * 90.0
+        sigma.append((rate_first - rate_second) ** 2 / (8100.0 * (1.0 / minutes_first + 1.0 / minutes_second)))
+        rates[player_id] = (
+            sum(row["value"] for row in rows),
+            sum(row["minutes"] for row in rows),
+        )
+    sampling_variance_per_minute = sum(sigma) / len(sigma)
+    total_minutes = sum(minutes for _total, minutes in rates.values())
+    mean_rate = sum(
+        (total / minutes * 90.0) * (minutes / total_minutes) for total, minutes in rates.values()
+    )
+    observed_variance = sum(
+        ((total / minutes * 90.0 - mean_rate) ** 2) * (minutes / total_minutes)
+        for total, minutes in rates.values()
+    )
+    expected_sampling = sum(
+        (8100.0 * sampling_variance_per_minute / minutes) * (minutes / total_minutes)
+        for _total, minutes in rates.values()
+    )
+    return {
+        "sampling_variance_per_minute": sampling_variance_per_minute,
+        "mean_rate": mean_rate,
+        "observed_rate_variance": observed_variance,
+        "between_player_rate_variance_per90": observed_variance - expected_sampling,
+    }
+
+
+def test_26b_the_derived_prior_strength_is_numerically_the_method_of_moments_value():
+    """The SCALE, not the direction.  A direction test cannot see a unit error.
+
+    ``ESS = 8100 * sigma_per_minute / between_player_rate_variance_per90`` is an
+    exposure weight in minutes, and the 8100 is the per-90 scale (90^2) that turns a
+    per-minute variance into one comparable with a per-90 spread.  Writing 90 there
+    instead shrinks every player in the league by two orders of magnitude and moves
+    every direction-only assertion the same way, so this test pins the VALUE: on a
+    designed population whose true spread and true noise are known, the published
+    ESS must equal the closed form — and must not equal the 90-scaled one.
+    """
+
+    config = player_ch.PlayerAttackChallengerConfig()
+    incumbent_config = player_rates.PlayerRatesConfig()
+    resolved = config.resolved(incumbent_config)
+    population = _designed_population()
+    result = player_ch.derived_prior_strength(
+        population,
+        resolved,
+        component=player_rates.COMPONENT_XG,
+        declared_ess=config.declared_ess(player_rates.COMPONENT_XG, incumbent_config),
+    )
+    assert result["status"] == player_ch.STRENGTH_DERIVED
+    assert result["basis"] == player_ch.ESS_BASIS_SPLIT_HALF_METHOD_OF_MOMENTS
+
+    # (a) the primaries are the units they are named for: the test's own re-derivation
+    # of each one, from the same rows, in minutes and in per-90 squares.
+    expected = _designed_expectations(population)
+    assert result["sampling_variance_per_minute"] == pytest.approx(
+        expected["sampling_variance_per_minute"], rel=1e-9
+    )
+    assert result["mean_rate"] == pytest.approx(expected["mean_rate"], rel=1e-9)
+    assert result["observed_rate_variance"] == pytest.approx(
+        expected["observed_rate_variance"], rel=1e-9
+    )
+    assert result["between_player_rate_variance_per90"] == pytest.approx(
+        expected["between_player_rate_variance_per90"], rel=1e-9
+    )
+    assert result["ess_units"] == "MINUTES_OF_EXPOSURE"
+    assert result["per90_variance_scale"] == 8100.0
+    assert result["ess_derivation"] == player_ch.ESS_DERIVATION
+
+    # (b) the closed form of the DESIGN: an arithmetic sequence of true per-90 rates,
+    # a declared alternation per match, twenty matches of ninety minutes each.  Each
+    # split half is 900 minutes, so a player's per-minute variance is
+    # ``(2 * base * noise)^2 / (8100 * (2 / 900))``.
+    players, rows_per_player, spread, noise = 40, 20, 0.00866, 0.147
+    half_minutes = rows_per_player / 2 * 90.0
+    between_true = spread**2 * (players**2 - 1) / 12.0
+    mean_true = 0.30 + spread * (players - 1) / 2.0
+    mean_square_true = between_true + mean_true**2
+    sigma_design = mean_square_true * noise**2 * half_minutes / 4050.0
+    between_design = between_true - 8100.0 * sigma_design / (rows_per_player * 90.0)
+    design_ess = 8100.0 * sigma_design / between_design
+    assert result["prior_ess_minutes"] == pytest.approx(design_ess, rel=1e-6)
+
+    # (c) the value on the MINUTES scale, and never the 90-scaled one.  A league whose
+    # per-90 spread and per-minute noise are these implies an exposure weight
+    # comparable to the incumbent's declared 850 minutes; the wrong constant would
+    # report about twenty minutes and shrink the prior to ~2% of its declared weight.
+    assert result["prior_ess_minutes"] == pytest.approx(
+        8100.0 * result["sampling_variance_per_minute"] / result["between_player_rate_variance_per90"],
+        rel=1e-9,
+    )
+    wrong_scale = (
+        90.0
+        * result["sampling_variance_per_minute"]
+        / result["between_player_rate_variance_per90"]
+    )
+    assert result["prior_ess_minutes"] != pytest.approx(wrong_scale, rel=1e-3)
+    assert result["prior_ess_minutes"] == pytest.approx(wrong_scale * 90.0, rel=1e-9)
+    assert 300.0 <= result["prior_ess_minutes"] <= 3000.0
 
 
 def test_26_the_derived_player_prior_strength_moves_in_both_directions():
@@ -1834,6 +2237,114 @@ def test_27_the_derived_player_prior_strength_fails_closed_with_its_reason():
     assert flat["status"] == player_ch.STRENGTH_FALLBACK
     assert flat["reason"] == player_ch.ESS_REASON_NON_POSITIVE_BETWEEN_VARIANCE
     assert flat["prior_ess_minutes"] == declared
+
+
+def test_27b_the_fallback_and_comparison_ess_come_from_the_resolved_incumbent_config():
+    """An incumbent run under a non-default config must be measured against IT.
+
+    The derived prior strength falls back to, and is compared against, the
+    incumbent's DECLARED prior strength.  Reading that off a fresh
+    ``PlayerRatesConfig()`` instead of the config the run actually resolved would
+    silently re-point both the fallback and the above/below-declared verdicts at
+    published defaults the caller never asked for — so the assertions below are
+    stated on a config whose declared strength is nothing like the default.
+    """
+
+    non_default = player_rates.PlayerRatesConfig(xg_prior_ess_minutes=1.0, xa_prior_ess_minutes=1.0)
+    default = player_rates.PlayerRatesConfig()
+    config = player_ch.PlayerAttackChallengerConfig()
+    assert config.declared_ess(player_rates.COMPONENT_XG) == default.xg_prior_ess_minutes
+    assert (
+        config.declared_ess(player_rates.COMPONENT_XG, non_default)
+        == non_default.xg_prior_ess_minutes
+    )
+    assert (
+        config.declared_ess(player_rates.COMPONENT_XA, non_default)
+        == non_default.xa_prior_ess_minutes
+    )
+    # A challenger-level override of the component governs when it is set, whatever
+    # the incumbent declares.
+    assert (
+        player_ch.PlayerAttackChallengerConfig(xg_prior_ess_minutes=333.0).declared_ess(
+            player_rates.COMPONENT_XG, non_default
+        )
+        == 333.0
+    )
+
+    # (a) the fallback path: a window too thin to derive anything uses the RESOLVED
+    # declared strength, and the comparison basis recorded with it is the same number.
+    thin = player_ch.derived_prior_strength(
+        _synthetic_population(0.02, 0.05, players=4),
+        config.resolved(non_default),
+        component=player_rates.COMPONENT_XG,
+        declared_ess=config.declared_ess(player_rates.COMPONENT_XG, non_default),
+    )
+    assert thin["status"] == player_ch.STRENGTH_FALLBACK
+    assert thin["prior_ess_minutes"] == non_default.xg_prior_ess_minutes
+    assert thin["declared_fallback_prior_ess_minutes"] == non_default.xg_prior_ess_minutes
+
+    # (b) end to end: the arms, and the incumbent comparison arm, are built against the
+    # resolved incumbent config rather than the published defaults.
+    conn = connect_database(":memory:")
+    _world(conn)
+    resolution = _pool(conn)
+    arm = player_ch.build_challenger_player_arms(
+        conn,
+        PLANNING_EVENT,
+        CUTOFF,
+        players=resolution["players"],
+        identities=_identities(resolution),
+        incumbent_config=non_default,
+    )
+    key = (ROLE_CHANGE_PLAYER, player_rates.COMPONENT_XG)
+    # Every player in this world carries a prior-season row above the tiny-sample
+    # threshold and no role signal moves his ESS scale, so the arm's base ESS IS the
+    # declared one — the number the whole comparison is weighted by.
+    assert arm.incumbent_rows[key]["prior_ess_before_discounts"] == non_default.xg_prior_ess_minutes
+    assert arm.incumbent_arm["incumbent_config_hash"] == non_default.config_hash()
+    # The derived estimate is far ABOVE this config's declared 1 minute, and the
+    # verdict is taken against the RESOLVED value: read off the defaults it would say
+    # the opposite, which is the defect this pins.
+    assert arm.ess_estimates[player_rates.COMPONENT_XG]["prior_ess_minutes"] > 1.0
+    assert arm.ess_estimates[player_rates.COMPONENT_XG][
+        "declared_fallback_prior_ess_minutes"
+    ] == non_default.xg_prior_ess_minutes
+    checked = 0
+    for family in arm.arm_names():
+        if player_ch.FAMILY_DATA_DERIVED_PRIOR_STRENGTH not in arm.families[family]:
+            continue
+        checked += 1
+        row = arm.row(family, key)
+        assert player_ch.FLAG_DERIVED_PRIOR_ESS_ABOVE_DECLARED in row["risk_flags"], family
+        assert player_ch.FLAG_DERIVED_PRIOR_ESS_BELOW_DECLARED not in row["risk_flags"], family
+        assert row["prior_ess_estimate"]["declared_fallback_prior_ess_minutes"] == 1.0
+    assert checked, "an arm carrying the derived-strength family must be exercised"
+
+    # (c) a config the window CANNOT support: every estimate falls back, and what it
+    # falls back to is the resolved config's own declared strength.
+    starved = player_ch.PlayerAttackChallengerConfig(ess_min_players=10_000)
+    fallback_arm = player_ch.build_challenger_player_arms(
+        conn,
+        PLANNING_EVENT,
+        CUTOFF,
+        players=resolution["players"],
+        identities=_identities(resolution),
+        incumbent_config=non_default,
+        challenger_config=starved,
+    )
+    assert (
+        fallback_arm.ess_estimates[player_rates.COMPONENT_XG]["status"] == player_ch.STRENGTH_FALLBACK
+    )
+    assert fallback_arm.incumbent_rows[key]["prior_ess_before_discounts"] == 1.0
+    checked = 0
+    for family in fallback_arm.arm_names():
+        if player_ch.FAMILY_DATA_DERIVED_PRIOR_STRENGTH not in fallback_arm.families[family]:
+            continue
+        checked += 1
+        row = fallback_arm.row(family, key)
+        assert row["prior_ess_basis"] == player_ch.ESS_BASIS_INCUMBENT_FALLBACK
+        assert player_ch.FLAG_DERIVED_PRIOR_ESS_UNAVAILABLE in row["risk_flags"], family
+    assert checked
 
 
 def test_28_the_team_reliability_estimator_moves_in_both_directions():
@@ -2160,6 +2671,9 @@ def test_36_the_artifact_carries_an_explicit_causality_audit():
         "current club identity (player/team joins)",
         "current role / scouting evidence",
         "player/team joins for historical priors",
+        # The arm the delta is measured against is audited like any other read: an
+        # audit that covered the challenger alone would leave the baseline unstated.
+        "frozen incumbent player-rate arm (the comparison)",
     ):
         assert required in surfaces, required
     for entry in audit:
@@ -2169,6 +2683,25 @@ def test_36_the_artifact_carries_an_explicit_causality_audit():
     assert discipline["second_predicate_introduced"] is False
     assert discipline["missing_is_zero"] is False
     assert "historical_observations" in discipline["boundary"]
+    assert "incumbent_player_rate_rows" in discipline["incumbent_arm"]
+    # The disclosure is on the artifact, not only in the module: the identity block
+    # and every event name the incumbent arm's construction.
+    assert (
+        artifact["identity"]["player_incumbent_arm_construction"]
+        == player_ch.INCUMBENT_ARM_CONSTRUCTION
+    )
+    assert artifact["identity"]["player_incumbent_arm_boundary"] == player_ch.INCUMBENT_ARM_BOUNDARY
+    assert artifact["player"]["incumbent_arm"]["construction"] == player_ch.INCUMBENT_ARM_CONSTRUCTION
+    assert artifact["player"]["incumbent_arm"]["boundary"] == player_ch.INCUMBENT_ARM_BOUNDARY
+    event = artifact["events"][0]
+    incumbent_arm = event["incumbent_arm"]
+    assert incumbent_arm["construction"] == player_ch.INCUMBENT_ARM_CONSTRUCTION
+    assert incumbent_arm["incumbent_module_modified"] is False
+    assert incumbent_arm["incumbent_pooled_rates_read_used"] is False
+    assert incumbent_arm["model_version"] == player_rates.PLAYER_RATE_MODEL_VERSION
+    assert incumbent_arm["incumbent_config_hash"] == player_rates.PlayerRatesConfig().config_hash()
+    assert incumbent_arm["rows"] == incumbent_arm["players"] * len(player_rates.COMPONENTS)
+    assert incumbent_arm["players"] > 0
 
 
 def test_37_every_emitted_exclusion_status_is_declared_and_never_scored_as_zero():

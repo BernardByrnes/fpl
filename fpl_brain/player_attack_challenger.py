@@ -31,12 +31,16 @@ strength from the evidence by method of moments: the per-minute variance of the
 attacking value is estimated from the split-half difference of each player's own
 matches, the between-player variance of true rates is what remains of the
 observed spread once that sampling variance is removed, and the implied ESS is
-``90 * sigma_per_minute / between_player_variance`` — the weight an
-empirical-Bayes posterior puts on a prior.  A league whose players differ little
-is shrunk hard; one whose players differ a lot is shrunk little.  Where the window
-cannot support the estimate (too few players, a non-positive between-player
-variance) the incumbent's declared constant stands, and the fallback and its
-reason are recorded.
+``8100 * sigma_per_minute / between_player_rate_variance_per90`` — the weight an
+empirical-Bayes posterior puts on a prior, in MINUTES.  The 8100 is 90 squared and
+it is not decoration: a rate is per 90 minutes, so a player with ``m`` minutes of
+exposure has rate variance ``8100 * sigma_per_minute / m``, and writing the
+shrinkage weight as ``ESS / (m + ESS)`` then identifies an ESS in units of
+exposure minutes only when the numerator carries the same ``90^2``.  A league
+whose players differ little is shrunk hard; one whose players differ a lot is
+shrunk little.  Where the window cannot support the estimate (too few players, a
+non-positive between-player variance) the incumbent's declared constant stands,
+and the fallback and its reason are recorded.
 
 *Family 2 — ``role_segmented_exposure``.*  The incumbent sums a player's whole
 current-season exposure into ONE current-rate estimate and discounts only the
@@ -89,11 +93,27 @@ prior":
   season's "0.00" is not a genuine zero, and only the declared xG-bearing seasons
   can contribute a same-player prior at all.
 
+THE INCUMBENT COMPARISON ARM IS CUTOFF-SAFE TOO
+-----------------------------------------------
+A challenger is only as honest as the arm it is scored against, so the incumbent
+side of the comparison is built here by :func:`incumbent_player_rate_rows`: the
+frozen incumbent's own arithmetic, field contract and identity
+(``PLAYER_RATE_MODEL_VERSION``), applied to the SAME evidence boundary the
+challenger reads — prior-season rows observable at the cutoff and league/position
+pools attributed by the cutoff-resolved identity.  Reached for directly, the
+incumbent's own prior reader takes no observation time and pools against the
+PERSISTED row, so an arm built that way moves when a post-cutoff season write or a
+later position change lands: it would then be a comparison against a model the
+cutoff could not have produced, and the ablation delta would carry the leak rather
+than the family.  ``player_rates`` is not modified and no version is re-pointed.
+
 THE EQUIVALENCE PROPERTY
 ------------------------
 With an EMPTY family set, on a store whose prior-season rows were all observable
-at the cutoff, the challenger reproduces the incumbent's prior choice, its ESS
-scaling and its posterior mean from the same evidence.  A test pins it.
+at the cutoff and whose cutoff identity agrees with the persisted row, the
+challenger reproduces the incumbent's prior choice, its ESS scaling and its
+posterior mean from the same evidence, and the incumbent arm reproduces the
+incumbent's own published numbers field by field.  Tests pin both.
 """
 
 from __future__ import annotations
@@ -140,6 +160,20 @@ ESS_REASON_TOO_FEW_SPLIT_PLAYERS = "TOO_FEW_PLAYERS_WITH_TWO_HALVES"
 ESS_REASON_NON_POSITIVE_BETWEEN_VARIANCE = "NON_POSITIVE_BETWEEN_PLAYER_VARIANCE"
 ESS_REASON_NO_SAMPLING_VARIANCE = "NO_POSITIVE_SAMPLING_VARIANCE"
 
+#: A rate is published per 90 minutes, so ``rate = total / minutes * PER90_MINUTES``.
+PER90_MINUTES = 90.0
+#: That scaling squared.  The unit contract of the derived prior strength:
+#: ``Var(rate_per90) = PER90_VARIANCE_SCALE * sigma_per_minute / minutes`` and
+#: ``ESS_minutes = PER90_VARIANCE_SCALE * sigma_per_minute / tau_per90_squared``.
+#: The two must carry the SAME constant or the published ESS is in the wrong units.
+PER90_VARIANCE_SCALE = PER90_MINUTES**2  # 8100.0
+ESS_DERIVATION = (
+    "ESS_minutes = 8100 * sigma_per_minute / between_player_rate_variance_per90, where "
+    "8100 = 90^2 is the per-90 scaling: a player with m minutes has rate variance "
+    "8100 * sigma_per_minute / m, so the empirical-Bayes weight ESS / (m + ESS) is in "
+    "exposure minutes only when the numerator carries the same 90^2"
+)
+
 STRENGTH_DERIVED = "DERIVED_FROM_THE_CUTOFFS_OWN_EVIDENCE"
 STRENGTH_DERIVED_CLAMPED = "DERIVED_AND_CLAMPED_TO_THE_DECLARED_BOUND"
 STRENGTH_FALLBACK = "DECLARED_CONSTANT_FALLBACK"
@@ -159,6 +193,34 @@ FLAG_PRIOR_MEAN_REPLACEMENT_UNAVAILABLE = "PRIOR_MEAN_REPLACEMENT_UNAVAILABLE"
 FLAG_POST_CUTOFF_HISTORY_EXCLUDED = "POST_CUTOFF_HISTORY_EXCLUDED"
 FLAG_UNDATED_HISTORY_EXCLUDED = "UNDATED_HISTORY_ROW_EXCLUDED"
 FLAG_NO_CUTOFF_PRIOR_SEASON = "NO_CUTOFF_OBSERVABLE_PRIOR_SEASON_ROW"
+
+# --- the frozen-incumbent comparison arm -----------------------------------
+ARM_INCUMBENT = "incumbent"
+INCUMBENT_ARM_CONSTRUCTION = "PE-7 ADAPTER: incumbent_player_rate_rows"
+INCUMBENT_ARM_BOUNDARY = (
+    "the incumbent's own projection arithmetic over the CUTOFF'S OWN evidence: prior-season rows "
+    "observable at the cutoff (observed_at <= cutoff) and league/position pools attributed by the "
+    "identity the cutoff resolves"
+)
+INCUMBENT_ARM_EQUIVALENCE = (
+    "on a store whose prior-season rows were all observable at the cutoff and whose cutoff identity "
+    "agrees with the persisted row, this arm's numbers are the incumbent's own published numbers"
+)
+#: The ONE flag whose wording differs, and why.  The incumbent attributes a pooled
+#: prior by the persisted ``players.element_type`` and says so; this arm attributes it
+#: by the position the CUTOFF resolves, so it may not re-use a name that would claim
+#: otherwise.  Every other flag is the incumbent's own token.
+INCUMBENT_ARM_FLAG_SUBSTITUTIONS: dict[str, str] = {
+    "POSITION_FROM_CURRENT_SQUAD": POSITION_BASIS,
+}
+#: Flags this arm may add that the incumbent's own read cannot emit: they name what
+#: the cutoff refused, which the incumbent has no vocabulary for because it reads no
+#: observation time at all.
+INCUMBENT_ARM_FLAG_ADDITIONS: tuple[str, ...] = (
+    FLAG_POST_CUTOFF_HISTORY_EXCLUDED,
+    FLAG_UNDATED_HISTORY_EXCLUDED,
+    FLAG_NO_CUTOFF_PRIOR_SEASON,
+)
 
 #: The incumbent's own flag names, reused so an ablation's delta stays
 #: attributable to a family rather than to a re-worded vocabulary.
@@ -257,10 +319,21 @@ class PlayerAttackChallengerConfig:
             "ess_max_minutes": float(self.ess_max_minutes),
         }
 
-    def declared_ess(self, component: str) -> float:
-        """The incumbent's declared ESS for a component, as this config reads it."""
+    def declared_ess(
+        self, component: str, incumbent_config: "incumbent.PlayerRatesConfig | None" = None
+    ) -> float:
+        """The incumbent's declared ESS for a component, as this config reads it.
 
-        fallback = incumbent.PlayerRatesConfig()
+        The fallback is the RESOLVED incumbent configuration, not a fresh default:
+        an evaluation that runs the incumbent under a non-default config must have
+        its derived prior strength fall back to, and be compared against, THAT
+        config's declared strength.  Defaulting to ``PlayerRatesConfig()`` here
+        silently re-points the comparison at a configuration the caller did not ask
+        for, so the incumbent config is a real argument and only omitted when the
+        caller genuinely means the published defaults.
+        """
+
+        fallback = incumbent_config or incumbent.PlayerRatesConfig()
         if component == incumbent.COMPONENT_XG:
             value = self.xg_prior_ess_minutes
             return float(fallback.xg_prior_ess_minutes if value is None else value)
@@ -715,8 +788,11 @@ def _sampling_variance_per_minute(
     against second, fourth, ...), so the split is not confounded with the recency
     of the season.  For a rate expressed per 90 minutes,
     ``Var(rate_half) = 8100 * sigma_per_minute / minutes_half``, so the squared
-    difference of the two halves identifies ``sigma_per_minute`` directly.  Only
-    players with TWO usable halves contribute, and the count is published.
+    difference of the two halves identifies ``sigma_per_minute`` directly — the
+    result is a PER-MINUTE variance, and the caller must scale it back to the per-90
+    rate scale with the same 8100 before it can stand beside a between-player
+    variance of per-90 rates.  Only players with TWO usable halves contribute, and
+    the count is published.
     """
 
     estimates: list[float] = []
@@ -729,9 +805,9 @@ def _sampling_variance_per_minute(
         minutes_second = sum(float(row["minutes"]) for row in second)
         if minutes_first <= 0 or minutes_second <= 0:
             continue
-        rate_first = sum(float(row["value"]) for row in first) / minutes_first * 90.0
-        rate_second = sum(float(row["value"]) for row in second) / minutes_second * 90.0
-        denominator = 8100.0 * (1.0 / minutes_first + 1.0 / minutes_second)
+        rate_first = sum(float(row["value"]) for row in first) / minutes_first * PER90_MINUTES
+        rate_second = sum(float(row["value"]) for row in second) / minutes_second * PER90_MINUTES
+        denominator = PER90_VARIANCE_SCALE * (1.0 / minutes_first + 1.0 / minutes_second)
         if denominator <= 0:
             continue
         estimates.append((rate_first - rate_second) ** 2 / denominator)
@@ -749,9 +825,17 @@ def derived_prior_strength(
 ) -> dict[str, Any]:
     """Method-of-moments empirical-Bayes prior strength for one component.
 
-    ``ESS = 90 * sigma_per_minute / between_player_variance``: the weight an
-    empirical-Bayes posterior puts on a prior, in minutes of exposure, when the
-    prior's mean is drawn from the population the observed players came from.
+    ``ESS = 8100 * sigma_per_minute / between_player_rate_variance_per90``: the
+    weight an empirical-Bayes posterior puts on a prior, in MINUTES of exposure,
+    when the prior's mean is drawn from the population the observed players came
+    from.  The two variance factors are on DIFFERENT scales on purpose — the
+    sampling term is per MINUTE and the between-player term is per 90 — and the
+    ``90^2`` in the numerator is what converts one into the other.  Dropping it
+    (or writing ``90`` there) publishes an ESS in units that are not minutes, and
+    the shrinkage weights are then wrong by two orders of magnitude: a population
+    that genuinely differs by 0.15 per 90 against per-minute noise of 0.001, which
+    is an ordinary attacking population, is exactly where a wrong constant stops
+    being visible in a direction test and shows up only as an absurd weight.
 
     Fail closed on a thin window, on a missing sampling variance or on a
     non-positive between-player variance: none of those can answer the question,
@@ -781,6 +865,9 @@ def derived_prior_strength(
         "min_players_required": min_players,
         "min_split_players_required": min_split_players,
         "max_prior_ess_minutes": max_minutes,
+        "ess_units": "MINUTES_OF_EXPOSURE",
+        "per90_variance_scale": PER90_VARIANCE_SCALE,
+        "ess_derivation": ESS_DERIVATION,
     }
     if len(rates) < min_players or split_designs < min_split_players:
         return {
@@ -794,7 +881,7 @@ def derived_prior_strength(
                 else ESS_REASON_TOO_FEW_SPLIT_PLAYERS
             ),
             "sampling_variance_per_minute": None,
-            "between_player_variance": None,
+            "between_player_rate_variance_per90": None,
         }
     if sampling_variance is None or sampling_variance <= 0.0 or not math.isfinite(sampling_variance):
         return {
@@ -804,20 +891,23 @@ def derived_prior_strength(
             "status": STRENGTH_FALLBACK,
             "reason": ESS_REASON_NO_SAMPLING_VARIANCE,
             "sampling_variance_per_minute": None,
-            "between_player_variance": None,
+            "between_player_rate_variance_per90": None,
         }
 
     # Exposure-weighted population mean rate, then each player's deviation from
     # it.  The mean squared deviation is the OBSERVED variance; removing the
     # sampling variance it contains leaves the spread of the true rates.
     total_minutes = sum(minutes for _total, minutes in rates)
-    mean_rate = sum((total / minutes * 90.0) * (minutes / total_minutes) for total, minutes in rates)
+    mean_rate = sum(
+        (total / minutes * PER90_MINUTES) * (minutes / total_minutes) for total, minutes in rates
+    )
     observed_variance = sum(
-        ((total / minutes * 90.0 - mean_rate) ** 2) * (minutes / total_minutes)
+        ((total / minutes * PER90_MINUTES - mean_rate) ** 2) * (minutes / total_minutes)
         for total, minutes in rates
     )
     expected_sampling = sum(
-        (8100.0 * sampling_variance / minutes) * (minutes / total_minutes) for _total, minutes in rates
+        (PER90_VARIANCE_SCALE * sampling_variance / minutes) * (minutes / total_minutes)
+        for _total, minutes in rates
     )
     between = observed_variance - expected_sampling
     if between <= 0.0:
@@ -829,9 +919,11 @@ def derived_prior_strength(
             "reason": ESS_REASON_NON_POSITIVE_BETWEEN_VARIANCE,
             "sampling_variance_per_minute": round(sampling_variance, 12),
             "observed_rate_variance": round(observed_variance, 12),
-            "between_player_variance": round(between, 12),
+            "between_player_rate_variance_per90": round(between, 12),
         }
-    raw_ess = 90.0 * sampling_variance / between
+    # The per-90 scale is REQUIRED here.  ``between`` is a variance of per-90 rates and
+    # ``sampling_variance`` is per minute, so the ESS is in minutes only with 90^2.
+    raw_ess = PER90_VARIANCE_SCALE * sampling_variance / between
     clamped = min(max(raw_ess, 0.0), max_minutes)
     return {
         **base,
@@ -841,7 +933,7 @@ def derived_prior_strength(
         "reason": None,
         "sampling_variance_per_minute": round(sampling_variance, 12),
         "observed_rate_variance": round(observed_variance, 12),
-        "between_player_variance": round(between, 12),
+        "between_player_rate_variance_per90": round(between, 12),
         "mean_rate": round(mean_rate, 12),
         "unclamped_prior_ess_minutes": round(raw_ess, 6),
     }
@@ -912,7 +1004,10 @@ def _project_component(
     if exposure["placeholder_rows"]:
         flags.append(hc.DIAG_COMPLETED_EVENT_PLACEHOLDER_ROW)
 
-    declared_ess = challenger_config.declared_ess(component)
+    # The comparison basis is the RESOLVED incumbent configuration, so a non-default
+    # incumbent config moves the fallback and the above/below-declared verdicts with it
+    # instead of being measured against published defaults the run did not use.
+    declared_ess = resolved_ess(resolved, component)
     prior_ess_base = (
         derived_ess_for(challenger_config, resolved, families, {component: ess_estimate or {}}, component)
         if FAMILY_DATA_DERIVED_PRIOR_STRENGTH in families and ess_estimate
@@ -1215,7 +1310,7 @@ def build_challenger_player_rate_projections(
                 population_exposure(conn, component, int(planning_event), cutoff, candidate_ids),
                 resolved,
                 component=component,
-                declared_ess=config.declared_ess(component),
+                declared_ess=resolved_ess(resolved, component),
             )
 
     out: list[dict[str, Any]] = []
@@ -1251,8 +1346,252 @@ def build_challenger_player_rate_projections(
 
 
 # ---------------------------------------------------------------------------
-# Arms.
+# The frozen-incumbent comparison arm: a cutoff-safe adapter.
 # ---------------------------------------------------------------------------
+
+
+def incumbent_player_rate_rows(
+    conn: sqlite3.Connection,
+    planning_event: int,
+    cutoff: str,
+    *,
+    players: Sequence[Mapping[str, Any]],
+    identities: Mapping[int, tuple[int, int]],
+    incumbent_config: "incumbent.PlayerRatesConfig | None" = None,
+    pools: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """THE INCUMBENT ARM: the incumbent's own arithmetic over the cutoff's evidence.
+
+    The frozen incumbent publishes no per-player entry point that accepts its
+    prior-season history as an argument.  ``player_rates.player_prior`` reads the
+    history table itself — with no observation time at all — and
+    ``player_rates.pooled_rates`` joins every pooled row to the PERSISTED ``players``
+    row.  An arm built by reaching for those directly therefore MOVES when a
+    post-cutoff season write lands or a later position change rewrites the persisted
+    row, which is a leak in the COMPARISON rather than in the incumbent: the arm is
+    then a model the earlier cutoff could not have produced, and every ablation delta
+    measured against it carries that leak.
+
+    So the incumbent side of the comparison is built here, and it is the incumbent:
+
+    * the POOLS are :func:`cutoff_stable_rate_pools` — the same builder the challenger
+      reads, over the same rows, attributed by the same cutoff-resolved identity;
+    * a PRIOR-SEASON row is visible only when it was observable at the cutoff
+      (``observed_at <= cutoff``), exactly as the challenger sees it, and rows the
+      cutoff refuses are counted and named rather than silently dropped;
+    * the CURRENT-season exposure and the structured role signal are the incumbent's
+      own ``current_rate_evidence`` and ``role_change_modifiers``, which already carry
+      the PE-1 boundary and the as-of rule;
+    * the prior hierarchy is the incumbent's, all four levels, applied to those
+      visible rows, with the incumbent's own declared parameters;
+    * the arithmetic, the published field contract and the identity
+      (``player_rates.PLAYER_RATE_MODEL_VERSION``) are the incumbent's.
+      ``player_rates`` is NOT modified, no version identifier is re-pointed and
+      nothing is promoted.
+
+    ONE declared renaming: the incumbent names a pooled prior
+    ``POSITION_FROM_CURRENT_SQUAD``, which is true of its own read and would be false
+    of this one, so this arm carries ``POSITION_FROM_CUTOFF_IDENTITY`` instead and
+    publishes the substitution.  Every other flag is the incumbent's own token.
+
+    On a store whose prior-season rows were all observable at the cutoff and whose
+    cutoff identity agrees with the persisted row, the numbers are IDENTICAL to
+    ``player_rates.build_player_rate_projections``; a test pins that field by field.
+    """
+
+    incumbent_config = incumbent_config or incumbent.PlayerRatesConfig()
+    # An EMPTY challenger config: every knob inherits, so the prior hierarchy runs on
+    # the incumbent's own declared parameters and nothing else.
+    resolved = PlayerAttackChallengerConfig().resolved(incumbent_config)
+    generated_at = utc_now()
+    if pools is None:
+        pools, _disclosure = cutoff_stable_rate_pools(conn, identities, cutoff=str(cutoff))
+
+    out: list[dict[str, Any]] = []
+    excluded_post_cutoff = 0
+    excluded_undated = 0
+    for player in sorted(players, key=lambda row: int(row["player_id"])):
+        player_id = int(player["player_id"])
+        team_id = int(player["team_id"])
+        element_type = int(player["element_type"])
+        notes = repo.scouting_current_rows_as_of(conn, str(cutoff), [player_id])
+        history = historical_season_rows_as_of(conn, player_id, str(cutoff))
+        history_excluded = dict(history.get("excluded") or {})
+        excluded_post_cutoff += int(history_excluded.get("post_cutoff_rows") or 0)
+        excluded_undated += int(history_excluded.get("undated_rows") or 0)
+        for component in incumbent.COMPONENTS:
+            prior = challenger_player_prior(
+                player_id, element_type, component, resolved, pools, history
+            )
+            evidence = incumbent.current_rate_evidence(
+                conn, player_id, component, int(planning_event), str(cutoff)
+            )
+            raw_prior_ess = resolved_ess(resolved, component) * float(prior.get("ess_scale", 1.0))
+            discount, modifier_records, role_flags = incumbent.role_change_modifiers(
+                notes, str(cutoff), incumbent_config, raw_prior_ess
+            )
+            prior_ess = raw_prior_ess * discount
+            portability_discount = 1.0
+            flags = list(prior["flags"]) + list(evidence["flags"])
+            if prior.get("same_player_history"):
+                portability_discount = float(resolved["club_portability_ess_discount"])
+                prior_ess *= portability_discount
+                flags.append("CLUB_PORTABILITY_UNVERIFIED")
+            if discount < 1.0:
+                flags.extend(role_flags)
+
+            prior_rate = prior["prior_rate"]
+            current_rate = evidence["current_rate"]
+            current_minutes = float(evidence["current_minutes"])
+            data_gaps: list[str] = []
+            if prior_rate is None and current_rate is None:
+                posterior = None
+                data_gaps.append("no prior and no current evidence; rate unavailable")
+                flags.append("NO_PRIOR_AND_NO_CURRENT_EVIDENCE")
+            elif prior_rate is None:
+                posterior = current_rate
+                flags.append("NO_PRIOR")
+            elif current_minutes <= 0 or current_rate is None:
+                posterior = prior_rate
+                flags.append("NO_CURRENT_EVIDENCE")
+            else:
+                posterior = (current_minutes * current_rate + prior_ess * prior_rate) / (
+                    current_minutes + prior_ess
+                )
+            posterior_ess = current_minutes + prior_ess
+            current_share = current_minutes / posterior_ess if posterior_ess > 0 else 0.0
+            prior_share = prior_ess / posterior_ess if posterior_ess > 0 else 0.0
+            if posterior is not None and posterior < 0.0:
+                flags.append("NEGATIVE_RATE")
+            if current_minutes < 0.0:
+                flags.append("INVALID_MINUTES")
+            if prior_rate is not None and prior_rate < 0.0:
+                flags.append("CORRUPT_HISTORICAL_FIELD")
+            if prior.get("prior_source") in {"position_pooled", "league_pooled"}:
+                data_gaps.append("no same-player historical xG prior; pooled prior used")
+            if evidence["placeholder_rows"]:
+                data_gaps.append(
+                    f"{hc.CERTIFIED_PREDICTION_INPUT_HISTORY_INCOMPLETE}: "
+                    f"{len(evidence['placeholder_rows'])} completed-fixture row(s) carry no official "
+                    "observation and contribute no exposure"
+                )
+            if history_excluded.get("post_cutoff_rows") or history_excluded.get("undated_rows"):
+                data_gaps.append(
+                    "prior-season rows that were not observable at the cutoff were excluded: "
+                    f"{history_excluded.get('post_cutoff_rows', 0)} written after it, "
+                    f"{history_excluded.get('undated_rows', 0)} with no observation time"
+                )
+
+            out.append(
+                {
+                    "player_id": int(player_id),
+                    "component": component,
+                    "event": int(planning_event),
+                    "prior_mean": round(prior_rate, 6) if prior_rate is not None else None,
+                    "prior_ess": round(prior_ess, 6),
+                    "prior_ess_before_discounts": round(raw_prior_ess, 6),
+                    "prior_source": prior["prior_source"],
+                    "prior_season": prior.get("prior_season"),
+                    "prior_minutes": round(float(prior.get("prior_minutes") or 0.0), 6),
+                    "current_minutes": round(current_minutes, 6),
+                    "current_total": round(float(evidence["current_total"]), 6),
+                    "current_rate": round(current_rate, 6) if current_rate is not None else None,
+                    "current_played_rows": int(evidence["played_rows"]),
+                    "posterior_mean": round(posterior, 6) if posterior is not None else None,
+                    "posterior_ess": round(posterior_ess, 6),
+                    "posterior_uncertainty": {
+                        "effective_minutes": round(posterior_ess, 6),
+                        "prior_share": round(prior_share, 6),
+                        "current_share": round(current_share, 6),
+                    },
+                    "role_modifier_applied": bool(modifier_records),
+                    "role_modifier_ids": [record["id"] for record in modifier_records],
+                    "role_modifier_records": modifier_records,
+                    "club_portability_discount": round(portability_discount, 6),
+                    "team_context": {"team_id": int(team_id)},
+                    "risk_flags": sorted(set(flags)),
+                    "model_version": incumbent.PLAYER_RATE_MODEL_VERSION,
+                    "generated_at": generated_at,
+                    "data_cutoff": str(cutoff),
+                    "arm": ARM_INCUMBENT,
+                    "arm_construction": {
+                        "construction": INCUMBENT_ARM_CONSTRUCTION,
+                        "boundary": INCUMBENT_ARM_BOUNDARY,
+                        "equivalence": INCUMBENT_ARM_EQUIVALENCE,
+                        "incumbent_module_modified": False,
+                        "incumbent_pooled_rates_read_used": False,
+                        "incumbent_history_read_used": False,
+                        "incumbent_flag_substitutions": dict(INCUMBENT_ARM_FLAG_SUBSTITUTIONS),
+                        "flag_additions_available": list(INCUMBENT_ARM_FLAG_ADDITIONS),
+                        "history_rows_excluded_post_cutoff": int(
+                            history_excluded.get("post_cutoff_rows") or 0
+                        ),
+                        "history_rows_excluded_undated": int(
+                            history_excluded.get("undated_rows") or 0
+                        ),
+                        "pool_identity": (
+                            "league and position pools attributed by the identity the cutoff resolves"
+                        ),
+                    },
+                    "provenance": {
+                        "prior_hierarchy": (
+                            "prev_season_same_player > multi_season_same_player > position_pooled > "
+                            "league_pooled"
+                        ),
+                        "history_xg_semantics": "season_total",
+                        "history_read": "cutoff-observable rows only (observed_at <= cutoff)",
+                        "xg_bearing_seasons": list(incumbent.XG_BEARING_SEASONS),
+                        "penalties": "embedded_in_xG",
+                        "npxg_separation": False,
+                        "penalty_note": (
+                            "No NPxG or penalty-xG field exists in the stored official data; "
+                            "penalties remain embedded and the rate is named xG_per90, never "
+                            "NPxG_per90."
+                        ),
+                        "club_identity_available": False,
+                        "position_basis": POSITION_BASIS,
+                        "role_change_semantics": (
+                            "reduces prior ESS only; never adds attacking output"
+                        ),
+                        "evidence_boundary": (
+                            "completed player-fixture rows (fixtures.finished=1) with minutes>0 "
+                            "before cutoff"
+                        ),
+                        "pool_identity": (
+                            "the accepted official bootstrap generation at or before the cutoff"
+                        ),
+                        "arm_construction": INCUMBENT_ARM_CONSTRUCTION,
+                        "promotion": "NOT_PERFORMED_CHALLENGER_ONLY",
+                    },
+                    "data_gaps": data_gaps,
+                }
+            )
+    disclosure = {
+        "construction": INCUMBENT_ARM_CONSTRUCTION,
+        "boundary": INCUMBENT_ARM_BOUNDARY,
+        "equivalence": INCUMBENT_ARM_EQUIVALENCE,
+        "model_version": incumbent.PLAYER_RATE_MODEL_VERSION,
+        "incumbent_config_hash": incumbent_config.config_hash(),
+        "incumbent_module_modified": False,
+        "incumbent_pooled_rates_read_used": False,
+        "incumbent_history_read_used": False,
+        "incumbent_read_note": (
+            "player_rates.player_prior reads player_season_histories with no observation time and "
+            "player_rates.pooled_rates joins each pooled row to the PERSISTED players row; both are "
+            "the incumbent's frozen behaviour, neither is rewritten, and neither is on this arm's "
+            "path"
+        ),
+        "flag_substitutions": dict(INCUMBENT_ARM_FLAG_SUBSTITUTIONS),
+        "flag_additions_available": list(INCUMBENT_ARM_FLAG_ADDITIONS),
+        "resolved_parameters": resolved,
+        "players": len(players),
+        "rows": len(out),
+        "history_rows_excluded_post_cutoff": excluded_post_cutoff,
+        "history_rows_excluded_undated": excluded_undated,
+        "pool_disclosure_used": True,
+        "cutoff": str(cutoff),
+    }
+    return out, disclosure
 
 
 @dataclass
@@ -1265,6 +1604,10 @@ class PlayerChallengerArms:
     arms: dict[str, dict[tuple[int, str], dict[str, Any]]] = field(default_factory=dict)
     families: dict[str, frozenset[str]] = field(default_factory=dict)
     pool_disclosure: dict[str, Any] = field(default_factory=dict)
+    #: How the incumbent arm itself was built: the cutoff-safe adapter, named, so a
+    #: reader can see that the arm the challenger is scored against reads the same
+    #: boundary rather than the mutable persisted rows.
+    incumbent_arm: dict[str, Any] = field(default_factory=dict)
     ess_estimates: dict[str, Any] = field(default_factory=dict)
     identity: dict[str, Any] = field(default_factory=dict)
     players: list[dict[str, Any]] = field(default_factory=list)
@@ -1308,11 +1651,13 @@ def build_challenger_player_arms(
 ) -> PlayerChallengerArms:
     """Project every candidate/component for the incumbent and the challenger arms.
 
-    The incumbent's own per-candidate projection function is called with the
-    CUTOFF-RESOLVED identity and its own current pools, so the incumbent arm is
-    incumbent code; where that function is reached for directly it is because the
-    incumbent publishes no per-player entry point that accepts a cutoff pool, and
-    the assertion below pins the two to the same construction.
+    The incumbent arm is built by :func:`incumbent_player_rate_rows`, the cutoff-safe
+    adapter: the incumbent's own arithmetic, field contract and identity over
+    cutoff-observable season history and the cutoff-stable pools.  Reaching for
+    ``player_rates.player_prior`` / ``player_rates.pooled_rates`` directly instead
+    would let a post-cutoff season write or a later position change move the arm the
+    challenger is scored against, so the comparison would carry the leak and the
+    ablation delta would stop being the family.
 
     The cutoff-stable pools, the derived prior strengths and the role evidence are
     built ONCE per event and shared by every arm, so an ablation's delta is the
@@ -1323,31 +1668,17 @@ def build_challenger_player_arms(
     challenger_config = challenger_config or PlayerAttackChallengerConfig()
     definitions = dict(arm_definitions or default_arm_definitions())
 
-    incumbent_pools = incumbent.pooled_rates(conn, incumbent_config)
-    incumbent_rows: list[dict[str, Any]] = []
-    generated_at = utc_now()
-    for player in sorted(players, key=lambda row: int(row["player_id"])):
-        player_id = int(player["player_id"])
-        element_type = int(player["element_type"])
-        notes = repo.scouting_current_rows_as_of(conn, cutoff, [player_id])
-        for component in incumbent.COMPONENTS:
-            incumbent_rows.append(
-                incumbent._project_component(
-                    conn,
-                    player_id,
-                    int(player["team_id"]),
-                    element_type,
-                    component,
-                    int(planning_event),
-                    cutoff,
-                    incumbent_config,
-                    generated_at,
-                    notes,
-                    incumbent_pools,
-                )
-            )
-
     pools, disclosure = cutoff_stable_rate_pools(conn, identities, cutoff=cutoff)
+    incumbent_rows, incumbent_arm_disclosure = incumbent_player_rate_rows(
+        conn,
+        int(planning_event),
+        cutoff,
+        players=players,
+        identities=identities,
+        incumbent_config=incumbent_config,
+        pools=pools,
+    )
+
     resolved = challenger_config.resolved(incumbent_config)
     candidate_ids = sorted(
         {int(player["player_id"]) for player in players} | {int(pid) for pid in identities}
@@ -1358,7 +1689,7 @@ def build_challenger_player_arms(
             population_exposure(conn, component, int(planning_event), cutoff, candidate_ids),
             resolved,
             component=component,
-            declared_ess=challenger_config.declared_ess(component),
+            declared_ess=resolved_ess(resolved, component),
         )
 
     arms: dict[str, dict[tuple[int, str], dict[str, Any]]] = {}
@@ -1383,6 +1714,7 @@ def build_challenger_player_arms(
         arms=arms,
         families={arm: frozenset(families) for arm, families in definitions.items()},
         pool_disclosure=disclosure,
+        incumbent_arm=dict(incumbent_arm_disclosure),
         ess_estimates=estimates,
         identity=challenger_identity(challenger_config, incumbent_config),
         players=[dict(player) for player in players],
