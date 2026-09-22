@@ -6,6 +6,11 @@
 Minutes are scored at PE-2's player-fixture component grain, so every fixture of
 a double gameweek is its own observation and is retained.
 
+Player identity is resolved as of each cutoff from the latest ACCEPTED official
+bootstrap generation at or before it; a cutoff with no usable generation fails
+closed (its candidates are excluded at EVENT scope) rather than being projected
+from the mutable ``players`` row.
+
 The artifact this prints is evidence for senior review.  It MEASURES; it does not
 accept or promote an arm, does not re-point an incumbent version identifier, and
 does not touch the Monte Carlo RNG.  Repeated event ids are normalized by the
@@ -56,10 +61,41 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\npopulation      : scored={population['scored']} excluded={population['excluded']} "
           f"candidates={population['candidates']} coverage={population['coverage_share']}")
     print("                  exclusions:", json.dumps(population["excluded_by_status"]))
-    print("                  accounting:", json.dumps(population["accounting"]["identity"]),
-          "->", population["accounting"]["reconciles"])
-    print("                  identity  :", json.dumps(population["identity"]["scored_rows_by_basis"]),
-          f"cutoff-safe={population['identity']['scored_rows_cutoff_safe']}")
+    accounting = population["accounting"]
+    print("                  accounting:", json.dumps({
+        "enumerated": accounting["enumerated_candidate_slots"],
+        "scored": accounting["scored_rows"],
+        "excluded": accounting["excluded_candidates"],
+        "status_total": accounting["excluded_by_status_total"],
+        "reconciles": accounting["reconciles"],
+        "status_totals_reconcile": accounting["status_totals_reconcile"],
+        "per_event_reconciles": accounting["per_event_reconciles"],
+    }))
+    identity_block = population["identity"]
+    print("                  identity  :", json.dumps(identity_block["scored_rows_by_basis"]),
+          f"cutoff-safe={identity_block['scored_rows_cutoff_safe']}",
+          f"live-fallback-allowed={identity_block['live_fallback_allowed']}")
+    for block in artifact["events"]:
+        generation = ((block.get("identity") or {}).get("generation") or {}) if block.get("identity") else {}
+        accepted = generation.get("accepted_generation") or {}
+        print(f"                  event {block['event']}: generation {accepted.get('id')} "
+              f"@ {accepted.get('captured_at')} pool={generation.get('element_ids_count')} "
+              f"usable={generation.get('usable')} {generation.get('reasons') or ''}")
+    priors = population["pool_priors"]
+    print("                  priors    :",
+          f"incumbent league_pools read used={priors['incumbent_league_pools_read_used']}")
+    for event, block in sorted(priors["per_event"].items()):
+        print(f"                  event {event}: pooled rows={block['pooled_rows']} "
+              f"without cutoff identity={block['pooled_rows_without_cutoff_identity']} "
+              f"players={block['pooled_players']}")
+    print("                  store divergence (reported, never scored):", json.dumps({
+        event: {
+            "cutoff_pool_not_in_persisted_pool": block["in_cutoff_generation_not_in_persisted_pool"],
+            "persisted_pool_not_in_cutoff_pool": block["in_persisted_pool_not_in_cutoff_generation"],
+        }
+        for event, block in sorted(artifact["store_divergence"]["per_event"].items())
+        if block
+    }))
     sample = artifact["sample"]
     print(f"sample          : events={sample['target_events_with_observations']}/"
           f"{sample['target_events']} observations={sample['player_fixture_observations']} "

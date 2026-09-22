@@ -156,9 +156,14 @@ CURRENT_STATUS: dict[int, tuple[str, int | None]] = {
 SCOUT_NOTES: dict[int, tuple[str, str]] = {15: ("rotation_risk", "high")}
 
 #: The capture of the official element list that every player is in.  It sits
-#: before event 1's deadline, so it is an official capture every cutoff in this
-#: world can see.
+#: before event 1's deadline, so the accepted bootstrap generation recorded from
+#: it is the official pool generation every cutoff in this world can see.
 IDENTITY_CAPTURE = "2026-08-20T08:00:00Z"
+
+#: Every player the seeded world knows, sorted.
+ALL_PLAYERS = sorted(
+    player for positions in SQUADS.values() for players in positions.values() for player in players
+)
 
 
 def _position_of(player_id):
@@ -174,8 +179,8 @@ def _official_element(player_id, *, team=None, position=None):
     """The official bootstrap element a capture was parsed from.
 
     The real payload carries the club (``team``) and the position
-    (``element_type``), which is what makes the capture the cutoff-safe record of
-    a player's identity.
+    (``element_type``), which is what makes the generation's own snapshot rows
+    the cutoff-safe record of a player's identity.
     """
 
     return {
@@ -185,7 +190,71 @@ def _official_element(player_id, *, team=None, position=None):
     }
 
 
-def _seed(conn, *, pgw_overrides=None, drop_events=(), extra_snapshots=(), placeholder_rows=()):
+def _seed_generation(
+    conn,
+    captured_at,
+    element_ids,
+    *,
+    accepted=True,
+    missing=(),
+    payloads=None,
+    run=None,
+):
+    """One bootstrap generation with its OWN snapshot rows.
+
+    A generation is resolvable only if its rows carry the official payload, so
+    they are written from ONE fetch run and the generation records that run --
+    exactly the shape the ingest path produces.  ``missing`` leaves an element id
+    in the recorded pool with no snapshot row at all, and ``payloads`` overrides
+    a row's payload (a partial capture, for instance).
+    """
+
+    ids = sorted({int(pid) for pid in element_ids})
+    omitted = {int(value) for value in missing}
+    record_run = repo.create_fetch_run(conn, "fetch_fpl") if run is None else int(run)
+    records = [
+        PlayerSnapshotRecord(
+            player_id=player_id,
+            captured_at=captured_at,
+            now_cost=50,
+            raw_json=(
+                _official_element(player_id)
+                if (payloads or {}).get(player_id) is None
+                else (payloads or {})[player_id]
+            ),
+        )
+        for player_id in ids
+        if player_id not in omitted
+    ]
+    with conn:
+        repo.insert_snapshots(conn, records, record_run)
+        generation_id = repo.record_bootstrap_generation(
+            conn,
+            captured_at=captured_at,
+            accepted=bool(accepted),
+            official_element_count=len(ids),
+            parsed_count=len(ids),
+            persisted_count=len(ids),
+            element_ids=ids,
+            element_ids_sha256=repo.element_ids_identity(ids)[1],
+            acceptance_rule="pe6-test",
+            acceptance_rule_version="BOOTSTRAP_GENERATION_ACCEPTANCE v1",
+            fetch_run_id=record_run,
+        )
+    return generation_id, record_run
+
+
+def _seed(
+    conn,
+    *,
+    pgw_overrides=None,
+    drop_events=(),
+    extra_snapshots=(),
+    placeholder_rows=(),
+    generation_accepted=True,
+    generation_missing_players=(),
+    generation_payloads=None,
+):
     """A two-sided world with official status trails, scouting notes and outcomes."""
 
     minutes_table = {player: dict(rows) for player, rows in PGW.items()}
@@ -332,17 +401,22 @@ def _seed(conn, *, pgw_overrides=None, drop_events=(), extra_snapshots=(), place
                 )
         for player_id, (status, chance) in sorted(CURRENT_STATUS.items()):
             insert_snapshot(player_id, "2026-09-10T08:00:00Z", status, chance)
-        # Every player appears in the official element list the world's cutoffs
-        # saw, and the payload rides on every capture.  A player with no status
-        # capture of his own gets one that states no status (None), which the
-        # incumbent reads exactly as it read "no snapshot at all": p_available
-        # 1.0 and an unattributable 0-minute row.
-        for player_id in sorted(
-            player for players in SQUADS.values() for positions in players.values() for player in positions
-        ):
-            insert_snapshot(player_id, IDENTITY_CAPTURE, None, None)
         for player_id, event, status, chance, captured_at in extra_snapshots:
             insert_snapshot(player_id, captured_at, status, chance, event)
+        # The official pool EVERY cutoff in this world resolves from: one ACCEPTED
+        # bootstrap generation, one fetch run, one snapshot row per element whose
+        # payload carries the club and the position.  A player with no status
+        # capture of his own has this row as his freshest capture, which states no
+        # status (None) and is therefore read by the incumbent exactly as it read
+        # "no snapshot at all": p_available 1.0 and an unattributable 0-minute row.
+        _seed_generation(
+            conn,
+            IDENTITY_CAPTURE,
+            ALL_PLAYERS,
+            accepted=generation_accepted,
+            missing=generation_missing_players,
+            payloads=generation_payloads,
+        )
         for player_id, (key, value) in sorted(SCOUT_NOTES.items()):
             import_id = repo.insert_scouting_import(
                 conn,
@@ -390,12 +464,27 @@ def _strip(rows):
 def _projection(row):
     """One row with the identity PROVENANCE removed.
 
-    ``player_identity`` records where the identity was resolved from, so it is
-    the one field that must change when the current row later disagrees with the
-    cutoff.  Everything else is the projection, and must not move.
+    ``player_identity`` records where the identity was resolved from and how far
+    the persisted row has diverged from it, so it is the one field that must
+    change when the current row later disagrees with the cutoff.  Everything else
+    is the projection, and must not move.
     """
 
     return _strip_value({key: value for key, value in row.items() if key != "player_identity"})
+
+
+#: The ONE artifact section that is deliberately store-dependent: it reports how
+#: far the persisted pool has moved from the cutoff's official pool.  Everything
+#: else must be byte-identical when the persisted row is mutated.
+_STORE_DIVERGENCE_SECTION = "store_divergence"
+
+
+def _scoring_artifact(artifact):
+    """The artifact with that one declared store-divergence section removed."""
+
+    return {
+        key: value for key, value in artifact.items() if key != _STORE_DIVERGENCE_SECTION
+    }
 
 
 def _fixture_for(event, team):
@@ -571,8 +660,9 @@ def test_post_cutoff_status_update_is_ignored(tmp_path):
 # ``players.team_id`` / ``element_type`` / ``is_active`` are CURRENT state: the
 # store keeps one row per player and overwrites it.  A later transfer, position
 # change or retirement must not be able to rewrite what an earlier cutoff
-# projected, so PE-6 resolves the identity from the official element capture the
-# cutoff could see.
+# projected, so PE-6 resolves the identity from the latest ACCEPTED official
+# bootstrap generation at or before the cutoff: its element id set is the
+# official pool, and its OWN snapshot rows carry the club and the position.
 # ---------------------------------------------------------------------------
 
 
@@ -583,97 +673,292 @@ def _resolved_identity(arms):
     }
 
 
+def _resolved_identity_rows(resolution):
+    return {
+        int(player["player_id"]): (int(player["team_id"]), int(player["element_type"]))
+        for player in resolution["players"]
+    }
+
+
+def _resolved_identity_of(resolution, player_id):
+    return next(
+        player for player in resolution["players"] if int(player["player_id"]) == player_id
+    )["identity"]
+
+
 def _player(arms, player_id):
     return next(player for player in arms.players if int(player["player_id"]) == player_id)
 
 
-def test_cutoff_captures_are_the_bulk_form_of_the_snapshot_reader(tmp_path):
-    """One read, one predicate: the bulk map IS ``analytics.snapshot_as_of``."""
+def test_the_official_pool_is_the_accepted_generation_at_the_cutoff(tmp_path):
+    """Membership, club and position all come from the generation's own rows."""
 
     conn = _db(tmp_path)
-    captures = ch.cutoff_official_captures(conn, CUTOFF)
-    live = {int(row["player_id"]): dict(row) for row in analytics.projectable_players(conn)}
-    assert captures, "the seeded world carries official captures"
-    for player_id in sorted(live):
-        single = analytics.snapshot_as_of(conn, player_id, CUTOFF)
-        if single is None:
-            assert player_id not in captures, player_id
-            continue
-        assert player_id in captures, player_id
-        assert int(captures[player_id]["id"]) == int(single["id"])
-        assert str(captures[player_id]["captured_at"]) == str(single["captured_at"])
-        assert captures[player_id]["raw_json"] == single["raw_json"]
-        assert ch.resolve_player_identity_as_of(
-            conn, player_id, CUTOFF, live_row=live[player_id]
-        ).as_dict() == ch._identity_from(
-            captures[player_id], live[player_id], allow_live_fallback=True
-        ).as_dict()
-    # Nothing captured after the cutoff is visible.
+    generation = ch.official_pool_generation_at_cutoff(conn, CUTOFF)
+    assert generation["usable"] is True, generation["reasons"]
+    assert generation["generation"]["accepted"] is True
+    assert generation["generation"]["captured_at"] == IDENTITY_CAPTURE
+    assert generation["generation"]["element_ids_sha256_matches_the_id_set"] is True
+    assert generation["element_ids"] == ALL_PLAYERS
+    assert generation["newest_attempt_is_the_accepted_generation"] is True
+    # The rows it resolves from are its OWN fetch run's rows, one per element.
+    rows = ch.generation_snapshot_rows(conn, generation["generation"], CUTOFF)
+    assert sorted(rows) == ALL_PLAYERS
+    assert {str(row["captured_at"]) for row in rows.values()} == {IDENTITY_CAPTURE}
+    assert len({int(row["fetch_run_id"]) for row in rows.values()}) == 1
+
+    pool = ch.resolve_candidate_pool(conn, CUTOFF)
+    assert pool["identity_available"] is True
+    assert [(p["player_id"], p["team_id"], p["element_type"]) for p in pool["players"]] == sorted(
+        (player_id, _team_of(player_id), _position_of(player_id)) for player_id in ALL_PLAYERS
+    )
+    assert pool["summary"]["basis_counts"] == {
+        ch.IDENTITY_BASIS_CUTOFF_GENERATION: len(ALL_PLAYERS)
+    }
+    assert pool["summary"]["cutoff_safe_rows"] == len(ALL_PLAYERS)
+    assert pool["summary"]["unresolved_candidates"] == 0
+
+    # A REJECTED generation is never read as authoritative, however new it is.
     with conn:
-        run = repo.create_fetch_run(conn, "fetch_fpl")
-        repo.insert_snapshots(
+        _seed_generation(
             conn,
-            [
-                PlayerSnapshotRecord(
-                    player_id=11,
-                    captured_at="2026-09-11T00:00:01Z",
-                    now_cost=50,
-                    raw_json=_official_element(11, team=2, position=4),
-                )
-            ],
-            run,
+            "2026-09-08T08:00:00Z",
+            [11],
+            accepted=False,
+            payloads={11: _official_element(11, team=3)},
         )
-    assert int(ch.cutoff_official_captures(conn, CUTOFF)[11]["id"]) == int(captures[11]["id"])
+    rejected = ch.official_pool_generation_at_cutoff(conn, CUTOFF)
+    assert rejected["element_ids"] == ALL_PLAYERS, "a refused generation must not redefine the pool"
+    assert rejected["newest_attempt_is_the_accepted_generation"] is False
+    assert rejected["newest_attempt"]["accepted"] is False
+    assert ch.resolve_candidate_pool(conn, CUTOFF)["players"] == pool["players"]
+
+    # A generation captured AFTER the cutoff is invisible to it.
+    with conn:
+        _seed_generation(
+            conn, "2026-09-11T08:00:00Z", [11], payloads={11: _official_element(11, team=3)}
+        )
+    assert ch.official_pool_generation_at_cutoff(conn, CUTOFF)["element_ids"] == ALL_PLAYERS
+    later = "2026-09-11T09:00:00Z"
+    assert ch.official_pool_generation_at_cutoff(conn, later)["element_ids"] == [11]
     conn.close()
 
 
-def test_later_team_position_and_membership_changes_cannot_alter_earlier_projections(tmp_path):
-    """Contract: the cutoff's identity wins over the current row, in both directions."""
+def test_a_cutoff_without_a_usable_generation_fails_closed(tmp_path):
+    """No accepted generation means no pool: nothing is read from the current row."""
+
+    conn = _db(tmp_path, generation_accepted=False)
+    generation = ch.official_pool_generation_at_cutoff(conn, CUTOFF)
+    assert generation["usable"] is False
+    assert generation["reasons"] == [ch.GENERATION_UNAVAILABLE_NO_ACCEPTED_GENERATION]
+    assert generation["generation"] is None
+    resolution = ch.resolve_candidate_pool(conn, CUTOFF)
+    assert resolution["identity_available"] is False
+    assert resolution["players"] == [] and resolution["unresolved"] == []
+    assert resolution["summary"]["identity_available"] is False
+    # A projection attempt stops rather than falling back to the mutable row.
+    with pytest.raises(ch.ChallengerInconsistencyError):
+        ch.build_challenger_arms(conn, 4, CUTOFF)
+
+    artifact = ev.evaluate_events(conn, [3])
+    population = artifact["population"]
+    assert population["scored"] == 0
+    assert population["excluded_by_status"][ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF] > 0
+    assert population["accounting"]["reconciles"] is True
+    assert population["accounting"]["status_totals_reconcile"] is True
+    block = artifact["events"][0]
+    assert block["status"] == "NOT_EVALUATABLE"
+    assert block["exclusion_scope"] == ev.SCOPE_EVENT
+    assert block["identity"]["generation"]["usable"] is False
+    exit_item = next(
+        item
+        for item in artifact["exclusions"]
+        if item["status"] == ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF
+    )
+    assert exit_item["scope"] == ev.SCOPE_EVENT
+    assert ch.GENERATION_UNAVAILABLE_NO_ACCEPTED_GENERATION in exit_item["detail"]
+    conn.close()
+
+
+def test_a_generation_id_set_that_contradicts_its_digest_is_refused(tmp_path):
+    """Identity is proven by the id set, so a corrupt one fails closed."""
+
+    conn = _db(tmp_path)
+    with conn:
+        conn.execute("UPDATE bootstrap_generations SET element_ids_sha256='deadbeef'")
+    generation = ch.official_pool_generation_at_cutoff(conn, CUTOFF)
+    assert generation["usable"] is False
+    assert ch.GENERATION_UNAVAILABLE_ID_SET_DIGEST_MISMATCH in generation["reasons"]
+    assert generation["generation"]["element_ids_sha256_matches_the_id_set"] is False
+    assert ch.resolve_candidate_pool(conn, CUTOFF)["identity_available"] is False
+    conn.close()
+
+
+def test_a_player_absent_from_the_cutoff_generation_is_not_a_candidate(tmp_path):
+    """The generation, not the persisted pool, decides membership."""
+
+    conn = _db(tmp_path)
+    # Player 23 exists in the persisted pool and has a full record, but the
+    # generation a LATER cutoff resolves from does not place him in the pool.
+    with conn:
+        _seed_generation(
+            conn,
+            "2026-09-08T08:00:00Z",
+            [player_id for player_id in ALL_PLAYERS if player_id != 23],
+        )
+        conn.execute("UPDATE players SET is_active=1 WHERE id=23")
+    assert 23 in {int(row["player_id"]) for row in analytics.projectable_players(conn)}
+
+    resolution = ch.resolve_candidate_pool(conn, CUTOFF)
+    assert 23 not in _resolved_identity_rows(resolution)
+    arms = ch.build_challenger_arms(conn, 4, CUTOFF, resolution=resolution)
+    assert 23 not in {int(key[0]) for key in arms.keys()}
+    # The divergence is REPORTED, with counts, rather than absorbed.
+    divergence = resolution["summary"]["persisted_pool_divergence"]
+    assert divergence["cutoff_generation_pool_size"] == len(ALL_PLAYERS) - 1
+    assert divergence["in_persisted_pool_not_in_cutoff_generation"] >= 1
+    assert "NOT a candidate" in divergence["rule"]
+
+    # An EARLIER cutoff (the generation the world had then) still places him in
+    # the pool, so membership is resolved per cutoff rather than globally.
+    earlier = "2026-09-07T00:00:00Z"
+    earlier_resolution = ch.resolve_candidate_pool(conn, earlier)
+    assert earlier_resolution["generation"]["accepted_generation"]["captured_at"] == IDENTITY_CAPTURE
+    assert earlier_resolution["generation"]["element_ids_count"] == len(ALL_PLAYERS)
+    assert 23 in _resolved_identity_rows(earlier_resolution)
+
+    # And an earlier projection is NOT moved by the later generation's pool.
+    artifact = ev.evaluate_events(conn, [3])
+    assert artifact["population"]["scored"] > 0
+    conn.close()
+
+
+def test_later_team_position_and_active_state_cannot_move_an_earlier_projection(tmp_path):
+    """THE regression: mutate team, position AND active state for players with history."""
 
     conn = _db(tmp_path)
     arms = ch.build_challenger_arms(conn, 4, CUTOFF)
+    artifact_before = ev.evaluate_events(conn, [2, 3])
     before = {key: _projection(_row(arms, key)) for key in sorted(arms.keys())}
     before_identity = _resolved_identity(arms)
-    # Player 24 carries no completed row (so mutating his club cannot move any
-    # league pool the incumbent aggregates) and player 40 carries a full record
-    # (so only his membership is mutated).  Both were in the official pool the
-    # cutoff saw.
-    assert _resolved_identity(arms)[24] == (1, 2)
-    assert _resolved_identity(arms)[40] == (2, 2)
+    # Every mutated player CARRIES HISTORICAL OBSERVATIONS, so each of them is a
+    # row in the league window the priors are pooled from -- exactly the case the
+    # persisted-row pooling could not survive.
+    assert all(player_id in before_identity for player_id in (10, 13, 23, 40))
     with conn:
-        conn.execute("UPDATE players SET team_id=3, element_type=4, is_active=0 WHERE id=24")
-        conn.execute("UPDATE players SET is_active=0 WHERE id=40")
+        conn.execute("UPDATE players SET team_id=3, element_type=4 WHERE id=10")
+        conn.execute("UPDATE players SET team_id=2, element_type=4, is_active=0 WHERE id=13")
+        conn.execute("UPDATE players SET team_id=2, element_type=1, is_active=0 WHERE id=23")
+        conn.execute("UPDATE players SET team_id=3, element_type=3, is_active=0 WHERE id=40")
 
     after = ch.build_challenger_arms(conn, 4, CUTOFF)
     assert sorted(after.keys()) == sorted(before), "the candidate set is unchanged"
     for key in before:
         assert _projection(_row(after, key)) == before[key], key
     assert _resolved_identity(after) == before_identity
-    # The mutation is real: player 24's club really moved in the persisted store.
-    assert conn.execute("SELECT team_id, element_type FROM players WHERE id=24").fetchone()[:] == (3, 4)
-
-    # The contract is EXACTLY this: the persisted pool has lost both players, and
-    # the cutoff-resolved pool has not.
+    # The mutation is real in the persisted store ...
+    assert conn.execute(
+        "SELECT team_id, element_type, is_active FROM players WHERE id=13"
+    ).fetchone()[:] == (2, 4, 0)
+    # ... and the persisted pool really lost them, while the cutoff pool did not.
     live_ids = {int(row["player_id"]) for row in analytics.projectable_players(conn)}
     pool_ids = {int(player["player_id"]) for player in after.players}
-    assert 24 not in live_ids and 40 not in live_ids
-    assert {24, 40} <= pool_ids
+    assert {13, 23, 40} & live_ids == set()
+    assert {13, 23, 40} <= pool_ids
 
-    # The divergence is recorded on the row rather than absorbed.  Player 24 has
-    # left the persisted pool entirely, so the divergence available here is the
-    # membership one; his club and position differences are asserted separately.
-    identity24 = _player(after, 24)["identity"]
-    assert identity24["basis"] == ch.IDENTITY_BASIS_CUTOFF_CAPTURE
-    assert identity24["cutoff_safe"] is True
-    assert (identity24["team_id"], identity24["element_type"]) == (1, 2)
-    assert identity24["in_official_pool"] is True
-    assert "membership:in_pool->absent_from_persisted_pool" in identity24["live_row_disagreement"]
-    assert "membership:in_pool->absent_from_persisted_pool" in (
-        _player(after, 40)["identity"]["live_row_disagreement"]
+    # The ARTIFACT is byte-identical too, not just the projections: every metric,
+    # stratum, exclusion, population count and digest.  The ONLY section allowed
+    # to differ is the declared store-divergence report, which exists to show that
+    # the persisted row moved and is an input to nothing.
+    artifact_after = ev.evaluate_events(conn, [2, 3])
+    assert json.dumps(_scoring_artifact(artifact_after), sort_keys=True, default=str) == json.dumps(
+        _scoring_artifact(artifact_before), sort_keys=True, default=str
     )
-    # And the projection really used the cutoff club: player 24's event-4 fixture
+    assert artifact_after["population"]["population_digest"] == artifact_before["population"][
+        "population_digest"
+    ]
+    before_generation = artifact_before["population"]["identity"]["cutoff_generations"]["3"][
+        "accepted_generation"
+    ]
+    after_generations = artifact_after["population"]["identity"]["cutoff_generations"]
+    assert set(after_generations) == {"2", "3"}
+    assert after_generations["3"]["accepted_generation"] == before_generation
+    assert all(block["usable"] is True for block in after_generations.values())
+    assert all(
+        block["accepted_generation"]["captured_at"] == IDENTITY_CAPTURE
+        for block in after_generations.values()
+    )
+    # The divergence itself DID change, and it says exactly why.
+    assert artifact_after["store_divergence"] != artifact_before["store_divergence"]
+    diverged = artifact_after["store_divergence"]["per_event"]
+    assert set(diverged) == {"2", "3"}
+    assert all(
+        block["in_cutoff_generation_not_in_persisted_pool"] >= 3 for block in diverged.values()
+    )
+    assert all(
+        block["in_persisted_pool_not_in_cutoff_generation"] == 0 for block in diverged.values()
+    )
+    assert artifact_after["store_divergence"]["scope"] == "reported, never scored"
+    for block in artifact_after["population"]["pool_priors"]["per_event"].values():
+        assert block["incumbent_league_pools_read_used"] is False
+        assert block["pooled_rows_without_cutoff_identity"] == 0
+
+    # The divergence is recorded on the row rather than absorbed: the persisted
+    # pool no longer lists him at all, while the cutoff's pool still does.
+    identity10 = _player(after, 10)["identity"]
+    assert identity10["basis"] == ch.IDENTITY_BASIS_CUTOFF_GENERATION
+    assert identity10["cutoff_safe"] is True
+    assert (identity10["team_id"], identity10["element_type"]) == (1, 2)
+    assert "club:1->3" in identity10["live_row_disagreement"]
+    assert "position:2->4" in identity10["live_row_disagreement"]
+    identity13 = _player(after, 13)["identity"]
+    assert identity13["basis"] == ch.IDENTITY_BASIS_CUTOFF_GENERATION
+    assert identity13["cutoff_safe"] is True
+    assert (identity13["team_id"], identity13["element_type"]) == (1, 2)
+    assert "membership:in_pool->absent_from_persisted_pool" in identity13["live_row_disagreement"]
+    identity23 = _player(after, 23)["identity"]
+    assert "membership:in_pool->absent_from_persisted_pool" in identity23["live_row_disagreement"]
+    # And a caller that hands the resolution a row it has kept with is_active=0
+    # gets the divergence named for what it is.
+    inactive_row = dict(
+        next(row for row in analytics.projectable_players(conn) if int(row["player_id"]) == 11)
+    )
+    inactive_row["is_active"] = 0
+    with_inactive = ch.resolve_candidate_pool(conn, CUTOFF, live_rows=[inactive_row])
+    assert "membership:in_pool->inactive" in _resolved_identity_of(with_inactive, 11)[
+        "live_row_disagreement"
+    ]
+    # And the projection really used the cutoff club: player 13's event-4 fixture
     # is team 1's, the one his cutoff identity gives him.
-    assert (24, _fixture_for(4, 1)) in after.keys()
+    assert (13, _fixture_for(4, 1)) in after.keys()
+    conn.close()
+
+
+def test_the_priors_mirror_the_incumbent_when_identity_matches_the_current_rows(tmp_path):
+    """The pooling mirror is pinned against the incumbent itself."""
+
+    conn = _db(tmp_path)
+    identities = {
+        int(row["player_id"]): (int(row["team_id"]), int(row["element_type"]))
+        for row in analytics.projectable_players(conn)
+    }
+    pools, disclosure = ch.cutoff_stable_league_pools(conn, 4, CUTOFF, identities)
+    reference = incumbent.league_pools(conn, 4, CUTOFF)
+    assert pools.position == reference.position
+    assert pools.team_position == reference.team_position
+    assert disclosure["incumbent_league_pools_read_used"] is False
+    assert "OBSERVATION_SQL_CLAUSES" in disclosure["boundary"]
+    assert disclosure["pooled_rows"] > 0
+    assert disclosure["pooled_rows_attributed"] == disclosure["pooled_rows"]
+    assert disclosure["pooled_rows_without_cutoff_identity"] == 0
+    assert disclosure["pooled_players"] > 0
+    # A player with no cutoff identity is not pooled, and the rows are COUNTED.
+    trimmed = {key: value for key, value in identities.items() if key != 10}
+    _without_10, counted = ch.cutoff_stable_league_pools(conn, 4, CUTOFF, trimmed)
+    assert counted["pooled_rows_without_cutoff_identity"] > 0
+    assert counted["pooled_rows"] - counted["pooled_rows_attributed"] == (
+        counted["pooled_rows_without_cutoff_identity"]
+    )
     conn.close()
 
 
@@ -683,21 +968,21 @@ def test_identity_disagreement_with_the_current_row_is_recorded(tmp_path):
     conn = _db(tmp_path)
     with conn:
         conn.execute("UPDATE players SET team_id=2, element_type=4 WHERE id=23")
-    players = ch.projectable_players_as_of(conn, CUTOFF)
-    player23 = next(row for row in players if int(row["player_id"]) == 23)
+    resolution = ch.resolve_candidate_pool(conn, CUTOFF)
+    player23 = next(row for row in resolution["players"] if int(row["player_id"]) == 23)
     assert (player23["team_id"], player23["element_type"]) == (1, 3)
     assert player23["identity_cutoff_safe"] is True
     assert "club:1->2" in player23["identity"]["live_row_disagreement"]
     assert "position:3->4" in player23["identity"]["live_row_disagreement"]
     # The event-4 fixture is team 1's, not the club the current row claims.
-    arms = ch.build_challenger_arms(conn, 4, CUTOFF, players=players)
+    arms = ch.build_challenger_arms(conn, 4, CUTOFF, resolution=resolution)
     assert (23, _fixture_for(4, 1)) in arms.keys()
     assert all(int(key[1]) == _fixture_for(4, 1) for key in arms.keys() if int(key[0]) == 23)
     conn.close()
 
 
 def test_post_cutoff_capture_cannot_move_an_earlier_identity(tmp_path):
-    """A capture after the cutoff is invisible to it, club and position included."""
+    """A later capture, and a later accepted generation, are invisible."""
 
     conn = _db(tmp_path)
     arms = ch.build_challenger_arms(conn, 4, CUTOFF)
@@ -705,6 +990,7 @@ def test_post_cutoff_capture_cannot_move_an_earlier_identity(tmp_path):
     assert _resolved_identity(arms)[11] == (1, 3)
     with conn:
         run = repo.create_fetch_run(conn, "fetch_fpl")
+        # A capture after the cutoff, carrying a different club and position.
         repo.insert_snapshots(
             conn,
             [
@@ -719,37 +1005,114 @@ def test_post_cutoff_capture_cannot_move_an_earlier_identity(tmp_path):
             ],
             run,
         )
-    # Part 1: the post-cutoff capture alone changes nothing at all.
     after = ch.build_challenger_arms(conn, 4, CUTOFF)
     assert _resolved_identity(after)[11] == (1, 3)
-    assert sorted(after.keys()) == sorted(before)
     for key in before:
         assert _projection(_row(after, key)) == before[key], key
 
-    # Part 2: the same capture plus a CURRENT-row change still changes nothing
-    # for the player whose club move cannot move the incumbent's pooled priors.
+    # A LATER ACCEPTED generation moves nobody at this cutoff either: it was not
+    # observable at it.
     with conn:
-        run = repo.create_fetch_run(conn, "fetch_fpl")
-        repo.insert_snapshots(
+        _seed_generation(
             conn,
-            [
-                PlayerSnapshotRecord(
-                    player_id=24,
-                    captured_at="2026-09-11T08:00:00Z",
-                    event_context=4,
-                    now_cost=50,
-                    status="a",
-                    raw_json=_official_element(24, team=3, position=4),
-                )
-            ],
-            run,
+            "2026-09-11T09:00:00Z",
+            ALL_PLAYERS,
+            payloads={11: _official_element(11, team=2, position=4)},
         )
-        conn.execute("UPDATE players SET team_id=3, element_type=4 WHERE id=24")
+        conn.execute("UPDATE players SET team_id=2, element_type=4 WHERE id=11")
     last = ch.build_challenger_arms(conn, 4, CUTOFF)
-    assert _resolved_identity(last)[24] == (1, 2)
-    assert sorted(last.keys()) == sorted(before)
+    assert _resolved_identity(last)[11] == (1, 3)
     for key in before:
         assert _projection(_row(last, key)) == before[key], key
+    # The later generation DOES govern a later cutoff.
+    later = ch.official_pool_generation_at_cutoff(conn, "2026-09-11T10:00:00Z")
+    assert later["generation"]["captured_at"] == "2026-09-11T09:00:00Z"
+    later_pool = ch.resolve_candidate_pool(conn, "2026-09-11T10:00:00Z")
+    assert _resolved_identity_rows(later_pool)[11] == (2, 4)
+    conn.close()
+
+
+def test_a_missing_or_partial_generation_capture_is_refused_not_filled(tmp_path):
+    """Missing evidence is not filled from the mutable row by default."""
+
+    # 1. No snapshot row in the generation for this player at all.
+    conn = _db(tmp_path, "missing.db", generation_missing_players=(11,))
+    resolution = ch.resolve_candidate_pool(conn, CUTOFF)
+    assert resolution["identity_available"] is True
+    assert 11 not in _resolved_identity_rows(resolution)
+    unresolved = next(item for item in resolution["unresolved"] if int(item["player_id"]) == 11)
+    assert unresolved["basis"] == ch.IDENTITY_BASIS_UNRESOLVED
+    assert unresolved["in_official_pool"] is True
+    assert "THE_CUTOFF_GENERATION_HOLDS_NO_SNAPSHOT_ROW_FOR_THIS_PLAYER" in unresolved["notes"]
+    assert any(
+        reason.startswith("THE_CUTOFF_GENERATION_HOLDS_NO_SNAPSHOT_ROW_FOR_THIS_PLAYER")
+        for reason in resolution["summary"]["unresolved_reasons"]
+    )
+    artifact = ev.evaluate_events(conn, [3])
+    assert artifact["population"]["excluded_by_status"][ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF] == 1
+    assert artifact["population"]["scored"] > 0
+    assert artifact["population"]["accounting"]["reconciles"] is True
+    assert artifact["population"]["identity"]["scored_rows_by_basis"] == {
+        ch.IDENTITY_BASIS_CUTOFF_GENERATION: artifact["population"]["scored"]
+    }
+    assert artifact["population"]["identity"]["live_fallback_allowed"] is False
+    # The excluded candidate is named, with its identity evidence, and it is not
+    # scored anywhere.
+    item = next(
+        entry
+        for entry in artifact["exclusions"]
+        if entry["status"] == ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF
+    )
+    assert int(item["player_id"]) == 11
+    assert item["candidates"] == 1
+    assert item["identity"]["basis"] == ch.IDENTITY_BASIS_UNRESOLVED
+
+    # 2. The row exists but leaves the club or the position unstated.
+    conn2 = _db(tmp_path, "partial.db", generation_payloads={11: {"id": 11, "team": 1}})
+    partial = ch.resolve_candidate_pool(conn2, CUTOFF)
+    assert 11 not in _resolved_identity_rows(partial)
+    partial_row = next(item for item in partial["unresolved"] if int(item["player_id"]) == 11)
+    assert "GENERATION_CAPTURE_CARRIES_NO_POSITION_FIELD" in partial_row["notes"]
+    assert ev.evaluate_events(conn2, [3])["population"]["excluded_by_status"].get(
+        ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF
+    ) == 1
+    conn.close()
+    conn2.close()
+
+
+def test_the_live_fallback_is_an_explicit_opt_in(tmp_path):
+    """The persisted row may fill a gap only when a caller asks for it."""
+
+    conn = _db(tmp_path, generation_missing_players=(11,))
+    # Default: refused, and the candidate is counted as unresolved.
+    default = ch.resolve_candidate_pool(conn, CUTOFF)
+    assert 11 not in _resolved_identity_rows(default)
+    # Opt-in: filled from the current row, and never reported as cutoff-safe.
+    opted_in = ch.resolve_candidate_pool(conn, CUTOFF, allow_live_fallback=True)
+    assert _resolved_identity_rows(opted_in)[11] == (_team_of(11), _position_of(11))
+    row11 = next(player for player in opted_in["players"] if int(player["player_id"]) == 11)
+    assert row11["identity_basis"] == ch.IDENTITY_BASIS_LIVE_FALLBACK
+    assert row11["identity_cutoff_safe"] is False
+    assert row11["identity_generation_id"] is not None
+    assert any(
+        note.startswith("FILLED_FROM_CURRENT_ROW") for note in row11["identity"]["notes"]
+    )
+    assert opted_in["summary"]["basis_counts"] == {
+        ch.IDENTITY_BASIS_CUTOFF_GENERATION: len(ALL_PLAYERS) - 1,
+        ch.IDENTITY_BASIS_LIVE_FALLBACK: 1,
+    }
+
+    artifact = ev.evaluate_events(conn, [3], allow_live_identity_fallback=True)
+    identity = artifact["population"]["identity"]
+    assert identity["live_fallback_allowed"] is True
+    assert identity["scored_rows_by_basis"][ch.IDENTITY_BASIS_LIVE_FALLBACK] > 0
+    assert identity["scored_rows_cutoff_safe"] < identity["scored_rows"]
+    assert identity["cutoff_safe_share"] < 1.0
+    strict = ev.evaluate_events(conn, [3])
+    assert strict["population"]["identity"]["live_fallback_allowed"] is False
+    assert strict["population"]["identity"]["scored_rows_cutoff_safe"] == (
+        strict["population"]["identity"]["scored_rows"]
+    )
     conn.close()
 
 
@@ -761,89 +1124,40 @@ def test_artifact_reports_where_every_identity_came_from(tmp_path):
     scored = artifact["population"]["scored"]
     assert scored > 0
     assert block["scored_rows"] == scored
-    assert block["scored_rows_by_basis"] == {ch.IDENTITY_BASIS_CUTOFF_CAPTURE: scored}
+    assert block["scored_rows_by_basis"] == {ch.IDENTITY_BASIS_CUTOFF_GENERATION: scored}
     assert block["scored_rows_cutoff_safe"] == scored
     assert block["cutoff_safe_share"] == 1.0
-    assert block["live_fallback_allowed"] is True
+    assert block["live_fallback_allowed"] is False
     assert block["basis_vocabulary"] == list(ch.IDENTITY_BASES)
-    # The residual the fix does NOT cover is disclosed rather than implied.
-    disclosure = block["incumbent_pool_identity"]
-    assert "league_pools" in disclosure["read"]
-    assert "not restate" in disclosure["pe6_disclosure"]
-    assert "AGGREGATE priors" in disclosure["pe6_disclosure"]
+    assert "accepted_generation_at" in block["generation_reader"]
+    assert "EVENT scope" in block["fail_closed_rule"]
+    generation = block["cutoff_generations"][str(artifact["events"][0]["event"])]
+    assert generation["accepted_generation"]["captured_at"] == IDENTITY_CAPTURE
+    assert generation["element_ids_count"] == len(ALL_PLAYERS)
+    assert "element_ids" not in generation, "the raw id list is not dumped into the artifact"
+
+    # The priors construction is disclosed, and it is not the incumbent's read.
+    priors = artifact["population"]["pool_priors"]
+    assert priors["incumbent_league_pools_read_used"] is False
+    assert "LeaguePools" in priors["note"] and "not used on this path" in priors["note"]
+    assert "cutoff_stable_league_pools" in priors["constructed_by"]
+
     event_identity = artifact["events"][0]["identity"]
-    assert event_identity["basis_counts"] == {
-        ch.IDENTITY_BASIS_CUTOFF_CAPTURE: len(ch.projectable_players_as_of(conn, cutoff))
-    }
-    assert event_identity["cutoff_safe_rows"] == event_identity["rows"]
+    assert event_identity["basis_counts"] == {ch.IDENTITY_BASIS_CUTOFF_GENERATION: len(ALL_PLAYERS)}
+    assert event_identity["cutoff_safe_rows"] == event_identity["rows"] == len(ALL_PLAYERS)
     assert event_identity["unresolved_candidates"] == 0
-    # Every capture used was observable at the cutoff, and the count says how
-    # many rows came from the newest of them.
-    assert event_identity["capture_moments"]
-    assert all(str(moment) <= cutoff for moment in event_identity["capture_moments"])
-    assert 0 < event_identity["rows_from_newest_capture"] <= event_identity["rows"]
-    assert (
-        event_identity["rows_from_newest_capture"] + event_identity["rows_from_older_captures"]
-        == event_identity["rows"]
-    )
-    assert "REPORTED, not " in event_identity["stale_capture_rule"]
-    # The artifact-wide staleness count is over SCORED rows; the event block's is
-    # over the whole candidate pool, so it is checked against the records.
+    assert event_identity["generation"]["element_ids_count"] == len(ALL_PLAYERS)
+    # Each scored row carries its own provenance, so a reviewer can audit one.
     records, _excluded, _counts, _reasons = ev.build_event_records(
         conn, 3, cutoff=cutoff, arms=ch.build_challenger_arms(conn, 3, cutoff)
     )
-    stale = sum(1 for item in records if item["identity_capture_is_newest"] is False)
-    assert block["scored_rows_from_older_captures"] == stale
     assert len(records) == scored
-    # Each scored row carries its own provenance, so a reviewer can audit one.
     for item in records:
-        assert item["identity_basis"] == ch.IDENTITY_BASIS_CUTOFF_CAPTURE
+        assert item["identity_basis"] == ch.IDENTITY_BASIS_CUTOFF_GENERATION
         assert item["identity_cutoff_safe"] is True
         assert int(item["player_identity"]["team_id"]) == int(item["team_id"])
         assert int(item["player_identity"]["element_type"]) == int(item["position_id"])
         assert str(item["player_identity"]["snapshot_captured_at"]) <= cutoff
-    conn.close()
-
-
-def test_identity_falls_back_visibly_and_can_be_refused(tmp_path):
-    """Missing cutoff evidence is not silent, and can be refused outright."""
-
-    conn = _db(tmp_path)
-    with conn:
-        conn.execute("DELETE FROM player_snapshots WHERE player_id=11")
-
-    # Default: the current row supplies the identity, and says so.
-    fallback = ch.projectable_players_as_of(conn, CUTOFF)
-    row11 = next(player for player in fallback if int(player["player_id"]) == 11)
-    assert row11["identity_basis"] == ch.IDENTITY_BASIS_LIVE_FALLBACK
-    assert row11["identity_cutoff_safe"] is False
-    assert row11["identity"]["in_official_pool"] is True
-    assert row11["identity"]["snapshot_captured_at"] is None
-    assert any("LIVE_FALLBACK" in note for note in row11["identity"]["notes"])
-    assert 11 in {int(player["player_id"]) for player in fallback}
-
-    # Refused: the candidate is named, never projected under a guess.
-    strict = ch.projectable_players_as_of(conn, CUTOFF, allow_live_fallback=False)
-    assert 11 not in {int(player["player_id"]) for player in strict}
-    unresolved = ch.unresolved_candidates_as_of(conn, CUTOFF, allow_live_fallback=False)
-    assert any(int(item["player_id"]) == 11 for item in unresolved)
-
-    artifact = ev.evaluate_events(conn, [3])
-    identity = artifact["population"]["identity"]
-    assert identity["scored_rows_by_basis"][ch.IDENTITY_BASIS_LIVE_FALLBACK] > 0
-    assert identity["scored_rows_cutoff_safe"] < identity["scored_rows"]
-    assert identity["cutoff_safe_share"] < 1.0
-
-    strict_artifact = ev.evaluate_events(conn, [3], allow_live_identity_fallback=False)
-    assert strict_artifact["population"]["identity"]["live_fallback_allowed"] is False
-    assert strict_artifact["population"]["identity"]["scored_rows_cutoff_safe"] == (
-        strict_artifact["population"]["identity"]["scored_rows"]
-    )
-    strict_statuses = strict_artifact["population"]["excluded_by_status"]
-    assert strict_statuses.get(ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF) == 1
-    assert strict_artifact["population"]["candidates"] == (
-        strict_artifact["population"]["scored"] + strict_artifact["population"]["excluded"]
-    )
     conn.close()
 
 
@@ -1539,7 +1853,7 @@ def test_repeated_event_ids_cannot_inflate_any_count(tmp_path):
 
 
 def test_evaluation_accounting_reconciles_when_a_cutoff_is_unavailable(tmp_path):
-    """An EVENT-scope exclusion accounts for its whole pool, so the totals add up."""
+    """An EVENT-scope exclusion accounts for its whole enumeration, so the totals add up."""
 
     conn = _db(tmp_path)
     with conn:
@@ -1551,19 +1865,77 @@ def test_evaluation_accounting_reconciles_when_a_cutoff_is_unavailable(tmp_path)
     population = artifact["population"]
     accounting = population["accounting"]
     assert population["candidates"] == population["scored"] + population["excluded"]
-    assert accounting["candidates"] == accounting["scored"] + accounting["excluded"]
+    assert accounting["enumerated_candidate_slots"] == (
+        accounting["scored_rows"] + accounting["excluded_candidates"]
+    )
     assert accounting["reconciles"] is True
+    assert accounting["status_totals_reconcile"] is True
+    assert accounting["per_event_reconciles"] is True
     # The whole unavailable-cutoff pool is accounted for, and exactly once.
     assert population["excluded_by_status"][ev.STATUS_EVENT_CUTOFF_UNAVAILABLE] == pool
     assert accounting["event_scope_exclusions"] == 1
     assert accounting["event_scope_candidates"] == pool
     assert sum(population["excluded_by_status"].values()) == population["excluded"]
+    assert accounting["excluded_by_status_total"] == population["excluded"]
     event_block = next(block for block in artifact["events"] if int(block["event"]) == 9)
     assert event_block["status"] == "NOT_EVALUATED"
     assert event_block["candidates"] == pool
+    assert event_block["candidate_slots_enumerated"] == pool
+    assert event_block["excluded_candidates"] == pool
     assert event_block["scored_observations"] == 0
     # The scored event is untouched by the unavailable one.
     assert population["scored"] == ev.evaluate_events(conn, [3])["population"]["scored"]
+    conn.close()
+
+
+def test_candidate_slots_are_enumerated_independently_of_the_scored_rows(tmp_path):
+    """The reconciliation compares an INDEPENDENT enumeration, not its own sum."""
+
+    conn = _db(tmp_path)
+    artifact = ev.evaluate_events(conn, [2, 3])
+    accounting = artifact["population"]["accounting"]
+    assert accounting["reconciles"] is True
+    assert accounting["status_totals_reconcile"] is True
+    assert accounting["per_event_reconciles"] is True
+    assert accounting["enumerated_candidate_slots"] == (
+        accounting["scored_rows"] + accounting["excluded_candidates"]
+    )
+    assert accounting["excluded_by_status_total"] == accounting["excluded_candidates"]
+    assert accounting["scored_rows"] == artifact["population"]["scored"]
+
+    # The enumeration is drawn from the pool and the fixtures, so it can be
+    # recomputed by hand: every candidate is one slot per fixture of his club in
+    # the event, or one slot when his club has none.
+    for event in (2, 3):
+        cutoff, _reasons = ev.event_cutoff(conn, event)
+        resolution = ch.resolve_candidate_pool(conn, cutoff)
+        enumeration = ev.candidate_slot_enumeration(conn, event, resolution=resolution)
+        fixtures_by_team = analytics.event_fixture_map(conn, event)
+        expected = sum(
+            len(fixtures_by_team.get(int(player["team_id"])) or []) or 1
+            for player in resolution["players"]
+        ) + len(resolution["unresolved"])
+        assert enumeration["slots"] == expected
+        assert enumeration["resolved_candidates"] == len(resolution["players"])
+        assert enumeration["unresolved_candidates"] == len(resolution["unresolved"])
+        block = next(item for item in artifact["events"] if int(item["event"]) == event)
+        assert block["candidate_slots_enumerated"] == expected
+        assert block["candidate_slot_enumeration"] == enumeration
+        assert block["candidate_slots_enumerated"] == (
+            block["scored_observations"] + block["excluded_candidates"]
+        )
+    # Event 2 is a double gameweek for team 2, so its slots really are counted per
+    # fixture rather than per player.
+    cutoff2, _reasons = ev.event_cutoff(conn, 2)
+    resolution2 = ch.resolve_candidate_pool(conn, cutoff2)
+    enum2 = ev.candidate_slot_enumeration(conn, 2, resolution=resolution2)
+    team2_fixtures = analytics.event_fixture_map(conn, 2)[2]
+    assert len(team2_fixtures) == 2
+    assert enum2["slots"] > enum2["resolved_candidates"]
+    # The totals are the sum of the per-event enumerations, not of the records.
+    assert accounting["enumerated_candidate_slots"] == sum(
+        int(block["candidate_slots_enumerated"]) for block in artifact["events"]
+    )
     conn.close()
 
 
@@ -1800,28 +2172,47 @@ def test_a_multi_family_subset_is_only_reported_through_its_own_arm(tmp_path):
 
 
 def test_no_second_causal_predicate_exists_in_pe6():
-    """PE-6 reuses the frozen boundary; it never restates it."""
+    """PE-6 reuses the frozen boundary and the canonical generation reader."""
 
     challenger_source = inspect.getsource(ch)
-    # The challenger's ONLY database read is the bulk form of the PE-1
-    # ``analytics.snapshot_as_of`` identity read: one table, one predicate
-    # (``captured_at <= cutoff``), no history table and no observation clause.
-    assert challenger_source.count("SELECT") == 1, "exactly one read, the identity capture"
-    assert "FROM player_snapshots" in challenger_source
-    assert ch.CUTOFF_CAPTURE_SQL == (
-        "SELECT player_id, captured_at, id, raw_json FROM player_snapshots "
-        "WHERE captured_at <= ? ORDER BY player_id, captured_at DESC, id DESC"
+    # Every database read in the challenger is declared as a named constant, and
+    # each one reads exactly one thing:
+    #   * the pool identity, from the generation the cutoff could see;
+    #   * which generation attempts existed at the cutoff (audit, never identity);
+    #   * the historical rows the priors are pooled from, under the PE-1 clause.
+    assert challenger_source.count("SELECT") == 4, "four declared reads"
+    for statement in (ch.GENERATION_SNAPSHOT_SQL, ch.GENERATION_SNAPSHOT_BY_CAPTURE_SQL):
+        assert "FROM player_snapshots" in statement
+        assert "fetch_run_id = ?" in statement or "captured_at = ?" in statement
+        assert "captured_at <= ?" in statement
+        for forbidden in ("player_gameweeks", "FROM fixtures", "updated_at", "finished", "kickoff_time"):
+            assert forbidden not in statement, forbidden
+    assert "FROM bootstrap_generations WHERE captured_at <= ?" in ch.GENERATION_ATTEMPT_SQL
+    # The pooling read does NOT restate the causal boundary: it interpolates the
+    # canonical clause, and takes its parameters from the canonical helper.
+    assert "{boundary}" in ch.PRIORS_SQL_TEMPLATE
+    assert "historical.OBSERVATION_SQL_CLAUSES" in challenger_source
+    assert "historical.boundary_params" in challenger_source
+    assert "updated_at" not in ch.PRIORS_SQL_TEMPLATE
+    assert "FROM players" not in challenger_source, (
+        "the persisted players row may be read for a divergence REPORT and through the explicit "
+        "fallback, never to resolve an identity by default"
     )
-    for forbidden in ("player_gameweeks", "FROM fixtures", "updated_at", "finished", "kickoff_time"):
-        assert forbidden not in ch.CUTOFF_CAPTURE_SQL, forbidden
+    # No second definition of "the latest accepted generation at or before the
+    # cutoff": PE-5's canonical reader is reused.
+    assert "outcome_ledger.accepted_generation_at" in challenger_source
     assert "analytics.completed_rows_as_of" in challenger_source
     assert "analytics.snapshot_as_of" in challenger_source
     assert "analytics.snapshot_history_as_of" in challenger_source
+    # The priors mirror the incumbent's own aggregation, which the suite pins
+    # against the incumbent itself rather than against a restated formula.
+    assert "incumbent.LeaguePools" in challenger_source
     evaluation_source = inspect.getsource(ev)
     # The evaluation's only reads are the exact-key outcome row, the event
     # deadline and the fixture kickoffs: never a window predicate.
     assert "FROM player_gameweeks WHERE player_id=? AND fixture_id=?" in evaluation_source
     assert "updated_at" not in evaluation_source
+    assert "FROM player_snapshots" not in evaluation_source
     # The frozen chain the challenger delegates to is the PE-1 reader.
     assert "historical.historical_player_fixture_rows" in inspect.getsource(
         analytics.completed_rows_as_of

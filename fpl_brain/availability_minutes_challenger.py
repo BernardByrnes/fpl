@@ -78,27 +78,45 @@ PLAYER IDENTITY IS RESOLVED AS OF THE CUTOFF
 CURRENT state: the store keeps one row per player and overwrites it, so a
 post-cutoff transfer, position change or retirement would silently rewrite which
 fixtures an earlier cutoff is projecting.  PE-6 therefore resolves every
-candidate's membership, club and position from the OFFICIAL ELEMENT CAPTURE at or
-before the cutoff (``player_snapshots.raw_json``, the payload the official
-bootstrap returned), never from the current row:
+candidate's membership, club and position from the **latest ACCEPTED official
+bootstrap generation at or before the cutoff** (``bootstrap_generations``), never
+from the current row:
 
-* the club and position come from the capture's own ``team`` / ``element_type``;
-* membership comes from being present in that capture at all;
-* the candidate set is the UNION of the captures at the cutoff and the persisted
-  pool, so a player who was in the official pool then and is inactive today is
-  still projected for that cutoff;
-* when a candidate has no cutoff capture at all, the current row is used ONLY as
-  a DECLARED fallback whose basis is recorded per row and counted in the
-  artifact (``identity_basis_counts``), so the un-resolvable share of a
-  population is visible rather than implied;
-* a row whose capture is not the newest one visible at the cutoff is REPORTED as
-  such rather than dropped: the freshest official list may not name him, and that
-  is doubt rather than evidence.
+* MEMBERSHIP is the generation's own element id set -- the official pool as it
+  stood at that cutoff.  A player the cutoff places in the pool stays a candidate
+  for that cutoff after he has been marked inactive, and a player only the
+  persisted pool lists is not a candidate at that cutoff at all (the divergence
+  is counted and reported, never silently absorbed);
+* CLUB and POSITION come from that generation's OWN snapshot rows
+  (``player_snapshots.raw_json`` filtered to the generation's fetch run), the
+  payload the official bootstrap returned -- not from a later capture, not from
+  the persisted row;
+* the generation is read through ``outcome_ledger.accepted_generation_at``, the
+  rule PE-5 certifies a freeze with, reused rather than restated; the id set is
+  verified against the generation's recorded digest, so a corrupted identity
+  fails closed instead of resolving a pool nobody recorded;
+* FAIL CLOSED.  A cutoff with no usable accepted generation at or before it has
+  no official pool, so no candidate is projected from the current row: the
+  evaluation excludes that event's candidate enumeration at EVENT scope
+  (``CANDIDATE_IDENTITY_UNAVAILABLE_AT_CUTOFF``) and scores nothing.  The live
+  fallback survives only as an EXPLICIT, recorded opt-in
+  (``allow_live_fallback=True``), never as a default;
+* a generation member whose own snapshot row is missing or leaves the club or
+  position unstated is UNRESOLVED, and an unresolved candidate is excluded with
+  its reason rather than filled from the current row.
 
-The read is the bulk form of ``analytics.snapshot_as_of`` -- the same predicate
-and the same ordering, so no second causal reader exists -- and the suite pins
-the two against each other player by player.  The incumbent's own pooled priors
-(``league_pools``) are the incumbent's frozen read and are not restated here.
+THE PRIORS ARE CONSTRUCTED HERE, FROM CUTOFF-STABLE IDENTITY
+------------------------------------------------------------
+``minutes_model.league_pools`` pools its position and team-position priors by
+joining every historical row to the PERSISTED ``players`` row, so a later
+transfer or position change moves a historical prior.  That read is the
+incumbent's frozen behaviour and is not rewritten.  Instead this adapter builds
+the same two tables (:func:`cutoff_stable_league_pools`) from the SAME canonical
+PE-1 boundary (``historical.OBSERVATION_SQL_CLAUSES``), attributing each pooled
+row by the identity resolved at the cutoff, and hands the result to the incumbent
+through its own ``LeaguePools`` contract -- the argument
+``project_player_fixture`` already takes.  The incumbent's own ``league_pools``
+read is therefore not on this path at all.
 
 WHERE THE NUMBERS COME FROM
 ---------------------------
@@ -129,17 +147,22 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from . import analytics
+from . import historical_observations as historical
 from . import minutes_model as incumbent
+from . import outcome_ledger
 from . import repositories as repo
 from .utils import utc_now
 
-AVAILABILITY_MINUTES_CHALLENGER_VERSION = "availability_minutes_challenger_v0.1.1"
-# v0.1.1: review pass.  Player membership, club and position are now resolved AS
-# OF THE CUTOFF from the official element captures that were observable then,
-# instead of being read from the current ``players`` row; a player the cutoff
-# can place in the official pool stays a candidate even if he is no longer
-# active today, and a post-cutoff club/position change can no longer move an
-# earlier projection.
+AVAILABILITY_MINUTES_CHALLENGER_VERSION = "availability_minutes_challenger_v0.1.2"
+# v0.1.2: review pass.  The official pool is the latest ACCEPTED bootstrap
+# generation at or before the cutoff, and club/position come from that
+# generation's OWN snapshot rows; a cutoff with no usable generation fails closed
+# instead of falling back to the mutable current row.  The league and
+# team-position priors are constructed here from cutoff-stable identity and handed
+# to the incumbent through its own LeaguePools contract.
+# v0.1.1: player membership, club and position were resolved per player from the
+# official element capture the cutoff could see, instead of from the current
+# players row.
 # v0.1.0: the first PE-6 challenger.  A challenger identity, not an incumbent
 # bump: nothing here is promoted, and the incumbent's own version strings are
 # read-only in this module.
@@ -346,16 +369,16 @@ def challenger_identity(
 
 
 # ---------------------------------------------------------------------------
-# Cutoff-safe player identity (membership, club, position).
+# Cutoff-stable player identity (membership, club, position).
 # ---------------------------------------------------------------------------
 
 #: Where a candidate's identity came from, in the order of preference.
-IDENTITY_BASIS_CUTOFF_CAPTURE = "CUTOFF_OFFICIAL_ELEMENT_CAPTURE"
+IDENTITY_BASIS_CUTOFF_GENERATION = "CUTOFF_ACCEPTED_BOOTSTRAP_GENERATION"
 IDENTITY_BASIS_LIVE_FALLBACK = "CURRENT_PLAYER_ROW_FALLBACK_NOT_CUTOFF_SAFE"
 IDENTITY_BASIS_UNRESOLVED = "NO_IDENTITY_EVIDENCE"
 
 IDENTITY_BASES: tuple[str, ...] = (
-    IDENTITY_BASIS_CUTOFF_CAPTURE,
+    IDENTITY_BASIS_CUTOFF_GENERATION,
     IDENTITY_BASIS_LIVE_FALLBACK,
     IDENTITY_BASIS_UNRESOLVED,
 )
@@ -364,12 +387,49 @@ IDENTITY_BASES: tuple[str, ...] = (
 OFFICIAL_ELEMENT_CLUB_FIELD = "team"
 OFFICIAL_ELEMENT_POSITION_FIELD = "element_type"
 
-#: The bulk form of ``analytics.snapshot_as_of``: the same predicate and the same
-#: ordering, so the population can be resolved in one read without a second
-#: causal definition existing anywhere in PE-6.  ``?`` order: cutoff.
-CUTOFF_CAPTURE_SQL = (
-    "SELECT player_id, captured_at, id, raw_json FROM player_snapshots "
-    "WHERE captured_at <= ? ORDER BY player_id, captured_at DESC, id DESC"
+#: Why a cutoff has no usable official pool generation.  Each is a fail-closed
+#: refusal, never a reason to read the persisted row.
+GENERATION_UNAVAILABLE_NO_ACCEPTED_GENERATION = (
+    "NO_ACCEPTED_OFFICIAL_BOOTSTRAP_GENERATION_AT_OR_BEFORE_THE_CUTOFF"
+)
+GENERATION_UNAVAILABLE_EMPTY_POOL = "GENERATION_RECORDS_AN_EMPTY_OFFICIAL_ELEMENT_ID_SET"
+GENERATION_UNAVAILABLE_ID_SET_DIGEST_MISMATCH = (
+    "GENERATION_ELEMENT_ID_SET_DOES_NOT_MATCH_ITS_RECORDED_DIGEST"
+)
+
+#: The generation's OWN snapshot rows, selected by the fetch run the generation
+#: was recorded from.  ``?`` order: fetch_run_id, cutoff.
+GENERATION_SNAPSHOT_SQL = (
+    "SELECT player_id, id, captured_at, fetch_run_id, raw_json FROM player_snapshots "
+    "WHERE fetch_run_id = ? AND captured_at <= ? ORDER BY player_id, id DESC"
+)
+
+#: The same rows for a generation recorded without a fetch run: the capture
+#: moment is then the only identity the generation carries.  ``?`` order:
+#: captured_at, cutoff.
+GENERATION_SNAPSHOT_BY_CAPTURE_SQL = (
+    "SELECT player_id, id, captured_at, fetch_run_id, raw_json FROM player_snapshots "
+    "WHERE captured_at = ? AND captured_at <= ? ORDER BY player_id, id DESC"
+)
+
+#: Every recorded generation attempt at or before the cutoff, whatever its
+#: acceptance, newest first (the caller takes the first row).  It is what makes
+#: "the latest ACCEPTED generation" auditable rather than asserted: a newer
+#: attempt is visible, with the reasons it was refused.  ``?`` order: cutoff.
+GENERATION_ATTEMPT_SQL = (
+    "SELECT id, captured_at, accepted, rejection_reasons_json, acceptance_rule "
+    "FROM bootstrap_generations WHERE captured_at <= ? ORDER BY captured_at DESC, id DESC"
+)
+
+#: The historical rows the cutoff-stable priors are pooled from.  The predicate
+#: is NOT restated: ``historical.OBSERVATION_SQL_CLAUSES`` is the PE-1 boundary,
+#: interpolated exactly as the incumbent's own pooling query interpolates it, so
+#: PE-6 pools over the same window the incumbent does.  ``?`` order comes from
+#: ``historical.boundary_params``.
+PRIORS_SQL_TEMPLATE = (
+    "SELECT pg.player_id AS player_id, pg.starts AS started, pg.minutes AS minutes "
+    "FROM player_gameweeks pg JOIN fixtures f ON f.id=pg.fixture_id "
+    "WHERE {boundary} AND pg.starts IS NOT NULL AND pg.minutes IS NOT NULL"
 )
 
 
@@ -380,6 +440,35 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _json_list(text: Any) -> list[Any]:
+    """A JSON list column, or an empty list.  Unparseable is empty, never a guess."""
+
+    if isinstance(text, (list, tuple)):
+        return list(text)
+    if isinstance(text, str) and text.strip():
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return []
+        return list(parsed) if isinstance(parsed, list) else []
+    return []
+
+
+def _generation_element_ids(generation: Mapping[str, Any]) -> list[int]:
+    """The generation's recorded element id set, sorted and de-duplicated.
+
+    ``element_ids_json`` is the column ``bootstrap_generations`` stores it in; a
+    caller that read the row through ``repositories.latest_accepted_bootstrap_generation``
+    arrives with it already parsed.  Both shapes are accepted, and neither is
+    guessed at: an unparseable set is an EMPTY set, which fails closed.
+    """
+
+    raw = generation.get("element_ids")
+    if raw is None:
+        raw = generation.get("element_ids_json")
+    return sorted({int(pid) for pid in _json_list(raw)})
 
 
 def _official_element_payload(capture: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -411,9 +500,13 @@ class PlayerIdentityAsOf:
     element_type: int | None
     in_official_pool: bool
     basis: str
+    #: The accepted generation the pool and its snapshot rows were read from.
+    generation_id: int | None
+    generation_captured_at: str | None
+    #: The generation snapshot row the club/position were read off, if any.
     snapshot_captured_at: str | None
-    #: True only when every resolved field came from the cutoff capture, so a
-    #: later change to the current row cannot move this identity.
+    #: True only when membership, club and position ALL came from the cutoff
+    #: generation, so a later change to the current row cannot move this identity.
     cutoff_safe: bool
     live_row_disagreement: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
@@ -425,6 +518,8 @@ class PlayerIdentityAsOf:
             "element_type": None if self.element_type is None else int(self.element_type),
             "in_official_pool": bool(self.in_official_pool),
             "basis": str(self.basis),
+            "generation_id": None if self.generation_id is None else int(self.generation_id),
+            "generation_captured_at": self.generation_captured_at,
             "snapshot_captured_at": self.snapshot_captured_at,
             "cutoff_safe": bool(self.cutoff_safe),
             "live_row_disagreement": list(self.live_row_disagreement),
@@ -432,197 +527,289 @@ class PlayerIdentityAsOf:
         }
 
 
-def _identity_from(
+def _identity_from_generation(
+    player_id: int,
+    generation: Mapping[str, Any],
     capture: Mapping[str, Any] | None,
     live_row: Mapping[str, Any] | None,
     *,
     allow_live_fallback: bool,
-    in_persisted_pool: bool | None = None,
 ) -> PlayerIdentityAsOf:
-    """Resolve one identity, preferring the cutoff capture over the current row.
+    """Resolve one generation member's identity, preferring its own capture row.
 
-    ``in_persisted_pool`` says whether the caller's enumeration still lists the
-    player.  A candidate the cutoff places in the pool but the persisted pool no
-    longer lists is a divergence worth recording, so it is reported even though
-    there is no current row to compare field by field.
+    MEMBERSHIP is already settled by the generation (he is in its element id
+    set); this resolves the club and the position.  The capture's own ``team`` /
+    ``element_type`` are the only cutoff-safe source.  A capture that is missing,
+    unparseable or silent about a field resolves NOTHING unless the caller has
+    explicitly opted into the live fallback, and a fallback-filled identity is
+    never reported as cutoff-safe.
+
+    ``live_row`` is the CURRENT ``players`` row, supplied explicitly by a caller
+    that has one.  It is read for two reasons only: as that recorded opt-in
+    fallback, and to RECORD how far the persisted state diverges from the
+    cutoff's (``live_row_disagreement``).  It never decides an identity by
+    default.
     """
 
-    if in_persisted_pool is None:
-        in_persisted_pool = live_row is not None
-    raw_id = (capture or {}).get("player_id")
-    if raw_id is None:
-        raw_id = (live_row or {}).get("player_id")
-    player_id = -1 if raw_id is None else int(raw_id)
-    captured_at = None if capture is None else (capture.get("captured_at") or None)
+    generation_id = _int_or_none(generation.get("id"))
+    generation_captured_at = (
+        None if generation.get("captured_at") is None else str(generation["captured_at"])
+    )
+    notes: list[str] = []
+    from_current_row: list[str] = []
+    snapshot_captured_at: str | None = None
+    if capture is None:
+        team: int | None = None
+        position: int | None = None
+        notes.append("THE_CUTOFF_GENERATION_HOLDS_NO_SNAPSHOT_ROW_FOR_THIS_PLAYER")
+    else:
+        payload = _official_element_payload(capture)
+        team = _int_or_none(payload.get(OFFICIAL_ELEMENT_CLUB_FIELD))
+        position = _int_or_none(payload.get(OFFICIAL_ELEMENT_POSITION_FIELD))
+        captured_at = capture.get("captured_at")
+        snapshot_captured_at = None if captured_at is None else str(captured_at)
+        if team is None:
+            notes.append("GENERATION_CAPTURE_CARRIES_NO_CLUB_FIELD")
+        if position is None:
+            notes.append("GENERATION_CAPTURE_CARRIES_NO_POSITION_FIELD")
+
     live_team = _int_or_none((live_row or {}).get("team_id"))
     live_position = _int_or_none((live_row or {}).get("element_type"))
+    if (team is None or position is None) and live_row is not None and allow_live_fallback:
+        if team is None:
+            team = live_team
+            from_current_row.append("club")
+        if position is None:
+            position = live_position
+            from_current_row.append("position")
+        if from_current_row:
+            notes.append("FILLED_FROM_CURRENT_ROW:" + "+".join(from_current_row))
 
-    if capture is None:
-        if live_row is None or not allow_live_fallback:
-            return PlayerIdentityAsOf(
-                player_id=player_id,
-                team_id=None,
-                element_type=None,
-                in_official_pool=False,
-                basis=IDENTITY_BASIS_UNRESOLVED,
-                snapshot_captured_at=None,
-                cutoff_safe=False,
-                notes=(
-                    "NO_CUTOFF_CAPTURE_AND_LIVE_FALLBACK_REFUSED"
-                    if live_row is not None
-                    else "NO_CUTOFF_CAPTURE_AND_NO_CURRENT_ROW",
-                ),
-            )
-        notes = ["LIVE_FALLBACK: no cutoff capture places this player in the official pool"]
-        if live_team is None or live_position is None:
-            notes.append("LIVE_ROW_CARRIES_NO_CLUB_OR_POSITION")
-        return PlayerIdentityAsOf(
-            player_id=player_id,
-            team_id=live_team,
-            element_type=live_position,
-            in_official_pool=bool(live_row.get("is_active")),
-            basis=IDENTITY_BASIS_LIVE_FALLBACK,
-            snapshot_captured_at=None,
-            cutoff_safe=False,
-            notes=tuple(notes),
-        )
+    if team is not None and position is not None:
+        if from_current_row:
+            basis = IDENTITY_BASIS_LIVE_FALLBACK
+        else:
+            basis = IDENTITY_BASIS_CUTOFF_GENERATION
+    else:
+        basis = IDENTITY_BASIS_UNRESOLVED
+        if live_row is not None and not allow_live_fallback:
+            notes.append("THE_CURRENT_ROW_IS_NOT_AN_ADMITTED_SUBSTITUTE")
 
-    payload = _official_element_payload(capture)
-    team = _int_or_none(payload.get(OFFICIAL_ELEMENT_CLUB_FIELD))
-    position = _int_or_none(payload.get(OFFICIAL_ELEMENT_POSITION_FIELD))
-    notes: list[str] = []
-    if team is None:
-        notes.append("CAPTURE_CARRIES_NO_CLUB_FIELD")
-    if position is None:
-        notes.append("CAPTURE_CARRIES_NO_POSITION_FIELD")
     disagreement: list[str] = []
-    if not in_persisted_pool:
+    if live_row is None:
         disagreement.append("membership:in_pool->absent_from_persisted_pool")
-    if live_row is not None:
+    else:
         if live_team is not None and team is not None and live_team != team:
             disagreement.append(f"club:{team}->{live_team}")
         if live_position is not None and position is not None and live_position != position:
             disagreement.append(f"position:{position}->{live_position}")
         if not live_row.get("is_active"):
-            # The cutoff evidence places him in the pool; the current row says he
-            # is gone.  The cutoff wins, and the disagreement is recorded.
+            # The cutoff generation places him in the pool; the current row says
+            # he is gone.  The cutoff wins, and the disagreement is recorded.
             disagreement.append("membership:in_pool->inactive")
-    cutoff_safe = team is not None and position is not None
-    if not cutoff_safe and allow_live_fallback and live_row is not None:
-        if (team is None and live_team is not None) or (position is None and live_position is not None):
-            notes.append("PARTIAL_FIELDS_FILLED_FROM_CURRENT_ROW")
-            team = team if team is not None else live_team
-            position = position if position is not None else live_position
     return PlayerIdentityAsOf(
-        player_id=player_id,
+        player_id=int(player_id),
         team_id=team,
         element_type=position,
         in_official_pool=True,
-        basis=IDENTITY_BASIS_CUTOFF_CAPTURE,
-        snapshot_captured_at=None if captured_at is None else str(captured_at),
-        cutoff_safe=cutoff_safe,
+        basis=basis,
+        generation_id=generation_id,
+        generation_captured_at=generation_captured_at,
+        snapshot_captured_at=snapshot_captured_at,
+        cutoff_safe=basis == IDENTITY_BASIS_CUTOFF_GENERATION,
         live_row_disagreement=tuple(disagreement),
         notes=tuple(notes),
     )
 
 
-def cutoff_official_captures(
-    conn: sqlite3.Connection, cutoff: str
+def generation_snapshot_rows(
+    conn: sqlite3.Connection, generation: Mapping[str, Any], cutoff: str
 ) -> dict[int, dict[str, Any]]:
-    """The freshest official element capture at or before ``cutoff``, per player.
+    """The generation's own snapshot rows, newest first per player.
 
-    Built from :data:`CUTOFF_CAPTURE_SQL`, which is the bulk form of
-    ``analytics.snapshot_as_of``: identical predicate (``captured_at <= cutoff``)
-    and identical ordering (``captured_at DESC, id DESC``), so a caller gets the
-    same row it would get one player at a time.  The suite pins the two against
-    each other, so this cannot silently become a second definition.
+    ``fetch_run_id`` is the generation's own record of the fetch it was parsed
+    from, so its snapshot rows are selected by that run.  A generation recorded
+    without one is selected by its capture moment instead: that is the only
+    identity such a row carries.  Either way the rows must have been observable
+    at the cutoff.
     """
 
+    fetch_run_id = _int_or_none(generation.get("fetch_run_id"))
+    captured_at = "" if generation.get("captured_at") is None else str(generation["captured_at"])
+    if fetch_run_id is None:
+        rows = conn.execute(
+            GENERATION_SNAPSHOT_BY_CAPTURE_SQL, (captured_at, str(cutoff))
+        ).fetchall()
+    else:
+        rows = conn.execute(GENERATION_SNAPSHOT_SQL, (fetch_run_id, str(cutoff))).fetchall()
     captures: dict[int, dict[str, Any]] = {}
-    for row in conn.execute(CUTOFF_CAPTURE_SQL, (str(cutoff),)).fetchall():
+    for row in rows:
         player_id = int(row["player_id"])
         if player_id in captures:  # the first row per player is the as-of winner
             continue
         captures[player_id] = {
             "player_id": player_id,
-            "captured_at": row["captured_at"],
             "id": row["id"],
+            "captured_at": row["captured_at"],
+            "fetch_run_id": row["fetch_run_id"],
             "raw_json": row["raw_json"],
         }
     return captures
 
 
-def resolve_player_identity_as_of(
-    conn: sqlite3.Connection,
-    player_id: int,
-    cutoff: str,
-    *,
-    live_row: Mapping[str, Any] | None = None,
-    allow_live_fallback: bool = True,
-) -> PlayerIdentityAsOf:
-    """One player's identity at ``cutoff``, from the capture visible then.
+def official_pool_generation_at_cutoff(conn: sqlite3.Connection, cutoff: str) -> dict[str, Any]:
+    """The official pool generation a prediction at ``cutoff`` must resolve from.
 
-    ``live_row`` is the CURRENT ``players`` row, supplied explicitly by a caller
-    that has one.  It is used only when the cutoff has no capture for the player,
-    and that fallback is always recorded (``basis`` /
-    ``IDENTITY_BASIS_LIVE_FALLBACK``) rather than passed off as cutoff evidence.
+    The reader is ``outcome_ledger.accepted_generation_at``: the accepted
+    generation at or before ``observed_at``, which is the rule PE-5 certifies a
+    freeze with.  It is reused rather than restated, so "latest accepted at or
+    before the cutoff" has exactly one definition in the codebase.
+
+    FAIL CLOSED: the returned ``usable`` is False -- with the reason -- when there
+    is no accepted generation at all at or before the cutoff, when the recorded
+    element id set is empty, or when that set does not hash to the digest the
+    generation recorded.  A caller must then project nothing rather than read the
+    mutable current row.
     """
 
-    capture = analytics.snapshot_as_of(conn, int(player_id), str(cutoff))
-    return _identity_from(capture, live_row, allow_live_fallback=allow_live_fallback)
+    generation = outcome_ledger.accepted_generation_at(conn, observed_at=str(cutoff))
+    attempt_row = conn.execute(GENERATION_ATTEMPT_SQL, (str(cutoff),)).fetchone()
+    attempt: dict[str, Any] | None = None
+    if attempt_row is not None:
+        record = dict(attempt_row)
+        attempt = {
+            "id": _int_or_none(record.get("id")),
+            "captured_at": None if record.get("captured_at") is None else str(record["captured_at"]),
+            "accepted": bool(record.get("accepted")),
+            "acceptance_rule": record.get("acceptance_rule"),
+            "rejection_reasons": _json_list(record.get("rejection_reasons_json")),
+        }
+    reasons: list[str] = []
+    element_ids: list[int] = []
+    digest_matches: bool | None = None
+    generation_block: dict[str, Any] | None = None
+    if generation is None:
+        reasons.append(GENERATION_UNAVAILABLE_NO_ACCEPTED_GENERATION)
+    else:
+        element_ids = _generation_element_ids(generation)
+        declared_digest = str(generation.get("element_ids_sha256") or "")
+        observed_digest = repo.element_ids_identity(element_ids)[1]
+        digest_matches = bool(declared_digest) and declared_digest == observed_digest
+        if not element_ids:
+            reasons.append(GENERATION_UNAVAILABLE_EMPTY_POOL)
+        elif not digest_matches:
+            reasons.append(GENERATION_UNAVAILABLE_ID_SET_DIGEST_MISMATCH)
+        generation_block = {
+            "id": _int_or_none(generation.get("id")),
+            "captured_at": (
+                None if generation.get("captured_at") is None else str(generation["captured_at"])
+            ),
+            "fetch_run_id": _int_or_none(generation.get("fetch_run_id")),
+            "accepted": True,
+            "official_element_count": _int_or_none(generation.get("official_element_count")),
+            "element_ids_count": len(element_ids),
+            "element_ids_sha256": declared_digest or None,
+            "element_ids_sha256_matches_the_id_set": digest_matches,
+            "acceptance_rule": generation.get("acceptance_rule"),
+            "acceptance_rule_version": generation.get("acceptance_rule_version"),
+        }
+    return {
+        "cutoff": str(cutoff),
+        "reader": (
+            "outcome_ledger.accepted_generation_at: the latest ACCEPTED official bootstrap "
+            "generation at or before the cutoff"
+        ),
+        "usable": not reasons,
+        "reasons": reasons,
+        "generation": generation_block,
+        "element_ids": element_ids,
+        "newest_attempt": attempt,
+        # None when there is no attempt to compare; a False here means a newer
+        # attempt at or before the cutoff was REFUSED, which is exactly why the
+        # accepted one is not the newest row in the table.
+        "newest_attempt_is_the_accepted_generation": (
+            None
+            if attempt is None or generation_block is None
+            else _int_or_none(attempt.get("id")) == generation_block["id"]
+        ),
+    }
+
+
+def generation_artifact_block(pool_generation: Mapping[str, Any]) -> dict[str, Any]:
+    """The pool-generation summary as an artifact block, without the raw id list."""
+
+    block = {key: value for key, value in dict(pool_generation).items() if key != "element_ids"}
+    block["element_ids_count"] = len(pool_generation.get("element_ids") or [])
+    block["accepted_generation"] = block.pop("generation", None)
+    return block
 
 
 def resolve_candidate_pool(
     conn: sqlite3.Connection,
     cutoff: str,
     *,
+    generation: Mapping[str, Any] | None = None,
     live_rows: Sequence[Mapping[str, Any]] | None = None,
-    captures: Mapping[int, Mapping[str, Any]] | None = None,
-    allow_live_fallback: bool = True,
+    allow_live_fallback: bool = False,
 ) -> dict[str, Any]:
-    """One pass: the resolved pool, the unresolved candidates and the summary.
+    """One pass: the candidate pool, the unresolved candidates and the summary.
 
-    The candidate set is the UNION of the players the cutoff captures place in
-    the official pool and the persisted pool (``analytics.projectable_players``,
-    the incumbent's own candidate rule).  The union matters in both directions: a
-    player who was in the pool at the cutoff and has since been marked inactive
-    is still a candidate for that cutoff, and a player the persisted pool lists
-    is still a candidate when the cutoff holds no capture for him (with the
-    declared live fallback recorded).
+    The candidate set IS the official pool at the cutoff: the element ids of the
+    latest ACCEPTED bootstrap generation at or before it.  Club and position come
+    from that generation's own snapshot rows.  A player only the persisted pool
+    lists is not a candidate here -- the generation did not place him in the
+    official pool at that cutoff -- and the divergence between the two is
+    reported in the summary rather than absorbed.
 
-    A candidate whose club or position cannot be resolved at all is returned in
-    ``unresolved`` rather than dropped, so a caller can classify it instead of
-    losing it silently.
+    A generation member whose own row is missing, unparseable, or leaves the club
+    or position unstated is returned in ``unresolved`` rather than dropped, so a
+    caller can classify it instead of losing it silently.  The persisted row is
+    read ONLY through the explicit ``allow_live_fallback`` opt-in, and such a row
+    is never reported as cutoff-safe.
+
+    ``identity_available`` False means the cutoff has no usable official pool at
+    all and the caller must fail closed: nothing is projected.
     """
 
+    cutoff = str(cutoff)
+    pool_generation = (
+        dict(generation) if generation is not None else official_pool_generation_at_cutoff(conn, cutoff)
+    )
     live = {
         int(row["player_id"]): dict(row)
         for row in (live_rows if live_rows is not None else analytics.projectable_players(conn))
     }
-    capture_map = (
-        dict(captures) if captures is not None else cutoff_official_captures(conn, cutoff)
-    )
-    moments = sorted(
-        {
-            str(row.get("captured_at"))
-            for row in capture_map.values()
-            if row.get("captured_at")
+    if not pool_generation.get("usable"):
+        return {
+            "cutoff": cutoff,
+            "identity_available": False,
+            "generation": generation_artifact_block(pool_generation),
+            "players": [],
+            "unresolved": [],
+            "summary": identity_resolution_summary(
+                [],
+                pool_generation=pool_generation,
+                unresolved=[],
+                persisted_pool_ids=sorted(live),
+                identity_available=False,
+            ),
         }
-    )
-    newest_capture = moments[-1] if moments else None
+    generation_row = pool_generation.get("generation") or {}
+    captures = generation_snapshot_rows(conn, generation_row, cutoff)
     players: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
-    for player_id in sorted(set(live) | set(int(pid) for pid in capture_map)):
-        identity = _identity_from(
-            capture_map.get(player_id),
+    for player_id in [int(pid) for pid in (pool_generation.get("element_ids") or [])]:
+        identity = _identity_from_generation(
+            player_id,
+            generation_row,
+            captures.get(player_id),
             live.get(player_id),
             allow_live_fallback=allow_live_fallback,
-            in_persisted_pool=player_id in live,
         )
-        if not identity.in_official_pool or identity.team_id is None or identity.element_type is None:
+        if identity.team_id is None or identity.element_type is None:
             unresolved.append(identity.as_dict())
             continue
-        captured_at = identity.snapshot_captured_at
+        snapshot = captures.get(player_id) or {}
         players.append(
             {
                 "player_id": int(player_id),
@@ -632,25 +819,25 @@ def resolve_candidate_pool(
                 "identity": identity.as_dict(),
                 "identity_basis": identity.basis,
                 "identity_cutoff_safe": bool(identity.cutoff_safe),
-                "identity_snapshot_captured_at": captured_at,
-                # Not the newest capture visible at the cutoff: the official list
-                # that was freshest then may not have named this player at all.
-                # Reported, never silently dropped.
-                "identity_capture_is_newest": (
-                    None
-                    if captured_at is None or newest_capture is None
-                    else str(captured_at) == newest_capture
-                ),
+                "identity_generation_id": identity.generation_id,
+                "identity_generation_captured_at": identity.generation_captured_at,
+                "identity_snapshot_id": _int_or_none(snapshot.get("id")),
+                "identity_snapshot_captured_at": identity.snapshot_captured_at,
             }
         )
     return {
-        "cutoff": str(cutoff),
+        "cutoff": cutoff,
+        "identity_available": True,
+        "generation": generation_artifact_block(pool_generation),
         "players": players,
         "unresolved": unresolved,
-        "summary": {
-            **identity_resolution_summary(players),
-            "unresolved_candidates": len(unresolved),
-        },
+        "summary": identity_resolution_summary(
+            players,
+            pool_generation=pool_generation,
+            unresolved=unresolved,
+            persisted_pool_ids=sorted(live),
+            identity_available=True,
+        ),
     }
 
 
@@ -658,17 +845,17 @@ def projectable_players_as_of(
     conn: sqlite3.Connection,
     cutoff: str,
     *,
+    generation: Mapping[str, Any] | None = None,
     live_rows: Sequence[Mapping[str, Any]] | None = None,
-    captures: Mapping[int, Mapping[str, Any]] | None = None,
-    allow_live_fallback: bool = True,
+    allow_live_fallback: bool = False,
 ) -> list[dict[str, Any]]:
     """The candidate pool with every identity resolved as of ``cutoff``."""
 
     return resolve_candidate_pool(
         conn,
         cutoff,
+        generation=generation,
         live_rows=live_rows,
-        captures=captures,
         allow_live_fallback=allow_live_fallback,
     )["players"]
 
@@ -677,17 +864,17 @@ def unresolved_candidates_as_of(
     conn: sqlite3.Connection,
     cutoff: str,
     *,
+    generation: Mapping[str, Any] | None = None,
     live_rows: Sequence[Mapping[str, Any]] | None = None,
-    captures: Mapping[int, Mapping[str, Any]] | None = None,
-    allow_live_fallback: bool = True,
+    allow_live_fallback: bool = False,
 ) -> list[dict[str, Any]]:
-    """Candidates the cutoff cannot place in the official pool, with their reasons."""
+    """Generation members the cutoff cannot place, with their reasons."""
 
     return resolve_candidate_pool(
         conn,
         cutoff,
+        generation=generation,
         live_rows=live_rows,
-        captures=captures,
         allow_live_fallback=allow_live_fallback,
     )["unresolved"]
 
@@ -702,48 +889,174 @@ def identity_basis_counts(players: Iterable[Mapping[str, Any]]) -> dict[str, int
     return dict(sorted(counts.items()))
 
 
-def identity_resolution_summary(players: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def identity_resolution_summary(
+    players: Sequence[Mapping[str, Any]],
+    *,
+    pool_generation: Mapping[str, Any] | None = None,
+    unresolved: Sequence[Mapping[str, Any]] = (),
+    persisted_pool_ids: Sequence[int] = (),
+    identity_available: bool = True,
+) -> dict[str, Any]:
     """The identity provenance of one candidate pool, for the artifact."""
 
     rows = list(players)
     safe = [row for row in rows if row.get("identity_cutoff_safe")]
-    moments = sorted(
-        {
-            str(row["identity_snapshot_captured_at"])
-            for row in rows
-            if row.get("identity_snapshot_captured_at")
+    reasons: dict[str, int] = {}
+    for item in unresolved:
+        for note in item.get("notes") or []:
+            reasons[str(note)] = reasons.get(str(note), 0) + 1
+    generation_ids = {
+        int(pid) for pid in ((pool_generation or {}).get("element_ids") or [])
+    }
+    persisted_ids = {int(pid) for pid in persisted_pool_ids}
+    divergence = (
+        None
+        if not identity_available or not generation_ids
+        else {
+            "cutoff_generation_pool_size": len(generation_ids),
+            "persisted_pool_size": len(persisted_ids),
+            "in_cutoff_generation_not_in_persisted_pool": len(generation_ids - persisted_ids),
+            "in_persisted_pool_not_in_cutoff_generation": len(persisted_ids - generation_ids),
+            "rule": (
+                "the cutoff generation defines the official pool at that cutoff: a player only "
+                "the persisted pool lists is NOT a candidate here (the generation did not place "
+                "him in the pool), and a player only the generation lists IS a candidate whatever "
+                "the persisted row says now"
+            ),
+            "scope": "reported, never scored: this divergence describes the store, not the model",
         }
     )
-    newest = moments[-1] if moments else None
-    from_newest = (
-        sum(
-            1
-            for row in rows
-            if newest is not None and str(row.get("identity_snapshot_captured_at") or "") == newest
-        )
-        if newest is not None
-        else 0
-    )
     return {
-        "basis_counts": identity_basis_counts(rows),
-        "rows": len(rows),
-        "cutoff_safe_rows": len(safe),
-        "cutoff_safe_share": (
-            round(len(safe) / len(rows), 6) if rows else None
-        ),
-        "capture_moments": moments,
-        "rows_from_newest_capture": from_newest,
-        "rows_from_older_captures": len(rows) - from_newest,
-        "stale_capture_rule": (
-            "a row whose capture is not the newest one visible at the cutoff is REPORTED, not "
-            "dropped: the freshest official list may not name him, and a stale capture is "
-            "doubt rather than evidence"
-        ),
+        "identity_available": bool(identity_available),
         "rule": (
-            "membership, club and position come from the official element capture at or before "
-            "the cutoff; the current players row is used only as a recorded fallback"
+            "membership comes from the latest ACCEPTED official bootstrap generation at or before "
+            "the cutoff; club and position come from that generation's own snapshot rows; the "
+            "persisted players row is never used unless a caller explicitly opts in"
         ),
+        "generation": None if pool_generation is None else generation_artifact_block(pool_generation),
+        "rows": len(rows),
+        "basis_counts": identity_basis_counts(rows),
+        "cutoff_safe_rows": len(safe),
+        "cutoff_safe_share": (round(len(safe) / len(rows), 6) if rows else None),
+        "unresolved_candidates": len(unresolved),
+        "unresolved_reasons": dict(sorted(reasons.items())),
+        "persisted_pool_divergence": divergence,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cutoff-stable league / team-position priors.
+# ---------------------------------------------------------------------------
+
+
+def cutoff_stable_league_pools(
+    conn: sqlite3.Connection,
+    planning_event: int,
+    cutoff: str,
+    identities: Mapping[int, tuple[int, int]],
+) -> tuple["incumbent.LeaguePools", dict[str, Any]]:
+    """The incumbent's priors, pooled from cutoff-stable identity.
+
+    ``minutes_model.league_pools`` joins every historical row it pools to the
+    PERSISTED ``players`` row for that row's club and position, so a post-cutoff
+    transfer or position change silently moves a historical prior.  That read is
+    the incumbent's frozen behaviour; this adapter does not rewrite it.  Instead
+    it builds the same two tables -- the position pools and the team-position
+    pools, with the incumbent's own keys, formulas and rounding -- over the SAME
+    canonical PE-1 boundary, attributing each pooled row by the identity resolved
+    at the cutoff, and returns them through the incumbent's own ``LeaguePools``
+    contract, which ``project_player_fixture`` already accepts.
+
+    ``identities`` maps ``player_id -> (team_id, element_type)`` as of the cutoff.
+    A row whose player has no cutoff identity is not pooled (the incumbent's own
+    query drops such rows by its inner join too) and is COUNTED, so the share of
+    the window this affects is visible rather than implied.
+    """
+
+    rows = conn.execute(
+        PRIORS_SQL_TEMPLATE.format(boundary=historical.OBSERVATION_SQL_CLAUSES),
+        historical.boundary_params(cutoff, planning_event=int(planning_event)),
+    ).fetchall()
+    position_pools: dict[int, dict[str, float]] = {}
+    team_position: dict[tuple[int, int], dict[str, float]] = {}
+    pooled_players: set[int] = set()
+    unattributed_rows = 0
+    for row in rows:
+        player_id = int(row["player_id"])
+        identity = identities.get(player_id)
+        if identity is None:
+            unattributed_rows += 1
+            continue
+        team_id = int(identity[0])
+        position = int(identity[1])
+        started = bool(row["started"])
+        minutes = float(row["minutes"])
+        pool = position_pools.setdefault(
+            position,
+            {
+                "starts": 0.0,
+                "rows": 0.0,
+                "start_minutes": 0.0,
+                "p60": 0.0,
+                "p80": 0.0,
+                "cameo_rows": 0.0,
+                "cameo_minutes_total": 0.0,
+                "cameo60": 0.0,
+            },
+        )
+        pool["rows"] += 1
+        if started:
+            pool["starts"] += 1
+            pool["start_minutes"] += minutes
+            pool["p60"] += 1 if minutes >= 60 else 0
+            pool["p80"] += 1 if minutes >= 80 else 0
+        elif minutes > 0:
+            pool["cameo_rows"] += 1
+            pool["cameo_minutes_total"] += minutes
+            pool["cameo60"] += 1 if minutes >= 60 else 0
+        team_pool = team_position.setdefault((team_id, position), {"rows": 0.0, "starts": 0.0})
+        team_pool["rows"] += 1
+        team_pool["starts"] += 1 if started else 0
+        pooled_players.add(player_id)
+
+    position: dict[int, dict[str, float]] = {}
+    for pos, pool in position_pools.items():
+        starts = float(pool["starts"])
+        rows_count = float(pool["rows"])
+        not_start_rows = rows_count - starts
+        cameo_rows = float(pool["cameo_rows"])
+        cameo_minutes = pool["cameo_minutes_total"] / cameo_rows if cameo_rows else 15.0
+        position[pos] = {
+            "start_rows": int(rows_count),
+            "p_start": round(starts / rows_count, 6) if rows_count else 0.0,
+            "minutes_if_start": round(pool["start_minutes"] / starts, 6) if starts else 0.0,
+            "p60_if_start": round(pool["p60"] / starts, 6) if starts else 0.0,
+            "p80_if_start": round(pool["p80"] / starts, 6) if starts else 0.0,
+            "not_start_rows": int(not_start_rows),
+            "cameo_rate": round(cameo_rows / not_start_rows, 6) if not_start_rows else 0.0,
+            "cameo_rows": int(cameo_rows),
+            "cameo_minutes": round(cameo_minutes, 6),
+            "cameo_p60": round(pool["cameo60"] / cameo_rows, 6) if cameo_rows else 0.0,
+        }
+    disclosure = {
+        "construction": "PE-6 ADAPTER: cutoff_stable_league_pools",
+        "boundary": "historical_observations.OBSERVATION_SQL_CLAUSES (the PE-1 canonical boundary)",
+        "identity_source": (
+            "the accepted official bootstrap generation at or before the cutoff, per pooled row"
+        ),
+        "incumbent_league_pools_read_used": False,
+        "incumbent_read_note": (
+            "minutes_model.league_pools joins its pooled rows to the PERSISTED players row; that "
+            "frozen read is not on this path"
+        ),
+        "pooled_rows": len(rows),
+        "pooled_rows_attributed": len(rows) - unattributed_rows,
+        "pooled_rows_without_cutoff_identity": unattributed_rows,
+        "pooled_players": len(pooled_players),
+        "position_keys": sorted(position),
+        "team_position_keys": len(team_position),
+    }
+    return incumbent.LeaguePools(position=position, team_position=team_position), disclosure
 
 
 # ---------------------------------------------------------------------------
@@ -1389,8 +1702,11 @@ class ChallengerArms:
     #: The cutoff-resolved candidate pool every arm was projected from, so the
     #: evaluation classifies exactly the population the arms cover.
     players: list[dict[str, Any]] = field(default_factory=list)
-    #: Candidates the cutoff could not place in the official pool, with reasons.
+    #: Generation members the cutoff could not place, with reasons.
     unresolved: list[dict[str, Any]] = field(default_factory=list)
+    #: The cut-off-stable priors this run was projected against, and how they
+    #: were built (no persisted-row identity anywhere in the pooling).
+    pool_priors: dict[str, Any] = field(default_factory=dict)
 
     def keys(self) -> list[tuple[int, int]]:
         return sorted(self.incumbent_rows)
@@ -1419,20 +1735,25 @@ def build_challenger_arms(
     incumbent_config: "incumbent.MinutesModelConfig | None" = None,
     challenger_config: AvailabilityMinutesChallengerConfig | None = None,
     arm_definitions: Mapping[str, frozenset[str]] | None = None,
-    players: Sequence[Mapping[str, Any]] | None = None,
-    unresolved: Sequence[Mapping[str, Any]] | None = None,
+    resolution: Mapping[str, Any] | None = None,
+    allow_live_identity_fallback: bool = False,
 ) -> ChallengerArms:
     """Project every player-fixture of the event for the incumbent and the arms.
 
-    The incumbent projection function is called unchanged.  The three deviations
-    are all recorded per row: ``include_conditionals=True`` (the coherent layer
-    needs the same conditionals), the CUTOFF-RESOLVED player identity (membership,
-    club and position as they stood at the cutoff rather than as they stand now),
-    and -- where the return-ramp refinement is in play -- a per-player
-    ``MinutesModelConfig`` carrying the attenuated ramp factors.
+    The incumbent projection function is called unchanged.  The deviations are
+    all recorded per row: ``include_conditionals=True`` (the coherent layer needs
+    the same conditionals), the CUTOFF-RESOLVED player identity (membership, club
+    and position as the cutoff's accepted generation records them rather than as
+    the persisted row now claims), the cutoff-stable ``LeaguePools`` the incumbent
+    is handed through its own contract, and -- where the return-ramp refinement is
+    in play -- a per-player ``MinutesModelConfig`` carrying the attenuated ramp
+    factors.
 
-    ``players`` lets a caller supply a pool it has already resolved, so the
-    evaluation's classification and its arms cannot disagree about who is who.
+    ``resolution`` lets a caller supply a pool it has already resolved
+    (:func:`resolve_candidate_pool`), so the evaluation's classification and its
+    arms cannot disagree about who is who.  It is required to be one that
+    RESOLVED its identity: a cutoff with no usable official pool generation stops
+    here rather than being projected under a guess.
     """
 
     config = incumbent_config or incumbent.MinutesModelConfig()
@@ -1441,25 +1762,39 @@ def build_challenger_arms(
     requested_families = frozenset().union(*definitions.values()) if definitions else frozenset()
     ramp_needed = FAMILY_RETURN_FROM_INJURY_RAMP in requested_families
 
-    if players is None:
-        resolution = resolve_candidate_pool(conn, cutoff)
-        pool = resolution["players"]
-        refused = resolution["unresolved"]
-    else:
-        pool = [dict(row) for row in players]
-        refused = [dict(row) for row in (unresolved or ())]
+    resolved = (
+        dict(resolution)
+        if resolution is not None
+        else resolve_candidate_pool(
+            conn, cutoff, allow_live_fallback=allow_live_identity_fallback
+        )
+    )
+    if not resolved.get("identity_available"):
+        raise ChallengerInconsistencyError(
+            "the cutoff has no usable official pool generation, so no candidate identity can be "
+            "resolved at it: "
+            + "; ".join((resolved.get("summary") or {}).get("generation", {}).get("reasons") or [])
+        )
+    pool = [dict(row) for row in resolved["players"]]
+    refused = [dict(row) for row in resolved["unresolved"]]
 
-    pools = incumbent.league_pools(conn, int(planning_event), cutoff)
+    identities = {
+        int(row["player_id"]): (int(row["team_id"]), int(row["element_type"])) for row in pool
+    }
+    pools, pool_priors = cutoff_stable_league_pools(
+        conn, int(planning_event), cutoff, identities
+    )
     fixtures_by_team = analytics.event_fixture_map(conn, int(planning_event))
     identity = challenger_identity(challenger_config, config)
-    identity["player_identity"] = identity_resolution_summary(pool)
-    identity["player_identity"]["unresolved_candidates"] = len(refused)
+    identity["player_identity"] = dict(resolved["summary"])
+    identity["pool_priors"] = pool_priors
     result = ChallengerArms(
         planning_event=int(planning_event),
         cutoff=cutoff,
         identity=identity,
         players=pool,
         unresolved=refused,
+        pool_priors=pool_priors,
     )
     for arm in definitions:
         result.arms[arm] = {}
