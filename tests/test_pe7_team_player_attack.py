@@ -31,9 +31,10 @@ Contract hard-test map
 
 Beyond the contract: challenger identity and provenance (21, 22), the empty-family
 equivalence with the incumbent (23, 24, 25), the incumbent COMPARISON arm's own
-cutoff safety and fidelity (2c, 4b, 25b), the derived estimators in both directions,
-at their fail-closed edges and on their numerical scale (26, 26b, 27, 27b, 28), the
-evaluation artifact's own limits (29-36), the declared disclosure vocabulary firing
+cutoff safety, fidelity and clock-independence (2c, 4b, 25b, 25c), the derived
+estimators in both directions, at their fail-closed edges and on their numerical
+scale (26, 26b, 27, 27b, 28), the evaluation artifact's own limits (29-36), the
+declared disclosure vocabulary firing
 (15d, 15e, 37), and a season-opening cutoff with no team evidence (32b).
 """
 
@@ -1953,8 +1954,23 @@ def test_25_the_incumbent_arm_is_the_incumbents_own_projection_code():
         assert published[key]["prior_source"] == arm.incumbent_rows[key]["prior_source"]
 
 
-def test_25b_the_incumbent_arm_is_the_incumbents_own_numbers_field_by_field():
-    """The adapter is the incumbent, not a look-alike.
+#: The fields two builds of the same row may legitimately differ in.  A row carries
+#: the wall clock its build ran at, and a wall clock is not model output, so it is
+#: EXCLUDED from cross-run field equality — under the vocabulary the artifact digest
+#: already strips (:data:`ev.VOLATILE_ARTIFACT_KEYS`).  The exclusion is asserted
+#: rather than assumed: every comparison below proves the difference set is
+#: contained in this set, so a new non-volatile field cannot hide inside it, and
+#: test_25c forces the two builds into different seconds so the equivalence cannot
+#: pass on a shared clock.
+VOLATILE_ROW_FIELDS: frozenset[str] = frozenset(ev.VOLATILE_ARTIFACT_KEYS)
+#: The fields the contract treats under their own declared rules instead of raw
+#: equality: the substituted pooled-prior flag, and the provenance block this arm
+#: extends with its own construction.
+DECLARED_ROW_DIFFERENCES: frozenset[str] = frozenset({"risk_flags", "provenance"})
+
+
+def _assert_incumbent_arm_row(key, expected, actual) -> bool:
+    """One comparison-arm row against the incumbent's own published row.
 
     On a store whose prior-season rows were all observable at the cutoff and whose
     cutoff identity agrees with the persisted row, the arm must equal the
@@ -1962,7 +1978,54 @@ def test_25b_the_incumbent_arm_is_the_incumbents_own_numbers_field_by_field():
     the whole hierarchy, not just the posterior — with exactly two declared
     differences: the pooled-prior flag is renamed (the arm attributes the pool by
     the cutoff's identity, so it may not claim the incumbent's persisted-squad
-    wording) and the adapter's own construction block is added.
+    wording) and the adapter's own construction block is added.  The wall clock each
+    build ran at is the one further field allowed to differ, and only because it is
+    a clock.
+
+    The contract sits here once so the same-second case (25b) and the clock-skewed
+    case (25c) cannot drift apart.  Returns True when this row exercised the
+    pooled-prior renaming, so the caller can assert the path was covered rather than
+    assumed away.
+    """
+
+    assert set(expected) <= set(actual), key
+    differing = {field for field in expected if actual[field] != expected[field]}
+    assert differing <= VOLATILE_ROW_FIELDS | DECLARED_ROW_DIFFERENCES, (key, differing)
+
+    # Every published provenance entry is the incumbent's, unchanged.
+    for name, value in expected["provenance"].items():
+        assert actual["provenance"][name] == value, (key, name)
+    # The flags differ ONLY by the declared renaming.
+    added = set(actual["risk_flags"]) - set(expected["risk_flags"])
+    removed = set(expected["risk_flags"]) - set(actual["risk_flags"])
+    allowed_additions = set(player_ch.INCUMBENT_ARM_FLAG_ADDITIONS) | set(
+        player_ch.INCUMBENT_ARM_FLAG_SUBSTITUTIONS.values()
+    )
+    assert added <= allowed_additions, (key, added)
+    assert removed <= set(player_ch.INCUMBENT_ARM_FLAG_SUBSTITUTIONS), (key, removed)
+    # The arm carries its identity and its own construction, not a rename of the
+    # incumbent's version string.
+    assert actual["model_version"] == player_rates.PLAYER_RATE_MODEL_VERSION
+    assert actual["arm"] == player_ch.ARM_INCUMBENT
+    assert actual["arm_construction"]["construction"] == player_ch.INCUMBENT_ARM_CONSTRUCTION
+    assert actual["arm_construction"]["incumbent_module_modified"] is False
+    assert actual["arm_construction"]["incumbent_pooled_rates_read_used"] is False
+    if "POSITION_FROM_CURRENT_SQUAD" in expected["risk_flags"]:
+        # The incumbent publishes this flag as a bare literal, so the test pins the
+        # literal rather than a constant that does not exist.
+        assert player_ch.POSITION_BASIS in actual["risk_flags"], key
+        return True
+    return False
+
+
+def test_25b_the_incumbent_arm_is_the_incumbents_own_numbers_field_by_field():
+    """The adapter is the incumbent, not a look-alike.
+
+    Both sides are built from the cutoff's own evidence and compared field by field
+    under the shared contract above.  The wall clock each build ran at is excluded
+    from that comparison, so the equivalence is a property of the two models rather
+    than of the second they happened to run in; test_25c proves the same thing with
+    the two builds forced apart.
     """
 
     conn = connect_database(":memory:")
@@ -1987,36 +2050,56 @@ def test_25b_the_incumbent_arm_is_the_incumbents_own_numbers_field_by_field():
 
     renamed = 0
     for key in sorted(published):
+        renamed += _assert_incumbent_arm_row(key, published[key], arm.incumbent_rows[key])
+    assert renamed, "the pooled-prior path must be exercised for the renaming to mean anything"
+
+
+def test_25c_the_equivalence_does_not_depend_on_the_two_builds_sharing_a_second(monkeypatch):
+    """25b's equivalence holds when the two builds land in DIFFERENT seconds.
+
+    25b builds both sides in one process, so an all-field equality would pass or
+    fail on whether the two builds happened to fall inside the same second: the row
+    carries the clock it was built at, and that clock is not the incumbent's
+    arithmetic.  The two builds here are forced apart — the comparison arm at
+    12:30:00, the incumbent's own publication at 12:30:11 — so the volatile field
+    really does differ between them and the shared contract has to carry the
+    equivalence on its own rather than on a coincidence of timing.
+    """
+
+    conn = connect_database(":memory:")
+    _world(conn, history_omit=(NO_PRIOR_PLAYER, ROLE_CHANGE_PLAYER))
+    resolution = _pool(conn)
+
+    arm_clock = "2026-09-12T12:30:00Z"
+    published_clock = "2026-09-12T12:30:11Z"
+    monkeypatch.setattr(player_ch, "utc_now", lambda: arm_clock)
+    arm = player_ch.build_challenger_player_arms(
+        conn,
+        PLANNING_EVENT,
+        CUTOFF,
+        players=resolution["players"],
+        identities=_identities(resolution),
+    )
+    monkeypatch.setattr(player_rates, "utc_now", lambda: published_clock)
+    pool_ids = {int(player["player_id"]) for player in resolution["players"]}
+    published = {
+        (int(row["player_id"]), str(row["component"])): row
+        for row in player_rates.build_player_rate_projections(conn, PLANNING_EVENT, CUTOFF)
+        if int(row["player_id"]) in pool_ids
+    }
+    assert set(published) == set(arm.incumbent_rows)
+
+    renamed = 0
+    clocks = set()
+    for key in sorted(published):
         expected = published[key]
         actual = arm.incumbent_rows[key]
-        for field in expected:
-            if field in {"risk_flags", "provenance"}:
-                continue
-            assert actual[field] == expected[field], (key, field)
-        # Every published provenance entry is the incumbent's, unchanged.
-        for name, value in expected["provenance"].items():
-            assert actual["provenance"][name] == value, (key, name)
-        # The flags differ ONLY by the declared renaming.
-        added = set(actual["risk_flags"]) - set(expected["risk_flags"])
-        removed = set(expected["risk_flags"]) - set(actual["risk_flags"])
-        allowed_additions = set(player_ch.INCUMBENT_ARM_FLAG_ADDITIONS) | set(
-            player_ch.INCUMBENT_ARM_FLAG_SUBSTITUTIONS.values()
-        )
-        assert added <= allowed_additions, (key, added)
-        assert removed <= set(player_ch.INCUMBENT_ARM_FLAG_SUBSTITUTIONS), (key, removed)
-        if "POSITION_FROM_CURRENT_SQUAD" in expected["risk_flags"]:
-            # The incumbent publishes this flag as a bare literal, so the test pins
-            # the literal rather than a constant that does not exist.
-            assert player_ch.POSITION_BASIS in actual["risk_flags"]
-            renamed += 1
-        # The arm carries its identity and its own construction, not a rename of the
-        # incumbent's version string.
-        assert actual["model_version"] == player_rates.PLAYER_RATE_MODEL_VERSION
-        assert actual["arm"] == player_ch.ARM_INCUMBENT
-        assert actual["arm_construction"]["construction"] == player_ch.INCUMBENT_ARM_CONSTRUCTION
-        assert actual["arm_construction"]["incumbent_module_modified"] is False
-        assert actual["arm_construction"]["incumbent_pooled_rates_read_used"] is False
-    assert renamed, "the pooled-prior path must be exercised for the renaming to mean anything"
+        clocks.add((actual["generated_at"], expected["generated_at"]))
+        renamed += _assert_incumbent_arm_row(key, expected, actual)
+    # The two builds really are in different seconds — the field under test moved,
+    # so the equivalence asserted above is not passing on a shared clock.
+    assert clocks == {(arm_clock, published_clock)}
+    assert renamed, "the clock-skewed case must cover the renaming path too"
 
 
 # ===========================================================================
