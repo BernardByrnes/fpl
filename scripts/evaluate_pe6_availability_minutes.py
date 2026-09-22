@@ -8,8 +8,8 @@ a double gameweek is its own observation and is retained.
 
 Player identity is resolved as of each cutoff from the latest ACCEPTED official
 bootstrap generation at or before it; a cutoff with no usable generation fails
-closed (its candidates are excluded at EVENT scope) rather than being projected
-from the mutable ``players`` row.
+closed (its candidates are excluded at EVENT scope, with no candidate count) rather
+than being projected or counted from the mutable ``players`` row.
 
 The artifact this prints is evidence for senior review.  It MEASURES; it does not
 accept or promote an arm, does not re-point an incumbent version identifier, and
@@ -60,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
     population = artifact["population"]
     print(f"\npopulation      : scored={population['scored']} excluded={population['excluded']} "
           f"candidates={population['candidates']} coverage={population['coverage_share']}")
+    if not population["candidates_complete"]:
+        print("                  candidate count UNAVAILABLE (no causal pool at the cutoff) for ",
+              population["events_without_a_candidate_count"])
     print("                  exclusions:", json.dumps(population["excluded_by_status"]))
     accounting = population["accounting"]
     print("                  accounting:", json.dumps({
@@ -70,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         "reconciles": accounting["reconciles"],
         "status_totals_reconcile": accounting["status_totals_reconcile"],
         "per_event_reconciles": accounting["per_event_reconciles"],
+        "candidate_enumeration": accounting["candidate_enumeration"],
     }))
     identity_block = population["identity"]
     print("                  identity  :", json.dumps(identity_block["scored_rows_by_basis"]),

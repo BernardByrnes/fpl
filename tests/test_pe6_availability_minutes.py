@@ -487,6 +487,36 @@ def _scoring_artifact(artifact):
     }
 
 
+def _resolved_identity_artifact(artifact):
+    """The cutoff-resolved identity of every event, and every candidate count.
+
+    All of it is resolved from the cutoff's official pool generation, so none of
+    it may move when the mutable persisted rows do -- whatever the event's cutoff
+    turned out to be able to resolve.
+    """
+
+    population = artifact["population"]
+    return {
+        "identity": population["identity"],
+        "candidate_counts": {
+            "candidates": population["candidates"],
+            "candidates_complete": population["candidates_complete"],
+            "events_with_a_candidate_count": population["events_with_a_candidate_count"],
+            "events_without_a_candidate_count": population["events_without_a_candidate_count"],
+            "excluded_by_status": population["excluded_by_status"],
+        },
+        "events": [
+            {
+                "event": block["event"],
+                "candidate_slots_enumerated": block["candidate_slots_enumerated"],
+                "candidate_slot_enumeration": block.get("candidate_slot_enumeration"),
+                "identity": block.get("identity"),
+            }
+            for block in artifact["events"]
+        ],
+    }
+
+
 def _fixture_for(event, team):
     return FIXTURE_BY_EVENT_TEAM[(event, team)]
 
@@ -709,6 +739,9 @@ def test_the_official_pool_is_the_accepted_generation_at_the_cutoff(tmp_path):
 
     pool = ch.resolve_candidate_pool(conn, CUTOFF)
     assert pool["identity_available"] is True
+    # A candidate POOL exists here, so a candidate count can be established.
+    assert pool["candidate_count_available"] is True
+    assert pool["summary"]["candidate_count_available"] is True
     assert [(p["player_id"], p["team_id"], p["element_type"]) for p in pool["players"]] == sorted(
         (player_id, _team_of(player_id), _position_of(player_id)) for player_id in ALL_PLAYERS
     )
@@ -756,6 +789,10 @@ def test_a_cutoff_without_a_usable_generation_fails_closed(tmp_path):
     assert resolution["identity_available"] is False
     assert resolution["players"] == [] and resolution["unresolved"] == []
     assert resolution["summary"]["identity_available"] is False
+    # With no pool there is no candidate COUNT either: it is unavailable, not
+    # enumerated from the mutable row.
+    assert resolution["candidate_count_available"] is False
+    assert resolution["summary"]["candidate_count_available"] is False
     # A projection attempt stops rather than falling back to the mutable row.
     with pytest.raises(ch.ChallengerInconsistencyError):
         ch.build_challenger_arms(conn, 4, CUTOFF)
@@ -763,20 +800,189 @@ def test_a_cutoff_without_a_usable_generation_fails_closed(tmp_path):
     artifact = ev.evaluate_events(conn, [3])
     population = artifact["population"]
     assert population["scored"] == 0
-    assert population["excluded_by_status"][ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF] > 0
-    assert population["accounting"]["reconciles"] is True
-    assert population["accounting"]["status_totals_reconcile"] is True
+    assert population["candidates"] is None
+    assert population["candidates_complete"] is False
+    assert population["events_without_a_candidate_count"] == [3]
+    assert population["excluded"] == 0
+    # The status is present with NO count: the exclusion happened, the number did
+    # not, and it is never read off the persisted pool.
+    assert population["excluded_by_status"] == {ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF: None}
+    accounting = population["accounting"]
+    assert accounting["reconciles"] is True
+    assert accounting["status_totals_reconcile"] is True
+    assert accounting["per_event_reconciles"] is True
+    assert accounting["candidate_enumeration"]["complete"] is False
+    assert accounting["candidate_enumeration"]["events_without_a_candidate_count"] == [3]
+    assert accounting["candidate_enumeration"]["statuses_without_a_candidate_count"] == {
+        ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF: 1
+    }
     block = artifact["events"][0]
     assert block["status"] == "NOT_EVALUATABLE"
     assert block["exclusion_scope"] == ev.SCOPE_EVENT
     assert block["identity"]["generation"]["usable"] is False
+    assert block["identity"]["candidate_count_available"] is False
+    assert block["candidates"] is None
+    assert block["candidate_count_available"] is False
+    assert block["excluded_candidates"] is None
+    assert block["candidate_slots_enumerated"] is None
+    assert block["candidate_slot_enumeration"]["available"] is False
+    assert block["candidate_slot_enumeration"]["slots"] is None
+    assert (
+        block["candidate_slot_enumeration"]["rule"] == ev.CANDIDATE_COUNT_UNAVAILABLE_RULE
+    )
     exit_item = next(
         item
         for item in artifact["exclusions"]
         if item["status"] == ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF
     )
     assert exit_item["scope"] == ev.SCOPE_EVENT
+    assert exit_item["candidates"] is None
+    assert exit_item["candidate_count_available"] is False
+    assert exit_item["candidate_count_basis"] == ev.CANDIDATE_COUNT_UNAVAILABLE_RULE
     assert ch.GENERATION_UNAVAILABLE_NO_ACCEPTED_GENERATION in exit_item["detail"]
+    conn.close()
+
+
+def test_a_fail_closed_artifact_cannot_be_moved_by_the_live_pool(tmp_path, monkeypatch):
+    """THE regression for a fail-closed cutoff: no persisted read, no count.
+
+    A cutoff with no usable official pool has no candidate pool, so it has no
+    candidate count either.  That number is NOT taken from the mutable ``players``
+    table -- not even the eager enumeration of it -- so a later team, position or
+    active-state write can move nothing in the artifact, and forcing the persisted
+    pool reader to fail proves the path does not call it at all.
+    """
+
+    conn = _db(tmp_path, generation_accepted=False)
+    before = ev.evaluate_events(conn, [2, 3])
+    population = before["population"]
+    assert population["candidates"] is None
+    assert population["candidates_complete"] is False
+    assert population["events_without_a_candidate_count"] == [2, 3]
+    assert population["excluded_by_status"] == {ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF: None}
+    assert population["excluded"] == 0
+    assert len(before["exclusions"]) == 2
+    assert {item["candidates"] for item in before["exclusions"]} == {None}
+    assert {block["candidate_slots_enumerated"] for block in before["events"]} == {None}
+    accounting = population["accounting"]
+    assert accounting["candidate_enumeration"]["statuses_without_a_candidate_count"] == {
+        ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF: 2
+    }
+    assert accounting["reconciles"] is True
+    assert accounting["status_totals_reconcile"] is True
+    # No divergence is reported for such a cutoff either: there is no pool to
+    # compare the persisted one against, and the persisted rows are not read.
+    assert before["store_divergence"]["per_event"] == {"2": None, "3": None}
+
+    # Mutate team, position AND active state, for players that carry historical
+    # observations AND for the whole pool at once.
+    with conn:
+        conn.execute("UPDATE players SET team_id=3, element_type=4 WHERE id=10")
+        conn.execute("UPDATE players SET team_id=2, element_type=4, is_active=0 WHERE id=13")
+        conn.execute("UPDATE players SET team_id=2, element_type=1, is_active=0 WHERE id=23")
+        conn.execute("UPDATE players SET is_active=0")
+    assert analytics.projectable_players(conn) == []
+    after = ev.evaluate_events(conn, [2, 3])
+    assert json.dumps(_strip_value(after), sort_keys=True, default=str) == json.dumps(
+        _strip_value(before), sort_keys=True, default=str
+    ), "a fail-closed artifact must not move when the persisted pool does"
+
+    # And the persisted-pool reader is not called at all on that path: the
+    # evaluation still produces the identical artifact when it cannot be read.
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError(
+            "the persisted player pool must not be enumerated for a fail-closed cutoff"
+        )
+
+    monkeypatch.setattr(analytics, "projectable_players", _refuse)
+    with pytest.raises(AssertionError):
+        analytics.projectable_players(conn)
+    forced = ev.evaluate_events(conn, [2, 3])
+    assert json.dumps(_strip_value(forced), sort_keys=True, default=str) == json.dumps(
+        _strip_value(before), sort_keys=True, default=str
+    )
+    # The slot enumeration for such an event says so directly, and never guesses.
+    cutoff, _reasons = ev.event_cutoff(conn, 3)
+    resolution = ch.resolve_candidate_pool(conn, cutoff)
+    enumeration = ev.candidate_slot_enumeration(conn, 3, resolution=resolution)
+    assert enumeration["available"] is False
+    assert enumeration["slots"] is None
+    assert ch.GENERATION_UNAVAILABLE_NO_ACCEPTED_GENERATION in enumeration["reason"]
+    conn.close()
+
+
+def test_a_fail_closed_cutoff_beside_a_scored_one_has_no_count_either(tmp_path):
+    """One event can fail closed while the next is scored; neither is guessed.
+
+    Identity is resolved PER CUTOFF, so an event whose cutoff resolves a corrupt
+    generation has no pool while an earlier event's cutoff still has one.  The
+    fail-closed event reports a null candidate count -- the persisted pool is not
+    enumerated for it even though the run is scoring other events -- and a later
+    write to the live rows moves the declared store-divergence report and nothing
+    else.
+    """
+
+    conn = _db(tmp_path)
+    with conn:
+        # ACCEPTED at 2026-09-01: before event 3's cutoff, after event 2's, and
+        # corrupt -- its recorded id-set digest does not match the id set.
+        generation_id, _run = _seed_generation(conn, "2026-09-01T08:00:00Z", [12, 13])
+        conn.execute(
+            "UPDATE bootstrap_generations SET element_ids_sha256='deadbeef' WHERE id=?",
+            (int(generation_id),),
+        )
+    artifact = ev.evaluate_events(conn, [2, 3])
+    population = artifact["population"]
+    assert population["scored"] > 0
+    assert population["candidates"] is None
+    assert population["candidates_complete"] is False
+    assert population["events_with_a_candidate_count"] == [2]
+    assert population["events_without_a_candidate_count"] == [3]
+    assert population["excluded_by_status"][ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF] is None
+    accounting = population["accounting"]
+    assert accounting["reconciles"] is True
+    assert accounting["status_totals_reconcile"] is True
+    assert accounting["per_event_reconciles"] is True
+    assert accounting["candidate_enumeration"]["complete"] is False
+    assert accounting["candidate_enumeration"]["events_with_a_candidate_count"] == [2]
+    assert accounting["candidate_enumeration"]["statuses_without_a_candidate_count"] == {
+        ev.STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF: 1
+    }
+    failed = next(block for block in artifact["events"] if int(block["event"]) == 3)
+    assert failed["status"] == "NOT_EVALUATABLE"
+    assert failed["identity"]["candidate_count_available"] is False
+    assert failed["candidates"] is None
+    assert failed["excluded_candidates"] is None
+    assert failed["candidate_slots_enumerated"] is None
+    assert failed["candidate_slot_enumeration"]["available"] is False
+    assert ch.GENERATION_UNAVAILABLE_ID_SET_DIGEST_MISMATCH in failed["reasons"][0]
+    scored_block = next(block for block in artifact["events"] if int(block["event"]) == 2)
+    assert scored_block["candidate_count_available"] is True
+    assert scored_block["candidate_slots_enumerated"] == (
+        scored_block["scored_observations"] + scored_block["excluded_candidates"]
+    )
+    # The store-divergence report is explicit for both: a pool to compare against
+    # for the scored event, and NOTHING read for the fail-closed one.
+    assert artifact["store_divergence"]["per_event"]["2"] is not None
+    assert artifact["store_divergence"]["per_event"]["3"] is None
+    before = _resolved_identity_artifact(artifact)
+    failed_exclusions = [
+        item for item in artifact["exclusions"] if int(item["event"]) == 3
+    ]
+
+    with conn:
+        conn.execute("UPDATE players SET team_id=3, element_type=4 WHERE id=10")
+        conn.execute("UPDATE players SET team_id=2, element_type=4, is_active=0 WHERE id=13")
+        conn.execute("UPDATE players SET is_active=0 WHERE id IN (23, 40)")
+    after = ev.evaluate_events(conn, [2, 3])
+    assert after["store_divergence"]["per_event"]["3"] is None
+    assert after["store_divergence"]["per_event"]["2"] != artifact["store_divergence"]["per_event"]["2"]
+    assert [block for block in after["events"] if int(block["event"]) == 3] == [failed]
+    assert [item for item in after["exclusions"] if int(item["event"]) == 3] == failed_exclusions
+    assert _resolved_identity_artifact(after) == before
+    assert json.dumps(
+        _strip_value(_scoring_artifact(after)), sort_keys=True, default=str
+    ) == json.dumps(_strip_value(_scoring_artifact(artifact)), sort_keys=True, default=str)
     conn.close()
 
 
@@ -1065,6 +1271,10 @@ def test_a_missing_or_partial_generation_capture_is_refused_not_filled(tmp_path)
     )
     assert int(item["player_id"]) == 11
     assert item["candidates"] == 1
+    assert item["team_id"] is None
+    assert item["cutoff_club_known"] is False
+    assert item["unresolved_candidate_slots"] == 1
+    assert item["fixtures"] == []
     assert item["identity"]["basis"] == ch.IDENTITY_BASIS_UNRESOLVED
 
     # 2. The row exists but leaves the club or the position unstated.
@@ -1078,6 +1288,150 @@ def test_a_missing_or_partial_generation_capture_is_refused_not_filled(tmp_path)
     ) == 1
     conn.close()
     conn2.close()
+
+
+def test_a_missing_position_candidate_on_a_dgw_team_is_two_enumerated_slots(tmp_path):
+    """An unresolved candidate is counted by the club the CUTOFF resolved.
+
+    Player 11's capture states his club (2) but no position, so the cutoff cannot
+    project him.  Club 2 plays a DOUBLE gameweek in event 2, so his exclusion
+    accounts for two player-fixture slots -- each of them independently enumerated
+    from the club the cutoff resolved, never from the persisted row's club (which
+    is team 1, a club with one fixture in that event).
+    """
+
+    conn = _db(tmp_path, generation_payloads={11: {"id": 11, "team": 2}})
+    cutoff, _reasons = ev.event_cutoff(conn, 2)
+    resolution = ch.resolve_candidate_pool(conn, cutoff)
+    assert resolution["identity_available"] is True
+    unresolved = next(item for item in resolution["unresolved"] if int(item["player_id"]) == 11)
+    assert unresolved["team_id"] == 2
+    assert unresolved["element_type"] is None
+    # The persisted row says something else entirely, and it is not used.
+    assert conn.execute("SELECT team_id, element_type FROM players WHERE id=11").fetchone()[:] == (
+        1,
+        3,
+    )
+
+    dgw_fixtures = sorted(int(fixture["id"]) for fixture in analytics.event_fixture_map(conn, 2)[2])
+    assert dgw_fixtures == [2, 3]
+    enumeration = ev.candidate_slot_enumeration(conn, 2, resolution=resolution)
+    assert enumeration["available"] is True
+    assert enumeration["unresolved_candidates"] == 1
+    assert enumeration["unresolved_candidates_with_a_cutoff_club"] == 1
+    assert enumeration["unresolved_candidates_without_a_cutoff_club"] == 0
+    assert enumeration["unresolved_candidate_slots"] == 2
+    assert enumeration["slots"] == enumeration["resolved_candidate_slots"] + 2
+
+    artifact = ev.evaluate_events(conn, [2])
+    item = next(
+        entry
+        for entry in artifact["exclusions"]
+        if entry["status"] == ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF
+    )
+    assert int(item["player_id"]) == 11
+    # The exclusion accounts for the SAME two slots the independent enumeration
+    # counted, names both fixtures, and names the club the cutoff resolved.
+    assert item["team_id"] == 2
+    assert item["cutoff_club_known"] is True
+    assert item["unresolved_candidate_slots"] == 2
+    assert item["candidates"] == 2
+    assert item["fixtures"] == dgw_fixtures
+    assert artifact["population"]["excluded_by_status"][ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF] == 2
+    block = next(block for block in artifact["events"] if int(block["event"]) == 2)
+    assert block["candidate_slot_enumeration"]["unresolved_candidate_slots"] == 2
+    assert block["candidate_slots_enumerated"] == enumeration["slots"]
+    assert block["candidate_slots_enumerated"] == (
+        block["scored_observations"] + block["excluded_candidates"]
+    )
+    accounting = artifact["population"]["accounting"]
+    assert accounting["reconciles"] is True
+    assert accounting["status_totals_reconcile"] is True
+    assert accounting["per_event_reconciles"] is True
+    # Player 11 is not scored anywhere, and the exclusion is not a projection.
+    assert 11 not in {int(key[0]) for key in ch.build_challenger_arms(conn, 2, cutoff).keys()}
+    conn.close()
+
+
+def test_a_live_admitted_club_is_not_used_to_count_slots(tmp_path):
+    """The slot count comes from the cutoff's club, never from an admitted one.
+
+    Under the explicit live-fallback opt-in a candidate whose own capture states
+    neither club nor position takes both from the persisted row.  That admitted
+    club is not the cutoff's, so it is never used to turn him into a
+    player-fixture count: he stays ONE slot, whatever the persisted row says, and
+    changing that row cannot move the count.
+    """
+
+    conn = _db(tmp_path, generation_missing_players=(11,))
+    with conn:
+        # The persisted row claims a DOUBLE gameweek club (2 plays twice in event
+        # 2) and no position at all.
+        conn.execute("UPDATE players SET team_id=2, element_type=NULL WHERE id=11")
+    cutoff, _reasons = ev.event_cutoff(conn, 2)
+    team2_fixtures = analytics.event_fixture_map(conn, 2)[2]
+    assert len(team2_fixtures) == 2
+
+    # Strict: the cutoff resolves no club at all, so one unresolved slot.
+    strict = ch.resolve_candidate_pool(conn, cutoff)
+    strict_row = next(row for row in strict["unresolved"] if int(row["player_id"]) == 11)
+    assert strict_row["team_id"] is None
+    assert strict_row["live_row_fields"] == []
+
+    # Opt-in: the club IS admitted from the persisted row, and recorded as such.
+    opted_in = ch.resolve_candidate_pool(conn, cutoff, allow_live_fallback=True)
+    admitted = next(row for row in opted_in["unresolved"] if int(row["player_id"]) == 11)
+    assert admitted["team_id"] == 2
+    assert admitted["element_type"] is None
+    assert admitted["basis"] == ch.IDENTITY_BASIS_UNRESOLVED
+    assert admitted["cutoff_safe"] is False
+    assert admitted["live_row_fields"] == ["club", "position"]
+
+    enumeration = ev.candidate_slot_enumeration(conn, 2, resolution=opted_in)
+    assert enumeration["unresolved_candidates"] == 1
+    assert enumeration["unresolved_candidates_with_a_cutoff_club"] == 0
+    assert enumeration["unresolved_candidates_without_a_cutoff_club"] == 1
+    assert enumeration["unresolved_candidate_slots"] == 1, "an admitted club is not the cutoff's"
+
+    artifact = ev.evaluate_events(conn, [2], allow_live_identity_fallback=True)
+    item = next(
+        entry
+        for entry in artifact["exclusions"]
+        if entry["status"] == ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF
+    )
+    assert int(item["player_id"]) == 11
+    assert item["candidates"] == 1
+    assert item["cutoff_club_known"] is False
+    assert item["fixtures"] == []
+    assert item["slot_basis"].startswith("THE_CUTOFF_RESOLVED_NO_CLUB")
+    assert item["identity"]["live_row_fields"] == ["club", "position"]
+    assert artifact["population"]["excluded_by_status"][ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF] == 1
+    block = next(block for block in artifact["events"] if int(block["event"]) == 2)
+    assert block["candidate_slot_enumeration"]["unresolved_candidate_slots"] == 1
+    assert block["candidate_slots_enumerated"] == (
+        block["scored_observations"] + block["excluded_candidates"]
+    )
+    assert artifact["population"]["accounting"]["reconciles"] is True
+
+    # Moving the persisted club moves the admitted identity's report, and NOT the
+    # slot count: it is one slot either way.
+    with conn:
+        conn.execute("UPDATE players SET team_id=3 WHERE id=11")
+    moved = ev.evaluate_events(conn, [2], allow_live_identity_fallback=True)
+    moved_item = next(
+        entry
+        for entry in moved["exclusions"]
+        if entry["status"] == ev.STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF
+    )
+    assert moved_item["identity"]["team_id"] == 3
+    assert moved_item["candidates"] == 1
+    assert moved_item["fixtures"] == []
+    moved_block = next(block for block in moved["events"] if int(block["event"]) == 2)
+    assert (
+        moved_block["candidate_slot_enumeration"]["slots"]
+        == block["candidate_slot_enumeration"]["slots"]
+    )
+    conn.close()
 
 
 def test_the_live_fallback_is_an_explicit_opt_in(tmp_path):
@@ -1853,38 +2207,73 @@ def test_repeated_event_ids_cannot_inflate_any_count(tmp_path):
 
 
 def test_evaluation_accounting_reconciles_when_a_cutoff_is_unavailable(tmp_path):
-    """An EVENT-scope exclusion accounts for its whole enumeration, so the totals add up."""
+    """An event with no cutoff has NO candidate count; the totals still add up.
+
+    The unavailable event is excluded at EVENT scope with a null candidate count --
+    the persisted pool is not enumerated to give it one -- so it contributes to
+    neither side of the reconciliation and is NAMED instead of being counted as
+    zero.  The scored event beside it is unaffected, and its own counts still
+    reconcile.
+    """
 
     conn = _db(tmp_path)
     with conn:
         repo.upsert_events(
             conn, [EventRecord(id=9, finished=1, data_checked=1, deadline_time=None, raw_json={})]
         )
-    pool = len(analytics.projectable_players(conn))
     artifact = ev.evaluate_events(conn, [3, 9])
     population = artifact["population"]
     accounting = population["accounting"]
-    assert population["candidates"] == population["scored"] + population["excluded"]
+    assert population["candidates"] is None
+    assert population["candidates_complete"] is False
+    assert population["events_with_a_candidate_count"] == [3]
+    assert population["events_without_a_candidate_count"] == [9]
     assert accounting["enumerated_candidate_slots"] == (
         accounting["scored_rows"] + accounting["excluded_candidates"]
     )
     assert accounting["reconciles"] is True
     assert accounting["status_totals_reconcile"] is True
     assert accounting["per_event_reconciles"] is True
-    # The whole unavailable-cutoff pool is accounted for, and exactly once.
-    assert population["excluded_by_status"][ev.STATUS_EVENT_CUTOFF_UNAVAILABLE] == pool
+    assert accounting["candidate_enumeration"]["complete"] is False
+    assert accounting["candidate_enumeration"]["events_without_a_candidate_count"] == [9]
+    # The event's status is present with NO count: it was excluded, it was not
+    # counted, and the count is never taken from the mutable persisted pool.
+    assert population["excluded_by_status"][ev.STATUS_EVENT_CUTOFF_UNAVAILABLE] is None
+    assert accounting["candidate_enumeration"]["statuses_without_a_candidate_count"] == {
+        ev.STATUS_EVENT_CUTOFF_UNAVAILABLE: 1
+    }
     assert accounting["event_scope_exclusions"] == 1
-    assert accounting["event_scope_candidates"] == pool
-    assert sum(population["excluded_by_status"].values()) == population["excluded"]
+    assert accounting["event_scope_candidates"] == 0
+    assert (
+        sum(
+            int(count) for count in population["excluded_by_status"].values() if count is not None
+        )
+        == population["excluded"]
+    )
     assert accounting["excluded_by_status_total"] == population["excluded"]
     event_block = next(block for block in artifact["events"] if int(block["event"]) == 9)
     assert event_block["status"] == "NOT_EVALUATED"
-    assert event_block["candidates"] == pool
-    assert event_block["candidate_slots_enumerated"] == pool
-    assert event_block["excluded_candidates"] == pool
+    assert event_block["candidates"] is None
+    assert event_block["candidate_count_available"] is False
+    assert event_block["candidate_slots_enumerated"] is None
+    assert event_block["excluded_candidates"] is None
+    assert event_block["candidate_slot_enumeration"]["available"] is False
+    assert event_block["candidate_slot_enumeration"]["slots"] is None
     assert event_block["scored_observations"] == 0
-    # The scored event is untouched by the unavailable one.
-    assert population["scored"] == ev.evaluate_events(conn, [3])["population"]["scored"]
+    exit_item = next(
+        item
+        for item in artifact["exclusions"]
+        if item["status"] == ev.STATUS_EVENT_CUTOFF_UNAVAILABLE
+    )
+    assert exit_item["scope"] == ev.SCOPE_EVENT
+    assert exit_item["candidates"] is None
+    assert exit_item["candidate_count_available"] is False
+    # The scored event is untouched by the unavailable one, and complete on its own.
+    scored_only = ev.evaluate_events(conn, [3])["population"]
+    assert population["scored"] == scored_only["scored"]
+    assert scored_only["candidates_complete"] is True
+    assert scored_only["events_without_a_candidate_count"] == []
+    assert scored_only["candidates"] == scored_only["scored"] + scored_only["excluded"]
     conn.close()
 
 
@@ -1905,19 +2294,32 @@ def test_candidate_slots_are_enumerated_independently_of_the_scored_rows(tmp_pat
 
     # The enumeration is drawn from the pool and the fixtures, so it can be
     # recomputed by hand: every candidate is one slot per fixture of his club in
-    # the event, or one slot when his club has none.
+    # the event, or one slot when his club has none, and an unresolved candidate is
+    # counted the same way from the club the CUTOFF knows -- or one slot when the
+    # cutoff knows no club either.
     for event in (2, 3):
         cutoff, _reasons = ev.event_cutoff(conn, event)
         resolution = ch.resolve_candidate_pool(conn, cutoff)
         enumeration = ev.candidate_slot_enumeration(conn, event, resolution=resolution)
         fixtures_by_team = analytics.event_fixture_map(conn, event)
-        expected = sum(
-            len(fixtures_by_team.get(int(player["team_id"])) or []) or 1
-            for player in resolution["players"]
-        ) + len(resolution["unresolved"])
+
+        def _slots(candidate):
+            team_id = candidate.get("team_id")
+            known = (
+                len(fixtures_by_team.get(int(team_id)) or []) if team_id is not None else 0
+            )
+            return known or 1
+
+        expected = sum(_slots(player) for player in resolution["players"]) + sum(
+            _slots(candidate) for candidate in resolution["unresolved"]
+        )
         assert enumeration["slots"] == expected
         assert enumeration["resolved_candidates"] == len(resolution["players"])
         assert enumeration["unresolved_candidates"] == len(resolution["unresolved"])
+        assert enumeration["slots"] == (
+            enumeration["resolved_candidate_slots"] + enumeration["unresolved_candidate_slots"]
+        )
+        assert enumeration["available"] is True
         block = next(item for item in artifact["events"] if int(item["event"]) == event)
         assert block["candidate_slots_enumerated"] == expected
         assert block["candidate_slot_enumeration"] == enumeration

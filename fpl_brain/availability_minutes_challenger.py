@@ -98,8 +98,11 @@ from the current row:
 * FAIL CLOSED.  A cutoff with no usable accepted generation at or before it has
   no official pool, so no candidate is projected from the current row: the
   evaluation excludes that event's candidate enumeration at EVENT scope
-  (``CANDIDATE_IDENTITY_UNAVAILABLE_AT_CUTOFF``) and scores nothing.  The live
-  fallback survives only as an EXPLICIT, recorded opt-in
+  (``CANDIDATE_IDENTITY_UNAVAILABLE_AT_CUTOFF``) and scores nothing.  The
+  persisted pool is not read on that path AT ALL -- not even to say how many
+  candidates the event has: the candidate count is unavailable
+  (``candidate_count_available`` False) rather than enumerated from mutable rows.
+  The live fallback survives only as an EXPLICIT, recorded opt-in
   (``allow_live_fallback=True``), never as a default;
 * a generation member whose own snapshot row is missing or leaves the club or
   position unstated is UNRESOLVED, and an unresolved candidate is excluded with
@@ -153,7 +156,11 @@ from . import outcome_ledger
 from . import repositories as repo
 from .utils import utc_now
 
-AVAILABILITY_MINUTES_CHALLENGER_VERSION = "availability_minutes_challenger_v0.1.2"
+AVAILABILITY_MINUTES_CHALLENGER_VERSION = "availability_minutes_challenger_v0.1.3"
+# v0.1.3: review pass.  The persisted pool is no longer read at all on the
+# fail-closed path: a cutoff with no usable official generation resolves no pool
+# and reports the candidate count as UNAVAILABLE instead of enumerating the
+# mutable rows for it.
 # v0.1.2: review pass.  The official pool is the latest ACCEPTED bootstrap
 # generation at or before the cutoff, and club/position come from that
 # generation's OWN snapshot rows; a cutoff with no usable generation fails closed
@@ -508,6 +515,11 @@ class PlayerIdentityAsOf:
     #: True only when membership, club and position ALL came from the cutoff
     #: generation, so a later change to the current row cannot move this identity.
     cutoff_safe: bool
+    #: Which fields came from the CURRENT players row -- the recorded opt-in
+    #: fallback.  Empty unless a caller admitted that fallback, and never empty on
+    #: a cutoff-safe identity.  Structural, so a consumer can tell a cutoff-resolved
+    #: club from an admitted one without parsing a note.
+    live_row_fields: tuple[str, ...] = ()
     live_row_disagreement: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
 
@@ -522,6 +534,7 @@ class PlayerIdentityAsOf:
             "generation_captured_at": self.generation_captured_at,
             "snapshot_captured_at": self.snapshot_captured_at,
             "cutoff_safe": bool(self.cutoff_safe),
+            "live_row_fields": list(self.live_row_fields),
             "live_row_disagreement": list(self.live_row_disagreement),
             "notes": list(self.notes),
         }
@@ -617,6 +630,7 @@ def _identity_from_generation(
         generation_captured_at=generation_captured_at,
         snapshot_captured_at=snapshot_captured_at,
         cutoff_safe=basis == IDENTITY_BASIS_CUTOFF_GENERATION,
+        live_row_fields=tuple(from_current_row),
         live_row_disagreement=tuple(disagreement),
         notes=tuple(notes),
     )
@@ -768,21 +782,25 @@ def resolve_candidate_pool(
     is never reported as cutoff-safe.
 
     ``identity_available`` False means the cutoff has no usable official pool at
-    all and the caller must fail closed: nothing is projected.
+    all and the caller must fail closed: nothing is projected, no candidate is
+    enumerated, and ``candidate_count_available`` is False with it -- the
+    persisted pool is not read on that path even to produce a count.
     """
 
     cutoff = str(cutoff)
     pool_generation = (
         dict(generation) if generation is not None else official_pool_generation_at_cutoff(conn, cutoff)
     )
-    live = {
-        int(row["player_id"]): dict(row)
-        for row in (live_rows if live_rows is not None else analytics.projectable_players(conn))
-    }
     if not pool_generation.get("usable"):
+        # FAIL CLOSED BEFORE the persisted pool is touched at all.  The current
+        # ``players`` table is mutable state, so an event with no causal pool is not
+        # enumerated from it -- not even to say how many candidates it has.  The
+        # count is unavailable, and a caller that needs one must derive it from
+        # valid cutoff evidence rather than from the live rows.
         return {
             "cutoff": cutoff,
             "identity_available": False,
+            "candidate_count_available": False,
             "generation": generation_artifact_block(pool_generation),
             "players": [],
             "unresolved": [],
@@ -790,10 +808,16 @@ def resolve_candidate_pool(
                 [],
                 pool_generation=pool_generation,
                 unresolved=[],
-                persisted_pool_ids=sorted(live),
                 identity_available=False,
             ),
         }
+    # Only NOW is the persisted pool read: as the recorded opt-in fallback for a
+    # generation member whose own capture is silent, and to report how far the
+    # store has diverged from the pool the cutoff resolved from.
+    live = {
+        int(row["player_id"]): dict(row)
+        for row in (live_rows if live_rows is not None else analytics.projectable_players(conn))
+    }
     generation_row = pool_generation.get("generation") or {}
     captures = generation_snapshot_rows(conn, generation_row, cutoff)
     players: list[dict[str, Any]] = []
@@ -828,6 +852,7 @@ def resolve_candidate_pool(
     return {
         "cutoff": cutoff,
         "identity_available": True,
+        "candidate_count_available": True,
         "generation": generation_artifact_block(pool_generation),
         "players": players,
         "unresolved": unresolved,
@@ -928,10 +953,16 @@ def identity_resolution_summary(
     )
     return {
         "identity_available": bool(identity_available),
+        #: A candidate COUNT exists only where a candidate POOL exists.  With no
+        #: usable generation there is no pool at the cutoff to enumerate, so the
+        #: count is unavailable rather than read off the mutable players rows.
+        "candidate_count_available": bool(identity_available),
         "rule": (
             "membership comes from the latest ACCEPTED official bootstrap generation at or before "
             "the cutoff; club and position come from that generation's own snapshot rows; the "
-            "persisted players row is never used unless a caller explicitly opts in"
+            "persisted players row is never used unless a caller explicitly opts in; and with no "
+            "usable generation the candidate count is unavailable rather than enumerated from "
+            "those mutable rows"
         ),
         "generation": None if pool_generation is None else generation_artifact_block(pool_generation),
         "rows": len(rows),

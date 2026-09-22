@@ -51,9 +51,10 @@ rows, never from the current ``players`` row (see
 the official pool stays a candidate for that cutoff whatever has happened since,
 and a post-cutoff transfer, position change or retirement cannot rewrite an
 earlier projection.  A cutoff with no usable accepted generation FAILS CLOSED:
-its candidates are excluded at EVENT scope and nothing is projected from the
-mutable row.  The resolved bases, the divergences and the fail-closed rule are
-reported in ``population.identity``.
+its candidates are excluded at EVENT scope, nothing is projected from the mutable
+row, and its candidate COUNT is unavailable rather than read off that row.  The
+resolved bases, the divergences and the fail-closed rule are reported in
+``population.identity``.
 
 The incumbent's pooled priors are built by the PE-6 adapter from that same
 cutoff-stable identity and handed to the incumbent through its own ``LeaguePools``
@@ -98,12 +99,16 @@ EXCLUSIONS ARE COUNTED, AND THEY ADD UP
 Excluded candidates are counted, never scored as zero, and every exclusion
 carries its SCOPE (``PLAYER`` or ``EVENT``) and how many candidates it accounts
 for.  An event whose cutoff -- or whose cutoff's official pool identity -- is
-unavailable excludes its whole candidate enumeration at event scope.  The
-reconciliation in ``population.accounting`` does NOT restate the classification's
-own arithmetic: it compares an INDEPENDENTLY ENUMERATED candidate-slot count
-(:func:`candidate_slot_enumeration`, which walks the cutoff-resolved pool and the
-event's fixtures) against the scored rows, the exclusion records and the per-status
-totals, and reports each comparison separately.
+unavailable excludes its whole candidate enumeration at event scope, and its
+candidate count is UNAVAILABLE (``None``) rather than enumerated from the mutable
+persisted pool: no causal pool, no count, and a missing count is never a zero.
+The reconciliation in ``population.accounting`` does NOT restate the
+classification's own arithmetic: it compares an INDEPENDENTLY ENUMERATED
+candidate-slot count (:func:`candidate_slot_enumeration`, which walks the
+cutoff-resolved pool and the event's fixtures) against the scored rows, the
+exclusion records and the per-status totals, and reports each comparison
+separately -- over the events whose candidate count can be established, and
+naming the events whose cannot.
 """
 
 from __future__ import annotations
@@ -119,7 +124,14 @@ from . import walk_forward as wf
 from . import walk_forward_metrics as wm
 from . import walk_forward_scoreboard as wfs
 
-EVALUATION_VERSION = "availability_minutes_evaluation_v1.2.0"
+EVALUATION_VERSION = "availability_minutes_evaluation_v1.3.0"
+# v1.3.0: review pass.  A candidate COUNT exists only where a candidate POOL
+# exists: an event whose cutoff (or whose cutoff's official pool identity) is
+# unavailable reports its candidate count as null instead of enumerating the
+# mutable persisted pool, and unresolved candidates are counted by the club the
+# CUTOFF knows rather than as one slot each.
+# v1.2.0: pool, priors and accounting resolved from the cutoff's accepted
+# generation; store divergence reported in one declared section.
 
 GRAIN_PLAYER_FIXTURE = wf.GRAIN_PLAYER_FIXTURE
 GRAIN_NOTE = (
@@ -655,6 +667,82 @@ def multi_family_subset_policy(
 # ---------------------------------------------------------------------------
 
 
+#: How one target event's candidate slots are enumerated, stated once so the
+#: independent enumeration and the exclusion records cannot describe two
+#: different units.
+CANDIDATE_SLOT_RULE = (
+    "the candidate pool is the official pool AS OF THE CUTOFF: the element id set of the latest "
+    "ACCEPTED official bootstrap generation at or before it.  One slot per candidate player-fixture "
+    "of each target event: a RESOLVED candidate is counted once per fixture the club his cutoff "
+    "identity gives him plays in the event, or once when that club has no fixture in it; an "
+    "UNRESOLVED candidate is counted the same way from the club the CUTOFF resolved -- once per "
+    "fixture of that club, or once when the cutoff resolved no club (or the club it did resolve has "
+    "no fixture in the event).  A club is NEVER taken from the persisted players row, so a club "
+    "admitted there by the explicit live-fallback opt-in counts as no cutoff club at all"
+)
+
+#: The rule for an event whose candidate count cannot be established at its
+#: cutoff.  The persisted pool is mutable state, so it is NOT enumerated to
+#: produce a number the cutoff does not support.
+CANDIDATE_COUNT_UNAVAILABLE_RULE = (
+    "an event whose cutoff, or whose cutoff's official pool identity, is unavailable has NO "
+    "candidate count: the mutable persisted pool is not enumerated to invent one, and the "
+    "unavailable count is reported as null rather than as zero"
+)
+
+
+def unresolved_candidate_slots(
+    fixtures_by_team: Mapping[int, Sequence[Mapping[str, Any]]],
+    candidate: Mapping[str, Any],
+) -> tuple[list[int], int, bool]:
+    """The fixtures, slot count and club provenance one unresolved candidate has.
+
+    Shared with :func:`build_event_records` so the exclusion records and the
+    independent enumeration cannot disagree about an unresolved candidate: one
+    slot per fixture of the club the CUTOFF resolved the candidate to, or ONE slot
+    (the candidate himself) when the cutoff resolved no club for him -- or when the
+    club he carries was admitted from the persisted players row by the explicit
+    live-fallback opt-in, which makes it no cutoff club at all.
+
+    The returned flag is True only when the club the count is drawn from is the
+    cutoff's own, so a caller can say WHICH club the number came from instead of
+    asserting one.
+    """
+
+    live_row_fields = {str(field) for field in (candidate.get("live_row_fields") or ())}
+    team_id = _int_or_none(candidate.get("team_id"))
+    if team_id is None or "club" in live_row_fields:
+        return [], 1, False
+    fixture_ids = sorted(
+        int(fixture["id"]) for fixture in (fixtures_by_team.get(int(team_id)) or [])
+    )
+    return fixture_ids, (len(fixture_ids) or 1), True
+
+
+def unavailable_candidate_enumeration(event: int, reason: str) -> dict[str, Any]:
+    """The enumeration of an event whose candidate count cannot be established.
+
+    Same shape as :func:`candidate_slot_enumeration`, with ``available`` False and
+    every count ``None``: a cutoff with no usable official pool has no candidates
+    to enumerate, and a count taken from the mutable persisted rows would be a
+    number the cutoff does not support.
+    """
+
+    return {
+        "event": int(event),
+        "available": False,
+        "slots": None,
+        "resolved_candidates": None,
+        "resolved_candidate_slots": None,
+        "unresolved_candidates": None,
+        "unresolved_candidate_slots": None,
+        "unresolved_candidates_with_a_cutoff_club": None,
+        "unresolved_candidates_without_a_cutoff_club": None,
+        "rule": CANDIDATE_COUNT_UNAVAILABLE_RULE,
+        "reason": str(reason),
+    }
+
+
 def candidate_slot_enumeration(
     conn: sqlite3.Connection, event: int, *, resolution: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -663,17 +751,34 @@ def candidate_slot_enumeration(
     An INDEPENDENT pass on purpose.  It walks the cutoff-resolved candidate pool
     and the event's fixtures and counts the slots a projection would have to
     produce -- ``max(1, fixtures of the candidate's club in this event)`` per
-    resolved candidate, one slot per unresolved candidate (no club, so no fixture
-    to name) -- without looking at the classification's bookkeeping.  The
+    candidate, with the club taken from the CUTOFF's identity for a resolved
+    candidate and from the cutoff's own (possibly partial) identity for an
+    unresolved one -- without looking at the classification's bookkeeping.  The
     artifact's reconciliation can therefore compare this enumeration against the
     scored rows and the exclusion records instead of restating their sum.
+
+    An unresolved candidate whose cutoff identity names no club is ONE slot (the
+    candidate himself): the persisted row's club is never substituted to turn him
+    into a player-fixture count, and a club the explicit live-fallback opt-in
+    admitted from that row is treated as no cutoff club at all.  A cutoff with no
+    usable official pool has no candidates and no count either: see
+    :func:`unavailable_candidate_enumeration`.
 
     ``resolution`` is the :func:`availability_minutes_challenger.resolve_candidate_pool`
     result the event's arms were built from, so the enumeration and the
     projections count the same candidates.
     """
 
-    fixtures_by_team = analytics.event_fixture_map(conn, int(event))
+    event = int(event)
+    if not bool(resolution.get("identity_available", True)):
+        return unavailable_candidate_enumeration(
+            event,
+            "; ".join(
+                (resolution.get("summary") or {}).get("generation", {}).get("reasons") or []
+            )
+            or "the cutoff has no usable official pool generation",
+        )
+    fixtures_by_team = analytics.event_fixture_map(conn, event)
     resolved_slots = 0
     resolved_candidates = 0
     for player in resolution.get("players") or ():
@@ -681,18 +786,30 @@ def candidate_slot_enumeration(
         fixtures = [] if team_id is None else (fixtures_by_team.get(int(team_id)) or [])
         resolved_slots += len(fixtures) or 1
         resolved_candidates += 1
-    unresolved_candidates = len(resolution.get("unresolved") or ())
+    unresolved_slots = 0
+    unresolved_with_club = 0
+    unresolved_without_club = 0
+    for candidate in resolution.get("unresolved") or ():
+        _fixtures, slots, club_is_the_cutoffs = unresolved_candidate_slots(
+            fixtures_by_team, candidate
+        )
+        if club_is_the_cutoffs:
+            unresolved_with_club += 1
+        else:
+            unresolved_without_club += 1
+        unresolved_slots += slots
     return {
-        "event": int(event),
-        "slots": resolved_slots + unresolved_candidates,
+        "event": event,
+        "available": True,
+        "slots": resolved_slots + unresolved_slots,
         "resolved_candidates": resolved_candidates,
         "resolved_candidate_slots": resolved_slots,
-        "unresolved_candidates": unresolved_candidates,
-        "unresolved_candidate_slots": unresolved_candidates,
-        "rule": (
-            "one slot per candidate player-fixture of the event, one slot for a candidate whose "
-            "club has no fixture in it, and one slot per candidate the cutoff cannot resolve"
-        ),
+        "unresolved_candidates": unresolved_with_club + unresolved_without_club,
+        "unresolved_candidate_slots": unresolved_slots,
+        "unresolved_candidates_with_a_cutoff_club": unresolved_with_club,
+        "unresolved_candidates_without_a_cutoff_club": unresolved_without_club,
+        "rule": CANDIDATE_SLOT_RULE,
+        "reason": None,
     }
 
 
@@ -767,13 +884,23 @@ def build_event_records(
             unresolved_identity = next(
                 row for row in unresolved if int(row["player_id"]) == player_id
             )
+            # The candidate's club is the one the CUTOFF resolved, and where there
+            # is one the exclusion accounts for one slot per fixture of that club in
+            # this event -- exactly what the independent enumeration counts.  Where
+            # the cutoff resolved no club, the candidate himself is the one slot: his
+            # club is never taken from the persisted row, and a club admitted there
+            # by the live-fallback opt-in is no cutoff club at all.
+            fixtures, slots, club_is_the_cutoffs = unresolved_candidate_slots(
+                fixtures_by_team, unresolved_identity
+            )
             exclude(
                 player_id,
-                None,
+                _int_or_none(unresolved_identity.get("team_id")),
                 STATUS_IDENTITY_UNRESOLVED_AT_CUTOFF,
                 "the cutoff places this player in the official pool but cannot resolve his club "
                 "and position, so no projection is attempted for him",
-                candidates=1,
+                fixtures=fixtures,
+                candidates=slots,
                 # The persisted-row disagreement is a STORE report, so it is kept
                 # out of the exclusion record and reported in ``store_divergence``
                 # instead: no scored number and no exclusion depends on it.
@@ -782,7 +909,14 @@ def build_event_records(
                         key: value
                         for key, value in unresolved_identity.items()
                         if key != "live_row_disagreement"
-                    }
+                    },
+                    "unresolved_candidate_slots": slots,
+                    "cutoff_club_known": club_is_the_cutoffs,
+                    "slot_basis": (
+                        "ONE_SLOT_PER_FIXTURE_OF_THE_CLUB_THE_CUTOFF_RESOLVED"
+                        if club_is_the_cutoffs
+                        else "THE_CUTOFF_RESOLVED_NO_CLUB_SO_THE_CANDIDATE_IS_ONE_SLOT"
+                    ),
                 },
             )
             continue
@@ -996,7 +1130,9 @@ def evaluate_events(
 
     A cutoff with no usable accepted official pool generation at all is excluded
     at EVENT scope with ``STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF``: nothing is
-    projected, and nothing is read from the mutable row.
+    projected, nothing is counted, and nothing is read from the mutable row --
+    the event's candidate count is reported as unavailable (``None``) rather than
+    enumerated from the persisted pool.
     """
 
     config = incumbent_config or incumbent.MinutesModelConfig()
@@ -1012,7 +1148,9 @@ def evaluate_events(
 
     records: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
-    status_counts: dict[str, int] = {}
+    #: status -> excluded candidate slots.  A status whose exclusions could not be
+    #: counted carries None: the exclusion happened, the number did not.
+    status_counts: dict[str, int | None] = {}
     event_blocks: list[dict[str, Any]] = []
     events_with_observations: list[int] = []
     events_excluded: list[dict[str, Any]] = []
@@ -1021,6 +1159,11 @@ def evaluate_events(
     #: fields on which an unresolved candidate's persisted row disagrees.  It is
     #: kept apart from every scored number on purpose -- see ``store_divergence``.
     store_divergence: dict[str, Any] = {"per_event": {}, "per_player": {}}
+
+    #: Events whose candidate count could not be established at their cutoff.  They
+    #: are listed by name, never represented by a number: no causal pool, no count.
+    unenumerable_events: list[int] = []
+    unenumerable_statuses: dict[str, int] = {}
 
     def identity_artifact_block(resolution: Mapping[str, Any] | None) -> dict[str, Any] | None:
         """A resolution summary WITHOUT its store-dependent divergence report."""
@@ -1040,9 +1183,25 @@ def evaluate_events(
         enumeration: Mapping[str, Any] | None,
         identity: Mapping[str, Any] | None,
     ) -> None:
-        """One EVENT-scope record that ACCOUNTS for every enumerated slot."""
+        """One EVENT-scope record that ACCOUNTS for every enumerated slot.
 
-        slots = int(enumeration["slots"]) if enumeration is not None else 0
+        ``enumeration`` is an optional :func:`candidate_slot_enumeration` result.
+        When it is absent, or reports ``available`` False, the event has NO
+        candidate count: the record then says so with ``candidates`` null instead
+        of enumerating the mutable persisted pool to produce a number the cutoff
+        does not support.  Such an event contributes to neither side of the
+        reconciliation and is named in ``accounting.candidate_enumeration``.
+        """
+
+        slots = _int_or_none((enumeration or {}).get("slots"))
+        if slots is None:
+            unenumerable_events.append(int(event))
+            unenumerable_statuses[status] = unenumerable_statuses.get(status, 0) + 1
+            # Explicitly UNAVAILABLE rather than absent: the exclusion happened, the
+            # count did not, and a count already recorded for this status is kept.
+            status_counts.setdefault(status, None)
+        else:
+            status_counts[status] = slots + int(status_counts.get(status) or 0)
         excluded.append(
             {
                 "event": int(event),
@@ -1051,11 +1210,14 @@ def evaluate_events(
                 "team_id": None,
                 "fixtures": [],
                 "candidates": slots,
+                "candidate_count_available": slots is not None,
                 "status": status,
                 "detail": detail,
+                "candidate_count_basis": (
+                    CANDIDATE_SLOT_RULE if slots is not None else CANDIDATE_COUNT_UNAVAILABLE_RULE
+                ),
             }
         )
-        status_counts[status] = status_counts.get(status, 0) + slots
         events_excluded.append({"event": int(event), "reasons": [detail]})
         event_blocks.append(
             {
@@ -1065,9 +1227,15 @@ def evaluate_events(
                 "cutoff_policy": CUTOFF_POLICY,
                 "reasons": [detail],
                 "candidates": slots,
+                "candidate_count_available": slots is not None,
                 "scored_observations": 0,
                 "excluded_candidates": slots,
                 "candidate_slots_enumerated": slots,
+                "candidate_slot_enumeration": (
+                    dict(enumeration)
+                    if enumeration is not None
+                    else unavailable_candidate_enumeration(event, detail)
+                ),
                 "exclusion_scope": SCOPE_EVENT,
                 "identity": identity,
             }
@@ -1076,17 +1244,17 @@ def evaluate_events(
     for event in target_events:
         cutoff, cutoff_reasons = event_cutoff(conn, event)
         if cutoff is None:
-            # The cutoff is unavailable, so no identity can be resolved at it and
-            # no projection exists.  The whole candidate enumeration of this
-            # event is excluded at EVENT scope: one row that ACCOUNTS for every
-            # slot, and the enumeration is the persisted pool, the only pool that
-            # can be enumerated without a cutoff at all.
+            # The cutoff is unavailable, so no identity can be resolved at it, no
+            # pool exists at it, and no projection exists.  The whole candidate
+            # enumeration of this event is excluded at EVENT scope -- with the
+            # candidate COUNT unavailable, because the only pool that could be
+            # counted without a cutoff is the mutable persisted one.
             exclude_whole_event(
                 event,
                 STATUS_EVENT_CUTOFF_UNAVAILABLE,
                 "; ".join(cutoff_reasons),
                 state="NOT_EVALUATED",
-                enumeration={"slots": len(analytics.projectable_players(conn))},
+                enumeration=None,
                 identity=None,
             )
             continue
@@ -1098,18 +1266,26 @@ def evaluate_events(
         if not resolution["identity_available"]:
             # FAIL CLOSED.  The cutoff has no usable official pool generation, so
             # the official pool at that cutoff cannot be named; nothing is
-            # projected and nothing is read from the mutable current row.
+            # projected, nothing is counted, and nothing is read from the mutable
+            # current row -- not even to say how many candidates there were.
             exclude_whole_event(
                 event,
                 STATUS_IDENTITY_UNAVAILABLE_AT_CUTOFF,
                 "; ".join((resolution["summary"].get("generation") or {}).get("reasons") or []),
                 state="NOT_EVALUATABLE",
-                enumeration={"slots": len(analytics.projectable_players(conn))},
+                enumeration=unavailable_candidate_enumeration(
+                    event,
+                    "; ".join(
+                        (resolution["summary"].get("generation") or {}).get("reasons") or []
+                    ),
+                ),
                 identity=identity_artifact_block(resolution),
             )
-            store_divergence["per_event"][str(int(event))] = resolution["summary"][
-                "persisted_pool_divergence"
-            ]
+            # No pool, no divergence to report -- and the persisted rows are not
+            # read to produce one.  The entry is explicit and null rather than
+            # absent, so the artifact says "not computable" instead of saying
+            # nothing.
+            store_divergence["per_event"][str(int(event))] = None
             continue
         arms = challenger.build_challenger_arms(
             conn,
@@ -1158,6 +1334,7 @@ def evaluate_events(
                     int(item["candidates"]) for item in event_excluded
                 ),
                 "candidate_slots_enumerated": int(enumeration["slots"]),
+                "candidate_count_available": True,
                 "candidate_slot_enumeration": enumeration,
                 "excluded_by_status": dict(sorted(event_status_counts.items())),
                 "exclusion_scope": SCOPE_PLAYER,
@@ -1227,16 +1404,29 @@ def evaluate_events(
         summary_basis = list(headline["measurement"]["basis"])
 
     scored_candidates = len(records)
-    excluded_candidates = sum(int(item["candidates"]) for item in excluded)
+    # An exclusion record whose candidate count is UNAVAILABLE (the event has no
+    # causal pool) contributes to neither side of the reconciliation and is not
+    # counted as zero anywhere.
+    excluded_candidates = sum(
+        int(item["candidates"]) for item in excluded if item.get("candidates") is not None
+    )
     # The reconciliation is against an INDEPENDENT enumeration of the candidate
-    # slots, never against a restatement of the classification's own sum.
-    enumerated_slots = sum(int(block["candidate_slots_enumerated"]) for block in event_blocks)
-    excluded_status_total = sum(int(count) for count in status_counts.values())
+    # slots, never against a restatement of the classification's own sum, and it
+    # covers exactly the events whose candidate count could be established.
+    enumerated_blocks = [
+        block for block in event_blocks if block["candidate_slots_enumerated"] is not None
+    ]
+    enumerated_events = sorted(int(block["event"]) for block in enumerated_blocks)
+    enumerated_slots = sum(int(block["candidate_slots_enumerated"]) for block in enumerated_blocks)
+    excluded_status_total = sum(
+        int(count) for count in status_counts.values() if count is not None
+    )
     per_event_reconciled = all(
         int(block["candidate_slots_enumerated"])
         == int(block["scored_observations"]) + int(block["excluded_candidates"])
-        for block in event_blocks
+        for block in enumerated_blocks
     )
+    candidate_counts_complete = not unenumerable_events
     identity_bases: dict[str, int] = {}
     for item in records:
         basis = str(item.get("identity_basis") or challenger.IDENTITY_BASIS_UNRESOLVED)
@@ -1269,13 +1459,8 @@ def evaluate_events(
         "cutoff_policy": CUTOFF_POLICY,
         "missing_data_policy_version": MISSING_DATA_POLICY_VERSION,
         "population_rule": {
-            "candidates": (
-                "one slot per candidate player-fixture of each target event, plus one slot for "
-                "a candidate whose club has no fixture in the event (he has no fixture to "
-                "enumerate), plus one slot per candidate the cutoff cannot resolve.  The "
-                "candidate pool is the official pool AS OF THE CUTOFF: the element id set of the "
-                "latest ACCEPTED official bootstrap generation at or before it"
-            ),
+            "candidates": CANDIDATE_SLOT_RULE,
+            "candidate_count_unavailable": CANDIDATE_COUNT_UNAVAILABLE_RULE,
             "scored": (
                 "a finalised event, a played fixture, a model projection from every arm, and a "
                 "non-placeholder official outcome row for that exact player-fixture"
@@ -1326,7 +1511,13 @@ def evaluate_events(
             "event_request": event_request,
             "events_with_observations": events_with_observations,
             "events_excluded": events_excluded,
-            "candidates": enumerated_slots,
+            # None when ANY target event has no candidate count: the total would
+            # then be a portion presented as a whole, and the persisted pool is not
+            # enumerated to close the gap.  The events that have one are named.
+            "candidates": enumerated_slots if candidate_counts_complete else None,
+            "candidates_complete": candidate_counts_complete,
+            "events_with_a_candidate_count": enumerated_events,
+            "events_without_a_candidate_count": sorted(unenumerable_events),
             "scored": scored_candidates,
             "excluded": excluded_candidates,
             "excluded_by_status": dict(sorted(status_counts.items())),
@@ -1336,13 +1527,28 @@ def evaluate_events(
                 "unit": "candidate slot",
                 "identity": (
                     "enumerated_candidate_slots == scored_rows + excluded_candidates, and "
-                    "sum(excluded_by_status) == excluded_candidates"
+                    "sum(excluded_by_status) == excluded_candidates, over the events whose "
+                    "candidate count can be established at their cutoff; an event with no causal "
+                    "pool contributes to neither side and has no count at all"
                 ),
                 "enumeration": (
                     "the candidate-slot total is enumerated INDEPENDENTLY of the scored rows "
                     "(candidate_slot_enumeration walks the cutoff-resolved pool and the event's "
                     "fixtures), so this is a comparison and not a restatement"
                 ),
+                "candidate_enumeration": {
+                    "complete": candidate_counts_complete,
+                    "events_with_a_candidate_count": enumerated_events,
+                    "events_without_a_candidate_count": sorted(unenumerable_events),
+                    "statuses_without_a_candidate_count": dict(sorted(unenumerable_statuses.items())),
+                    "enumerated_candidate_slots": enumerated_slots,
+                    "scored_rows": scored_candidates,
+                    "excluded_candidates": excluded_candidates,
+                    "reconciles_over_events_with_a_candidate_count": (
+                        enumerated_slots == scored_candidates + excluded_candidates
+                    ),
+                    "rule": CANDIDATE_COUNT_UNAVAILABLE_RULE,
+                },
                 "enumerated_candidate_slots": enumerated_slots,
                 "scored_rows": scored_candidates,
                 "excluded_candidates": excluded_candidates,
@@ -1354,13 +1560,15 @@ def evaluate_events(
                 "event_scope_candidates": sum(
                     int(item["candidates"])
                     for item in excluded
-                    if str(item.get("scope")) == SCOPE_EVENT
+                    if str(item.get("scope")) == SCOPE_EVENT and item.get("candidates") is not None
                 ),
                 "note": (
                     "an event whose cutoff (or whose cutoff's official pool identity) is "
                     "unavailable excludes its whole candidate enumeration in one EVENT-scope "
-                    "record; that record accounts for its slots, so the status counts and the "
-                    "totals still add up"
+                    "record.  Where that event has no candidate count, the record -- and its "
+                    "entry in excluded_by_status -- carries null for it, and the counts above "
+                    "cover the events that do have one: the two sides still add up, and the "
+                    "events left out are named rather than counted as zero"
                 ),
             },
             "identity": {
@@ -1385,9 +1593,10 @@ def evaluate_events(
                     "persisted players row is read only through the explicit opt-in"
                 ),
                 "fail_closed_rule": (
-                    "a cutoff with no usable accepted generation is excluded at EVENT scope and "
-                    "projected from nothing, so a later write can never decide an earlier "
-                    "prediction's identity"
+                    "a cutoff with no usable accepted generation is excluded at EVENT scope, "
+                    "projected from nothing and counted from nothing: a later write can never "
+                    "decide an earlier prediction's identity, and the mutable persisted pool is "
+                    "not enumerated to give such an event a candidate count"
                 ),
             },
             "pool_priors": {
@@ -1410,7 +1619,7 @@ def evaluate_events(
             "shared_population_enforced_by": "walk_forward.assert_same_population",
             "coverage_share": (
                 round(scored_candidates / enumerated_slots, wm.METRIC_DECIMALS)
-                if enumerated_slots
+                if enumerated_slots and candidate_counts_complete
                 else None
             ),
         },
@@ -1424,6 +1633,11 @@ def evaluate_events(
             "scope": "reported, never scored",
             "per_event": store_divergence["per_event"],
             "per_player": store_divergence["per_player"],
+            "per_event_null_note": (
+                "a null per-event entry means that cutoff has no usable official pool to compare "
+                "the persisted pool against: the persisted rows are not read there at all, so "
+                "there is nothing to report and nothing is assumed"
+            ),
             "note": (
                 "the persisted pool is not an input to any projection: it is read only to report "
                 "how far the store has diverged from the cutoff's official pool (per event) and "
