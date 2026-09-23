@@ -19,8 +19,9 @@ contracts:
 * the four declared probability surfaces, on the anchor ``xpts_v1`` population
   read from :func:`walk_forward_scoreboard.player_fixture_population` (so this
   module and the scoreboard cannot drift onto two different populations);
-* each origin's FIT BASIS from PE-5's append-only point-in-time observation
-  captures, never from the current-state table;
+* each origin's FIT BASIS from the FROZEN prediction rows of the earlier events
+  plus PE-5's append-only point-in-time observation captures, never from the
+  current ``fixtures`` / ``player_gameweeks`` / ``players`` state;
 * the persisted expected-points components at the grain each is persisted at;
 * the Monte Carlo quantile grid, through the scoreboard's own coverage block;
 * the uncalibrated FPL assist-mapping constant, as a DECISION it reports rather
@@ -36,18 +37,24 @@ nothing for it to correct.
 
 NO IN-SAMPLE CALIBRATION
 ------------------------
-A transform scored at target event ``E`` is fitted only on outcomes that were
-officially final AND captured STRICTLY BEFORE ``E``'s own certified cutoff, as
-proven by PE-5's append-only observation captures.  The basis uses the outcome
-value THAT capture states, so a later official correction is a later observation
-and cannot rewrite an earlier transform.  A row whose timing cannot be proven --
-no capture, a capture that arrived after the cutoff, a provisional observation, a
-finality that is unstated or too late -- is EXCLUDED AND COUNTED, never assumed
-known.  Every origin's fitted parameters and fit basis are recorded, the basis
-digest is part of the fitted version string, and a basis containing an outcome at
-or after its origin is REFUSED rather than approximated.  A figure produced by
-fitting and scoring on the same event set is not evidence and is never reported as
-if it were.
+A transform scored at target event ``E`` is fitted only on the FROZEN prediction
+rows of strictly earlier events whose outcome was officially final AND captured
+STRICTLY BEFORE ``E``'s own certified cutoff, as proven by PE-5's append-only
+observation captures.  Membership comes from the persisted prediction, not from
+the current tables: the projection rows are immutable at storage level and the
+realised outcome is derived against the position PERSISTED with the prediction,
+so a fixture that has since lost its played flag, a realised row that has since
+been removed or blanked, a placeholder that has since appeared or a position that
+has since been re-listed cannot add to or remove from a historical basis.  The
+basis uses the outcome value THAT capture states, so a later official correction
+is a later observation and cannot rewrite an earlier transform.  A row whose
+timing cannot be proven -- no capture, a capture that arrived after the cutoff, a
+provisional observation, a finality that is unstated or too late -- is EXCLUDED
+AND COUNTED, never assumed known.  Every origin's fitted parameters and fit basis
+are recorded, the basis digest is part of the fitted version string, and a basis
+containing an outcome at or after its origin is REFUSED rather than approximated.
+A figure produced by fitting and scoring on the same event set is not evidence
+and is never reported as if it were.
 
 SAME POPULATION OR NO COMPARISON
 --------------------------------
@@ -109,16 +116,19 @@ DIAGNOSIS_MISCALIBRATED = "MISCALIBRATED"
 DIAGNOSIS_NO_MATERIAL_DEFECT = "NO_MATERIAL_DEFECT_DETECTED"
 DIAGNOSIS_INSUFFICIENT = "INSUFFICIENT_FOR_DIAGNOSIS"
 
-#: Why a row of the declared population did NOT enter an origin's fit basis.  A
-#: basis row must carry a PE-5 point-in-time observation whose official finality
-#: AND capture both fall strictly before the origin's certified cutoff; anything
-#: whose timing cannot be proven is excluded and counted, never assumed known.
+#: Why a row of the frozen prediction population did NOT enter an origin's fit
+#: basis.  A basis row must be a persisted prediction row carrying the field the
+#: surface is defined on, and must carry a PE-5 point-in-time observation whose
+#: official finality AND capture both fall strictly before the origin's certified
+#: cutoff; anything whose timing cannot be proven is excluded and counted, never
+#: assumed known.
 BASIS_CAPTURE_ABSENT = "POINT_IN_TIME_CAPTURE_ABSENT"
 BASIS_CAPTURE_NOT_BEFORE_CUTOFF = "CAPTURE_NOT_BEFORE_CUTOFF"
 BASIS_PROVISIONAL = "OBSERVATION_PROVISIONAL_AT_CUTOFF"
 BASIS_FINALITY_UNPROVABLE = "OFFICIAL_FINALITY_UNPROVABLE"
 BASIS_FINALITY_NOT_BEFORE_CUTOFF = "OFFICIAL_FINALITY_NOT_BEFORE_CUTOFF"
 BASIS_OUTCOME_UNAVAILABLE = "POINT_IN_TIME_OUTCOME_UNAVAILABLE"
+BASIS_PREDICTION_FIELD_ABSENT = "FROZEN_PREDICTION_FIELD_ABSENT"
 
 BASIS_EXCLUSION_REASONS: tuple[str, ...] = (
     BASIS_CAPTURE_ABSENT,
@@ -127,6 +137,34 @@ BASIS_EXCLUSION_REASONS: tuple[str, ...] = (
     BASIS_FINALITY_UNPROVABLE,
     BASIS_FINALITY_NOT_BEFORE_CUTOFF,
     BASIS_OUTCOME_UNAVAILABLE,
+    BASIS_PREDICTION_FIELD_ABSENT,
+)
+
+#: The declared precedence of the exclusions above.  A row is counted under ONE
+#: reason, and the order is a rule rather than an artefact: a frozen prediction
+#: row that does not carry the field the surface is defined on was never a
+#: candidate observation at all, so it is counted before its timing is examined.
+BASIS_EXCLUSION_PRECEDENCE = (
+    "FROZEN_PREDICTION_FIELD_ABSENT, then the point-in-time timing ladder "
+    "(POINT_IN_TIME_CAPTURE_ABSENT / CAPTURE_NOT_BEFORE_CUTOFF / OBSERVATION_PROVISIONAL_AT_CUTOFF / "
+    "OFFICIAL_FINALITY_UNPROVABLE / OFFICIAL_FINALITY_NOT_BEFORE_CUTOFF), then "
+    "POINT_IN_TIME_OUTCOME_UNAVAILABLE"
+)
+
+#: The declared fit-basis policy, stated once and carried by every block that
+#: builds a basis, so the rule a fitted transform obeyed is readable from the
+#: artifact rather than inferred from the code that produced it.
+BASIS_MEMBERSHIP_POLICY = (
+    "membership is the FROZEN prediction rows of strictly earlier target events of the anchor "
+    "xpts_v1 runs -- read from the immutable projection rows, so a fixture that has since lost its "
+    "played flag, a realised player_gameweeks row that has since been removed or blanked, a "
+    "scheduled-placeholder flag that has since appeared and a players row that has since been "
+    "re-listed cannot add to or remove from a historical basis -- combined with PE-5 append-only "
+    "point-in-time observation captures whose official finality AND capture both fall strictly "
+    "before the origin's OWN certified cutoff.  The realised outcome is derived against the "
+    "position PERSISTED WITH THE PREDICTION, and the outcome VALUE is the capture's, so a later "
+    "correction is a later observation and cannot rewrite an earlier transform.  A row whose "
+    "timing cannot be proven is excluded and counted with its own reason."
 )
 
 #: Declared a priori.  A reliability bin whose observed frequency differs from its
@@ -435,13 +473,25 @@ def realised_component(
     """The realised counterpart of one persisted component, or ``None`` for a gap.
 
     ``None`` means the realised quantity could not be established from the stored
-    official facts.  It is counted as a data gap and never scored as zero.
+    official facts.  It is counted as a data gap and never scored as zero -- with
+    one declared exception.  Where the frozen scoring rules answer the question by
+    POSITION alone, the real zero is returned BEFORE the component's own outcome
+    column is consulted: a forward's save points and a forward's goals-conceded
+    deduction do not depend on ``saves`` or ``goals_conceded`` any more than a
+    GKP's DefCon points depend on ``defensive_contribution``, so an absent column
+    there is not an unavailable outcome and must not drop a covered row out of the
+    component population.  The order matters: consulting an irrelevant column
+    first turns a structural zero into a gap.
     """
 
     if outcome is None:
         return None
     minutes = outcome.get("minutes")
     if minutes is None:
+        # The row-level availability test every selector shares: without minutes
+        # there is no official performance record to score at all (a scheduled
+        # placeholder has a NULL minutes column), so this is a gap rather than a
+        # structural zero.
         return None
     minutes = int(minutes)
     if selector == "appearance_points":
@@ -467,11 +517,14 @@ def realised_component(
         earned = rules.earns_clean_sheet_points(position, minutes, int(conceded))
         return float(rules.clean_sheet_points_for(position) if earned else 0)
     if selector == "goals_conceded_points":
+        # A position outside goals_conceded_positions suffers no deduction whatever
+        # it conceded, so its realised value is a REAL zero and it is returned
+        # BEFORE the conceded column is read.
+        if position not in rules.goals_conceded_positions:
+            return 0.0
         conceded = outcome.get("goals_conceded")
         if conceded is None:
             return None
-        if position not in rules.goals_conceded_positions:
-            return 0.0
         steps = int(conceded) // int(rules.goals_conceded_per_deduction)
         return -float(steps) * abs(float(rules.goals_conceded_points_for(position)))
     if selector == "defcon_points":
@@ -490,11 +543,14 @@ def realised_component(
             return None
         return float(rules.defcon_points) if float(contribution) >= threshold else 0.0
     if selector == "save_points":
+        # The same rule as DefCon, on the other side: only a GKP can earn save
+        # points, so an outfield position's realised value is a REAL zero and it is
+        # returned BEFORE the saves column is read.
+        if position != "GKP":
+            return 0.0
         saves = outcome.get("saves")
         if saves is None:
             return None
-        if position != "GKP":
-            return 0.0
         return float(int(saves) // int(rules.saves_per_point))
     if selector == "yellow_card_points":
         cards = outcome.get("yellow_cards")
@@ -522,10 +578,13 @@ def structural_zero_rule(
     """Why this position earns a REAL zero on this component, or ``None`` if it does not.
 
     A position outside the component's declared positions earns nothing from it by
-    the frozen scoring rules -- a GKP earns no DefCon points, a forward concedes no
-    deductions -- so its realised value is a genuine zero and the row BELONGS in
-    the component population.  Reporting the count makes that coverage visible
-    instead of leaving a reader to infer it from an ``N``.
+    the frozen scoring rules -- a GKP earns no DefCon points, an outfield player
+    earns no save points, a forward concedes no deductions -- so its realised value
+    is a genuine zero, INDEPENDENT of the component's own outcome column, and the
+    row BELONGS in the component population.  ``realised_component`` therefore
+    returns that zero before consulting the column, and this function reports the
+    rule by token.  Reporting the count makes the coverage visible instead of
+    leaving a reader to infer it from an ``N``.
     """
 
     if selector == "defcon_points" and position not in rules.defcon_positions:
@@ -724,25 +783,123 @@ def comparison_gate(
 # ---------------------------------------------------------------------------
 
 
+def _count_exclusion(counters: dict[str, int], reason: str) -> None:
+    """Count one refusal under exactly one reason."""
+
+    key = str(reason)
+    counters[key] = counters.get(key, 0) + 1
+
+
+@dataclass(frozen=True)
+class FrozenPredictionRow:
+    """One persisted prediction row of an earlier event's own certified run.
+
+    This is the FROZEN half of a fit basis.  ``player_fixture_xpts_projections``
+    refuses UPDATE and DELETE at storage level, so the position a prediction was
+    made at and the probability it stated cannot be re-pointed by a later refresh
+    of ``fixtures``, ``player_gameweeks`` or ``players``.  Basis membership is
+    therefore a property of what was PERSISTED at prediction time, never of what
+    the current tables happen to say about a historical row.
+    """
+
+    event: int
+    player_id: int
+    fixture_id: int
+    xpts_run_id: int
+    position: str
+    payload: Mapping[str, Any]
+
+    @property
+    def key(self) -> tuple[int, int, int]:
+        return (int(self.event), int(self.player_id), int(self.fixture_id))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "event": int(self.event),
+            "player_id": int(self.player_id),
+            "fixture_id": int(self.fixture_id),
+            "xpts_run_id": int(self.xpts_run_id),
+            "position": str(self.position),
+            "population": "frozen prediction row (immutable at storage level)",
+        }
+
+
+def frozen_prediction_rows(
+    conn: sqlite3.Connection, *, runs: Mapping[int, int], events: Sequence[int]
+) -> dict[int, list[FrozenPredictionRow]]:
+    """Each event's frozen prediction rows, read from its own certified run.
+
+    Read straight from the persisted, immutable projection rows rather than
+    through the declared SCORING population, because the two answer different
+    questions.  The scoring population is PE-2's declared CURRENT-STATE population
+    -- played fixtures, a realised row that exists now and is not a placeholder, a
+    position read from today's ``players`` table -- and it is the population every
+    SCORED figure covers.  A fit basis is a different role: what was PREDICTED at
+    the position it was predicted for, and what was THEN captured as final.  So a
+    row that has since lost its played-fixture flag, its realised row, or its
+    current position listing is still evidence of what an earlier transform was
+    fitted on, and the two populations are named separately wherever both are
+    reported.
+    """
+
+    wanted = sorted({int(event) for event in events})
+    out: dict[int, list[FrozenPredictionRow]] = {event: [] for event in wanted}
+    for event in wanted:
+        run_id = runs.get(event)
+        if run_id is None:
+            continue
+        for record in conn.execute(
+            "SELECT player_id, fixture_id, position, payload_json "
+            "FROM player_fixture_xpts_projections WHERE projection_run_id=? AND event=? "
+            "ORDER BY player_id, fixture_id",
+            (int(run_id), int(event)),
+        ):
+            out[event].append(
+                FrozenPredictionRow(
+                    event=int(event),
+                    player_id=int(record["player_id"]),
+                    fixture_id=int(record["fixture_id"]),
+                    xpts_run_id=int(run_id),
+                    position=str(record["position"] or ""),
+                    payload=json.loads(record["payload_json"]) if record["payload_json"] else {},
+                )
+            )
+    return out
+
+
 def point_in_time_basis(
     *,
     conn: sqlite3.Connection,
-    rows: Sequence[sb.ProbabilityScoringRow],
+    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]],
     cutoffs: Mapping[int, str],
-    selector: str,
+    definition: sb.ProbabilityMetricDefinition,
 ) -> tuple[dict[int, list[pc.CalibrationObservation]], dict[int, dict[str, int]]]:
-    """Each origin's fit basis, built ONLY from PE-5 point-in-time evidence.
+    """Each origin's fit basis: frozen prediction rows PLUS PE-5 point-in-time evidence.
 
-    For every origin event ``E`` the basis is the declared population's rows from
-    strictly earlier events whose outcome is proven by an APPEND-ONLY PE-5
-    observation capture to have been officially final AND captured strictly before
-    ``E``'s certified cutoff.  The outcome value used is the one that capture
-    states, not the current table's value: a later official refresh is a later
-    capture and therefore cannot retroactively rewrite what an earlier transform
-    was fitted on.
+    For every origin event ``E`` the basis is the FROZEN prediction rows of strictly
+    earlier events whose outcome is proven by an APPEND-ONLY PE-5 observation
+    capture to have been officially final AND captured strictly before ``E``'s
+    certified cutoff.  Three properties follow, and each is a rule rather than an
+    implementation detail:
+
+    * MEMBERSHIP COMES FROM THE PREDICTION, NOT FROM THE CURRENT TABLES.  The rows
+      are the persisted projection rows of the earlier events' own certified runs,
+      so neither a fixture that has since lost its played flag, nor a realised
+      ``player_gameweeks`` row that has since been removed or blanked, nor a
+      scheduled-placeholder flag that has since appeared can add to or remove from
+      a historical basis.
+    * THE POSITION IS THE PREDICTION-TIME POSITION.  The realised outcome is
+      derived against the position PERSISTED WITH THE PREDICTION rather than
+      against today's ``players`` row, because the question a prediction asked was
+      asked at the position it was made at.
+    * THE OUTCOME VALUE IS THE CAPTURE'S.  A later official refresh is a later
+      capture, so it cannot retroactively rewrite what an earlier transform was
+      fitted on.
 
     Every refusal is named rather than assumed:
 
+    * ``FROZEN_PREDICTION_FIELD_ABSENT`` -- the prediction row does not carry the
+      field this surface is defined on, so it was never a candidate observation;
     * ``POINT_IN_TIME_CAPTURE_ABSENT`` -- the key has no observation at all;
     * ``CAPTURE_NOT_BEFORE_CUTOFF`` -- the result was official in time, but the
       repository captured it after the origin's cutoff;
@@ -755,21 +912,20 @@ def point_in_time_basis(
       this surface's realised outcome is defined on.
 
     Every refusal is counted by reason, per origin, so the size of the excluded
-    evidence is visible rather than silently missing.
+    evidence is visible rather than silently missing, and the precedence between
+    the reasons is declared by :data:`BASIS_EXCLUSION_PRECEDENCE` rather than left
+    to the order of the branches below.
     """
 
-    by_event: dict[int, list[sb.ProbabilityScoringRow]] = {}
-    for row in rows:
-        by_event.setdefault(int(row.event), []).append(row)
-    origins = sorted(by_event)
-    basis: dict[int, list[pc.CalibrationObservation]] = {origin: [] for origin in origins}
-    excluded: dict[int, dict[str, int]] = {origin: {} for origin in origins}
-    if not origins:
+    events = sorted({int(event) for event in prediction_rows})
+    basis: dict[int, list[pc.CalibrationObservation]] = {origin: [] for origin in events}
+    excluded: dict[int, dict[str, int]] = {origin: {} for origin in events}
+    if not events:
         return basis, excluded
 
     captures: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for capture in ledger.observation_captures(
-        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, events=origins
+        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, events=events
     ):
         if capture.get("fixture_id") is None:
             continue
@@ -777,22 +933,28 @@ def point_in_time_basis(
             (int(capture["event"]), int(capture["player_id"]), int(capture["fixture_id"])), []
         ).append(capture)
 
-    for origin in origins:
+    for origin in events:
         cutoff = _require_cutoff(cutoffs, origin)
-        for event in (candidate for candidate in origins if candidate < origin):
-            for row in by_event[event]:
+        for event in (candidate for candidate in events if candidate < origin):
+            for row in prediction_rows[event]:
+                statement = row.payload.get(definition.field)
+                if statement is None:
+                    _count_exclusion(excluded[origin], BASIS_PREDICTION_FIELD_ABSENT)
+                    continue
                 outcome, reason = _point_in_time_outcome(
-                    captures.get(row.key, ()), cutoff=cutoff, selector=selector, row=row
+                    captures.get(row.key, ()),
+                    cutoff=cutoff,
+                    selector=definition.outcome_selector,
+                    position=row.position,
                 )
                 if reason is not None:
-                    counters = excluded[origin]
-                    counters[reason] = counters.get(reason, 0) + 1
+                    _count_exclusion(excluded[origin], reason)
                     continue
                 basis[origin].append(
                     pc.CalibrationObservation(
                         event=int(row.event),
                         key=(int(row.player_id), int(row.fixture_id)),
-                        probability=float(row.probability),
+                        probability=float(statement),
                         outcome=float(outcome),
                     )
                 )
@@ -806,9 +968,15 @@ def _point_in_time_outcome(
     *,
     cutoff: str,
     selector: str,
-    row: sb.ProbabilityScoringRow,
+    position: str,
 ) -> tuple[float | None, str | None]:
-    """``(realised outcome, exclusion reason)`` for one row at one cutoff."""
+    """``(realised outcome, exclusion reason)`` for one frozen row at one cutoff.
+
+    ``position`` is the position the prediction was MADE at, taken from the frozen
+    prediction row: the realised outcome a probability names has to be judged at
+    the position the probability was stated for, not at whatever position the
+    current ``players`` table lists today.
+    """
 
     visible = [
         capture
@@ -830,7 +998,7 @@ def _point_in_time_outcome(
     if final_at >= str(cutoff):
         return None, BASIS_FINALITY_NOT_BEFORE_CUTOFF
     realised = sb.realised_probability_outcome(
-        selector, chosen.get("payload") or {}, row.position
+        selector, chosen.get("payload") or {}, str(position)
     )
     if realised is None:
         return None, BASIS_OUTCOME_UNAVAILABLE
@@ -950,6 +1118,7 @@ def _challenger_block(
     *,
     conn: sqlite3.Connection,
     rows: Sequence[sb.ProbabilityScoringRow],
+    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]],
     cutoffs: Mapping[int, str],
     definition: sb.ProbabilityMetricDefinition,
     grain: str,
@@ -961,10 +1130,15 @@ def _challenger_block(
     reportable block and the rows the arm could actually cover.  A row whose
     origin had no admissible transform is EXCLUDED AND COUNTED, never scored under
     a transform fitted somewhere else.
+
+    The basis and the scored population are two different roles and are named
+    separately: the basis is the FROZEN prediction rows plus point-in-time
+    evidence (what a transform was allowed to learn from), and the scored rows are
+    PE-2's declared current-state population (what the figures cover).
     """
 
     basis_by_origin, excluded_by_origin = point_in_time_basis(
-        conn=conn, rows=rows, cutoffs=cutoffs, selector=definition.outcome_selector
+        conn=conn, prediction_rows=prediction_rows, cutoffs=cutoffs, definition=definition
     )
     fits = causal_origins(basis_by_origin, surface=definition.metric, grain=grain)
     origins: list[dict[str, Any]] = []
@@ -1015,19 +1189,16 @@ def _challenger_block(
         "method": pc.PLATT_FIT_METHOD,
         "policy_version": pc.CAUSAL_FIT_POLICY_VERSION,
         "calibration_policy_version": pc.PROBABILITY_CALIBRATION_POLICY_VERSION,
-        "basis_policy": (
-            "the same surface's rows from strictly earlier target events of this anchor, restricted to "
-            "the declared population AND to rows whose PE-5 point-in-time capture proves the outcome "
-            "was officially final and captured strictly before the origin's certified cutoff.  A row "
-            "whose timing cannot be proven is excluded and counted, and an origin with an insufficient "
-            "basis is reported rather than fitted from rows the figures do not cover"
-        ),
+        "basis_policy": BASIS_MEMBERSHIP_POLICY,
         "basis_evidence": {
             "ledger_version": ledger.OUTCOME_LEDGER_VERSION,
             "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
             "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
             "grain": ledger.GRAIN_PLAYER_FIXTURE,
+            "membership": "frozen prediction rows of the strictly earlier events of the anchor xpts_v1 runs",
+            "position": "the position persisted with each prediction row, never the current players row",
             "strictly_before_cutoff": True,
+            "exclusion_precedence": BASIS_EXCLUSION_PRECEDENCE,
             "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
         },
         "origins": origins,
@@ -1266,6 +1437,7 @@ def probability_calibration_block(
     *,
     events: Sequence[int],
     xpts_runs: Mapping[int, int],
+    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]] | None = None,
     cutoffs: Mapping[int, str] | None = None,
     excluded_events: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
@@ -1273,7 +1445,8 @@ def probability_calibration_block(
 
     The order is the contract's rule 1 made structural.  The incumbent figure and
     its diagnosis are computed for every surface; a challenger is built ONLY where
-    the diagnosis is MISCALIBRATED.
+    the diagnosis is MISCALIBRATED, and its basis is the frozen prediction rows of
+    the anchor's own runs, never the current-state tables.
     """
 
     wanted = sorted({int(event) for event in events})
@@ -1286,6 +1459,11 @@ def probability_calibration_block(
         by_metric[row.metric].append(row)
 
     declared_cutoffs = dict(cutoffs or {})
+    frozen = (
+        dict(prediction_rows)
+        if prediction_rows is not None
+        else frozen_prediction_rows(conn, runs=xpts_runs, events=wanted)
+    )
     surfaces: list[dict[str, Any]] = []
     for definition in sb.PROBABILITY_METRICS:
         rows = by_metric[definition.metric]
@@ -1301,6 +1479,7 @@ def probability_calibration_block(
             challenger, _covered = _challenger_block(
                 conn=conn,
                 rows=rows,
+                prediction_rows=frozen,
                 cutoffs=declared_cutoffs,
                 definition=definition,
                 grain=wf.GRAIN_PLAYER_FIXTURE,
@@ -1645,6 +1824,7 @@ def assist_mapping_block(
     *,
     events: Sequence[int],
     xpts_runs: Mapping[int, int],
+    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]] | None = None,
     cutoffs: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     """The uncalibrated assist-mapping constant, as a decision PE-8 reports.
@@ -1655,14 +1835,24 @@ def assist_mapping_block(
     reported as a candidate; PE-8 does not re-point the constant, and it never
     silences the truthful ``FPL_ASSIST_MAPPING_UNCALIBRATED`` flag.
 
-    Each origin's fit basis is PE-5 point-in-time evidence, exactly as the
-    probability surfaces' is: the realised assists come from the observation
-    capture that was final and captured strictly before that origin's certified
-    cutoff, and a row whose timing cannot be proven is excluded and counted.
+    Each origin's fit basis is built exactly as the probability surfaces' is:
+    the FROZEN prediction rows of the strictly earlier events -- the persisted
+    ``expected_xa`` the production formula multiplies, and the position the
+    prediction was made at -- combined with the PE-5 observation capture that was
+    final and captured strictly before that origin's certified cutoff.  A row
+    whose timing cannot be proven is excluded and counted.
+
+    ``pooled_evidence`` is the ADMISSIBLE evidence, and nothing else: every row
+    that entered at least one origin's basis, counted ONCE (at the value admitted
+    at the latest origin that could see it), with the refusals summed by reason
+    beside it.  The declared descriptive floors are tested against that pool, so a
+    late capture, a provisional read, an absent observation or a correction that
+    arrived after every cutoff cannot make the evidence look larger than what a
+    fit was allowed to learn from, and a row's CURRENT table value is never
+    substituted for the value the capture stated.
     """
 
     config = xpts_module.XPtsConfig()
-    wanted = sorted({int(event) for event in events})
     declared_cutoffs = dict(cutoffs or {})
     block: dict[str, Any] = {
         "surface": ASSIST_MAPPING_SURFACE,
@@ -1677,42 +1867,34 @@ def assist_mapping_block(
         },
         "method": pc.ASSIST_MAPPING_FIT_METHOD,
         "policy_version": pc.CAUSAL_FIT_POLICY_VERSION,
-        "basis_policy": (
-            "the same population's strictly earlier target events, restricted to rows whose PE-5 "
-            "point-in-time capture proves the official assists were final and captured strictly before "
-            "the origin's certified cutoff; expected_xa is the persisted expected xA the production "
-            "formula multiplies, and a row whose timing cannot be proven is excluded and counted"
-        ),
+        "basis_policy": BASIS_MEMBERSHIP_POLICY,
         "basis_evidence": {
             "ledger_version": ledger.OUTCOME_LEDGER_VERSION,
             "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
             "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
             "grain": ledger.GRAIN_PLAYER_FIXTURE,
+            "membership": "frozen prediction rows of the strictly earlier events of the anchor xpts_v1 runs",
+            "expected_side": "the persisted expected_xa of the frozen prediction row",
+            "realised_side": "the official assists column OF THE CAPTURE, never the current table's",
             "strictly_before_cutoff": True,
+            "exclusion_precedence": BASIS_EXCLUSION_PRECEDENCE,
             "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
         },
         "origins": [],
-        "pooled_evidence": {
-            "observations": 0,
-            "events": 0,
-            "expected_assists_total": 0.0,
-            "realised_assists_total": 0.0,
-        },
+        "pooled_evidence": _pooled_evidence({}, {}, candidate_rows=0),
     }
-    if not wanted or not xpts_runs:
+    wanted = sorted({int(event) for event in events})
+    frozen = (
+        {int(event): list(rows) for event, rows in prediction_rows.items()}
+        if prediction_rows is not None
+        else frozen_prediction_rows(conn, runs=xpts_runs, events=wanted)
+    )
+    by_event: dict[int, list[FrozenPredictionRow]] = {
+        int(event): list(rows) for event, rows in sorted(frozen.items()) if rows
+    }
+    if not by_event:
         block["decision"] = assist_mapping_decision(block["origins"], block["pooled_evidence"])
         return block
-
-    population = sb.player_fixture_population(conn, events=wanted, xpts_runs=xpts_runs)
-    observations: list[tuple[int, sb.PlayerFixtureScoringRow, float]] = []
-    for row in population["rows"]:
-        expected = row.payload.get("expected_xa")
-        if expected is None:
-            continue
-        observations.append((int(row.event), row, float(expected)))
-    by_event: dict[int, list[tuple[sb.PlayerFixtureScoringRow, float]]] = {}
-    for event, row, expected in observations:
-        by_event.setdefault(int(event), []).append((row, expected))
 
     captures: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for capture in ledger.observation_captures(
@@ -1724,22 +1906,29 @@ def assist_mapping_block(
             (int(capture["event"]), int(capture["player_id"]), int(capture["fixture_id"])), []
         ).append(capture)
 
-    pooled_expected = 0.0
-    pooled_realised = 0.0
-    pooled_observations = 0
+    # One entry per admissible ROW, keyed by its own identity.  Origins are walked
+    # in ascending order and a later admission overwrites an earlier one, so a row
+    # that appears in several bases is counted once, at the value the latest origin
+    # that could see it admitted.
+    pooled: dict[tuple[int, int, int], tuple[float, float]] = {}
+    excluded_total: dict[str, int] = {}
+    candidate_rows = 0
     for origin in sorted(by_event):
         cutoff = _require_cutoff(declared_cutoffs, origin)
         basis_rows: list[pc.AssistMappingObservation] = []
         excluded: dict[str, int] = {}
-        for event in sorted(by_event):
-            if int(event) >= int(origin):
-                continue
-            for row, expected in by_event[event]:
+        for event in (candidate for candidate in sorted(by_event) if int(candidate) < int(origin)):
+            for row in by_event[event]:
+                candidate_rows += 1
+                expected = row.payload.get("expected_xa")
+                if expected is None:
+                    _count_exclusion(excluded, BASIS_PREDICTION_FIELD_ABSENT)
+                    continue
                 realised, reason = _point_in_time_assists(
-                    captures.get(row.key, ()), cutoff=cutoff, row=row
+                    captures.get(row.key, ()), cutoff=cutoff
                 )
                 if reason is not None:
-                    excluded[reason] = excluded.get(reason, 0) + 1
+                    _count_exclusion(excluded, reason)
                     continue
                 basis_rows.append(
                     pc.AssistMappingObservation(
@@ -1749,6 +1938,13 @@ def assist_mapping_block(
                         realised_assists=float(realised),
                     )
                 )
+        for observation in basis_rows:
+            pooled[(int(observation.event), int(observation.key[0]), int(observation.key[1]))] = (
+                float(observation.expected_assists),
+                float(observation.realised_assists),
+            )
+        for reason, count in excluded.items():
+            excluded_total[reason] = excluded_total.get(reason, 0) + int(count)
         fit = pc.fit_assist_mapping_causal(
             basis_rows, origin_event=int(origin), surface=ASSIST_MAPPING_SURFACE, grain=ASSIST_MAPPING_GRAIN
         )
@@ -1756,6 +1952,7 @@ def assist_mapping_block(
             "origin_event": int(origin),
             "cutoff": cutoff,
             "rows_at_origin": len(by_event[int(origin)]),
+            "rows_admitted_at_origin": len(basis_rows),
             "basis_excluded_by_reason": {key: int(value) for key, value in sorted(excluded.items())},
             "fit": fit.as_dict(),
         }
@@ -1765,33 +1962,74 @@ def assist_mapping_block(
             # policy it was fitted under is not evidence of anything.
             entry["provenance"] = pc.assist_mapping_from_payload(fit.as_payload())
         block["origins"].append(entry)
-    for _event, row, expected in observations:
-        assists = row.outcome.get("assists")
-        if assists is None:
-            continue
-        pooled_expected += float(expected)
-        pooled_realised += float(int(assists))
-        pooled_observations += 1
-    block["pooled_evidence"] = {
-        "observations": int(pooled_observations),
-        "events": len(by_event),
-        "expected_assists_total": round(pooled_expected, 6),
-        "realised_assists_total": round(pooled_realised, 6),
-    }
+
+    block["pooled_evidence"] = _pooled_evidence(pooled, excluded_total, candidate_rows=candidate_rows)
     block["decision"] = assist_mapping_decision(block["origins"], block["pooled_evidence"])
     return block
+
+
+def _pooled_evidence(
+    pooled: Mapping[tuple[int, int, int], tuple[float, float]],
+    excluded: Mapping[str, int],
+    *,
+    candidate_rows: int,
+) -> dict[str, Any]:
+    """The pooled ADMISSIBLE evidence, with the refusals beside it.
+
+    ``observations`` and ``events`` are what the declared descriptive floors bind
+    on: rows that actually entered a fit basis, counted once each.  A row that no
+    origin was allowed to learn from -- a late, provisional, absent or
+    post-cutoff-corrected capture -- is not in the pool at all; it appears in
+    ``excluded_by_reason`` instead, so the size of what could not be used is
+    visible rather than missing.
+    """
+
+    rows = [pooled[key] for key in sorted(pooled)]
+    observations = len(rows)
+    events = len({int(key[0]) for key in pooled})
+    sufficient = (
+        events >= sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE
+        and observations >= sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE
+    )
+    return {
+        "policy_version": pc.CAUSAL_FIT_POLICY_VERSION,
+        "basis": (
+            "the union of the origins' admissible fit bases: rows whose PE-5 point-in-time capture was "
+            "FINAL and captured strictly before an origin's own certified cutoff, deduplicated by row "
+            "and counted once, at the value admitted at the latest origin that could see it.  The "
+            "current tables' outcome columns are never read, and a row no origin could learn from is "
+            "excluded rather than pooled"
+        ),
+        "observations": int(observations),
+        "events": int(events),
+        "candidate_rows_examined": int(candidate_rows),
+        "excluded_by_reason": {str(key): int(value) for key, value in sorted(excluded.items())},
+        "expected_assists_total": round(sum(expected for expected, _realised in rows), 6),
+        "realised_assists_total": round(sum(realised for _expected, realised in rows), 6),
+        "sample_interpretation": sb.SAMPLE_DESCRIPTIVE_ONLY if sufficient else sb.SAMPLE_INSUFFICIENT,
+        "floors": {
+            "policy_version": sb.SAMPLE_POLICY_VERSION,
+            "min_target_events_for_descriptive_reporting": sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE,
+            "min_observations_for_descriptive_reporting": sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE,
+            "basis": (
+                "the PE-2 disclosure floor, NOT a significance threshold; it is tested against the "
+                "ADMISSIBLE evidence only, so evidence no transform could use cannot meet it"
+            ),
+        },
+    }
 
 
 def _point_in_time_assists(
     captures: Sequence[Mapping[str, Any]],
     *,
     cutoff: str,
-    row: sb.PlayerFixtureScoringRow,
 ) -> tuple[int | None, str | None]:
-    """``(realised assists, exclusion reason)`` for one row at one cutoff.
+    """``(realised assists, exclusion reason)`` for one frozen prediction row.
 
     The realised side is the official assists column OF THE CAPTURE, so a later
-    official refresh cannot rewrite what an earlier fit was fitted on.
+    official refresh is a later capture and cannot rewrite what an earlier fit was
+    fitted on.  The current ``player_gameweeks`` column is never consulted: it is
+    the newest state of the row, not the state that was known at the cutoff.
     """
 
     visible = [
@@ -1825,11 +2063,14 @@ def assist_mapping_decision(
 
     ``NO_CHANGE`` is an expected outcome, not a failure: the coefficient stays
     ``1.0`` and the truthful flag keeps being emitted.  ``CANDIDATE_FOR_REVIEW``
-    says a causal fit exists AND the evidence meets the declared descriptive
-    floors -- it still does not move the constant, because a promotion changes
-    production behaviour and belongs to review.
+    says a causal fit exists AND the admissible evidence meets the declared
+    descriptive floors -- it still does not move the constant, because a promotion
+    changes production behaviour and belongs to review.
 
-    A fit counts as admissible only after its PROVENANCE is read back through
+    Both inputs are ADMISSIBLE evidence: ``pooled`` counts only rows that entered a
+    real fit basis, so a late, provisional, absent or later-corrected capture can
+    neither meet nor inflate a floor.  A fit counts as admissible only after its
+    PROVENANCE is read back through
     :func:`probability_calibration.assist_mapping_from_payload`: a coefficient
     whose payload is missing its identity or the policy it was fitted under, or
     whose content disagrees with the identity it records, is not evidence and
@@ -1852,11 +2093,26 @@ def assist_mapping_decision(
         )
         if bool(fit.get("in_bounds")):
             admissible.append(provenance)
+    evidence = {
+        "observations": int(observations),
+        "events": int(events),
+        "basis": (
+            "admissible point-in-time evidence only: rows that entered an origin's fit basis, counted "
+            "once; the current tables' outcome columns and any capture no cutoff admitted are not counted"
+        ),
+        "candidate_rows_examined": int(pooled.get("candidate_rows_examined") or 0),
+        "excluded_by_reason": {
+            str(key): int(value)
+            for key, value in sorted((pooled.get("excluded_by_reason") or {}).items())
+        },
+        "sample_interpretation": str(pooled.get("sample_interpretation") or ""),
+    }
     reasons: list[str] = []
     if not sufficient:
         reasons.append(
             "the available causal evidence is below the declared descriptive floors "
-            f"({events} event(s), {observations} observation(s)), so it cannot support a promotion"
+            f"({events} event(s), {observations} observation(s) that an origin's fit could actually "
+            "learn from), so it cannot support a promotion"
         )
     if not admissible:
         reasons.append(
@@ -1878,6 +2134,7 @@ def assist_mapping_decision(
             "candidate_coefficients": sorted(
                 {float(provenance["coefficient"]) for provenance in admissible}
             ),
+            "evidence": evidence,
             "floors": {
                 "min_target_events": sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE,
                 "min_observations": sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE,
@@ -1891,6 +2148,7 @@ def assist_mapping_decision(
         "flag_after": ASSIST_MAPPING_FLAG,
         "reasons": reasons,
         "candidate_coefficients": [],
+        "evidence": evidence,
         "floors": {
             "min_target_events": sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE,
             "min_observations": sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE,
@@ -2074,16 +2332,30 @@ def evaluate(
     # that reached past its origin's cutoff would describe a world in which the
     # target was already known.
     cutoffs = {int(event): anchor.for_event(int(event)).cutoff for event in final_events}
+    # The FROZEN half of every fit basis, read from the immutable projection rows
+    # of the anchor's own runs: membership, the stated probability and the position
+    # a prediction was made at all come from what was persisted, never from the
+    # current fixtures / player_gameweeks / players state.
+    prediction_rows = frozen_prediction_rows(conn, runs=xpts_runs, events=final_events)
 
     probability_block = probability_calibration_block(
-        conn, events=final_events, xpts_runs=xpts_runs, cutoffs=cutoffs, excluded_events=excluded_events
+        conn,
+        events=final_events,
+        xpts_runs=xpts_runs,
+        prediction_rows=prediction_rows,
+        cutoffs=cutoffs,
+        excluded_events=excluded_events,
     )
     expected_value = expected_value_block(
         conn, anchor=anchor, events=final_events, xpts_runs=xpts_runs
     )
     coverage = monte_carlo_block(conn, events=final_events, monte_carlo_runs=monte_carlo_runs)
     assist = assist_mapping_block(
-        conn, events=final_events, xpts_runs=xpts_runs, cutoffs=cutoffs
+        conn,
+        events=final_events,
+        xpts_runs=xpts_runs,
+        prediction_rows=prediction_rows,
+        cutoffs=cutoffs,
     )
 
     body: dict[str, Any] = {
@@ -2109,13 +2381,22 @@ def evaluate(
                 "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
                 "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
                 "grain": ledger.GRAIN_PLAYER_FIXTURE,
-                "basis_rule": (
-                    "a fit basis row must carry a PE-5 append-only observation capture that is FINAL "
-                    "and whose official finality AND capture both fall strictly before the origin's OWN "
-                    "certified cutoff; a row whose timing cannot be proven is excluded and counted, "
-                    "never assumed known, and the outcome value used is the capture's, so a later "
-                    "correction cannot rewrite an earlier transform"
+                "basis_rule": BASIS_MEMBERSHIP_POLICY,
+                "basis_membership": (
+                    "the frozen prediction rows of the anchor's own xpts_v1 runs read from "
+                    "player_fixture_xpts_projections, which refuses UPDATE and DELETE at storage level"
                 ),
+                "basis_position": (
+                    "the position persisted with each prediction row; the current players row is not "
+                    "consulted to decide what an earlier transform was fitted on"
+                ),
+                "scored_population": (
+                    "a different role, unchanged: the SCORED figures cover PE-2's declared "
+                    "current-state population (played fixtures, a realised row that exists now and is "
+                    "not a scheduled placeholder, the current position), which is what makes them "
+                    "reproducible against the scoreboard"
+                ),
+                "exclusion_precedence": BASIS_EXCLUSION_PRECEDENCE,
                 "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
             },
             "per_event_runs": {
@@ -2189,9 +2470,23 @@ def claims_block() -> dict[str, Any]:
             "NOT PERFORMED; every transform is scored at an origin strictly after its own fit basis"
         ),
         "fit_basis": (
-            "PE-5 append-only point-in-time observation captures only; a row whose official finality or "
-            "capture timing cannot be proven strictly before the origin's certified cutoff is excluded "
-            "and counted, and a later correction cannot rewrite an earlier transform"
+            "PE-5 append-only point-in-time observation captures over the FROZEN prediction rows of the "
+            "earlier events, with the position persisted with each prediction; a row whose official "
+            "finality or capture timing cannot be proven strictly before the origin's certified cutoff "
+            "is excluded and counted, a later correction cannot rewrite an earlier transform, and no "
+            "current fixtures / player_gameweeks / players state decides historical basis membership"
+        ),
+        "scored_population": (
+            "PE-2's declared current-state population, unchanged: the scored figures cover played "
+            "fixtures with a realised row that exists now and is not a scheduled placeholder, which is "
+            "what makes them reproducible against the scoreboard.  The fit basis is a different role "
+            "and is named separately wherever both appear"
+        ),
+        "assist_evidence": (
+            "the assist-mapping pooled evidence and its declared floors rest on ADMISSIBLE point-in-time "
+            "evidence only -- rows that entered a real fit basis, counted once -- so a late, "
+            "provisional, absent or later-corrected capture cannot meet or inflate a floor, and its "
+            "refusals are reported by reason"
         ),
         "challenger_construction": (
             "a challenger is constructed ONLY where the surface's diagnosis is MISCALIBRATED; where no "
@@ -2216,11 +2511,18 @@ def limitations_block() -> list[str]:
         "that flag: its bias is a description, not a causal claim.",
         "A causally fitted transform is evidence for review, not a production change: PE-8 reports it "
         "and does not re-point anything.",
-        "A fit basis is built only from PE-5 append-only point-in-time captures that were official and "
-        "recorded strictly before the origin's own certified cutoff; a postponed result, a late capture "
-        "or an unproven timing is excluded and counted rather than assumed known.",
-        "A position outside a component's declared positions earns a real zero from that component and "
-        "is covered (the count is reported); it is not a gap in the evidence.",
+        "A fit basis is built from the FROZEN prediction rows of the earlier events plus PE-5 "
+        "append-only point-in-time captures that were official and recorded strictly before the "
+        "origin's own certified cutoff, at the position the prediction was made at; a postponed result, "
+        "a late capture or an unproven timing is excluded and counted rather than assumed known, and no "
+        "change to the current fixtures / player_gameweeks / players tables can move an earlier "
+        "transform.",
+        "A position outside a component's declared positions earns a real zero from that component, "
+        "returned before the component's own outcome column is consulted, and the row is covered (the "
+        "count is reported); it is not a gap in the evidence.",
+        "The assist-mapping pooled evidence and its declared descriptive floors count admissible "
+        "point-in-time evidence only, deduplicated by row; evidence no transform could learn from is "
+        "reported as an exclusion rather than pooled.",
         "CONTINUOUS_PROXY_TIE_LIMITATION from PE-3 remains an open, accepted limitation.",
         "Models, baselines and outcomes are read from persisted runs; nothing here regenerates a "
         "prediction, writes a database row, or changes any incumbent identity.",

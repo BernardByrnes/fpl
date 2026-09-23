@@ -49,12 +49,16 @@ logit is defined.
 THE BASIS IS POINT-IN-TIME EVIDENCE
 -----------------------------------
 The fitting routines here take observations; the CALLER decides which ones.
-PE-8's caller builds them from PE-5's append-only, point-in-time observation
-captures: a basis row must carry a FINAL official observation whose official
-finality AND capture both fall strictly before the origin's certified cutoff,
-and a row whose timing cannot be proven is excluded and counted rather than
-assumed known.  A later correction is a later capture and therefore cannot enter
-an earlier basis.
+PE-8's caller builds them from the FROZEN prediction rows of the strictly earlier
+events -- the persisted, immutable projection rows, at the position each
+prediction was made at -- combined with PE-5's append-only, point-in-time
+observation captures: a basis row must carry a FINAL official observation whose
+official finality AND capture both fall strictly before the origin's certified
+cutoff, and a row whose timing cannot be proven is excluded and counted rather
+than assumed known.  A later correction is a later capture and therefore cannot
+enter an earlier basis, and neither the current ``fixtures`` /
+``player_gameweeks`` / ``players`` state nor a row's newest value can decide what
+an earlier transform was fitted on.
 
 A FITTED PAYLOAD CARRIES ITS PROVENANCE
 ---------------------------------------
@@ -1201,10 +1205,12 @@ def policy() -> dict[str, Any]:
             "before E; a basis containing an outcome at or after E is refused, not approximated"
         ),
         "fit_basis_evidence": (
-            "PE-5 append-only point-in-time observation captures only: a basis row must carry a FINAL "
-            "official observation whose official finality AND capture both fall strictly before the "
-            "origin's certified cutoff, and a row whose timing cannot be proven is excluded and counted "
-            "rather than assumed known"
+            "the FROZEN prediction rows of the strictly earlier events -- immutable projection rows, at "
+            "the position each prediction was made at -- combined with PE-5 append-only point-in-time "
+            "observation captures: a basis row must carry a FINAL official observation whose official "
+            "finality AND capture both fall strictly before the origin's certified cutoff, and a row "
+            "whose timing cannot be proven is excluded and counted rather than assumed known.  No "
+            "current fixtures / player_gameweeks / players state decides historical basis membership"
         ),
         "fitted_payload_provenance": (
             "a fitted payload carries the canonical identity AND the applicable policy versions -- the "

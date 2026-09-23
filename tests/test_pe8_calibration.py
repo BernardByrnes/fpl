@@ -18,7 +18,9 @@ The ``_big_world`` factory builds a population large enough to cross the DECLARE
 sample floors (10 target events, 2000 observations), because those floors are
 policy and are not lowered for a test: it is the only way to exercise the
 READY_FOR_MERGE branch, the multi-origin causal fit, and the population-wide
-reliability bins honestly.
+reliability bins honestly.  It carries ELEVEN events, because the admissible fit
+evidence of an eleven-event world is the ten-event pool a floor of ten is written
+for: the last event's results are admissible at no origin.
 """
 
 from __future__ import annotations
@@ -68,6 +70,11 @@ SMALL_CAPTURED_AT = "2026-09-08T09:00:00Z"
 #: origin's cutoff falls BEFORE the next event's result is final: "strictly before
 #: THIS origin's cutoff" is a different filter at every origin rather than one
 #: global date, which is the rule under test.
+#:
+#: The ladder is anchored so that its LAST event's cutoff still lies in the past
+#: for an eleven-event world: a projection run may not claim a data cutoff later
+#: than the moment it was produced, so the world is seated before "now" for the
+#: run factory to accept it.
 def _event_times(event: int, *, ladder: bool) -> dict:
     if not ladder:
         return {
@@ -77,7 +84,7 @@ def _event_times(event: int, *, ladder: bool) -> dict:
             "captured_at": SMALL_CAPTURED_AT,
             "cutoff": CUTOFF,
         }
-    day = 5 + 2 * (int(event) - 5)
+    day = 4 + 2 * (int(event) - BIG_EVENTS[0])
     return {
         "kickoff": f"2026-09-{day:02d}T14:00:00Z",
         "updated_at": f"2026-09-{day + 1:02d}T09:00:00Z",
@@ -561,7 +568,7 @@ def world(tmp_path):
 
 # --- the population large enough to cross the DECLARED sample floors ---------
 
-BIG_EVENTS = tuple(range(5, 15))
+BIG_EVENTS = tuple(range(5, 16))
 BIG_PLAYERS = tuple(range(1000, 1200))
 BIG_TEAM_OF = {player_id: (1 if player_id < 1100 else 2) for player_id in BIG_PLAYERS}
 BIG_GROUP_A = tuple(player_id for player_id in BIG_PLAYERS if player_id % 2 == 0)
@@ -662,7 +669,14 @@ def _big_world(
     per_event_cutoffs: bool = False,
     capture_overrides: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict:
-    """A calibrated population over ten events: 4000 fixture rows and 2000 event rows.
+    """A calibrated population over eleven events: 4400 fixture rows and 2200 event rows.
+
+    Eleven events, not ten, because a transform may only be fitted on outcomes
+    finalised strictly BEFORE its origin: the LAST event's results are admissible
+    at no origin at all, so the admissible evidence pool of an eleven-event world
+    is the ten-event, 4000-observation pool the declared descriptive floors are
+    written for.  The floors are never lowered to make a green test -- the world is
+    made big enough to reach them honestly.
 
     The stated probabilities and the realised frequencies agree exactly at the bin
     level, and every component's predicted mean equals its realised mean, so
@@ -1493,6 +1507,85 @@ def test_the_defcon_component_covers_positions_outside_defcon_positions_as_a_rea
     assert surface["population"]["outcome_unavailable"] == 4
 
 
+def test_save_and_goals_conceded_components_return_their_structural_zero_first():
+    """The declared structural-zero policy holds for save and goals-conceded too.
+
+    A position the frozen rules exclude from a component earns a REAL zero from it
+    whatever the component's own outcome column says, so that column is IRRELEVANT
+    to the question and is not consulted: an outfield player earns no save points
+    and a forward suffers no deduction whether the column is present, absent or
+    impossible.  Consulting it first -- as this evaluation used to -- turns a
+    covered structural zero into a data gap and drops the row out of the population
+    for a question the rules had already answered.
+    """
+
+    # An absent (or present-but-irrelevant) column is NOT a gap for an excluded position.
+    assert ce.realised_component("save_points", {"minutes": 90, "starts": 1}, "MID") == 0.0
+    assert ce.realised_component("save_points", {"minutes": 0}, "DEF") == 0.0
+    assert ce.realised_component("save_points", {"minutes": 90, "saves": 30}, "FWD") == 0.0
+    assert ce.realised_component("goals_conceded_points", {"minutes": 90}, "MID") == 0.0
+    assert ce.realised_component("goals_conceded_points", {"minutes": 90}, "FWD") == 0.0
+    assert (
+        ce.realised_component("goals_conceded_points", {"minutes": 90, "goals_conceded": 9}, "FWD")
+        == 0.0
+    )
+    # It is still a GAP for a position the component does apply to: there the
+    # question is open, so an absent column is missing evidence rather than a zero.
+    assert ce.realised_component("save_points", {"minutes": 90}, "GKP") is None
+    assert ce.realised_component("goals_conceded_points", {"minutes": 90}, "GKP") is None
+    assert ce.realised_component("goals_conceded_points", {"minutes": 90}, "DEF") is None
+    rules = DEFAULT_SCORING_RULES
+    assert ce.realised_component("save_points", {"minutes": 90, "saves": 7}, "GKP") == float(
+        7 // rules.saves_per_point
+    )
+    assert ce.realised_component(
+        "goals_conceded_points", {"minutes": 90, "goals_conceded": 4}, "DEF"
+    ) == -float(4 // rules.goals_conceded_per_deduction)
+    # The row-level availability test every selector shares is unchanged: a row with
+    # no performance record at all is a gap, whatever the position.
+    assert ce.realised_component("save_points", {"starts": 1}, "MID") is None
+    assert ce.realised_component("goals_conceded_points", {"starts": 1}, "FWD") is None
+    # Every component that has a structural zero states its rule by token.
+    assert "not GKP" in ce.structural_zero_rule("save_points", "MID")
+    assert "goals_conceded_positions" in ce.structural_zero_rule("goals_conceded_points", "FWD")
+    assert ce.structural_zero_rule("save_points", "GKP") is None
+    assert ce.structural_zero_rule("goals_conceded_points", "GKP") is None
+
+
+def test_the_save_and_goals_conceded_components_cover_those_rows_end_to_end(tmp_path):
+    """The same rule, observable in the artifact with the columns blanked.
+
+    Every big-world player is a MID, so both components answer "a real zero" for
+    every row.  Blanking the columns must therefore leave both populations intact
+    and report the coverage -- while a component whose column IS the question keeps
+    reporting the gap, because the structural-zero rule is not a licence to ignore
+    a genuinely required field.
+    """
+
+    conn, built = _single_use_world(tmp_path, name="pe8-structural-zero")
+    try:
+        with conn:
+            conn.execute("UPDATE player_gameweeks SET saves=NULL, goals_conceded=NULL")
+        artifact = _evaluate(conn, built)
+    finally:
+        conn.close()
+
+    rows = artifact["expected_value"]["component_diagnostics"]["population"]["rows"]
+    assert rows == len(BIG_PLAYERS) * 2 * len(BIG_EVENTS)
+    for name in ("save_xpts", "goals_conceded_xpts"):
+        entry = _component(artifact, name)
+        assert entry["n"] == rows, f"{name}: the covered rows were dropped"
+        assert entry["realised_unavailable"] == 0
+        assert entry["structural_zero_rows"] == rows
+        assert entry["structural_zero_by_position"] == {"MID": rows}
+        assert entry["structural_zero_rule"]
+        assert entry["bias"]["value"] == pytest.approx(0.0, abs=1e-9)
+    sheet = _component(artifact, "clean_sheet_xpts")
+    assert sheet["structural_zero_rule"] is None
+    assert sheet["n"] == 0
+    assert sheet["realised_unavailable"] == rows
+
+
 def test_defcon_calibration_identity_is_carried_and_single_definition(world):
     """Hard test 22: the DefCon figure is tied to the spec that produced it."""
 
@@ -2233,12 +2326,12 @@ def test_the_terminal_state_is_ready_for_merge_on_a_calibrated_population(big_wo
 
     conn, built = big_world
     artifact = _evaluate(conn, built)
-    assert artifact["expected_value"]["headline"]["n"] == len(BIG_PLAYERS) * len(BIG_EVENTS) == 2000
+    assert artifact["expected_value"]["headline"]["n"] == len(BIG_PLAYERS) * len(BIG_EVENTS) == 2200
     assert artifact["expected_value"]["headline"]["bias"]["value"] == pytest.approx(0.0, abs=1e-9)
     for surface in artifact["probability_calibration"]["surfaces"]:
         sample = surface["sample"]
-        assert sample["target_events"] == len(BIG_EVENTS) == 10
-        assert sample["observations"] == 4000
+        assert sample["target_events"] == len(BIG_EVENTS) == 11
+        assert sample["observations"] == 4400
         assert sample["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
         reliability = surface["incumbent"]["figure"]["reliability"]
         assert reliability["bins_over_floor"] == 1
@@ -2249,7 +2342,7 @@ def test_the_terminal_state_is_ready_for_merge_on_a_calibrated_population(big_wo
         )
         assert surface["causal_challenger"]["constructed"] is False
     for entry in artifact["expected_value"]["component_diagnostics"]["components"]:
-        assert entry["n"] == 4000
+        assert entry["n"] == 4400
         assert abs(float(entry["bias"]["value"])) <= ce.MATERIAL_COMPONENT_BIAS_TOLERANCE_POINTS, (
             f"{entry['component']} is biased in a world designed to be unbiased"
         )
@@ -2295,7 +2388,13 @@ def test_a_causal_assist_mapping_fit_is_a_candidate_that_still_changes_nothing(t
         pooled = artifact["assist_mapping"]["pooled_evidence"]
     finally:
         conn.close()
+    # The pooled evidence is the ADMISSIBLE evidence: rows that entered a real fit
+    # basis, counted once.  The last event's results are admissible at no origin --
+    # nothing is strictly after them -- so an eleven-event world offers ten events
+    # and 4000 rows, and nothing was refused on the way.
     assert pooled["observations"] == 4000 and pooled["events"] == 10
+    assert pooled["excluded_by_reason"] == {}
+    assert pooled["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
     assert pooled["expected_assists_total"] == pytest.approx(200.0, abs=1e-6)
     assert pooled["realised_assists_total"] == pytest.approx(200.0, abs=1e-6)
     assert decision["outcome"] == ce.ASSIST_MAPPING_CANDIDATE
@@ -2310,6 +2409,201 @@ def test_a_causal_assist_mapping_fit_is_a_candidate_that_still_changes_nothing(t
     assert xpts_module.XPtsConfig().assist_mapping_calibrated is False
     assert any("belongs to review" in reason for reason in artifact["terminal_state"]["reasons"])
     assert artifact["terminal_state"]["state"] == ce.TERMINAL_OPEN
+
+
+def _assist_evidence_world(tmp_path, *, name: str, **kwargs):
+    """A world whose assist evidence is wide enough to cross the declared floors."""
+
+    kwargs.setdefault("expected_xa", 0.05)
+    kwargs.setdefault("assist_every", 20)
+    return _single_use_world(tmp_path, name=name, **kwargs)
+
+
+def _assist_identities(artifact) -> dict[int, str | None]:
+    """Each origin's fitted-coefficient identity, or ``None`` where no fit exists."""
+
+    return {
+        int(entry["origin_event"]): (entry["fit"].get("provenance") or {}).get("identity")
+        for entry in artifact["assist_mapping"]["origins"]
+    }
+
+
+def test_assist_floors_rest_on_admissible_evidence_and_its_exclusions_are_reported(tmp_path):
+    """Hard tests 20 and 21: a late, provisional or absent capture cannot meet a floor.
+
+    In every variant event 6's result is still sitting in the CURRENT table -- 400
+    official rows, exactly the rows the previous pooled count read -- and no origin's
+    cutoff admits it, so it is excluded and counted rather than pooled.  The declared
+    floors are then not met on admissible evidence, and the constant does not move:
+    NO_CHANGE with its reason, never a promotion built on evidence no fit was
+    allowed to learn from.
+    """
+
+    reason_by_variant = (
+        ("late", {6: {"captured_at": "2026-09-11T00:00:00Z"}}, ce.BASIS_CAPTURE_NOT_BEFORE_CUTOFF),
+        # After the football event, before the official finality: PE-5 records it
+        # PROVISIONAL, and a provisional read is never promoted.
+        ("provisional", {6: {"captured_at": "2026-09-06T20:00:00Z"}}, ce.BASIS_PROVISIONAL),
+        ("absent", {6: {"skip": True}}, ce.BASIS_CAPTURE_ABSENT),
+    )
+    reference_conn, reference_built = _assist_evidence_world(tmp_path, name="pe8-assist-ref")
+    try:
+        reference = _evaluate(reference_conn, reference_built)
+    finally:
+        reference_conn.close()
+    reference_pooled = reference["assist_mapping"]["pooled_evidence"]
+    # The admissible pool of an ELEVEN-event world is the ten-event pool the declared
+    # floors are written for: the last event's results are admissible at no origin,
+    # because no origin is strictly after them.
+    assert reference_pooled["observations"] == 4000 and reference_pooled["events"] == 10
+    assert reference_pooled["excluded_by_reason"] == {}
+    assert reference_pooled["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
+    assert reference["assist_mapping"]["decision"]["outcome"] == ce.ASSIST_MAPPING_CANDIDATE
+
+    rows_of_event_six = len(BIG_PLAYERS) * 2
+    origins_that_can_see_event_six = len([event for event in BIG_EVENTS if int(event) > 6])
+    # The last event is never admissible and event 6 is refused, so nine events remain.
+    admissible_events = len(BIG_EVENTS) - 2
+    admissible_rows = admissible_events * rows_of_event_six
+    for label, overrides, reason in reason_by_variant:
+        conn, built = _assist_evidence_world(
+            tmp_path, name=f"pe8-assist-{label}", capture_overrides=overrides
+        )
+        try:
+            artifact = _evaluate(conn, built)
+            pooled = artifact["assist_mapping"]["pooled_evidence"]
+            decision = artifact["assist_mapping"]["decision"]
+            current_state_rows = conn.execute(
+                "SELECT COUNT(*) FROM player_gameweeks WHERE event=6"
+            ).fetchone()[0]
+            origin_seven = next(
+                entry
+                for entry in artifact["assist_mapping"]["origins"]
+                if int(entry["origin_event"]) == 7
+            )
+        finally:
+            conn.close()
+        assert current_state_rows == rows_of_event_six, (
+            f"{label}: the current table still holds the rows the old count pooled"
+        )
+        assert pooled["observations"] == admissible_rows and pooled["events"] == admissible_events
+        assert pooled["excluded_by_reason"] == {
+            reason: rows_of_event_six * origins_that_can_see_event_six
+        }, label
+        assert pooled["sample_interpretation"] == sb.SAMPLE_INSUFFICIENT
+        assert decision["outcome"] == ce.ASSIST_MAPPING_NO_CHANGE, label
+        assert decision["promotion_performed"] is False
+        assert decision["coefficient_after"] == 1.0
+        assert decision["assist_mapping_calibrated_after"] is False
+        assert decision["flag_after"] == ce.ASSIST_MAPPING_FLAG
+        assert decision["candidate_coefficients"] == []
+        assert decision["evidence"]["observations"] == admissible_rows
+        assert decision["evidence"]["events"] == admissible_events
+        assert decision["evidence"]["excluded_by_reason"] == pooled["excluded_by_reason"]
+        assert any("floors" in text for text in decision["reasons"])
+        # The per-origin counter names WHICH origin had to do without the evidence.
+        assert origin_seven["basis_excluded_by_reason"] == {reason: rows_of_event_six}
+
+
+def test_a_later_correction_cannot_change_an_earlier_assist_decision(tmp_path):
+    """A correction captured after every cutoff is not evidence, and neither is the
+    current table's newest value for the same row.
+
+    Event 5's assists are corrected in two places at once: an append-only SECOND
+    observation of the same player-fixture, recorded after every origin's cutoff, and
+    the current ``player_gameweeks`` column rewritten to a value nothing ever
+    admitted.  The decision must be reproduced exactly -- same per-origin fitted
+    identities, same pooled totals, same CANDIDATE_FOR_REVIEW -- while the scored
+    figures do move, which is what proves both edits happened.
+    """
+
+    reference_conn, reference_built = _assist_evidence_world(tmp_path, name="pe8-assist-later-ref")
+    try:
+        reference = _evaluate(reference_conn, reference_built)
+    finally:
+        reference_conn.close()
+    reference_pooled = reference["assist_mapping"]["pooled_evidence"]
+    reference_identities = _assist_identities(reference)
+
+    conn, built = _assist_evidence_world(tmp_path, name="pe8-assist-corrected")
+    try:
+        _append_assist_correction(conn, event=5, captured_at="2026-09-11T00:00:00Z", extra=3)
+        with conn:
+            conn.execute("UPDATE player_gameweeks SET assists=9 WHERE event=5")
+        artifact = _evaluate(conn, built)
+        pooled = artifact["assist_mapping"]["pooled_evidence"]
+        decision = artifact["assist_mapping"]["decision"]
+        rewritten = conn.execute(
+            "SELECT SUM(assists) FROM player_gameweeks WHERE event=5"
+        ).fetchone()[0]
+        retained = ledger.observation_captures(
+            conn, grain=ledger.GRAIN_PLAYER_FIXTURE, event=5, player_id=int(sorted(BIG_PLAYERS)[0])
+        )
+        for_fixture = [
+            capture
+            for capture in retained
+            if int(capture["fixture_id"]) == sorted(_big_fixtures(5))[0]
+        ]
+    finally:
+        conn.close()
+
+    # Both edits are real: the current table was rewritten, and the correction is a
+    # SECOND retained observation rather than a rewrite of the first.
+    assert rewritten == 9 * len(BIG_PLAYERS) * 2, "event 5's two fixture rows per player were rewritten"
+    assert len(for_fixture) == 2
+    assert len({capture["capture_digest"] for capture in for_fixture}) == 2
+    assert any(capture["supersedes_capture_id"] is not None for capture in for_fixture)
+
+    # Neither edit is evidence at any origin's cutoff, so nothing about the decision moves.
+    assert pooled["excluded_by_reason"] == {}
+    assert pooled["observations"] == reference_pooled["observations"]
+    assert pooled["events"] == reference_pooled["events"]
+    assert pooled["expected_assists_total"] == reference_pooled["expected_assists_total"]
+    assert pooled["realised_assists_total"] == reference_pooled["realised_assists_total"]
+    assert _assist_identities(artifact) == reference_identities, (
+        "a correction captured after every cutoff changed an earlier fitted coefficient"
+    )
+    assert decision["outcome"] == reference["assist_mapping"]["decision"]["outcome"]
+    assert decision["candidate_coefficients"] == (
+        reference["assist_mapping"]["decision"]["candidate_coefficients"]
+    )
+    assert ce.artifact_digest(artifact) != ce.artifact_digest(reference)
+
+
+def _append_assist_correction(
+    conn: sqlite3.Connection, *, event: int, captured_at: str, extra: int
+) -> None:
+    """Append one corrective observation of a key's official assists.
+
+    A correction is a NEW immutable observation of a key that already has one: the
+    earlier evidence survives and the supersession is explicit, so a cutoff that
+    precedes the correction cannot see it.
+    """
+
+    key = sorted(BIG_PLAYERS)[0]
+    fixture_id = sorted(_big_fixtures(event))[0]
+    existing = ledger.observation_captures(
+        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, event=int(event), player_id=int(key)
+    )
+    assert existing, "the world records the observations this correction supersedes"
+    original = next(
+        capture for capture in existing if int(capture["fixture_id"]) == int(fixture_id)
+    )
+    fields = dict(original["payload"])
+    fields["assists"] = int(fields.get("assists") or 0) + int(extra)
+    ledger.capture_observation(
+        conn,
+        grain=ledger.GRAIN_PLAYER_FIXTURE,
+        event=int(event),
+        player_id=int(key),
+        fixture_id=int(fixture_id),
+        fields=fields,
+        source_name="official_correction",
+        captured_at=captured_at,
+        official_final_at=str(original["official_final_at"]),
+        supersedes_capture_id=int(original["id"]) if original.get("id") is not None else None,
+        correction_reason="a late official correction of the same player-fixture",
+    )
 
 
 def test_a_later_realised_outcome_leaves_every_earlier_transform_untouched(tmp_path):
@@ -2420,7 +2714,7 @@ def test_a_postponed_result_cannot_enter_a_basis_before_its_official_finality(tm
     for metric in ("BRIER_P_START", "BRIER_P_60_PLUS", "BRIER_DEFCON"):
         origin_seven = _origin(artifact, metric, 7)
         rows_of_event_six = len(BIG_PLAYERS) * 2
-        assert origin_seven["cutoff"] == "2026-09-08T12:00:00Z"
+        assert origin_seven["cutoff"] == "2026-09-07T12:00:00Z"
         assert origin_seven["basis_excluded_by_reason"] == {
             ce.BASIS_FINALITY_NOT_BEFORE_CUTOFF: rows_of_event_six
         }
@@ -2550,7 +2844,7 @@ def test_a_provisional_capture_is_never_promoted_into_a_basis(tmp_path):
     conn, built = _warm_world(
         tmp_path,
         name="pe8-provisional",
-        capture_overrides={6: {"captured_at": "2026-09-08T08:00:00Z"}},
+        capture_overrides={6: {"captured_at": "2026-09-07T08:00:00Z"}},
     )
     try:
         artifact = _evaluate(conn, built)
@@ -2615,6 +2909,178 @@ def _append_correction(conn, *, event: int, captured_at: str) -> None:
         supersedes_capture_id=int(original["id"]) if original.get("id") is not None else None,
         correction_reason="an official correction of the same player-fixture",
     )
+
+
+# ---------------------------------------------------------------------------
+# The fit basis is frozen prediction rows + point-in-time captures, never the
+# current fixtures / player_gameweeks / players state
+# ---------------------------------------------------------------------------
+
+
+def _mutate_current_state(conn: sqlite3.Connection) -> None:
+    """Re-point the CURRENT tables after the fact, in the four ways that matter.
+
+    None of this touches a frozen prediction row or a PE-5 capture -- both are
+    immutable at storage level -- so every edit changes how a HISTORICAL row looks
+    TODAY.  Eligibility (a played fixture), required outcome fields, placeholder
+    state and the position listing are exactly the current-state inputs the
+    declared SCORING population reads, which is why they are the inputs a fit basis
+    must not read.
+    """
+
+    with conn:
+        # (1) eligibility: event 5's fixtures stop being played fixtures
+        conn.execute("UPDATE fixtures SET finished=0, started=0 WHERE event=5")
+        # (2) required outcome fields: event 6's rows lose the columns the surfaces
+        #     are defined on
+        conn.execute(
+            "UPDATE player_gameweeks SET minutes=NULL, starts=NULL, goals_conceded=NULL,"
+            " defensive_contribution=NULL WHERE event=6"
+        )
+        # (3) placeholder state: event 7's rows take the scheduled-placeholder
+        #     signature (every performance column NULL)
+        conn.execute(
+            "UPDATE player_gameweeks SET minutes=NULL, starts=NULL, total_points=NULL,"
+            " goals_scored=NULL, assists=NULL, clean_sheets=NULL, goals_conceded=NULL, saves=NULL,"
+            " bonus=NULL, yellow_cards=NULL, defensive_contribution=NULL WHERE event=7"
+        )
+        # (4) position: every group-A player is currently listed as a goalkeeper
+        conn.execute("UPDATE players SET element_type=1 WHERE id < 1100")
+
+
+def _basis_by_metric(conn: sqlite3.Connection, built: Mapping[str, Any]) -> dict[str, Any]:
+    """Every surface's per-origin basis, straight from the production builder.
+
+    The basis VALUES and the per-origin exclusion counters, keyed by origin, so two
+    worlds can be compared row for row rather than by count.
+    """
+
+    cutoffs = {
+        int(event): built["artifact"]["certified_bundles"][str(event)]["cutoff"]
+        for event in built["events"]
+    }
+    rows = ce.frozen_prediction_rows(conn, runs=built["xpts_runs"], events=built["events"])
+    out: dict[str, Any] = {}
+    for definition in sb.PROBABILITY_METRICS:
+        basis, excluded = ce.point_in_time_basis(
+            conn=conn, prediction_rows=rows, cutoffs=cutoffs, definition=definition
+        )
+        out[definition.metric] = {
+            int(origin): (
+                tuple(
+                    (int(entry.event), entry.key, float(entry.probability), float(entry.outcome))
+                    for entry in basis[origin]
+                ),
+                {str(key): int(value) for key, value in sorted(excluded[origin].items())},
+            )
+            for origin in basis
+        }
+    return out
+
+
+def test_a_current_state_mutation_cannot_change_an_earlier_fit_identity(tmp_path):
+    """Eligibility, outcome fields, placeholder state and position are all mutated.
+
+    ONE database is evaluated, then the four edits are applied AFTER the fact, then
+    it is evaluated again.  Each edit really does move the declared SCORING
+    population -- the scored figures MUST change, or the mutation would prove
+    nothing -- while no origin's fit basis, fitted version or fitted identity moves,
+    because those are built from the frozen prediction rows and the point-in-time
+    captures rather than from how history looks today.
+    """
+
+    conn, built = _warm_world(tmp_path, name="pe8-history")
+    try:
+        reference = _evaluate(conn, built)
+        reference_bases = _basis_by_metric(conn, built)
+        _mutate_current_state(conn)
+        mutated = _evaluate(conn, built)
+        mutated_bases = _basis_by_metric(conn, built)
+        # The frozen half really is frozen: the storage layer refuses to re-point a
+        # prediction row at all, which is what makes the invariance below structural
+        # rather than a matter of discipline.
+        for statement in (
+            "UPDATE player_fixture_xpts_projections SET position='GKP'",
+            "DELETE FROM player_fixture_xpts_projections",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(statement)
+    finally:
+        conn.close()
+
+    # The mutations are REAL: every scored population moved, and every one shrank,
+    # because a row that loses its eligibility, its required fields, its
+    # non-placeholder state or its current position leaves the scored population.
+    for metric in SURFACES:
+        assert (
+            _surface(mutated, metric)["population"]["scored"]
+            < _surface(reference, metric)["population"]["scored"]
+        ), metric
+    assert ce.artifact_digest(mutated) != ce.artifact_digest(reference)
+
+    # ... and not one of them reached a basis, a fitted version or an identity.
+    assert mutated_bases == reference_bases, "a current-state edit moved a historical basis"
+    compared = 0
+    for metric in SURFACES:
+        reference_challenger = _surface(reference, metric)["causal_challenger"]
+        mutated_challenger = _surface(mutated, metric)["causal_challenger"]
+        if not reference_challenger["constructed"]:
+            assert mutated_challenger["status"] == ce.STATUS_NOT_FITTED, metric
+            assert mutated_challenger["origins"] == []
+            continue
+        compared += 1
+        assert mutated_challenger["constructed"] is True
+        assert _fits(mutated, metric) == _fits(reference, metric), (
+            f"{metric}: a current-state edit changed a fitted transform"
+        )
+        for reference_origin, mutated_origin in zip(
+            reference_challenger["origins"], mutated_challenger["origins"]
+        ):
+            assert reference_origin["origin_event"] == mutated_origin["origin_event"]
+            assert (
+                reference_origin["fit"]["basis"]["digest"] == mutated_origin["fit"]["basis"]["digest"]
+            )
+            assert reference_origin["fit"]["basis"]["events"] == mutated_origin["fit"]["basis"]["events"]
+            assert reference_origin["fit"]["basis"]["observations"] == (
+                mutated_origin["fit"]["basis"]["observations"]
+            )
+            assert reference_origin.get("provenance") == mutated_origin.get("provenance")
+    assert compared >= 3, "the miscalibrated surfaces must still fit in both worlds"
+
+
+def test_the_basis_uses_the_prediction_time_position_not_the_current_one(tmp_path):
+    """The realised outcome is judged at the position the prediction was MADE at.
+
+    Re-listing every player as a goalkeeper leaves the DefCon basis untouched: the
+    threshold question is answered at the position PERSISTED with the prediction,
+    not at the position the current ``players`` table lists today.  The scored
+    population does read the current position, and it moves -- a GKP defines no
+    threshold at all -- which is what proves the edit happened.
+    """
+
+    conn, built = _warm_world(tmp_path, name="pe8-position")
+    try:
+        rows = ce.frozen_prediction_rows(conn, runs=built["xpts_runs"], events=built["events"])
+        assert {row.position for row in rows[5]} == {"MID"}
+        reference_basis = _basis_by_metric(conn, built)["BRIER_DEFCON"]
+        assert reference_basis[7][0], "origin 7 has a DefCon basis to compare"
+
+        with conn:
+            conn.execute("UPDATE players SET element_type=1 WHERE id < 1100")
+        assert {row.position for row in rows[5]} == {"MID"}, (
+            "the frozen prediction rows carry the position they were made at"
+        )
+        artifact = _evaluate(conn, built)
+        mutated_basis = _basis_by_metric(conn, built)["BRIER_DEFCON"]
+        scored = _surface(artifact, "BRIER_DEFCON")["population"]
+    finally:
+        conn.close()
+
+    assert mutated_basis == reference_basis, (
+        "the DefCon basis followed the current position listing instead of the persisted one"
+    )
+    assert scored["outcome_unavailable"] > 0, "the SCORED population does read the current position"
+    assert scored["scored"] < len(BIG_PLAYERS) * 2 * len(BIG_EVENTS)
 
 
 def test_the_out_of_scope_surfaces_are_declared_rather_than_silently_skipped(world):
@@ -2722,15 +3188,15 @@ def test_every_reported_figure_carries_its_sample_size_and_a_floor_label(big_wor
     conn, built = big_world
     artifact = _evaluate(conn, built)
     headline = artifact["expected_value"]["headline"]
-    assert headline["sample"]["observations"] == headline["n"] == 2000
+    assert headline["sample"]["observations"] == headline["n"] == 2200
     assert headline["sample"]["target_events_with_observations"] == len(BIG_EVENTS)
     assert headline["sample"]["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
     assert headline["sample"]["policy"]["policy_version"] == sb.SAMPLE_POLICY_VERSION
     for entry in artifact["expected_value"]["component_diagnostics"]["components"]:
-        assert entry["sample"]["observations"] == entry["n"] == 4000
+        assert entry["sample"]["observations"] == entry["n"] == 4400
         assert entry["sample"]["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
     coverage = artifact["monte_carlo_coverage"]["sample"]
-    assert coverage["observations"] == 4000
+    assert coverage["observations"] == 4400
     assert coverage["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
     assert "same declared disclosure floor" in coverage["note"]
     assert "NOT a significance threshold" in headline["sample"]["policy"]["basis"]
