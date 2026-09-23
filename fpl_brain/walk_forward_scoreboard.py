@@ -194,6 +194,198 @@ PROBABILITY_POPULATION_POLICY = (
     "and the position defines the required threshold (DefCon excludes GKP, which has none)"
 )
 
+
+@dataclass(frozen=True)
+class PlayerFixtureScoringRow:
+    """One (player, fixture) candidate on the declared probability population.
+
+    This is the population the probability surfaces are scored on, exposed as
+    explicit rows so a second consumer (PE-8's calibration diagnosis) reads the
+    SAME rows rather than restating the policy.  Two figures computed over two
+    different row sets are not comparable, however similar their ``N``.
+    """
+
+    event: int
+    player_id: int
+    fixture_id: int
+    position: str
+    xpts_run_id: int
+    payload: Mapping[str, Any]
+    outcome: Mapping[str, Any]
+
+    @property
+    def key(self) -> tuple[int, int, int]:
+        """The fixture-grain key: event, player, fixture."""
+
+        return (int(self.event), int(self.player_id), int(self.fixture_id))
+
+    def risk_flags(self) -> tuple[str, ...]:
+        return tuple(sorted(str(flag) for flag in (self.payload.get("risk_flags") or [])))
+
+    def defcon_calibration_payload(self) -> Mapping[str, Any] | None:
+        value = self.payload.get("defcon_calibration")
+        return value if isinstance(value, Mapping) else None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "event": int(self.event),
+            "player_id": int(self.player_id),
+            "fixture_id": int(self.fixture_id),
+            "position": str(self.position),
+            "xpts_run_id": int(self.xpts_run_id),
+            "risk_flags": list(self.risk_flags()),
+        }
+
+
+@dataclass(frozen=True)
+class ProbabilityScoringRow:
+    """One scored probability: the declared metric, the stated value, the realised outcome."""
+
+    metric: str
+    event: int
+    player_id: int
+    fixture_id: int
+    position: str
+    probability: float
+    outcome: float
+    xpts_run_id: int
+    risk_flags: tuple[str, ...]
+    defcon_calibration_payload: Mapping[str, Any] | None = None
+
+    @property
+    def key(self) -> tuple[int, int, int]:
+        return (int(self.event), int(self.player_id), int(self.fixture_id))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "metric": str(self.metric),
+            "event": int(self.event),
+            "player_id": int(self.player_id),
+            "fixture_id": int(self.fixture_id),
+            "position": str(self.position),
+            "probability": float(self.probability),
+            "outcome": float(self.outcome),
+            "xpts_run_id": int(self.xpts_run_id),
+            "risk_flags": list(self.risk_flags),
+        }
+
+
+def player_fixture_population(
+    conn: sqlite3.Connection,
+    *,
+    events: Sequence[int],
+    xpts_runs: Mapping[int, int],
+) -> dict[str, Any]:
+    """The declared player x fixture population, as explicit rows.
+
+    Applies :data:`PROBABILITY_POPULATION_POLICY` once, in one place: the anchor
+    ``xpts_v1`` run of each target event, its played fixtures, and a realised
+    ``player_gameweeks`` row for the same ``(player, fixture)`` that is not a
+    scheduled placeholder.  Rows dropped before that point are counted by reason
+    rather than silently discarded.
+    """
+
+    wanted = sorted({int(event) for event in events})
+    block: dict[str, Any] = {
+        "grain": wf.GRAIN_PLAYER_FIXTURE,
+        "rows": [],
+        "versions": [],
+        "run_ids_by_event": {int(event): int(run_id) for event, run_id in sorted(xpts_runs.items())},
+        "candidates": 0,
+        "excluded": {"fixture_not_played": 0, "outcome_row_missing": 0},
+    }
+    if not wanted or not xpts_runs:
+        return block
+    played = _played_fixture_ids(conn, wanted)
+    outcomes = _outcome_rows(conn, wanted)
+    positions = _positions(conn)
+    versions: set[str] = set()
+    for event in wanted:
+        run_id = xpts_runs.get(event)
+        if run_id is None:
+            continue
+        version = _run_version(conn, run_id)
+        if version:
+            versions.add(version)
+        for record in conn.execute(
+            "SELECT player_id, fixture_id, payload_json FROM player_fixture_xpts_projections "
+            "WHERE projection_run_id=? AND event=? ORDER BY player_id, fixture_id",
+            (int(run_id), int(event)),
+        ):
+            block["candidates"] += 1
+            player_id = int(record["player_id"])
+            fixture_id = int(record["fixture_id"])
+            if fixture_id not in played:
+                block["excluded"]["fixture_not_played"] += 1
+                continue
+            outcome = outcomes.get((player_id, fixture_id))
+            if outcome is None:
+                block["excluded"]["outcome_row_missing"] += 1
+                continue
+            block["rows"].append(
+                PlayerFixtureScoringRow(
+                    event=int(event),
+                    player_id=player_id,
+                    fixture_id=fixture_id,
+                    position=positions.get(player_id) or "",
+                    xpts_run_id=int(run_id),
+                    payload=json.loads(record["payload_json"]) if record["payload_json"] else {},
+                    outcome=outcome,
+                )
+            )
+    block["versions"] = sorted(versions)
+    return block
+
+
+def probability_scoring_rows(
+    rows: Sequence[PlayerFixtureScoringRow],
+    *,
+    metrics: Sequence[ProbabilityMetricDefinition] = PROBABILITY_METRICS,
+) -> dict[str, Any]:
+    """Split a declared population into the per-metric scored probability rows.
+
+    A row whose probability is absent is excluded and counted -- never scored as
+    ``0.0`` -- and a stored probability outside ``[0, 1]`` fails closed rather
+    than being clipped into a different question.
+    """
+
+    scored: list[ProbabilityScoringRow] = []
+    absent = {definition.metric: 0 for definition in metrics}
+    gaps = {definition.metric: 0 for definition in metrics}
+    for row in rows:
+        for definition in metrics:
+            raw = row.payload.get(definition.field)
+            if raw is None:
+                absent[definition.metric] += 1
+                continue
+            probability = float(raw)
+            if not 0.0 <= probability <= 1.0:
+                raise ScoreboardError(
+                    f"{definition.field} for player {row.player_id} fixture {row.fixture_id} "
+                    f"is {probability!r}, outside [0, 1]"
+                )
+            realised = _realised_probability_outcome(
+                definition.outcome_selector, row.outcome, row.position
+            )
+            if realised is None:
+                gaps[definition.metric] += 1
+                continue
+            scored.append(
+                ProbabilityScoringRow(
+                    metric=definition.metric,
+                    event=int(row.event),
+                    player_id=int(row.player_id),
+                    fixture_id=int(row.fixture_id),
+                    position=str(row.position),
+                    probability=float(probability),
+                    outcome=float(realised),
+                    xpts_run_id=int(row.xpts_run_id),
+                    risk_flags=row.risk_flags(),
+                    defcon_calibration_payload=row.defcon_calibration_payload(),
+                )
+            )
+    return {"rows": tuple(scored), "absent": absent, "outcome_unavailable": gaps}
+
 #: Monte Carlo quantiles are stored on a grid carrying the CORE components only.
 #: Bonus is deterministic in that kernel, so there is no total-points distribution
 #: and no CRPS.  The labels below say COVERAGE, never "calibrated predictive
@@ -313,8 +505,9 @@ def _outcome_rows(
     }
     out: dict[tuple[int, int], dict[str, Any]] = {}
     for row in conn.execute(
-        "SELECT player_id, fixture_id, event, minutes, starts, goals_scored, assists, clean_sheets, "
-        "goals_conceded, saves, yellow_cards, defensive_contribution FROM player_gameweeks "
+        "SELECT player_id, fixture_id, event, minutes, starts, total_points, goals_scored, assists, "
+        "clean_sheets, goals_conceded, saves, bonus, yellow_cards, defensive_contribution "
+        "FROM player_gameweeks "
         f"WHERE fixture_id > 0 AND event IN ({placeholders})",
         tuple(wanted),
     ):
@@ -535,58 +728,22 @@ def probability_metrics(
     events: Sequence[int],
     xpts_runs: Mapping[int, int],
 ) -> list[dict[str, Any]]:
-    """Brier scores for the declared probabilities, on their declared populations."""
+    """Brier scores for the declared probabilities, on their declared populations.
+
+    The population and the scored rows both come from
+    :func:`player_fixture_population` / :func:`probability_scoring_rows`, so this
+    function and any other consumer of the declared probability population cannot
+    drift apart.
+    """
 
     wanted = sorted({int(event) for event in events})
     if not wanted or not xpts_runs:
         return []
-    played = _played_fixture_ids(conn, wanted)
-    outcomes = _outcome_rows(conn, wanted)
-    positions = _positions(conn)
+    population = player_fixture_population(conn, events=wanted, xpts_runs=xpts_runs)
+    scored = probability_scoring_rows(population["rows"])
     collected: dict[str, list[tuple[float, float]]] = {d.metric: [] for d in PROBABILITY_METRICS}
-    absent: dict[str, int] = {d.metric: 0 for d in PROBABILITY_METRICS}
-    gaps: dict[str, int] = {d.metric: 0 for d in PROBABILITY_METRICS}
-    versions: set[str] = set()
-    for event in wanted:
-        run_id = xpts_runs.get(event)
-        if run_id is None:
-            continue
-        version = _run_version(conn, run_id)
-        if version:
-            versions.add(version)
-        for record in conn.execute(
-            "SELECT player_id, fixture_id, payload_json FROM player_fixture_xpts_projections "
-            "WHERE projection_run_id=? AND event=? ORDER BY player_id, fixture_id",
-            (int(run_id), int(event)),
-        ):
-            fixture_id = int(record["fixture_id"])
-            if fixture_id not in played:
-                continue
-            outcome = outcomes.get((int(record["player_id"]), fixture_id))
-            if outcome is None:
-                continue
-            payload = json.loads(record["payload_json"]) if record["payload_json"] else {}
-            position = positions.get(int(record["player_id"])) or ""
-            for definition in PROBABILITY_METRICS:
-                raw = payload.get(definition.field)
-                if raw is None:
-                    absent[definition.metric] += 1
-                    continue
-                probability = float(raw)
-                if not 0.0 <= probability <= 1.0:
-                    # A stored probability outside [0, 1] is a trust failure in
-                    # the producer.  Clipping would score a different question.
-                    raise ScoreboardError(
-                        f"{definition.field} for player {record['player_id']} fixture {fixture_id} "
-                        f"is {probability!r}, outside [0, 1]"
-                    )
-                realised = _realised_probability_outcome(
-                    definition.outcome_selector, outcome, position
-                )
-                if realised is None:
-                    gaps[definition.metric] += 1
-                    continue
-                collected[definition.metric].append((probability, realised))
+    for row in scored["rows"]:
+        collected[row.metric].append((row.probability, row.outcome))
 
     out: list[dict[str, Any]] = []
     for definition in PROBABILITY_METRICS:
@@ -595,7 +752,7 @@ def probability_metrics(
         realised_values = [value for _p, value in pairs]
         entry = definition.as_dict()
         entry["run_ids_by_event"] = {int(event): int(run_id) for event, run_id in sorted(xpts_runs.items())}
-        entry["versions"] = sorted(versions)
+        entry["versions"] = list(population["versions"])
         entry["brier"] = wm.brier_score(probabilities, realised_values).as_dict()
         entry["brier_reference"] = wm.brier_reference_score(realised_values).as_dict()
         entry["observed_rate"] = (
@@ -605,8 +762,8 @@ def probability_metrics(
         )
         entry["population"] = {
             "scored": len(pairs),
-            "probability_absent": absent[definition.metric],
-            "outcome_unavailable": gaps[definition.metric],
+            "probability_absent": scored["absent"][definition.metric],
+            "outcome_unavailable": scored["outcome_unavailable"][definition.metric],
         }
         out.append(entry)
     return out
