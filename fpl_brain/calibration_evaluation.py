@@ -19,19 +19,35 @@ contracts:
 * the four declared probability surfaces, on the anchor ``xpts_v1`` population
   read from :func:`walk_forward_scoreboard.player_fixture_population` (so this
   module and the scoreboard cannot drift onto two different populations);
+* each origin's FIT BASIS from PE-5's append-only point-in-time observation
+  captures, never from the current-state table;
 * the persisted expected-points components at the grain each is persisted at;
 * the Monte Carlo quantile grid, through the scoreboard's own coverage block;
 * the uncalibrated FPL assist-mapping constant, as a DECISION it reports rather
   than a value it may change.
 
+DIAGNOSE, THEN FIT
+------------------
+Every surface is measured and diagnosed first.  A challenger is constructed ONLY
+where the diagnosis is MISCALIBRATED: a transform exists to correct a measured
+defect, and fitting one speculatively -- then reporting its parameters "for
+description" -- would put a candidate calibration in front of a reviewer with
+nothing for it to correct.
+
 NO IN-SAMPLE CALIBRATION
 ------------------------
-A transform scored at target event ``E`` is fitted only on outcomes finalised
-STRICTLY BEFORE ``E``.  Every origin's fitted parameters and fit basis are
-recorded, the basis digest is part of the fitted version string, and a basis
-containing an outcome at or after its origin is REFUSED rather than
-approximated.  A figure produced by fitting and scoring on the same event set is
-not evidence and is never reported as if it were.
+A transform scored at target event ``E`` is fitted only on outcomes that were
+officially final AND captured STRICTLY BEFORE ``E``'s own certified cutoff, as
+proven by PE-5's append-only observation captures.  The basis uses the outcome
+value THAT capture states, so a later official correction is a later observation
+and cannot rewrite an earlier transform.  A row whose timing cannot be proven --
+no capture, a capture that arrived after the cutoff, a provisional observation, a
+finality that is unstated or too late -- is EXCLUDED AND COUNTED, never assumed
+known.  Every origin's fitted parameters and fit basis are recorded, the basis
+digest is part of the fitted version string, and a basis containing an outcome at
+or after its origin is REFUSED rather than approximated.  A figure produced by
+fitting and scoring on the same event set is not evidence and is never reported as
+if it were.
 
 SAME POPULATION OR NO COMPARISON
 --------------------------------
@@ -46,7 +62,9 @@ MISSING IS COUNTED, NEVER ZERO
 ------------------------------
 A row whose probability is absent is excluded and counted; a scored probability
 outside ``[0, 1]`` fails closed; a bin under the declared sample floor is
-reported as insufficient; an empty count is rendered as null, never ``0.0``.
+reported as insufficient; an empty count is rendered as null, never ``0.0``.  A
+position outside a component's declared positions earns a REAL zero from it, so
+that row is coverage rather than a gap, and the rule is stated by token.
 """
 
 from __future__ import annotations
@@ -62,6 +80,7 @@ from . import defcon_calibration as defcon_cal
 from . import joint_minutes
 from . import minutes_model
 from . import monte_carlo
+from . import outcome_ledger as ledger
 from . import player_rates
 from . import probability_calibration as pc
 from . import team_model
@@ -83,10 +102,32 @@ TERMINAL_OPEN = "OPEN"
 STATUS_OK = "OK"
 STATUS_UNREACHABLE = "UNREACHABLE"
 STATUS_POPULATION_MISMATCH = "POPULATION_MISMATCH"
+#: No challenger was constructed at all, because nothing was diagnosed to correct.
+STATUS_NOT_FITTED = "NOT_FITTED"
 
 DIAGNOSIS_MISCALIBRATED = "MISCALIBRATED"
 DIAGNOSIS_NO_MATERIAL_DEFECT = "NO_MATERIAL_DEFECT_DETECTED"
 DIAGNOSIS_INSUFFICIENT = "INSUFFICIENT_FOR_DIAGNOSIS"
+
+#: Why a row of the declared population did NOT enter an origin's fit basis.  A
+#: basis row must carry a PE-5 point-in-time observation whose official finality
+#: AND capture both fall strictly before the origin's certified cutoff; anything
+#: whose timing cannot be proven is excluded and counted, never assumed known.
+BASIS_CAPTURE_ABSENT = "POINT_IN_TIME_CAPTURE_ABSENT"
+BASIS_CAPTURE_NOT_BEFORE_CUTOFF = "CAPTURE_NOT_BEFORE_CUTOFF"
+BASIS_PROVISIONAL = "OBSERVATION_PROVISIONAL_AT_CUTOFF"
+BASIS_FINALITY_UNPROVABLE = "OFFICIAL_FINALITY_UNPROVABLE"
+BASIS_FINALITY_NOT_BEFORE_CUTOFF = "OFFICIAL_FINALITY_NOT_BEFORE_CUTOFF"
+BASIS_OUTCOME_UNAVAILABLE = "POINT_IN_TIME_OUTCOME_UNAVAILABLE"
+
+BASIS_EXCLUSION_REASONS: tuple[str, ...] = (
+    BASIS_CAPTURE_ABSENT,
+    BASIS_CAPTURE_NOT_BEFORE_CUTOFF,
+    BASIS_PROVISIONAL,
+    BASIS_FINALITY_UNPROVABLE,
+    BASIS_FINALITY_NOT_BEFORE_CUTOFF,
+    BASIS_OUTCOME_UNAVAILABLE,
+)
 
 #: Declared a priori.  A reliability bin whose observed frequency differs from its
 #: mean stated probability by more than this, and which meets the declared bin
@@ -230,10 +271,6 @@ class CalibrationEvaluationError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _probability_definitions() -> dict[str, sb.ProbabilityMetricDefinition]:
-    return {definition.metric: definition for definition in sb.PROBABILITY_METRICS}
-
-
 @dataclass(frozen=True)
 class ComponentDefinition:
     """One persisted expected-points component and its realised counterpart.
@@ -248,6 +285,9 @@ class ComponentDefinition:
     selector: str
     realised: str
     interpretation: str
+    #: Set when a position outside the component's declared positions earns a real
+    #: zero rather than a gap, so the coverage of those rows is stated.
+    zero_rule: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -260,6 +300,7 @@ class ComponentDefinition:
             ),
             "realised_target": str(self.realised),
             "interpretation": str(self.interpretation),
+            "structural_zero_rule": None if self.zero_rule is None else str(self.zero_rule),
         }
 
 
@@ -308,6 +349,10 @@ COMPONENT_DEFINITIONS: tuple[ComponentDefinition, ...] = (
         selector="goals_conceded_points",
         realised="-(floor(conceded / goals_conceded_per_deduction)) x deduction points, for GKP/DEF only",
         interpretation="direct for GKP/DEF; identically zero elsewhere by the scoring rules",
+        zero_rule=(
+            "a position outside goals_conceded_positions earns a real zero deduction, so the row is "
+            "covered rather than dropped"
+        ),
     ),
     ComponentDefinition(
         component="defcon_xpts",
@@ -317,6 +362,10 @@ COMPONENT_DEFINITIONS: tuple[ComponentDefinition, ...] = (
             "direct on the calibrated probability it is built from; the inverse action rate it "
             "consumes may be weakly evidenced (DEFCON_PRIOR_WEAK)"
         ),
+        zero_rule=(
+            "a position outside the declared DefCon positions (GKP) earns no DefCon points, so its "
+            "realised value is a real zero and the row is covered rather than dropped"
+        ),
     ),
     ComponentDefinition(
         component="save_xpts",
@@ -325,6 +374,10 @@ COMPONENT_DEFINITIONS: tuple[ComponentDefinition, ...] = (
         interpretation=(
             "approximation-flagged at production time: the save rate is shrunk toward a prior "
             "(SAVE_MODEL_LOW_CONFIDENCE) and the pressure multiplier is bounded"
+        ),
+        zero_rule=(
+            "an outfield position earns a real zero save points, so the row is covered rather than "
+            "dropped"
         ),
     ),
     ComponentDefinition(
@@ -422,12 +475,19 @@ def realised_component(
         steps = int(conceded) // int(rules.goals_conceded_per_deduction)
         return -float(steps) * abs(float(rules.goals_conceded_points_for(position)))
     if selector == "defcon_points":
+        # A position outside the declared DefCon positions earns no DefCon points
+        # at all -- GKP is such a position, and the frozen rules say so explicitly
+        # (``defcon_positions`` excludes it).  That is a REAL zero, so it is
+        # returned BEFORE the threshold and the contribution are consulted: the
+        # realised value does not depend on either, and treating a missing
+        # contribution column as "unknown" here would drop a covered row out of
+        # the component population for a question that was already answered.
+        if position not in rules.defcon_positions:
+            return 0.0
         threshold = rules.defcon_threshold_for(position)
         contribution = outcome.get("defensive_contribution")
         if threshold is None or contribution is None:
             return None
-        if position not in rules.defcon_positions:
-            return 0.0
         return float(rules.defcon_points) if float(contribution) >= threshold else 0.0
     if selector == "save_points":
         saves = outcome.get("saves")
@@ -454,6 +514,27 @@ def realised_component(
         # target are the same event by construction.
         return mc_calibration.actual_modelled_core(outcome, position, rules)
     raise CalibrationEvaluationError(f"unknown component selector {selector!r}")
+
+
+def structural_zero_rule(
+    selector: str, position: str, *, rules=DEFAULT_SCORING_RULES
+) -> str | None:
+    """Why this position earns a REAL zero on this component, or ``None`` if it does not.
+
+    A position outside the component's declared positions earns nothing from it by
+    the frozen scoring rules -- a GKP earns no DefCon points, a forward concedes no
+    deductions -- so its realised value is a genuine zero and the row BELONGS in
+    the component population.  Reporting the count makes that coverage visible
+    instead of leaving a reader to infer it from an ``N``.
+    """
+
+    if selector == "defcon_points" and position not in rules.defcon_positions:
+        return f"{position} is outside the declared DefCon positions, so it earns no DefCon points"
+    if selector == "goals_conceded_points" and position not in rules.goals_conceded_positions:
+        return f"{position} is outside goals_conceded_positions, so it suffers no deduction"
+    if selector == "save_points" and position != "GKP":
+        return f"{position} is not GKP, so it earns no save points"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -643,71 +724,281 @@ def comparison_gate(
 # ---------------------------------------------------------------------------
 
 
-def causal_origins(
-    rows: Sequence[sb.ProbabilityScoringRow],
+def point_in_time_basis(
     *,
-    surface: str,
-    grain: str = wf.GRAIN_PLAYER_FIXTURE,
-    clip_floor: float = pc.DEFAULT_CLIP_FLOOR,
-) -> dict[int, pc.CausalFit]:
-    """One fit per target event, over the same surface's strictly earlier rows.
+    conn: sqlite3.Connection,
+    rows: Sequence[sb.ProbabilityScoringRow],
+    cutoffs: Mapping[int, str],
+    selector: str,
+) -> tuple[dict[int, list[pc.CalibrationObservation]], dict[int, dict[str, int]]]:
+    """Each origin's fit basis, built ONLY from PE-5 point-in-time evidence.
 
-    The basis is drawn from THIS surface's rows inside the declared population and
-    from strictly earlier target events of the same anchor.  Nothing outside the
-    declared population is borrowed: a fit that reached beyond it would describe a
-    population no reported figure covers.
+    For every origin event ``E`` the basis is the declared population's rows from
+    strictly earlier events whose outcome is proven by an APPEND-ONLY PE-5
+    observation capture to have been officially final AND captured strictly before
+    ``E``'s certified cutoff.  The outcome value used is the one that capture
+    states, not the current table's value: a later official refresh is a later
+    capture and therefore cannot retroactively rewrite what an earlier transform
+    was fitted on.
+
+    Every refusal is named rather than assumed:
+
+    * ``POINT_IN_TIME_CAPTURE_ABSENT`` -- the key has no observation at all;
+    * ``CAPTURE_NOT_BEFORE_CUTOFF`` -- the result was official in time, but the
+      repository captured it after the origin's cutoff;
+    * ``OBSERVATION_PROVISIONAL_AT_CUTOFF`` -- the visible read was provisional;
+    * ``OFFICIAL_FINALITY_UNPROVABLE`` -- the capture states no official finality;
+    * ``OFFICIAL_FINALITY_NOT_BEFORE_CUTOFF`` -- the postponed-result case: the
+      football event happened, but its result was not official when the origin's
+      prediction was issued;
+    * ``POINT_IN_TIME_OUTCOME_UNAVAILABLE`` -- the capture does not carry the field
+      this surface's realised outcome is defined on.
+
+    Every refusal is counted by reason, per origin, so the size of the excluded
+    evidence is visible rather than silently missing.
     """
 
     by_event: dict[int, list[sb.ProbabilityScoringRow]] = {}
     for row in rows:
         by_event.setdefault(int(row.event), []).append(row)
-    fits: dict[int, pc.CausalFit] = {}
-    for origin in sorted(by_event):
-        basis = [
-            pc.CalibrationObservation(
-                event=int(candidate.event),
-                key=(int(candidate.player_id), int(candidate.fixture_id)),
-                probability=float(candidate.probability),
-                outcome=float(candidate.outcome),
-            )
-            for event, candidates in by_event.items()
-            if int(event) < int(origin)
-            for candidate in candidates
-        ]
-        fits[int(origin)] = pc.fit_platt_causal(
-            basis, origin_event=int(origin), surface=str(surface), grain=str(grain),
+    origins = sorted(by_event)
+    basis: dict[int, list[pc.CalibrationObservation]] = {origin: [] for origin in origins}
+    excluded: dict[int, dict[str, int]] = {origin: {} for origin in origins}
+    if not origins:
+        return basis, excluded
+
+    captures: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    for capture in ledger.observation_captures(
+        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, events=origins
+    ):
+        if capture.get("fixture_id") is None:
+            continue
+        captures.setdefault(
+            (int(capture["event"]), int(capture["player_id"]), int(capture["fixture_id"])), []
+        ).append(capture)
+
+    for origin in origins:
+        cutoff = _require_cutoff(cutoffs, origin)
+        for event in (candidate for candidate in origins if candidate < origin):
+            for row in by_event[event]:
+                outcome, reason = _point_in_time_outcome(
+                    captures.get(row.key, ()), cutoff=cutoff, selector=selector, row=row
+                )
+                if reason is not None:
+                    counters = excluded[origin]
+                    counters[reason] = counters.get(reason, 0) + 1
+                    continue
+                basis[origin].append(
+                    pc.CalibrationObservation(
+                        event=int(row.event),
+                        key=(int(row.player_id), int(row.fixture_id)),
+                        probability=float(row.probability),
+                        outcome=float(outcome),
+                    )
+                )
+    for origin, counters in excluded.items():
+        excluded[origin] = {key: int(value) for key, value in sorted(counters.items())}
+    return basis, excluded
+
+
+def _point_in_time_outcome(
+    captures: Sequence[Mapping[str, Any]],
+    *,
+    cutoff: str,
+    selector: str,
+    row: sb.ProbabilityScoringRow,
+) -> tuple[float | None, str | None]:
+    """``(realised outcome, exclusion reason)`` for one row at one cutoff."""
+
+    visible = [
+        capture
+        for capture in captures
+        if capture.get("captured_at") is not None and str(capture["captured_at"]) < str(cutoff)
+    ]
+    if not visible:
+        return None, _unavailable_evidence_reason(captures, cutoff=cutoff)
+    # The declared supersession policy from PE-5, reused rather than restated, so
+    # a key with several visible captures resolves exactly as the ledger resolves it.
+    chosen = ledger.select_capture(visible)
+    if chosen is None:  # pragma: no cover - ``visible`` is non-empty
+        return None, BASIS_CAPTURE_ABSENT
+    if str(chosen.get("observation_state")) != ledger.OBSERVATION_FINAL:
+        return None, BASIS_PROVISIONAL
+    final_at = str(chosen.get("official_final_at") or "").strip()
+    if not final_at:
+        return None, BASIS_FINALITY_UNPROVABLE
+    if final_at >= str(cutoff):
+        return None, BASIS_FINALITY_NOT_BEFORE_CUTOFF
+    realised = sb.realised_probability_outcome(
+        selector, chosen.get("payload") or {}, row.position
+    )
+    if realised is None:
+        return None, BASIS_OUTCOME_UNAVAILABLE
+    return float(realised), None
+
+
+def _unavailable_evidence_reason(
+    captures: Sequence[Mapping[str, Any]], *, cutoff: str
+) -> str:
+    """Why no capture could be read before ``cutoff``, as one countable reason.
+
+    The two causes are different evidence problems and are reported separately: a
+    result that was not OFFICIAL yet (the football side -- the postponed case) and
+    a result that was official but had not been CAPTURED yet (the repository
+    side).  Neither is assumed known; both are counted.
+    """
+
+    if not captures:
+        return BASIS_CAPTURE_ABSENT
+    late_finality = any(
+        str(capture.get("observation_state")) == ledger.OBSERVATION_FINAL
+        and str(capture.get("official_final_at") or "").strip()
+        and str(capture["official_final_at"]) >= str(cutoff)
+        for capture in captures
+    )
+    return BASIS_FINALITY_NOT_BEFORE_CUTOFF if late_finality else BASIS_CAPTURE_NOT_BEFORE_CUTOFF
+
+
+def _require_cutoff(cutoffs: Mapping[int, str], origin: int) -> str:
+    """The origin's certified cutoff, or refuse: an origin without one is not causal."""
+
+    value = str(cutoffs.get(int(origin)) or "").strip()
+    if not value:
+        raise CalibrationEvaluationError(
+            f"origin event {int(origin)} declares no certified cutoff, so no point-in-time basis can "
+            "be built for it"
+        )
+    return value
+
+
+def causal_origins(
+    basis_by_origin: Mapping[int, Sequence[pc.CalibrationObservation]],
+    *,
+    surface: str,
+    grain: str = wf.GRAIN_PLAYER_FIXTURE,
+    clip_floor: float = pc.DEFAULT_CLIP_FLOOR,
+) -> dict[int, pc.CausalFit]:
+    """One fit per target event, over that origin's own strictly earlier basis.
+
+    The bases are supplied already filtered -- in production by
+    :func:`point_in_time_basis`, which is what makes them PE-5 evidence rather
+    than "every row from an earlier event".  Nothing here reaches for a row the
+    supplied basis does not contain: a fit that borrowed beyond it would describe
+    a population no reported figure covers.
+    """
+
+    return {
+        int(origin): pc.fit_platt_causal(
+            list(observations),
+            origin_event=int(origin),
+            surface=str(surface),
+            grain=str(grain),
             clip_floor=clip_floor,
         )
-    return fits
+        for origin, observations in sorted(basis_by_origin.items())
+    }
+
+
+def _not_fitted_block(surface: str, grain: str, diagnosis: Mapping[str, Any]) -> dict[str, Any]:
+    """The declared record for a surface that produced NO challenger.
+
+    A transform exists to correct a MEASURED miscalibration.  Where nothing is
+    diagnosed, nothing is fitted: reporting fitted parameters "for description
+    only" would put a candidate calibration in front of a reviewer with no defect
+    for it to correct, and the phase forbids fitting speculatively.
+    """
+
+    status = str(diagnosis.get("status"))
+    if status == DIAGNOSIS_INSUFFICIENT:
+        reason = (
+            "the sample cannot support a calibration claim on this surface, so no defect is diagnosed "
+            "and NO challenger was constructed"
+        )
+    else:
+        reason = (
+            "no material defect is diagnosed on this surface, so NO challenger was constructed: a "
+            "transform exists only to correct a measured miscalibration"
+        )
+    return {
+        "surface": str(surface),
+        "grain": str(grain),
+        "status": STATUS_NOT_FITTED,
+        "constructed": False,
+        "reason": reason,
+        "diagnosis_status": status,
+        "method": pc.PLATT_FIT_METHOD,
+        "policy_version": pc.CAUSAL_FIT_POLICY_VERSION,
+        "calibration_policy_version": pc.PROBABILITY_CALIBRATION_POLICY_VERSION,
+        "basis_policy": (
+            "no basis was built: a basis exists to fit a transform, and no transform is admissible "
+            "without a diagnosed defect"
+        ),
+        "origins": [],
+        "rows_without_origin_transform": None,
+        "excluded_by_reason": {},
+        "basis_excluded_by_reason": {},
+        "exclusion_reasons": [],
+        "population": None,
+        "gate": None,
+        "incumbent_on_comparison_population": None,
+        "candidate": None,
+        "versions_in_force": [],
+    }
 
 
 def _challenger_block(
-    rows: Sequence[sb.ProbabilityScoringRow],
     *,
-    surface: str,
+    conn: sqlite3.Connection,
+    rows: Sequence[sb.ProbabilityScoringRow],
+    cutoffs: Mapping[int, str],
+    definition: sb.ProbabilityMetricDefinition,
     grain: str,
 ) -> tuple[dict[str, Any], list[sb.ProbabilityScoringRow]]:
     """The causal challenger arm: fitted transform per origin, scored at its own origin.
 
-    Returns the reportable block and the rows the arm could actually cover.  A row
-    whose origin had no admissible transform is EXCLUDED AND COUNTED, never scored
-    under a transform fitted somewhere else.
+    Constructed only after a diagnosis, never before: the caller reaches this
+    function only for a MISCALIBRATED surface, and the block says so.  Returns the
+    reportable block and the rows the arm could actually cover.  A row whose
+    origin had no admissible transform is EXCLUDED AND COUNTED, never scored under
+    a transform fitted somewhere else.
     """
 
-    fits = causal_origins(rows, surface=surface, grain=grain)
+    basis_by_origin, excluded_by_origin = point_in_time_basis(
+        conn=conn, rows=rows, cutoffs=cutoffs, selector=definition.outcome_selector
+    )
+    fits = causal_origins(basis_by_origin, surface=definition.metric, grain=grain)
     origins: list[dict[str, Any]] = []
     covered: list[sb.ProbabilityScoringRow] = []
     excluded_by_reason: dict[str, int] = {}
+    # The basis exclusions, summed over the origins: the per-origin counters below
+    # say WHICH origin had to do without which rows, and this says how much
+    # evidence the surface's fits collectively could not use.
+    basis_excluded_total: dict[str, int] = {}
+    for counters in excluded_by_origin.values():
+        for reason, count in counters.items():
+            basis_excluded_total[str(reason)] = basis_excluded_total.get(str(reason), 0) + int(count)
     for origin in sorted(fits):
         fit = fits[origin]
         origin_rows = [row for row in rows if int(row.event) == int(origin)]
         record: dict[str, Any] = {
             "origin_event": int(origin),
+            "cutoff": _require_cutoff(cutoffs, origin),
             "fit": fit.as_dict(),
             "rows_at_origin": len(origin_rows),
             "rows_scored_at_origin": 0,
+            "basis_excluded_by_reason": dict(excluded_by_origin.get(int(origin), {})),
         }
         if fit.available:
+            # The fitted payload is read back through the fail-closed reader
+            # before it is reported: a transform that cannot state its identity and
+            # the policy it was fitted under is not a reportable calibration, and
+            # an absent or mismatched provenance stops the evaluation here rather
+            # than producing a number a consumer cannot attribute.
+            spec = fit.spec
+            if spec is None:  # pragma: no cover - guarded by ``available``
+                raise CalibrationEvaluationError("an available fit carries no spec")
+            pc.from_payload(spec.as_payload())
+            record["provenance"] = spec.as_payload()
             covered.extend(origin_rows)
             record["rows_scored_at_origin"] = len(origin_rows)
         else:
@@ -716,24 +1007,53 @@ def _challenger_block(
         origins.append(record)
 
     block: dict[str, Any] = {
-        "surface": str(surface),
+        "surface": str(definition.metric),
         "grain": str(grain),
+        "status": None,
+        "constructed": True,
+        "diagnosis_status": DIAGNOSIS_MISCALIBRATED,
         "method": pc.PLATT_FIT_METHOD,
         "policy_version": pc.CAUSAL_FIT_POLICY_VERSION,
         "calibration_policy_version": pc.PROBABILITY_CALIBRATION_POLICY_VERSION,
         "basis_policy": (
             "the same surface's rows from strictly earlier target events of this anchor, restricted to "
-            "the declared population; an origin with an insufficient basis is reported rather than "
-            "fitted from rows the figures do not cover"
+            "the declared population AND to rows whose PE-5 point-in-time capture proves the outcome "
+            "was officially final and captured strictly before the origin's certified cutoff.  A row "
+            "whose timing cannot be proven is excluded and counted, and an origin with an insufficient "
+            "basis is reported rather than fitted from rows the figures do not cover"
         ),
+        "basis_evidence": {
+            "ledger_version": ledger.OUTCOME_LEDGER_VERSION,
+            "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
+            "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
+            "grain": ledger.GRAIN_PLAYER_FIXTURE,
+            "strictly_before_cutoff": True,
+            "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
+        },
         "origins": origins,
-        "rows_without_origin_transform": sum(
-            1 for row in rows if not fits[int(row.event)].available
-        ),
+        "basis_excluded_by_reason": {
+            str(key): int(value) for key, value in sorted(basis_excluded_total.items())
+        },
         "excluded_by_reason": {str(key): int(value) for key, value in sorted(excluded_by_reason.items())},
     }
+    block["rows_without_origin_transform"] = sum(
+        1 for row in rows if not fits[int(row.event)].available
+    )
+    return _score_challenger(block, rows, covered, fits, excluded_by_reason, grain=grain), covered
+
+
+def _score_challenger(
+    block: dict[str, Any],
+    rows: Sequence[sb.ProbabilityScoringRow],
+    covered: Sequence[sb.ProbabilityScoringRow],
+    fits: Mapping[int, pc.CausalFit],
+    excluded_by_reason: Mapping[str, int],
+    *,
+    grain: str,
+) -> dict[str, Any]:
+    """Score the arm on the identical population, or report it unreachable."""
+
     if not covered:
-        reasons = sorted(excluded_by_reason)
         block.update(
             {
                 "status": STATUS_UNREACHABLE,
@@ -741,11 +1061,11 @@ def _challenger_block(
                     "no origin had an admissible causal transform, so the challenger cannot cover the "
                     "comparison population"
                 ),
-                "exclusion_reasons": reasons,
+                "exclusion_reasons": sorted(excluded_by_reason),
                 "population": {
                     "population_digest": None,
                     "n": 0,
-                    "rows_without_origin_transform": len(rows),
+                    "rows_without_origin_transform": int(block["rows_without_origin_transform"]),
                     "excluded_by_reason": block["excluded_by_reason"],
                 },
                 "gate": None,
@@ -753,7 +1073,7 @@ def _challenger_block(
                 "candidate": None,
             }
         )
-        return block, covered
+        return block
 
     covered_keys = [row.key for row in covered]
     # Two independent derivations of the same set: the per-origin loop above, and
@@ -772,14 +1092,14 @@ def _challenger_block(
                 "population": {
                     "population_digest": None,
                     "n": 0,
-                    "rows_without_origin_transform": block["rows_without_origin_transform"],
+                    "rows_without_origin_transform": int(block["rows_without_origin_transform"]),
                     "excluded_by_reason": block["excluded_by_reason"],
                 },
                 "incumbent_on_comparison_population": None,
                 "candidate": None,
             }
         )
-        return block, covered
+        return block
 
     incumbent_pairs = [(row.probability, row.outcome) for row in incumbent_rows]
     candidate_pairs: list[tuple[float, float]] = []
@@ -796,7 +1116,7 @@ def _challenger_block(
             "population": {
                 "population_digest": gate["population_digest"],
                 "n": len(covered),
-                "rows_without_origin_transform": block["rows_without_origin_transform"],
+                "rows_without_origin_transform": int(block["rows_without_origin_transform"]),
                 "excluded_by_reason": block["excluded_by_reason"],
             },
             "incumbent_on_comparison_population": _figure(
@@ -812,7 +1132,7 @@ def _challenger_block(
             ),
         }
     )
-    return block, covered
+    return block
 
 
 # ---------------------------------------------------------------------------
@@ -900,33 +1220,33 @@ def defcon_calibration_block(
 
 
 def _transform_mandate(diagnosis: Mapping[str, Any], challenger: Mapping[str, Any]) -> dict[str, Any]:
-    """Whether the fitted transform has a MANDATE, which only a diagnosed defect gives it.
+    """Whether a transform has a MANDATE, which only a diagnosed defect gives it.
 
-    A transform exists to correct a measured miscalibration.  Where no defect is
-    diagnosed the fitted parameters are still reported -- they are the sensitivity
-    of the stated probabilities to a logit-linear map, which is exactly what a
-    reader needs to see when the answer is "no defect" -- but they are not a
-    candidate calibration, and nothing here proposes one.
+    A transform exists to correct a measured miscalibration.  So the DIAGNOSIS
+    comes first and decides whether a challenger is constructed at all: where no
+    defect is diagnosed, the challenger block records that none was built, rather
+    than reporting fitted parameters a reviewer might read as a candidate.
     """
 
     status = str(diagnosis.get("status"))
     if status == DIAGNOSIS_MISCALIBRATED:
         mandate = "DIAGNOSED_DEFECT"
         note = (
-            "a material calibration gap is diagnosed, so a transform has a mandate; it is still not "
-            "promoted, and the transform's own status says whether an admissible one exists"
+            "a material calibration gap is diagnosed, so a transform has a mandate; the challenger is "
+            "fitted per origin from strictly earlier point-in-time evidence, and it is still not "
+            "promoted, so the transform's own status says whether an admissible one exists"
         )
     elif status == DIAGNOSIS_INSUFFICIENT:
         mandate = "INSUFFICIENT_FOR_DIAGNOSIS"
         note = (
             "the sample cannot support a calibration claim on this surface, so no defect is diagnosed "
-            "and a transform is fitted for description only"
+            "and no challenger was constructed"
         )
     else:
         mandate = "NO_DEFECT_DIAGNOSED"
         note = (
-            "no material defect is diagnosed on this surface, so the fitted parameters are a "
-            "descriptive sensitivity rather than a candidate calibration"
+            "no material defect is diagnosed on this surface, so no challenger was constructed: "
+            "fitting one would be a speculative transform with nothing to correct"
         )
     return {
         "mandate": mandate,
@@ -935,7 +1255,8 @@ def _transform_mandate(diagnosis: Mapping[str, Any], challenger: Mapping[str, An
         "transform_status": str(challenger.get("status")),
         "rule": (
             "a transform is admissible only to correct a measured miscalibration on a declared "
-            "surface; PE-8 fits none speculatively and promotes none at all"
+            "surface; the surface is diagnosed first and PE-8 fits no challenger unless the diagnosis "
+            "is MISCALIBRATED, and promotes none at all"
         ),
     }
 
@@ -945,9 +1266,15 @@ def probability_calibration_block(
     *,
     events: Sequence[int],
     xpts_runs: Mapping[int, int],
+    cutoffs: Mapping[int, str] | None = None,
     excluded_events: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    """Every declared probability surface: diagnosis first, then any transform."""
+    """Every declared probability surface: diagnosis first, then any transform.
+
+    The order is the contract's rule 1 made structural.  The incumbent figure and
+    its diagnosis are computed for every surface; a challenger is built ONLY where
+    the diagnosis is MISCALIBRATED.
+    """
 
     wanted = sorted({int(event) for event in events})
     population = sb.player_fixture_population(conn, events=wanted, xpts_runs=xpts_runs)
@@ -958,7 +1285,7 @@ def probability_calibration_block(
     for row in scored["rows"]:
         by_metric[row.metric].append(row)
 
-    definitions = _probability_definitions()
+    declared_cutoffs = dict(cutoffs or {})
     surfaces: list[dict[str, Any]] = []
     for definition in sb.PROBABILITY_METRICS:
         rows = by_metric[definition.metric]
@@ -967,12 +1294,21 @@ def probability_calibration_block(
         figure = _figure(probabilities, outcomes)
         events_with_rows = sorted({int(row.event) for row in rows})
         keys = [row.key for row in rows]
-        challenger, _covered = _challenger_block(
-            rows, surface=definition.metric, grain=wf.GRAIN_PLAYER_FIXTURE
-        )
         diagnosis = _diagnosis(
             figure["reliability"]["bins_over_floor"], figure["reliability"]["max_abs_gap_over_floor"]
         )
+        if diagnosis["status"] == DIAGNOSIS_MISCALIBRATED and rows:
+            challenger, _covered = _challenger_block(
+                conn=conn,
+                rows=rows,
+                cutoffs=declared_cutoffs,
+                definition=definition,
+                grain=wf.GRAIN_PLAYER_FIXTURE,
+            )
+        else:
+            challenger = _not_fitted_block(
+                definition.metric, wf.GRAIN_PLAYER_FIXTURE, diagnosis
+            )
         block: dict[str, Any] = {
             "metric": definition.metric,
             "definition": definition.as_dict(),
@@ -1178,6 +1514,9 @@ def _component_block(
     absent: dict[str, int] = {definition.component: 0 for definition in COMPONENT_DEFINITIONS}
     flags: dict[str, set[str]] = {definition.component: set() for definition in COMPONENT_DEFINITIONS}
     events_seen: dict[str, set[int]] = {definition.component: set() for definition in COMPONENT_DEFINITIONS}
+    structural_zeros: dict[str, dict[str, int]] = {
+        definition.component: {} for definition in COMPONENT_DEFINITIONS
+    }
     for row in population["rows"]:
         for definition in COMPONENT_DEFINITIONS:
             value = row.payload.get(definition.component)
@@ -1188,6 +1527,11 @@ def _component_block(
             if target is None:
                 gaps[definition.component] += 1
                 continue
+            if target == 0.0 and structural_zero_rule(definition.selector, row.position) is not None:
+                # A real zero from the scoring rules, not a missing observation: the
+                # row is covered, and the count says which positions supplied it.
+                counters = structural_zeros[definition.component]
+                counters[str(row.position)] = counters.get(str(row.position), 0) + 1
             predictions[definition.component].append(float(value))
             realised_values[definition.component].append(float(target))
             flags[definition.component].update(row.risk_flags())
@@ -1206,6 +1550,10 @@ def _component_block(
                 "n": len(predicted),
                 "predicted_absent": absent[definition.component],
                 "realised_unavailable": gaps[definition.component],
+                "structural_zero_rows": sum(structural_zeros[definition.component].values()),
+                "structural_zero_by_position": {
+                    key: int(value) for key, value in sorted(structural_zeros[definition.component].items())
+                },
                 "mae": _metric_or_none(wm.mean_absolute_error, predicted, actual),
                 "bias": _metric_or_none(wm.mean_bias, predicted, actual),
                 "median_ae": _metric_or_none(wm.median_absolute_error, predicted, actual),
@@ -1297,6 +1645,7 @@ def assist_mapping_block(
     *,
     events: Sequence[int],
     xpts_runs: Mapping[int, int],
+    cutoffs: Mapping[int, str] | None = None,
 ) -> dict[str, Any]:
     """The uncalibrated assist-mapping constant, as a decision PE-8 reports.
 
@@ -1305,10 +1654,16 @@ def assist_mapping_block(
     different value and a review promotes it.  A fit that IS supported is
     reported as a candidate; PE-8 does not re-point the constant, and it never
     silences the truthful ``FPL_ASSIST_MAPPING_UNCALIBRATED`` flag.
+
+    Each origin's fit basis is PE-5 point-in-time evidence, exactly as the
+    probability surfaces' is: the realised assists come from the observation
+    capture that was final and captured strictly before that origin's certified
+    cutoff, and a row whose timing cannot be proven is excluded and counted.
     """
 
     config = xpts_module.XPtsConfig()
     wanted = sorted({int(event) for event in events})
+    declared_cutoffs = dict(cutoffs or {})
     block: dict[str, Any] = {
         "surface": ASSIST_MAPPING_SURFACE,
         "grain": ASSIST_MAPPING_GRAIN,
@@ -1323,10 +1678,19 @@ def assist_mapping_block(
         "method": pc.ASSIST_MAPPING_FIT_METHOD,
         "policy_version": pc.CAUSAL_FIT_POLICY_VERSION,
         "basis_policy": (
-            "the same population's strictly earlier target events; expected_xa is the persisted "
-            "expected xA the production formula multiplies, and the realised side is the official "
-            "assists column for the same player and fixture"
+            "the same population's strictly earlier target events, restricted to rows whose PE-5 "
+            "point-in-time capture proves the official assists were final and captured strictly before "
+            "the origin's certified cutoff; expected_xa is the persisted expected xA the production "
+            "formula multiplies, and a row whose timing cannot be proven is excluded and counted"
         ),
+        "basis_evidence": {
+            "ledger_version": ledger.OUTCOME_LEDGER_VERSION,
+            "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
+            "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
+            "grain": ledger.GRAIN_PLAYER_FIXTURE,
+            "strictly_before_cutoff": True,
+            "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
+        },
         "origins": [],
         "pooled_evidence": {
             "observations": 0,
@@ -1350,38 +1714,57 @@ def assist_mapping_block(
     for event, row, expected in observations:
         by_event.setdefault(int(event), []).append((row, expected))
 
+    captures: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+    for capture in ledger.observation_captures(
+        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, events=sorted(by_event)
+    ):
+        if capture.get("fixture_id") is None:
+            continue
+        captures.setdefault(
+            (int(capture["event"]), int(capture["player_id"]), int(capture["fixture_id"])), []
+        ).append(capture)
+
     pooled_expected = 0.0
     pooled_realised = 0.0
     pooled_observations = 0
     for origin in sorted(by_event):
+        cutoff = _require_cutoff(declared_cutoffs, origin)
         basis_rows: list[pc.AssistMappingObservation] = []
+        excluded: dict[str, int] = {}
         for event in sorted(by_event):
             if int(event) >= int(origin):
                 continue
             for row, expected in by_event[event]:
-                realised = row.outcome.get("assists")
-                if realised is None:
-                    # The realised side is the official assists column for the same
-                    # player and fixture; an absent column is a gap, not a zero.
+                realised, reason = _point_in_time_assists(
+                    captures.get(row.key, ()), cutoff=cutoff, row=row
+                )
+                if reason is not None:
+                    excluded[reason] = excluded.get(reason, 0) + 1
                     continue
                 basis_rows.append(
                     pc.AssistMappingObservation(
                         event=int(event),
                         key=(int(row.player_id), int(row.fixture_id)),
                         expected_assists=float(expected),
-                        realised_assists=float(int(realised)),
+                        realised_assists=float(realised),
                     )
                 )
         fit = pc.fit_assist_mapping_causal(
             basis_rows, origin_event=int(origin), surface=ASSIST_MAPPING_SURFACE, grain=ASSIST_MAPPING_GRAIN
         )
-        block["origins"].append(
-            {
-                "origin_event": int(origin),
-                "rows_at_origin": len(by_event[int(origin)]),
-                "fit": fit.as_dict(),
-            }
-        )
+        entry: dict[str, Any] = {
+            "origin_event": int(origin),
+            "cutoff": cutoff,
+            "rows_at_origin": len(by_event[int(origin)]),
+            "basis_excluded_by_reason": {key: int(value) for key, value in sorted(excluded.items())},
+            "fit": fit.as_dict(),
+        }
+        if fit.available:
+            # Read the fitted payload back through the fail-closed reader before it
+            # is reported: a coefficient that cannot state its identity and the
+            # policy it was fitted under is not evidence of anything.
+            entry["provenance"] = pc.assist_mapping_from_payload(fit.as_payload())
+        block["origins"].append(entry)
     for _event, row, expected in observations:
         assists = row.outcome.get("assists")
         if assists is None:
@@ -1399,6 +1782,42 @@ def assist_mapping_block(
     return block
 
 
+def _point_in_time_assists(
+    captures: Sequence[Mapping[str, Any]],
+    *,
+    cutoff: str,
+    row: sb.PlayerFixtureScoringRow,
+) -> tuple[int | None, str | None]:
+    """``(realised assists, exclusion reason)`` for one row at one cutoff.
+
+    The realised side is the official assists column OF THE CAPTURE, so a later
+    official refresh cannot rewrite what an earlier fit was fitted on.
+    """
+
+    visible = [
+        capture
+        for capture in captures
+        if capture.get("captured_at") is not None and str(capture["captured_at"]) < str(cutoff)
+    ]
+    if not visible:
+        return None, _unavailable_evidence_reason(captures, cutoff=cutoff)
+    chosen = ledger.select_capture(visible)
+    if chosen is None:  # pragma: no cover - ``visible`` is non-empty
+        return None, BASIS_CAPTURE_ABSENT
+    if str(chosen.get("observation_state")) != ledger.OBSERVATION_FINAL:
+        return None, BASIS_PROVISIONAL
+    final_at = str(chosen.get("official_final_at") or "").strip()
+    if not final_at:
+        return None, BASIS_FINALITY_UNPROVABLE
+    if final_at >= str(cutoff):
+        return None, BASIS_FINALITY_NOT_BEFORE_CUTOFF
+    payload = chosen.get("payload") or {}
+    assists = payload.get("assists")
+    if assists is None:
+        return None, BASIS_OUTCOME_UNAVAILABLE
+    return int(assists), None
+
+
 def assist_mapping_decision(
     origins: Sequence[Mapping[str, Any]], pooled: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1409,6 +1828,12 @@ def assist_mapping_decision(
     says a causal fit exists AND the evidence meets the declared descriptive
     floors -- it still does not move the constant, because a promotion changes
     production behaviour and belongs to review.
+
+    A fit counts as admissible only after its PROVENANCE is read back through
+    :func:`probability_calibration.assist_mapping_from_payload`: a coefficient
+    whose payload is missing its identity or the policy it was fitted under, or
+    whose content disagrees with the identity it records, is not evidence and
+    stops the decision rather than contributing a candidate.
     """
 
     observations = int(pooled.get("observations") or 0)
@@ -1417,11 +1842,16 @@ def assist_mapping_decision(
         events >= sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE
         and observations >= sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE
     )
-    admissible = [
-        entry
-        for entry in origins
-        if (entry.get("fit") or {}).get("available") and (entry.get("fit") or {}).get("in_bounds")
-    ]
+    admissible: list[dict[str, Any]] = []
+    for entry in origins:
+        fit = entry.get("fit") or {}
+        if not fit.get("available"):
+            continue
+        provenance = pc.assist_mapping_from_payload(
+            entry.get("provenance") or fit.get("provenance")
+        )
+        if bool(fit.get("in_bounds")):
+            admissible.append(provenance)
     reasons: list[str] = []
     if not sufficient:
         reasons.append(
@@ -1446,7 +1876,7 @@ def assist_mapping_decision(
                 "senior review"
             ],
             "candidate_coefficients": sorted(
-                {float((entry["fit"])["coefficient"]) for entry in admissible}
+                {float(provenance["coefficient"]) for provenance in admissible}
             ),
             "floors": {
                 "min_target_events": sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE,
@@ -1640,15 +2070,21 @@ def evaluate(
     final_events, excluded_events = _final_events(conn, target_events)
     xpts_runs = _xpts_runs(anchor, final_events)
     monte_carlo_runs = _ancillary_runs(anchor, final_events, "monte_carlo_v1")
+    # Each origin's own certified cutoff, from its own certified bundle: a basis
+    # that reached past its origin's cutoff would describe a world in which the
+    # target was already known.
+    cutoffs = {int(event): anchor.for_event(int(event)).cutoff for event in final_events}
 
     probability_block = probability_calibration_block(
-        conn, events=final_events, xpts_runs=xpts_runs, excluded_events=excluded_events
+        conn, events=final_events, xpts_runs=xpts_runs, cutoffs=cutoffs, excluded_events=excluded_events
     )
     expected_value = expected_value_block(
         conn, anchor=anchor, events=final_events, xpts_runs=xpts_runs
     )
     coverage = monte_carlo_block(conn, events=final_events, monte_carlo_runs=monte_carlo_runs)
-    assist = assist_mapping_block(conn, events=final_events, xpts_runs=xpts_runs)
+    assist = assist_mapping_block(
+        conn, events=final_events, xpts_runs=xpts_runs, cutoffs=cutoffs
+    )
 
     body: dict[str, Any] = {
         "schema": PE8_SCHEMA_VERSION,
@@ -1667,6 +2103,21 @@ def evaluate(
             "target_events": [int(event) for event in target_events],
             "events_evaluated": [int(event) for event in final_events],
             "events_excluded": [dict(entry) for entry in excluded_events],
+            "per_event_cutoffs": {int(event): cutoffs[int(event)] for event in final_events},
+            "point_in_time_evidence": {
+                "ledger_version": ledger.OUTCOME_LEDGER_VERSION,
+                "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
+                "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
+                "grain": ledger.GRAIN_PLAYER_FIXTURE,
+                "basis_rule": (
+                    "a fit basis row must carry a PE-5 append-only observation capture that is FINAL "
+                    "and whose official finality AND capture both fall strictly before the origin's OWN "
+                    "certified cutoff; a row whose timing cannot be proven is excluded and counted, "
+                    "never assumed known, and the outcome value used is the capture's, so a later "
+                    "correction cannot rewrite an earlier transform"
+                ),
+                "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
+            },
             "per_event_runs": {
                 str(event): {
                     "xpts_v1": xpts_runs.get(int(event)),
@@ -1737,6 +2188,20 @@ def claims_block() -> dict[str, Any]:
         "in_sample_calibration": (
             "NOT PERFORMED; every transform is scored at an origin strictly after its own fit basis"
         ),
+        "fit_basis": (
+            "PE-5 append-only point-in-time observation captures only; a row whose official finality or "
+            "capture timing cannot be proven strictly before the origin's certified cutoff is excluded "
+            "and counted, and a later correction cannot rewrite an earlier transform"
+        ),
+        "challenger_construction": (
+            "a challenger is constructed ONLY where the surface's diagnosis is MISCALIBRATED; where no "
+            "defect is diagnosed, no transform is fitted and the block says so"
+        ),
+        "fitted_provenance": (
+            "every fitted payload carries its canonical identity and the applicable policy versions, and "
+            "a payload whose identity or policy is absent or mismatched fails closed rather than "
+            "producing an unattributable number"
+        ),
     }
 
 
@@ -1751,6 +2216,11 @@ def limitations_block() -> list[str]:
         "that flag: its bias is a description, not a causal claim.",
         "A causally fitted transform is evidence for review, not a production change: PE-8 reports it "
         "and does not re-point anything.",
+        "A fit basis is built only from PE-5 append-only point-in-time captures that were official and "
+        "recorded strictly before the origin's own certified cutoff; a postponed result, a late capture "
+        "or an unproven timing is excluded and counted rather than assumed known.",
+        "A position outside a component's declared positions earns a real zero from that component and "
+        "is covered (the count is reported); it is not a gap in the evidence.",
         "CONTINUOUS_PROXY_TIE_LIMITATION from PE-3 remains an open, accepted limitation.",
         "Models, baselines and outcomes are read from persisted runs; nothing here regenerates a "
         "prediction, writes a database row, or changes any incumbent identity.",

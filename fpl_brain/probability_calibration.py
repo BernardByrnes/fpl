@@ -46,6 +46,26 @@ expectation.  The interior clip is declared as a spec field (``clip_floor``,
 bounded inside ``(0, 0.5)``) and applies strictly inside the interval, where the
 logit is defined.
 
+THE BASIS IS POINT-IN-TIME EVIDENCE
+-----------------------------------
+The fitting routines here take observations; the CALLER decides which ones.
+PE-8's caller builds them from PE-5's append-only, point-in-time observation
+captures: a basis row must carry a FINAL official observation whose official
+finality AND capture both fall strictly before the origin's certified cutoff,
+and a row whose timing cannot be proven is excluded and counted rather than
+assumed known.  A later correction is a later capture and therefore cannot enter
+an earlier basis.
+
+A FITTED PAYLOAD CARRIES ITS PROVENANCE
+---------------------------------------
+A fitted spec's payload records its canonical identity AND the applicable
+policy versions -- the calibration policy it was produced under and, for a
+causally fitted version, the fit policy it was fitted under.  :func:`from_payload`
+REQUIRES all three and fails closed when any is absent or disagrees, so a
+calibration cannot be resolved from a payload that does not say what produced
+it.  The identity hash covers the fit policy too, so a re-pointed provenance
+changes the identity.
+
 DETERMINISM
 -----------
 Every fit sorts its observations into one canonical order before any arithmetic,
@@ -172,6 +192,10 @@ class ProbabilityCalibration:
     intercept: float
     slope: float
     clip_floor: float = DEFAULT_CLIP_FLOOR
+    #: The policy a FITTED version was fitted under.  ``None`` on a declared spec
+    #: such as the incumbent, which was not fitted here at all.  It is part of
+    #: ``as_dict`` and therefore part of the canonical identity.
+    fit_policy_version: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("version", "method"):
@@ -181,6 +205,13 @@ class ProbabilityCalibration:
             raise ProbabilityCalibrationError(
                 f"unknown calibration method {self.method!r}; declared: {list(CALIBRATION_METHODS)}"
             )
+        if self.fit_policy_version is not None:
+            declared = str(self.fit_policy_version).strip()
+            if declared != CAUSAL_FIT_POLICY_VERSION:
+                raise ProbabilityCalibrationError(
+                    f"unknown fit policy version {self.fit_policy_version!r}; declared: "
+                    f"{CAUSAL_FIT_POLICY_VERSION!r}"
+                )
         for name in ("intercept", "slope", "clip_floor"):
             value = getattr(self, name)
             try:
@@ -301,6 +332,9 @@ class ProbabilityCalibration:
             "intercept": float(self.intercept),
             "slope": float(self.slope),
             "clip_floor": float(self.clip_floor),
+            "fit_policy_version": (
+                None if self.fit_policy_version is None else str(self.fit_policy_version)
+            ),
         }
 
     def identity(self) -> str:
@@ -309,7 +343,7 @@ class ProbabilityCalibration:
         return analytics.canonical_hash(self.as_dict())
 
     def as_payload(self) -> dict[str, Any]:
-        """The spec plus its canonical identity, as written into a payload."""
+        """The spec, its canonical identity and the policy versions it was produced under."""
 
         payload = self.as_dict()
         payload["identity"] = self.identity()
@@ -352,6 +386,12 @@ def is_declared_version(version: Any) -> bool:
     return any(key.startswith(namespace) and len(key) > len(namespace) for namespace in DECLARED_VERSION_NAMESPACES)
 
 
+def is_fitted_version(version: Any) -> bool:
+    """Whether ``version`` names a causally fitted transform rather than a declared spec."""
+
+    return str(version or "").strip().startswith(PLATT_FIT_VERSION_PREFIX + ".")
+
+
 def resolve(version: str | None) -> ProbabilityCalibration:
     """The registered spec for ``version``, or fail closed.
 
@@ -377,9 +417,17 @@ def from_payload(payload: Mapping[str, Any] | None) -> ProbabilityCalibration:
 
     A causally fitted transform resolves here, not through :func:`resolve`: the
     payload carries the parameters and the canonical identity, and the identity
-    is RECOMPUTED and compared.  A payload whose version namespace is unknown, or
-    whose identity disagrees with its own parameters, or which disagrees with a
-    registered spec of the same version, raises.
+    is RECOMPUTED and compared.  A payload is refused when
+
+    * it carries no canonical ``identity``, because a spec that cannot be tied
+      to its own content is not a version anyone can resolve;
+    * its ``policy_version`` is absent or is not the declared calibration policy;
+    * a FITTED version names no ``fit_policy_version``, or names one that is not
+      the declared fit policy (and a declared spec claims one it was not fitted
+      under);
+    * its identity disagrees with its own parameters;
+    * it disagrees with a registered spec of the same version;
+    * its version namespace is unknown.
     """
 
     if payload is None:
@@ -396,17 +444,51 @@ def from_payload(payload: Mapping[str, Any] | None) -> ProbabilityCalibration:
         intercept=payload.get("intercept"),
         slope=payload.get("slope"),
         clip_floor=payload.get("clip_floor", DEFAULT_CLIP_FLOOR),
+        fit_policy_version=payload.get("fit_policy_version"),
     )
     if not is_declared_version(spec.version):
         raise ProbabilityCalibrationError(
             f"persisted probability calibration version {spec.version!r} is not recognised"
         )
+
     recorded = payload.get("identity")
-    if recorded is not None and str(recorded) != spec.identity():
+    if recorded is None or not str(recorded).strip():
+        raise ProbabilityCalibrationError(
+            f"persisted probability calibration {spec.version!r} carries no canonical identity; a "
+            "calibration that cannot be tied to the spec that produced it is not resolvable"
+        )
+
+    declared_policy = str(payload.get("policy_version") or "").strip()
+    if not declared_policy:
+        raise ProbabilityCalibrationError(
+            f"persisted probability calibration {spec.version!r} carries no policy_version; the "
+            "applicable policy that produced it must travel with it"
+        )
+    if declared_policy != PROBABILITY_CALIBRATION_POLICY_VERSION:
+        raise ProbabilityCalibrationError(
+            f"persisted probability calibration {spec.version!r} declares policy_version "
+            f"{declared_policy!r}, not the declared {PROBABILITY_CALIBRATION_POLICY_VERSION!r}"
+        )
+
+    fit_policy = str(payload.get("fit_policy_version") or "").strip()
+    if is_fitted_version(spec.version):
+        if fit_policy != CAUSAL_FIT_POLICY_VERSION:
+            raise ProbabilityCalibrationError(
+                f"fitted probability calibration {spec.version!r} declares fit_policy_version "
+                f"{fit_policy or None!r}, not the declared {CAUSAL_FIT_POLICY_VERSION!r}"
+            )
+    elif fit_policy:
+        raise ProbabilityCalibrationError(
+            f"declared probability calibration {spec.version!r} claims fit_policy_version "
+            f"{fit_policy!r}, but it is a declared spec and not a causal fit"
+        )
+
+    if str(recorded) != spec.identity():
         raise ProbabilityCalibrationError(
             f"persisted probability calibration {spec.version!r} records identity {recorded!r} "
             f"but its parameters hash to {spec.identity()}"
         )
+
     known = KNOWN_CALIBRATIONS.get(spec.version)
     if known is not None and known.as_dict() != spec.as_dict():
         raise ProbabilityCalibrationError(
@@ -837,6 +919,7 @@ def fit_platt_causal(
         intercept=intercept,
         slope=slope,
         clip_floor=clip_floor,
+        fit_policy_version=CAUSAL_FIT_POLICY_VERSION,
     )
     check = spec.verify_monotone()
     if not check["monotone_non_decreasing"] or not check["boundaries_exact"]:
@@ -850,6 +933,36 @@ def fit_platt_causal(
         available=True, basis=basis, method=PLATT_FIT_METHOD, spec=spec,
         detail={**detail, "slope": slope, "intercept": intercept, "monotone_check": check},
     )
+
+
+def _assist_mapping_body(
+    *,
+    surface: str,
+    grain: str,
+    coefficient: float,
+    basis_digest: str,
+    events: Sequence[int],
+    origin_event: int,
+    observations: int,
+) -> dict[str, Any]:
+    """One definition of the bytes an assist-mapping identity hashes over.
+
+    The fit writes them and the reader recomputes them, so the two cannot drift
+    into hashing different things.
+    """
+
+    return {
+        "surface": str(surface),
+        "grain": str(grain),
+        "method": ASSIST_MAPPING_FIT_METHOD,
+        "coefficient": float(coefficient),
+        "declared_bounds": [float(bound) for bound in ASSIST_MAPPING_FIT_BOUNDS],
+        "basis_digest": str(basis_digest),
+        "fit_basis_events": [int(event) for event in events],
+        "fit_basis_origin_event": int(origin_event),
+        "fit_basis_observations": int(observations),
+        "policy_version": CAUSAL_FIT_POLICY_VERSION,
+    }
 
 
 @dataclass(frozen=True)
@@ -884,8 +997,98 @@ class AssistMappingFit:
             ),
             "declared_bounds": [float(bound) for bound in ASSIST_MAPPING_FIT_BOUNDS],
             "basis": self.basis.as_dict(),
+            "provenance": None if not self.available else self.as_payload(),
             "detail": {str(k): v for k, v in sorted(self.detail.items())},
         }
+
+    def _body(self) -> dict[str, Any]:
+        if not self.available or self.coefficient is None:
+            raise CausalFitError("an unavailable assist-mapping fit has no provenance to bind")
+        return _assist_mapping_body(
+            surface=self.basis.surface,
+            grain=self.basis.grain,
+            coefficient=float(self.coefficient),
+            basis_digest=self.basis.digest,
+            events=self.basis.events,
+            origin_event=self.basis.origin_event,
+            observations=self.basis.observations,
+        )
+
+    def identity(self) -> str:
+        """Canonical hash of the fitted payload -- the provenance tie."""
+
+        return analytics.canonical_hash(self._body())
+
+    def as_payload(self) -> dict[str, Any]:
+        """The fitted coefficient, its basis and the policy it was fitted under, hashed."""
+
+        payload = self._body()
+        payload["identity"] = analytics.canonical_hash(self._body())
+        return payload
+
+
+def assist_mapping_from_payload(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Read a fitted assist-mapping payload back, fail-closed on anything unusable.
+
+    A fitted coefficient is only usable when the payload says which fit produced
+    it: the canonical ``identity``, the applicable ``policy_version``, the
+    declared method and the basis digest the fit was computed over.  Any of them
+    absent, unknown or disagreeing raises rather than degrading to a coefficient
+    nobody can attribute.
+    """
+
+    if payload is None:
+        raise CausalFitError(
+            "a fitted assist-mapping payload is required; refusing to use an unattributed coefficient"
+        )
+    if not isinstance(payload, Mapping):
+        raise CausalFitError(
+            f"assist-mapping provenance must be a mapping, got {type(payload).__name__}"
+        )
+    recorded = payload.get("identity")
+    if recorded is None or not str(recorded).strip():
+        raise CausalFitError(
+            "the fitted assist-mapping payload carries no canonical identity, so the coefficient "
+            "cannot be tied to the fit that produced it"
+        )
+    declared_policy = str(payload.get("policy_version") or "").strip()
+    if declared_policy != CAUSAL_FIT_POLICY_VERSION:
+        raise CausalFitError(
+            f"the fitted assist-mapping payload declares policy_version {declared_policy or None!r}, "
+            f"not the declared {CAUSAL_FIT_POLICY_VERSION!r}"
+        )
+    if str(payload.get("method") or "") != ASSIST_MAPPING_FIT_METHOD:
+        raise CausalFitError(
+            f"the fitted assist-mapping payload declares method {payload.get('method')!r}, not the "
+            f"declared {ASSIST_MAPPING_FIT_METHOD!r}"
+        )
+    if not str(payload.get("basis_digest") or "").strip():
+        raise CausalFitError("the fitted assist-mapping payload carries no fit-basis digest")
+    try:
+        coefficient = float(payload.get("coefficient"))
+        events = [int(event) for event in (payload.get("fit_basis_events") or [])]
+        origin_event = int(payload.get("fit_basis_origin_event"))
+        observations = int(payload.get("fit_basis_observations"))
+    except (TypeError, ValueError) as exc:
+        raise CausalFitError(
+            f"the fitted assist-mapping payload carries no readable fit basis or coefficient: {payload!r}"
+        ) from exc
+    body = _assist_mapping_body(
+        surface=str(payload.get("surface") or ""),
+        grain=str(payload.get("grain") or ""),
+        coefficient=coefficient,
+        basis_digest=str(payload.get("basis_digest")),
+        events=events,
+        origin_event=origin_event,
+        observations=observations,
+    )
+    recomputed = analytics.canonical_hash(body)
+    if str(recorded) != recomputed:
+        raise CausalFitError(
+            f"the fitted assist-mapping payload records identity {recorded!r} but its content hashes "
+            f"to {recomputed}"
+        )
+    return {**body, "identity": str(recorded)}
 
 
 def fit_assist_mapping_causal(
@@ -996,6 +1199,22 @@ def policy() -> dict[str, Any]:
         "causality": (
             "a transform applied at origin event E is fitted only on outcomes finalised strictly "
             "before E; a basis containing an outcome at or after E is refused, not approximated"
+        ),
+        "fit_basis_evidence": (
+            "PE-5 append-only point-in-time observation captures only: a basis row must carry a FINAL "
+            "official observation whose official finality AND capture both fall strictly before the "
+            "origin's certified cutoff, and a row whose timing cannot be proven is excluded and counted "
+            "rather than assumed known"
+        ),
+        "fitted_payload_provenance": (
+            "a fitted payload carries the canonical identity AND the applicable policy versions -- the "
+            "calibration policy and, for a fitted version, the fit policy -- and the reader fails closed "
+            "when any is absent or disagrees; the identity hash covers the fit policy, so a re-pointed "
+            "provenance changes the identity"
+        ),
+        "diagnosis_before_fit": (
+            "a surface is diagnosed BEFORE anything is fitted, and no challenger is constructed or "
+            "reported unless the diagnosis is MISCALIBRATED"
         ),
         "ranking_behaviour": {            "within_event_ordering": (
                 "preserved: a monotone non-decreasing transform cannot reorder two players' stated "

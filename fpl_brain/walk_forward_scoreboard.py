@@ -689,6 +689,22 @@ def _unavailable_arm(
 # ---------------------------------------------------------------------------
 
 
+def realised_probability_outcome(
+    selector: str, outcome: Mapping[str, Any], position: str
+) -> float | None:
+    """The declared realised 0/1 for one probability metric, from any official outcome.
+
+    :func:`_realised_probability_outcome` is the definition
+    :func:`probability_scoring_rows` scores against.  A consumer that must derive
+    the SAME realised outcome from a different official record -- PE-8 builds its
+    fitting basis from PE-5's point-in-time observation captures rather than from
+    the current-state table -- calls this, so the producer's event and the
+    alternative record cannot drift onto two definitions.
+    """
+
+    return _realised_probability_outcome(str(selector), outcome, str(position))
+
+
 def _realised_probability_outcome(
     selector: str, outcome: Mapping[str, Any], position: str
 ) -> float | None:

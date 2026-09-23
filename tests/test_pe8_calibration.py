@@ -38,6 +38,7 @@ from fpl_brain import calibration_evaluation as ce
 from fpl_brain import defcon_calibration as defcon_cal
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import monte_carlo as mc_module
+from fpl_brain import outcome_ledger as ledger
 from fpl_brain import probability_calibration as pc
 from fpl_brain import walk_forward as wf
 from fpl_brain import walk_forward_metrics as wm
@@ -54,6 +55,36 @@ MINUTES_RUN_VERSION = "minutes_v1.5.2"
 #: The registered DefCon calibration, written into every persisted DefCon row.
 DEFCON_PAYLOAD = defcon_cal.DEFCON_PLATT_V1.as_dict()
 DISTRIBUTION_BASIS = "CORE (bonus deterministic, variance unmodelled)"
+
+#: PE-5 point-in-time evidence for the single-cutoff worlds: every realised row is
+#: a FINAL official observation, finalised and captured well before the cutoff, so
+#: a fit basis can be built from what was officially known THEN rather than from
+#: whatever the current table happens to hold.
+SMALL_OFFICIAL_FINAL_AT = "2026-09-07T09:00:00Z"
+SMALL_CAPTURED_AT = "2026-09-08T09:00:00Z"
+
+#: The per-event timing ladder the causal-basis tests use.  Kickoff, official
+#: finality, capture and certified cutoff each move two days per event, so an
+#: origin's cutoff falls BEFORE the next event's result is final: "strictly before
+#: THIS origin's cutoff" is a different filter at every origin rather than one
+#: global date, which is the rule under test.
+def _event_times(event: int, *, ladder: bool) -> dict:
+    if not ladder:
+        return {
+            "kickoff": "2026-09-06T14:00:00Z",
+            "updated_at": SMALL_OFFICIAL_FINAL_AT,
+            "official_final_at": SMALL_OFFICIAL_FINAL_AT,
+            "captured_at": SMALL_CAPTURED_AT,
+            "cutoff": CUTOFF,
+        }
+    day = 5 + 2 * (int(event) - 5)
+    return {
+        "kickoff": f"2026-09-{day:02d}T14:00:00Z",
+        "updated_at": f"2026-09-{day + 1:02d}T09:00:00Z",
+        "official_final_at": f"2026-09-{day + 1:02d}T09:00:00Z",
+        "captured_at": f"2026-09-{day + 1:02d}T10:00:00Z",
+        "cutoff": f"2026-09-{day - 1:02d}T12:00:00Z",
+    }
 
 TEAM_OF = {10: 1, 11: 1, 12: 1, 13: 2, 14: 2, 15: 3, 16: 1}
 POSITION_OF = {10: "GKP", 11: "DEF", 12: "MID", 13: "FWD", 14: "MID", 15: "MID", 16: "MID"}
@@ -366,6 +397,19 @@ def _small_world(
             " VALUES (15,5,100,0,'element_summary','2026-09-05T08:00:00Z','{}')"
         )
 
+    # PE-5 point-in-time evidence, through the production capture path: the same
+    # rows the declared population scores are recorded as FINAL official
+    # observations, finalised and captured before the cutoff.  A fit basis reads
+    # THESE, not the current-state table, and the scheduled placeholder above is
+    # refused by the capture boundary rather than stored as a zero.
+    for event in events:
+        ledger.capture_completed_player_fixtures(
+            conn,
+            int(event),
+            captured_at=SMALL_CAPTURED_AT,
+            official_final_at=SMALL_OFFICIAL_FINAL_AT,
+        )
+
     xpts_runs = {
         event: analytics.create_projection_run(
             conn,
@@ -615,6 +659,8 @@ def _big_world(
     expected_xa: float = 0.0,
     assist_every: int = 0,
     alt_last_event: bool = False,
+    per_event_cutoffs: bool = False,
+    capture_overrides: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict:
     """A calibrated population over ten events: 4000 fixture rows and 2000 event rows.
 
@@ -628,10 +674,19 @@ def _big_world(
     origin's fit basis contains its own event, so every fitted transform must be
     unmoved while the last event's scored figures change: the causality contract,
     checked at the evaluation level rather than only inside the fit.
+
+    ``per_event_cutoffs`` gives every event its own certified cutoff on the timing
+    ladder, which is what makes "strictly before THIS origin's cutoff" testable.
+    ``capture_overrides`` replaces the timing or the state of one event's PE-5
+    captures (``official_final_at``, ``captured_at``, ``observation_state``, or
+    ``skip`` to record none at all).
     """
 
     from fpl_brain.models import EventRecord, FixtureRecord, PlayerRecord, PositionRecord, TeamRecord
     from fpl_brain import repositories as repo
+
+    overrides = {int(event): dict(values) for event, values in (capture_overrides or {}).items()}
+    times = {int(event): _event_times(int(event), ladder=per_event_cutoffs) for event in BIG_EVENTS}
 
     with conn:
         repo.upsert_teams(conn, [TeamRecord(id=team, name=f"Team {team}") for team in (1, 2)])
@@ -667,7 +722,8 @@ def _big_world(
             conn,
             [
                 FixtureRecord(id=fixture_id, event=event, team_h=pair[0], team_a=pair[1],
-                              finished=1, started=1, kickoff_time="2026-09-06T14:00:00Z", raw_json={})
+                              finished=1, started=1, kickoff_time=times[int(event)]["kickoff"],
+                              raw_json={})
                 for event in BIG_EVENTS
                 for fixture_id, pair in sorted(_big_fixtures(event).items())
             ],
@@ -680,7 +736,9 @@ def _big_world(
             model_version=version,
             planning_event=event,
             planning_context_hash="pe8-big",
-            data_cutoff=CUTOFF,
+            # The run's own data cutoff is its event's certified cutoff, so the
+            # world stays self-consistent on the per-event ladder too.
+            data_cutoff=times[int(event)]["cutoff"],
             scouting_cutoff=None,
             official_run_ids={},
             source_snapshot_sha256=CODE_SNAPSHOT,
@@ -724,8 +782,7 @@ def _big_world(
                             "INSERT INTO player_gameweeks(player_id, event, fixture_id, minutes, starts,"
                             " total_points, goals_scored, assists, clean_sheets, goals_conceded, saves,"
                             " bonus, yellow_cards, defensive_contribution, source, updated_at, raw_json)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?,0,?,0,?,'element_summary',"
-                            "'2026-09-07T09:00:00Z','{}')",
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,0,?,0,?,'element_summary',?,'{}')",
                             (
                                 player_id,
                                 event,
@@ -739,6 +796,7 @@ def _big_world(
                                 facts["conceded"],
                                 facts["bonus"],
                                 facts["contribution"],
+                                times[int(event)]["updated_at"],
                             ),
                         )
                         conn.execute(
@@ -790,6 +848,22 @@ def _big_world(
                             ),
                         )
                         row_number += 1
+            # PE-5 point-in-time evidence for this event, through the production
+            # capture path.  The timing is what an origin's basis filter tests: an
+            # event can be told to record nothing at all (``skip``), to be finalised
+            # or captured later, or to be read BEFORE it was officially final (a
+            # capture whose moment precedes its own finality, which PE-5 records as
+            # PROVISIONAL rather than upgrading it silently).
+            settings = overrides.get(int(event), {})
+            if not settings.get("skip"):
+                ledger.capture_completed_player_fixtures(
+                    conn,
+                    int(event),
+                    captured_at=str(settings.get("captured_at") or times[int(event)]["captured_at"]),
+                    official_final_at=str(
+                        settings.get("official_final_at") or times[int(event)]["official_final_at"]
+                    ),
+                )
         for run_id in list(xpts_runs.values()) + list(mc_runs.values()) + list(minutes_runs.values()):
             conn.execute("UPDATE projection_runs SET status='complete' WHERE id=?", (int(run_id),))
 
@@ -800,7 +874,7 @@ def _big_world(
         "certified_bundles": {
             str(event): {
                 "event": event,
-                "cutoff": CUTOFF,
+                "cutoff": times[int(event)]["cutoff"],
                 "runs": {
                     "xpts_v1": xpts_runs[event],
                     "minutes_v1": minutes_runs[event],
@@ -830,14 +904,62 @@ def big_world(tmp_path_factory):
         conn.close()
 
 
-def _single_use_world(tmp_path, **kwargs):
-    conn = connect_database(tmp_path / "pe8-variant.db")
+def _single_use_world(tmp_path, *, name: str = "pe8-variant", **kwargs):
+    conn = connect_database(tmp_path / f"{name}.db")
     try:
         built = _big_world(conn, **kwargs)
     except Exception:
         conn.close()
         raise
     return conn, built
+
+
+#: A population whose p_start / p_60_plus / defcon_p_hit are MATERIALLY
+#: miscalibrated: group A states 0.58 and realises 0.60, group B states 0.52 and
+#: realises 0.30.  The pooled bin therefore states 0.55 and realises 0.45, and the
+#: realised rate still RISES with the stated probability, so the fitted transform
+#: is monotone and admissible.  Correcting a clean surface is what the contract
+#: forbids; this world is what makes the corrected behaviour observable, and the
+#: defect is large enough to survive a whole event's outcomes being rewritten.
+WARM_START_SHARE_A = 0.60
+WARM_START_SHARE_B = 0.30
+
+
+def _warm_world(tmp_path, *, name: str = "pe8-warm", **kwargs):
+    """The miscalibrated-with-a-monotone-fit world, on the per-event timing ladder."""
+
+    kwargs.setdefault("per_event_cutoffs", True)
+    kwargs.setdefault("start_share_a", WARM_START_SHARE_A)
+    kwargs.setdefault("start_share_b", WARM_START_SHARE_B)
+    return _single_use_world(tmp_path, name=name, **kwargs)
+
+
+def _basis_by_origin(rows):
+    """A purely event-ordered per-origin basis, for the fit-level contract tests.
+
+    This is deliberately NOT the production basis builder: it applies no PE-5
+    timing filter at all, which is exactly what lets the tests below prove that
+    the fit itself refuses a late outcome and that an origin's transform is a
+    function of its basis alone.
+    """
+
+    by_event: dict[int, list[Any]] = {}
+    for row in rows:
+        by_event.setdefault(int(row.event), []).append(row)
+    basis: dict[int, list[pc.CalibrationObservation]] = {}
+    for origin in sorted(by_event):
+        basis[origin] = [
+            pc.CalibrationObservation(
+                event=int(candidate.event),
+                key=(int(candidate.player_id), int(candidate.fixture_id)),
+                probability=float(candidate.probability),
+                outcome=float(candidate.outcome),
+            )
+            for event in sorted(by_event)
+            if int(event) < origin
+            for candidate in by_event[event]
+        ]
+    return basis
 
 
 def _evaluate(conn, world, **kwargs):
@@ -967,7 +1089,7 @@ def test_a_post_origin_outcome_cannot_change_an_earlier_transform(monkeypatch):
     """Hard test 2: the fit basis is strictly earlier, and later rows cannot move it."""
 
     early_rows = _row_basis(events=(5, 6, 7))
-    early = ce.causal_origins(early_rows, surface="BRIER_P_START")[7]
+    early = ce.causal_origins(_basis_by_origin(early_rows), surface="BRIER_P_START")[7]
     assert early.available is True
     assert tuple(early.basis.events) == (5, 6)
     identity = early.spec.identity()
@@ -977,7 +1099,7 @@ def test_a_post_origin_outcome_cannot_change_an_earlier_transform(monkeypatch):
     # because events 8 and 9 are not in its basis, and the basis is what the
     # version and identity are derived from.
     with_later = early_rows + _row_basis(events=(8, 9), positives=0.95)
-    unchanged = ce.causal_origins(with_later, surface="BRIER_P_START")[7]
+    unchanged = ce.causal_origins(_basis_by_origin(with_later), surface="BRIER_P_START")[7]
     assert unchanged.spec.identity() == identity
     assert unchanged.spec.version == version
     assert unchanged.basis.digest == early.basis.digest
@@ -986,7 +1108,7 @@ def test_a_post_origin_outcome_cannot_change_an_earlier_transform(monkeypatch):
     # And a CHANGED outcome INSIDE the basis does move it: the invariance above is
     # causality, not a digest that ignores its inputs.
     mutated = ce.causal_origins(
-        _row_basis(events=(5, 6, 7), positives=0.75), surface="BRIER_P_START"
+        _basis_by_origin(_row_basis(events=(5, 6, 7), positives=0.75)), surface="BRIER_P_START"
     )[7]
     assert mutated.spec.identity() != identity
 
@@ -1001,42 +1123,47 @@ def test_a_post_origin_outcome_cannot_change_an_earlier_transform(monkeypatch):
         )
 
 
-def test_the_evaluation_records_a_strictly_earlier_basis_for_every_origin():
+def test_the_evaluation_records_a_strictly_earlier_basis_for_every_origin(tmp_path):
     """Hard test 2, at the evaluation's own wiring: origins score under their own fit."""
 
-    rows = _row_basis(events=(5, 6, 7), per_event=220, spread=0.1)
-    fits = ce.causal_origins(rows, surface="BRIER_P_START")
-    assert sorted(fits) == [5, 6, 7]
-    assert fits[5].available is False and fits[5].reason == pc.FIT_INSUFFICIENT_OBSERVATIONS
-    for origin, fit in fits.items():
-        assert fit.basis.as_dict()["strictly_before_origin"] is True
-        assert all(event < origin for event in fit.basis.events)
-    assert tuple(fits[7].basis.events) == (5, 6)
-    assert fits[7].basis.observations == 440
-    assert fits[7].available is True
-
-    block, covered = ce._challenger_block(rows, surface="BRIER_P_START", grain=wf.GRAIN_PLAYER_FIXTURE)
-    assert block["status"] == ce.STATUS_OK, "origins 6 and 7 have a basis; origin 5 does not"
-    assert block["rows_without_origin_transform"] == 220
-    assert block["excluded_by_reason"] == {pc.FIT_INSUFFICIENT_OBSERVATIONS: 220}
-    assert len(covered) == 440
-    assert block["population"]["n"] == 440
-    assert block["population"]["rows_without_origin_transform"] == 220
-    assert block["gate"]["same_population"] is True
-    assert block["incumbent_on_comparison_population"]["n"] == 440
-    assert block["candidate"]["n"] == 440
-    assert [entry["rows_scored_at_origin"] for entry in block["origins"]] == [0, 220, 220]
-    assert block["origins"][0]["fit"]["reason"] == pc.FIT_INSUFFICIENT_OBSERVATIONS
-    assert block["origins"][1]["fit"]["available"] is True
-    # The transform in force at each origin is the one fitted for that origin, and
-    # the two origins have different bases, so they are different transforms.
-    assert block["origins"][1]["fit"]["spec"]["version"] != block["origins"][2]["fit"]["spec"]["version"]
-    assert block["versions_in_force"] == sorted(
-        {
-            block["origins"][1]["fit"]["spec"]["version"],
-            block["origins"][2]["fit"]["spec"]["version"],
-        }
+    conn, built = _warm_world(tmp_path, name="pe8-basis")
+    try:
+        artifact = _evaluate(conn, built)
+    finally:
+        conn.close()
+    surface = _surface(artifact, "BRIER_P_START")
+    assert surface["diagnosis"]["status"] == ce.DIAGNOSIS_MISCALIBRATED
+    challenger = surface["causal_challenger"]
+    assert challenger["constructed"] is True
+    assert challenger["status"] == ce.STATUS_OK
+    cropped = built["events"][:-1]
+    by_origin = {int(entry["origin_event"]): entry for entry in challenger["origins"]}
+    assert sorted(by_origin) == list(built["events"])
+    for origin, entry in by_origin.items():
+        assert entry["fit"]["basis"]["strictly_before_origin"] is True
+        assert all(event < origin for event in entry["fit"]["basis"]["events"])
+        assert entry["cutoff"] == artifact["identity"]["per_event_cutoffs"][origin]
+    # The first origin has no strictly earlier event to learn from, so it scores
+    # nothing under a transform; every later origin has the whole history before it.
+    first = by_origin[built["events"][0]]
+    assert first["fit"]["available"] is False
+    assert first["fit"]["reason"] == pc.FIT_INSUFFICIENT_OBSERVATIONS
+    assert first["fit"]["basis"]["events"] == []
+    assert first["rows_scored_at_origin"] == 0
+    last = by_origin[built["events"][-1]]
+    assert last["fit"]["available"] is True
+    assert last["fit"]["basis"]["events"] == cropped
+    assert last["fit"]["basis"]["observations"] == len(BIG_PLAYERS) * 2 * len(cropped)
+    assert last["basis_excluded_by_reason"] == {}
+    assert challenger["rows_without_origin_transform"] == len(BIG_PLAYERS) * 2
+    assert challenger["excluded_by_reason"] == {pc.FIT_INSUFFICIENT_OBSERVATIONS: len(BIG_PLAYERS) * 2}
+    assert challenger["population"]["n"] + challenger["rows_without_origin_transform"] == (
+        surface["population"]["scored"]
     )
+    # The transform in force at each origin is the one fitted for THAT origin, so
+    # no two origins share a version.
+    versions = [entry["fit"]["spec"]["version"] for entry in challenger["origins"] if entry["fit"]["available"]]
+    assert len(versions) == len(set(versions)) == len(built["events"]) - 1
 
 
 def test_the_transform_is_a_versioned_artifact_with_canonical_identity_and_provenance():
@@ -1107,11 +1234,25 @@ def test_an_unknown_calibration_version_fails_closed_with_no_identity_fallback()
             }
         )
     # A tampered identity is refused even when the version namespace is declared.
+    # A hand-built spec in the FITTED namespace must declare the fit policy too:
+    # it is in the identity, and a fitted payload that does not say what fitted it
+    # is refused before the parameters are even compared.
+    with pytest.raises(pc.ProbabilityCalibrationError) as error:
+        pc.from_payload(
+            pc.ProbabilityCalibration(
+                version=pc.PLATT_FIT_VERSION_PREFIX + ".0123456789abcdef",
+                method=pc.METHOD_PLATT,
+                intercept=-0.4,
+                slope=1.1,
+            ).as_payload()
+        )
+    assert "fit_policy_version" in str(error.value)
     spec = pc.ProbabilityCalibration(
         version=pc.PLATT_FIT_VERSION_PREFIX + ".0123456789abcdef",
         method=pc.METHOD_PLATT,
         intercept=-0.4,
         slope=1.1,
+        fit_policy_version=pc.CAUSAL_FIT_POLICY_VERSION,
     )
     tampered = spec.as_payload()
     tampered["slope"] = 1.2
@@ -1309,6 +1450,47 @@ def test_defcon_is_scored_and_gkp_is_excluded_not_fabricated(world):
          + (0.4 - 0) ** 2 * 2 + (0.3 - 0) ** 2 * 2 + (0.6 - 1) ** 2 * 2 + (0.2 - 0) ** 2 * 2) / 16,
         abs=1e-9,
     )
+
+
+def test_the_defcon_component_covers_positions_outside_defcon_positions_as_a_real_zero(world):
+    """A GKP earns no DefCon points, so its realised value is a REAL zero.
+
+    The zero is returned BEFORE the threshold and the contribution column are
+    consulted: a position outside ``defcon_positions`` earns nothing whatever the
+    contribution says, so an absent contribution column is not an unavailable
+    outcome there.  The component therefore COVERS those rows, and the count of
+    them is reported rather than left for a reader to infer from an ``N``.
+    """
+
+    # No contribution column at all, and a contribution far above any threshold:
+    # both are a real zero for a position the rules exclude.
+    assert ce.realised_component("defcon_points", {"minutes": 90, "starts": 1}, "GKP") == 0.0
+    assert (
+        ce.realised_component(
+            "defcon_points", {"minutes": 90, "starts": 1, "defensive_contribution": 30}, "GKP"
+        )
+        == 0.0
+    )
+    # An outfield position still needs its contribution: there the question is open,
+    # and an absent column is a data gap rather than a zero.
+    assert ce.realised_component("defcon_points", {"minutes": 90, "starts": 1}, "MID") is None
+    assert ce.realised_component("defcon_points", {"minutes": 90, "starts": 1, "defensive_contribution": 20}, "MID") == 2.0
+
+    conn, built = world
+    artifact = _evaluate(conn, built)
+    component = _component(artifact, "defcon_xpts")
+    population_rows = artifact["expected_value"]["component_diagnostics"]["population"]["rows"]
+    assert component["n"] == population_rows, "the GKP rows are covered, not dropped"
+    assert component["realised_unavailable"] == 0
+    assert component["structural_zero_by_position"] == {"GKP": 4}, "player 10: two fixtures, two events"
+    assert component["structural_zero_rows"] == 4
+    assert component["structural_zero_rule"] and "DefCon positions" in component["structural_zero_rule"]
+    assert component["bias"]["value"] == pytest.approx(0.0, abs=1e-9)
+    # The PROBABILITY surface still excludes GKP, because a probability with no
+    # threshold would be a fabricated question: the two are different claims.
+    surface = _surface(artifact, "BRIER_DEFCON")
+    assert surface["population"]["scored"] == population_rows - 4
+    assert surface["population"]["outcome_unavailable"] == 4
 
 
 def test_defcon_calibration_identity_is_carried_and_single_definition(world):
@@ -1704,8 +1886,19 @@ def test_assist_mapping_calibrated_only_alongside_a_declared_versioned_mapping()
         source,
     ), "the truthful disclosure is emitted while the mapping is uncalibrated"
 
-    admissible = {"available": True, "in_bounds": True, "coefficient": 0.83}
-    origins = [{"origin_event": 14, "fit": admissible}]
+    # A real fit, so the provenance the decision validates is a genuine one: 200
+    # rows of expected 1.0 against realised 0.5 is a coefficient of exactly 0.5.
+    fit = pc.fit_assist_mapping_causal(
+        [
+            pc.AssistMappingObservation(
+                event=5, key=(1000 + index, 100), expected_assists=1.0, realised_assists=0.5
+            )
+            for index in range(pc.MIN_FIT_OBSERVATIONS)
+        ],
+        origin_event=6,
+    )
+    assert fit.available is True
+    origins = [{"origin_event": 6, "fit": fit.as_dict()}]
     pooled = {"observations": sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE, "events": sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE}
     candidate = ce.assist_mapping_decision(origins, pooled)
     assert candidate["outcome"] == ce.ASSIST_MAPPING_CANDIDATE
@@ -1713,13 +1906,100 @@ def test_assist_mapping_calibrated_only_alongside_a_declared_versioned_mapping()
     assert candidate["coefficient_after"] == 1.0, "PE-8 does not re-point the production constant"
     assert candidate["assist_mapping_calibrated_after"] is False
     assert candidate["flag_after"] == ce.ASSIST_MAPPING_FLAG
-    assert candidate["candidate_coefficients"] == [0.83]
+    assert candidate["candidate_coefficients"] == [0.5]
     # Below the floors the same admissible fit changes nothing at all.
     thin = ce.assist_mapping_decision(origins, {"observations": 10, "events": 2})
     assert thin["outcome"] == ce.ASSIST_MAPPING_NO_CHANGE
     assert thin["coefficient_after"] == 1.0
     # And no fit at all is a NO_CHANGE with its own reason.
     assert ce.assist_mapping_decision([], pooled)["outcome"] == ce.ASSIST_MAPPING_NO_CHANGE
+
+
+def test_a_fitted_payload_without_identity_or_policy_provenance_fails_closed():
+    """A fitted coefficient is only usable when its payload says what produced it."""
+
+    fit = pc.fit_assist_mapping_causal(
+        [
+            pc.AssistMappingObservation(
+                event=5, key=(1000 + index, 100), expected_assists=1.0, realised_assists=0.5
+            )
+            for index in range(pc.MIN_FIT_OBSERVATIONS)
+        ],
+        origin_event=6,
+    )
+    payload = fit.as_payload()
+    assert payload["identity"] == fit.identity()
+    assert payload["policy_version"] == pc.CAUSAL_FIT_POLICY_VERSION
+    assert pc.assist_mapping_from_payload(payload)["coefficient"] == 0.5
+
+    no_identity = {key: value for key, value in payload.items() if key != "identity"}
+    with pytest.raises(pc.CausalFitError) as error:
+        pc.assist_mapping_from_payload(no_identity)
+    assert "no canonical identity" in str(error.value)
+
+    wrong_policy = {**payload, "policy_version": "some_other_fit_policy_v1.0.0"}
+    with pytest.raises(pc.CausalFitError) as error:
+        pc.assist_mapping_from_payload(wrong_policy)
+    assert "policy_version" in str(error.value)
+
+    # A coefficient edited after the fit is refused: the identity covers it.
+    tampered = {**payload, "coefficient": 2.0}
+    with pytest.raises(pc.CausalFitError) as error:
+        pc.assist_mapping_from_payload(tampered)
+    assert "records identity" in str(error.value)
+
+    with pytest.raises(pc.CausalFitError):
+        pc.assist_mapping_from_payload(None)
+
+    # The decision reads provenance, so a fit whose payload carries none cannot
+    # contribute a candidate at all.
+    entries = [{"origin_event": 6, "fit": fit.as_dict()}]
+    crippled = [{"origin_event": 6, "fit": {**fit.as_dict(), "provenance": None}}]
+    pooled = {
+        "observations": sb.MIN_OBSERVATIONS_FOR_DESCRIPTIVE,
+        "events": sb.MIN_TARGET_EVENTS_FOR_DESCRIPTIVE,
+    }
+    assert ce.assist_mapping_decision(entries, pooled)["outcome"] == ce.ASSIST_MAPPING_CANDIDATE
+    with pytest.raises(pc.CausalFitError):
+        ce.assist_mapping_decision(crippled, pooled)
+
+
+def test_a_fitted_probability_payload_without_identity_or_policy_fails_closed():
+    """Hard test 3/4: identity AND applicable policy provenance, or nothing."""
+
+    fit = pc.fit_platt_causal(
+        _platt_basis(events=(5, 6)),
+        origin_event=7,
+        surface="BRIER_P_START",
+        grain=wf.GRAIN_PLAYER_FIXTURE,
+    )
+    payload = fit.spec.as_payload()
+    assert payload["fit_policy_version"] == pc.CAUSAL_FIT_POLICY_VERSION
+    assert pc.from_payload(payload).identity() == fit.spec.identity()
+
+    for missing, message in (
+        ("identity", "no canonical identity"),
+        ("policy_version", "no policy_version"),
+        ("fit_policy_version", "fit_policy_version"),
+    ):
+        crippled = {key: value for key, value in payload.items() if key != missing}
+        with pytest.raises(pc.ProbabilityCalibrationError) as error:
+            pc.from_payload(crippled)
+        assert message in str(error.value)
+
+    wrong_policy = {**payload, "policy_version": "prob_calibration_policy_v9.9.9"}
+    with pytest.raises(pc.ProbabilityCalibrationError):
+        pc.from_payload(wrong_policy)
+    wrong_fit_policy = {**payload, "fit_policy_version": "prob_causal_fit_v9.9.9"}
+    with pytest.raises(pc.ProbabilityCalibrationError):
+        pc.from_payload(wrong_fit_policy)
+    # A DECLARED spec may not claim to have been fitted: the provenance has to
+    # describe the spec it travels with.
+    declared = pc.INCUMBENT_IDENTITY.as_payload()
+    with pytest.raises(pc.ProbabilityCalibrationError):
+        pc.from_payload({**declared, "fit_policy_version": pc.CAUSAL_FIT_POLICY_VERSION})
+    # And the fit policy is inside the identity, so re-pointing it changes it.
+    assert pc.from_payload(declared).identity() == pc.INCUMBENT_IDENTITY.identity()
 
 
 # ---------------------------------------------------------------------------
@@ -1747,21 +2027,36 @@ def test_a_population_mismatch_is_unreachable_not_scored(world):
     artifact = _evaluate(conn, built)
     surface = _surface(artifact, "BRIER_P_START")
     challenger = surface["causal_challenger"]
-    assert challenger["status"] == ce.STATUS_UNREACHABLE, "the reference world has too little history"
+    # The reference world cannot support a calibration claim at all, so nothing is
+    # fitted: no candidate exists to be compared on any population, matched or not.
+    assert surface["diagnosis"]["status"] == ce.DIAGNOSIS_INSUFFICIENT
+    assert challenger["status"] == ce.STATUS_NOT_FITTED
+    assert challenger["constructed"] is False
     assert challenger["candidate"] is None and challenger["incumbent_on_comparison_population"] is None
-    assert challenger["excluded_by_reason"] == {pc.FIT_INSUFFICIENT_OBSERVATIONS: 20}
-    assert challenger["population"]["n"] == 0
-    assert challenger["population"]["population_digest"] is None
-    assert "cannot cover the comparison population" in challenger["reason"]
+    assert challenger["origins"] == []
+    assert "no defect is diagnosed" in challenger["reason"]
 
 
-def test_an_incumbent_and_its_causal_challenger_share_one_population_digest(big_world):
-    """Hard test 23: identical digests, or no comparison."""
+def test_an_incumbent_and_its_causal_challenger_share_one_population_digest(tmp_path):
+    """Hard test 23: identical digests, or no comparison.
 
-    conn, built = big_world
-    artifact = _evaluate(conn, built)
+    On the CLEAN population nothing is fitted at all, so there is no challenger to
+    compare; on the miscalibrated one a challenger exists and is compared on the
+    identical key set, which is what the gate below proves.
+    """
+
+    conn, built = _warm_world(tmp_path, name="pe8-school")
+    try:
+        artifact = _evaluate(conn, built)
+    finally:
+        conn.close()
+    challenged = 0
     for surface in artifact["probability_calibration"]["surfaces"]:
         challenger = surface["causal_challenger"]
+        if surface["diagnosis"]["status"] != ce.DIAGNOSIS_MISCALIBRATED:
+            assert challenger["status"] == ce.STATUS_NOT_FITTED, surface["metric"]
+            continue
+        challenged += 1
         assert challenger["status"] == ce.STATUS_OK, surface["metric"]
         assert challenger["gate"]["same_population"] is True
         assert challenger["population"]["population_digest"] == challenger["gate"]["population_digest"]
@@ -1773,10 +2068,19 @@ def test_an_incumbent_and_its_causal_challenger_share_one_population_digest(big_
         )
         assert incumbent_figure["brier"]["n"] == candidate_figure["brier"]["n"]
         assert len(challenger["versions_in_force"]) >= 1
+        # Every fitted payload travels with the identity and the policies that
+        # produced it, and the identity is recomputed from the parameters.
+        for entry in challenger["origins"]:
+            if entry["fit"]["available"]:
+                provenance = entry["provenance"]
+                assert provenance["policy_version"] == pc.PROBABILITY_CALIBRATION_POLICY_VERSION
+                assert provenance["fit_policy_version"] == pc.CAUSAL_FIT_POLICY_VERSION
+                assert pc.from_payload(provenance).identity() == provenance["identity"]
         # Both arms cover the identical keys, and the digest is the fixture grain one.
         assert challenger["population"]["population_digest"] != surface["population"]["population_digest"], (
             "the comparison population is the challenger's causal coverage, not the whole surface"
         )
+    assert challenged >= 1, "a miscalibrated world must produce at least one constructed challenger"
 
 
 # ---------------------------------------------------------------------------
@@ -1940,7 +2244,10 @@ def test_the_terminal_state_is_ready_for_merge_on_a_calibrated_population(big_wo
         assert reliability["bins_over_floor"] == 1
         assert reliability["max_abs_gap_over_floor"] <= ce.MATERIAL_CALIBRATION_GAP_TOLERANCE
         assert surface["diagnosis"]["status"] == ce.DIAGNOSIS_NO_MATERIAL_DEFECT
-        assert surface["causal_challenger"]["status"] == ce.STATUS_OK
+        assert surface["causal_challenger"]["status"] == ce.STATUS_NOT_FITTED, (
+            "no defect is diagnosed, so nothing is fitted and no challenger is reported"
+        )
+        assert surface["causal_challenger"]["constructed"] is False
     for entry in artifact["expected_value"]["component_diagnostics"]["components"]:
         assert entry["n"] == 4000
         assert abs(float(entry["bias"]["value"])) <= ce.MATERIAL_COMPONENT_BIAS_TOLERANCE_POINTS, (
@@ -2005,13 +2312,16 @@ def test_a_causal_assist_mapping_fit_is_a_candidate_that_still_changes_nothing(t
     assert artifact["terminal_state"]["state"] == ce.TERMINAL_OPEN
 
 
-def test_a_later_realised_outcome_leaves_every_earlier_transform_untouched(big_world, tmp_path):
+def test_a_later_realised_outcome_leaves_every_earlier_transform_untouched(tmp_path):
     """Hard tests 2 and 23 at scale: the last event's outcomes move nothing earlier."""
 
-    conn, built = big_world
-    reference = _evaluate(conn, built)
+    conn, built = _warm_world(tmp_path, name="pe8-ref")
+    try:
+        reference = _evaluate(conn, built)
+    finally:
+        conn.close()
 
-    conn_alt, built_alt = _single_use_world(tmp_path, alt_last_event=True)
+    conn_alt, built_alt = _warm_world(tmp_path, name="pe8-alt", alt_last_event=True)
     try:
         altered = _evaluate(conn_alt, built_alt)
     finally:
@@ -2023,6 +2333,16 @@ def test_a_later_realised_outcome_leaves_every_earlier_transform_untouched(big_w
         altered["probability_calibration"]["surfaces"],
     ):
         assert reference_surface["metric"] == altered_surface["metric"]
+        # The last event's SCORED figure moves on every surface: causality, not a
+        # frozen artifact.
+        assert (
+            reference_surface["incumbent"]["figure"]["observed_rate"]
+            != altered_surface["incumbent"]["figure"]["observed_rate"]
+        )
+        # A surface with no diagnosed defect has nothing fitted in either world.
+        if reference_surface["diagnosis"]["status"] != ce.DIAGNOSIS_MISCALIBRATED:
+            assert reference_surface["causal_challenger"]["status"] == ce.STATUS_NOT_FITTED
+            continue
         reference_fits = {
             int(entry["origin_event"]): (
                 None if entry["fit"]["spec"] is None else entry["fit"]["spec"]["version"]
@@ -2047,12 +2367,254 @@ def test_a_later_realised_outcome_leaves_every_earlier_transform_untouched(big_w
         )
         assert last_basis["events"] == [int(event) for event in BIG_EVENTS[:-1]]
         assert last_basis["strictly_before_origin"] is True
-        # The last event's SCORED figure does move: causality, not a frozen file.
-        assert (
-            reference_surface["incumbent"]["figure"]["observed_rate"]
-            != altered_surface["incumbent"]["figure"]["observed_rate"]
-        )
     assert ce.artifact_digest(reference) != ce.artifact_digest(altered)
+
+
+# ---------------------------------------------------------------------------
+# PE-5 point-in-time evidence: postponed, late-captured, corrected outcomes
+# ---------------------------------------------------------------------------
+
+
+def _fits(artifact, metric):
+    surface = _surface(artifact, metric)
+    return {
+        int(entry["origin_event"]): (
+            None if entry["fit"]["spec"] is None else entry["fit"]["spec"]["version"]
+        )
+        for entry in surface["causal_challenger"]["origins"]
+    }
+
+
+def _origin(artifact, metric, origin):
+    surface = _surface(artifact, metric)
+    for entry in surface["causal_challenger"]["origins"]:
+        if int(entry["origin_event"]) == int(origin):
+            return entry
+    raise AssertionError(f"{metric}: origin {origin} is absent")
+
+
+def test_a_postponed_result_cannot_enter_a_basis_before_its_official_finality(tmp_path):
+    """A result that was not official at an origin's cutoff is not evidence there.
+
+    Event 6's result is officially finalised after origin 7's certified cutoff and
+    before origin 8's, so origin 7 must fit WITHOUT it (and say so, with the count)
+    while origin 8 legitimately has it.
+    """
+
+    postponed_at = "2026-09-09T09:00:00Z"
+    conn, built = _warm_world(
+        tmp_path,
+        name="pe8-postponed",
+        capture_overrides={6: {"official_final_at": postponed_at, "captured_at": "2026-09-09T10:00:00Z"}},
+    )
+    try:
+        artifact = _evaluate(conn, built)
+    finally:
+        conn.close()
+    reference_conn, reference_built = _warm_world(tmp_path, name="pe8-postponed-ref")
+    try:
+        reference = _evaluate(reference_conn, reference_built)
+    finally:
+        reference_conn.close()
+
+    for metric in ("BRIER_P_START", "BRIER_P_60_PLUS", "BRIER_DEFCON"):
+        origin_seven = _origin(artifact, metric, 7)
+        rows_of_event_six = len(BIG_PLAYERS) * 2
+        assert origin_seven["cutoff"] == "2026-09-08T12:00:00Z"
+        assert origin_seven["basis_excluded_by_reason"] == {
+            ce.BASIS_FINALITY_NOT_BEFORE_CUTOFF: rows_of_event_six
+        }
+        assert 6 not in origin_seven["fit"]["basis"]["events"]
+        assert origin_seven["fit"]["basis"]["events"] == [5]
+        assert origin_seven["fit"]["available"] is True, "one earlier event is enough to fit"
+        # The surface-level total counts the same rows: every origin whose cutoff
+        # precedes the postponed finality had to do without event 6's evidence.
+        assert _surface(artifact, metric)["causal_challenger"]["basis_excluded_by_reason"] == {
+            ce.BASIS_FINALITY_NOT_BEFORE_CUTOFF: rows_of_event_six
+        }
+        # Origin 6 has no strictly earlier event at all, so it never even sees the
+        # question; origin 8's cutoff is after the postponed finality, so its basis
+        # contains event 6 and the transform there is the reference one.
+        eight = _origin(artifact, metric, 8)
+        assert eight["basis_excluded_by_reason"] == {}
+        assert 6 in eight["fit"]["basis"]["events"]
+        assert _fits(artifact, metric)[8] == _fits(reference, metric)[8]
+        # Origin 7's own transform therefore DIFFERS from the reference world's,
+        # because the evidence it may not use is evidence the reference used.
+        assert _fits(artifact, metric)[7] != _fits(reference, metric)[7]
+
+
+def test_a_late_capture_is_excluded_and_counted_until_its_capture_time(tmp_path):
+    """An outcome that was official in time but READ after the cutoff is not evidence.
+
+    Event 6 is officially final before origin 7's cutoff, but the repository only
+    captured it the next day: at origin 7 the row is excluded and counted, and from
+    origin 8 onwards it is available again.
+    """
+
+    conn, built = _warm_world(
+        tmp_path,
+        name="pe8-late",
+        capture_overrides={6: {"captured_at": "2026-09-09T09:00:00Z"}},
+    )
+    try:
+        artifact = _evaluate(conn, built)
+    finally:
+        conn.close()
+
+    for metric in ("BRIER_P_START", "BRIER_DEFCON"):
+        seven = _origin(artifact, metric, 7)
+        assert seven["basis_excluded_by_reason"] == {
+            ce.BASIS_CAPTURE_NOT_BEFORE_CUTOFF: len(BIG_PLAYERS) * 2
+        }
+        assert seven["fit"]["basis"]["events"] == [5]
+        assert _surface(artifact, metric)["causal_challenger"]["basis_excluded_by_reason"] == {
+            ce.BASIS_CAPTURE_NOT_BEFORE_CUTOFF: len(BIG_PLAYERS) * 2
+        }
+        eight = _origin(artifact, metric, 8)
+        assert eight["basis_excluded_by_reason"] == {}
+        assert eight["fit"]["basis"]["events"] == [5, 6, 7]
+    # A row with no capture at all is a different reason, and it is counted too.
+    absent_conn, absent_built = _warm_world(tmp_path, name="pe8-absent", capture_overrides={6: {"skip": True}})
+    try:
+        absent = _evaluate(absent_conn, absent_built)
+    finally:
+        absent_conn.close()
+    seven = _origin(absent, "BRIER_P_START", 7)
+    assert seven["basis_excluded_by_reason"] == {
+        ce.BASIS_CAPTURE_ABSENT: len(BIG_PLAYERS) * 2
+    }
+    assert seven["fit"]["basis"]["events"] == [5]
+
+
+def test_a_later_correction_cannot_change_an_earlier_transform(tmp_path):
+    """A correction is a LATER capture, so it is invisible to an earlier origin.
+
+    Event 5's outcome is corrected after origin 6's and origin 7's cutoffs but
+    before origin 8's.  Origins 6 and 7 must fit exactly as they did without the
+    correction; origin 8's basis picks the corrected value up, so its transform
+    moves.  Nothing about this can happen by reading the current table: the
+    correction is a second, append-only observation of the same key.
+    """
+
+    conn, built = _warm_world(tmp_path, name="pe8-ref2")
+    try:
+        reference = _evaluate(conn, built)
+    finally:
+        conn.close()
+
+    corrected_conn, corrected_built = _warm_world(tmp_path, name="pe8-corrected")
+    try:
+        _append_correction(corrected_conn, event=5, captured_at="2026-09-09T10:00:00Z")
+        corrected = _evaluate(corrected_conn, corrected_built)
+        # The correction is a NEW observation of the same key: the earlier capture
+        # is still retained beside it, which is what append-only means.
+        retained = ledger.observation_captures(
+            corrected_conn,
+            grain=ledger.GRAIN_PLAYER_FIXTURE,
+            event=5,
+            player_id=int(sorted(BIG_PLAYERS)[0]),
+        )
+        for_fixture = [capture for capture in retained if int(capture["fixture_id"]) == sorted(_big_fixtures(5))[0]]
+        assert len(for_fixture) == 2, "a correction adds an observation; it never overwrites one"
+        assert len({capture["capture_digest"] for capture in for_fixture}) == 2
+        assert any(capture["supersedes_capture_id"] is not None for capture in for_fixture)
+    finally:
+        corrected_conn.close()
+
+    for metric in ("BRIER_P_START", "BRIER_P_60_PLUS", "BRIER_DEFCON"):
+        reference_fits = _fits(reference, metric)
+        corrected_fits = _fits(corrected, metric)
+        # Origins 6 and 7 are fitted and unmoved: the correction was not yet captured.
+        for origin in (6, 7):
+            assert reference_fits[origin] is not None
+            assert corrected_fits[origin] == reference_fits[origin], (
+                f"{metric}: a later correction changed origin {origin}'s transform"
+            )
+            assert _origin(corrected, metric, origin)["basis_excluded_by_reason"] == {}
+        # Origin 8's basis is visible at its cutoff, so it takes the corrected value.
+        assert corrected_fits[8] != reference_fits[8], (
+            f"{metric}: a correction captured before origin 8's cutoff must be used there"
+        )
+
+
+def test_a_provisional_capture_is_never_promoted_into_a_basis(tmp_path):
+    """A read made before the result was official stays provisional for ever.
+
+    Event 6's capture is taken an hour before the event's official finality, so
+    PE-5 records it PROVISIONAL.  Nothing may treat it as evidence of the result:
+    the row is excluded at every origin that can see it, with its own reason, even
+    though the event IS final by the time the evaluation runs.
+    """
+
+    conn, built = _warm_world(
+        tmp_path,
+        name="pe8-provisional",
+        capture_overrides={6: {"captured_at": "2026-09-08T08:00:00Z"}},
+    )
+    try:
+        artifact = _evaluate(conn, built)
+        capture = next(
+            capture
+            for capture in ledger.observation_captures(
+                conn, grain=ledger.GRAIN_PLAYER_FIXTURE, event=6
+            )
+        )
+        assert capture["observation_state"] == ledger.OBSERVATION_PROVISIONAL
+    finally:
+        conn.close()
+
+    for metric in ("BRIER_P_START", "BRIER_DEFCON"):
+        seven = _origin(artifact, metric, 7)
+        assert seven["basis_excluded_by_reason"] == {ce.BASIS_PROVISIONAL: len(BIG_PLAYERS) * 2}
+        assert seven["fit"]["basis"]["events"] == [5]
+        # Later origins can see the capture, and it is STILL not evidence.
+        last = _origin(artifact, metric, BIG_EVENTS[-1])
+        assert last["basis_excluded_by_reason"] == {ce.BASIS_PROVISIONAL: len(BIG_PLAYERS) * 2}
+        assert 6 not in last["fit"]["basis"]["events"]
+
+
+def _append_correction(conn, *, event: int, captured_at: str) -> None:
+    """Append one corrective observation for the first player of ``event``.
+
+    The capture is a SECOND, immutable observation of a key that already has one:
+    PE-5 forbids updating an earlier capture in place, so the earlier evidence
+    survives and the supersession is explicit.
+    """
+
+    key = sorted(BIG_PLAYERS)[0]
+    fixture_id = sorted(_big_fixtures(event))[0]
+    existing = ledger.observation_captures(
+        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, event=int(event), player_id=int(key)
+    )
+    assert existing, "the world records the observations this correction supersedes"
+    original = next(
+        capture for capture in existing if int(capture["fixture_id"]) == int(fixture_id)
+    )
+    fields = dict(original["payload"])
+    # One field per declared surface the fit is scored on, so the correction moves
+    # the basis of a p_start, a p_60_plus and a defcon transform alike.  The DefCon
+    # flip crosses the position's declared threshold, which is what changes the
+    # realised 0/1 rather than a number the outcome never reads.
+    threshold = int(DEFAULT_SCORING_RULES.defcon_threshold_for("MID"))
+    fields["starts"] = 1 - int(fields.get("starts") or 0)
+    fields["minutes"] = 30 if int(fields.get("minutes") or 0) >= 60 else 90
+    fields["defensive_contribution"] = (
+        0 if int(fields.get("defensive_contribution") or 0) >= threshold else threshold + 3
+    )
+    ledger.capture_observation(
+        conn,
+        grain=ledger.GRAIN_PLAYER_FIXTURE,
+        event=int(event),
+        player_id=int(key),
+        fixture_id=int(fixture_id),
+        fields=fields,
+        source_name="official_correction",
+        captured_at=captured_at,
+        official_final_at=str(original["official_final_at"]),
+        supersedes_capture_id=int(original["id"]) if original.get("id") is not None else None,
+        correction_reason="an official correction of the same player-fixture",
+    )
 
 
 def test_the_out_of_scope_surfaces_are_declared_rather_than_silently_skipped(world):
@@ -2096,23 +2658,28 @@ def test_a_transform_has_a_mandate_only_from_a_diagnosed_defect(big_world, tmp_p
         mandate = surface["transform_mandate"]
         assert mandate["mandate"] == "NO_DEFECT_DIAGNOSED"
         assert mandate["promotable_by_pe8"] is False
-        assert mandate["transform_status"] == ce.STATUS_OK, (
-            "the transform is still fitted and reported: it is the sensitivity of a clean surface"
+        assert mandate["transform_status"] == ce.STATUS_NOT_FITTED, (
+            "no defect is diagnosed, so NO challenger is constructed at all"
         )
-        assert "descriptive sensitivity" in mandate["note"]
+        assert "no challenger was constructed" in mandate["note"]
         assert "promotes none" in mandate["rule"]
+        assert surface["causal_challenger"]["origins"] == []
 
-    conn_alt, built_alt = _single_use_world(tmp_path, start_share_a=0.30)
+    # The same population with a real defect does construct one -- and still does
+    # not promote it.
+    conn_warm, built_warm = _warm_world(tmp_path, name="pe8-mandate")
     try:
-        diagnosed = _evaluate(conn_alt, built_alt)
+        diagnosed = _evaluate(conn_warm, built_warm)
     finally:
-        conn_alt.close()
+        conn_warm.close()
     surface = _surface(diagnosed, "BRIER_P_START")
     mandate = surface["transform_mandate"]
+    assert surface["diagnosis"]["status"] == ce.DIAGNOSIS_MISCALIBRATED
     assert mandate["mandate"] == "DIAGNOSED_DEFECT"
     assert mandate["promotable_by_pe8"] is False
-    assert mandate["transform_status"] == ce.STATUS_UNREACHABLE
+    assert mandate["transform_status"] == ce.STATUS_OK
     assert "still not promoted" in mandate["note"]
+    assert surface["causal_challenger"]["constructed"] is True
 
     # The ranking-behaviour statement the contract asks for, in one place.
     ranking = pc.policy()["ranking_behaviour"]
