@@ -1,4 +1,4 @@
-# Prediction Engine V1 roadmap — post-PE-7 authority
+# Prediction Engine V1 roadmap — post-PE-8 authority
 
 This document is product and engineering authority for the Prediction Engine V1
 phase sequence. Each phase is finite and is completed only at its stated review
@@ -72,14 +72,26 @@ The PE-7 contract is defined in
 
 ### PE-8 — Calibration
 
-**STATUS: NEXT**
+**STATUS: FROZEN**
+
+reviewed source: `491b8ae58c3b570ab60d783cf4ec21a2b987d821`
+
+merge: `95b6f71afbe6996b975f7815de854449edf892ff`
+
+calibration outcome: **NO PROMOTION** — no model version was bumped and no calibration
+version was replaced; the merged evidence artifact declares `promotion: NOT PERFORMED`
+and `production_wiring: NONE`, so no calibration transform is wired into a production
+decision path.
 
 The PE-8 contract is defined in
 [PE-8-CALIBRATION.md](PE-8-CALIBRATION.md).
 
 ### PE-9 — Certification Integration
 
-**STATUS: BLOCKED on PE-8**
+**STATUS: NEXT**
+
+The PE-9 contract is defined in
+[PE-9-CERTIFICATION-INTEGRATION.md](PE-9-CERTIFICATION-INTEGRATION.md).
 
 ### PE-10 — End-to-End Acceptance / Prediction Engine V1 Freeze
 
@@ -111,6 +123,6 @@ The PE-8 contract is defined in
 
 - `CONTINUOUS_PROXY_TIE_LIMITATION` from PE-3
 
-These accepted contracts remain unchanged by the post-PE-7 authority rollover.
+These accepted contracts remain unchanged by the post-PE-8 authority rollover.
 PE-4's frozen aggregation contract is defined in
 [PE-4-DGW-BLANK-WORLD-AGGREGATION.md](PE-4-DGW-BLANK-WORLD-AGGREGATION.md).
