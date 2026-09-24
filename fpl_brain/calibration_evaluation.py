@@ -19,9 +19,11 @@ contracts:
 * the four declared probability surfaces, on the anchor ``xpts_v1`` population
   read from :func:`walk_forward_scoreboard.player_fixture_population` (so this
   module and the scoreboard cannot drift onto two different populations);
-* each origin's FIT BASIS from the FROZEN prediction rows of the earlier events
-  plus PE-5's append-only point-in-time observation captures, never from the
-  current ``fixtures`` / ``player_gameweeks`` / ``players`` state;
+* each origin's FIT BASIS from the FROZEN prediction rows of every strictly
+  earlier APPLICABLE certified target event -- a population decided by the
+  certification, never by today's ``events`` row -- plus PE-5's append-only
+  point-in-time observation captures, never from the current ``fixtures`` /
+  ``player_gameweeks`` / ``players`` state;
 * the persisted expected-points components at the grain each is persisted at;
 * the Monte Carlo quantile grid, through the scoreboard's own coverage block;
 * the uncalibrated FPL assist-mapping constant, as a DECISION it reports rather
@@ -55,6 +57,23 @@ are recorded, the basis digest is part of the fitted version string, and a basis
 containing an outcome at or after its origin is REFUSED rather than approximated.
 A figure produced by fitting and scoring on the same event set is not evidence
 and is never reported as if it were.
+
+SCORED ELIGIBILITY AND BASIS MEMBERSHIP ARE TWO QUESTIONS
+---------------------------------------------------------
+They are answered from different evidence and the two must not be conflated.  A
+SCORED figure -- and the ORIGIN a transform is applied at, because a transform is
+only ever applied where a figure is scored -- covers PE-2's declared
+CURRENT-STATE population: the FINAL target events, read through
+:func:`planning.event_data_state`.  A target event that is not officially FINAL
+today leaves that population and is reported with its state.  A fit basis is a
+different question: its CANDIDATES are the frozen prediction rows of every
+APPLICABLE certified anchor target event, where "applicable" is decided by the
+CERTIFICATION -- the anchor bundle's own ``xpts_v1`` run for that event -- and
+never by the mutable current ``events`` row.  Each origin then admits the
+strictly earlier candidates solely through the frozen prediction and the PE-5
+capture / finality-at-cutoff rules.  A current ``events.finished`` edit can
+therefore move a scored figure and the origin set; it can never add a row to or
+remove a row from a later origin's basis, because no basis ever read it.
 
 SAME POPULATION OR NO COMPARISON
 --------------------------------
@@ -151,20 +170,38 @@ BASIS_EXCLUSION_PRECEDENCE = (
     "POINT_IN_TIME_OUTCOME_UNAVAILABLE"
 )
 
+#: The declared fit-basis CANDIDATE population, stated once and carried by every
+#: block that builds a basis.  Candidacy is a different question from SCORED
+#: eligibility, and the two read different evidence: a scored figure (and the
+#: origin a transform is applied at) keeps the CURRENT-STATE FINAL filter, while a
+#: candidate row is decided by the CERTIFICATION, so a target event that has since
+#: lost its current FINAL state still contributes the rows it was predicted under
+#: and cannot remove them from a later origin's basis.
+FIT_BASIS_CANDIDATE_POLICY = (
+    "candidates are the FROZEN prediction rows of every APPLICABLE certified anchor target event -- "
+    "'applicable' is decided by the CERTIFICATION (the anchor bundle's own certified xpts_v1 run for "
+    "that event), never by the mutable current events.finished / events.data_checked row -- so a target "
+    "event that has since lost its current FINAL state still contributes the rows it was predicted "
+    "under and cannot remove them from a later origin's basis.  SCORED eligibility and the ORIGIN set "
+    "are a different question with a different filter, and are left exactly as PE-2 declares them: only "
+    "a FINAL target event is scored, and only a FINAL target event is an origin a transform is applied "
+    "at, so an event that is not final today is excluded and counted rather than fitted for."
+)
+
 #: The declared fit-basis policy, stated once and carried by every block that
 #: builds a basis, so the rule a fitted transform obeyed is readable from the
 #: artifact rather than inferred from the code that produced it.
 BASIS_MEMBERSHIP_POLICY = (
-    "membership is the FROZEN prediction rows of strictly earlier target events of the anchor "
-    "xpts_v1 runs -- read from the immutable projection rows, so a fixture that has since lost its "
-    "played flag, a realised player_gameweeks row that has since been removed or blanked, a "
-    "scheduled-placeholder flag that has since appeared and a players row that has since been "
-    "re-listed cannot add to or remove from a historical basis -- combined with PE-5 append-only "
-    "point-in-time observation captures whose official finality AND capture both fall strictly "
-    "before the origin's OWN certified cutoff.  The realised outcome is derived against the "
+    "membership is the FROZEN prediction rows of the strictly earlier CANDIDATES -- every applicable "
+    "certified anchor target event of the anchor xpts_v1 runs -- read from the immutable projection "
+    "rows, so a fixture that has since lost its played flag, a realised player_gameweeks row that has "
+    "since been removed or blanked, a scheduled-placeholder flag that has since appeared and a players "
+    "row that has since been re-listed cannot add to or remove from a historical basis -- combined with "
+    "PE-5 append-only point-in-time observation captures whose official finality AND capture both fall "
+    "strictly before the origin's OWN certified cutoff.  The realised outcome is derived against the "
     "position PERSISTED WITH THE PREDICTION, and the outcome VALUE is the capture's, so a later "
-    "correction is a later observation and cannot rewrite an earlier transform.  A row whose "
-    "timing cannot be proven is excluded and counted with its own reason."
+    "correction is a later observation and cannot rewrite an earlier transform.  A row whose timing "
+    "cannot be proven is excluded and counted with its own reason."
 )
 
 #: Declared a priori.  A reliability bin whose observed frequency differs from its
@@ -604,9 +641,15 @@ def structural_zero_rule(
 def _final_events(conn: sqlite3.Connection, events: Sequence[int]) -> tuple[list[int], list[dict[str, Any]]]:
     """The target events whose stored official state is FINAL, and the rest.
 
-    The declared probability population is restricted to FINAL target events, so
-    a provisional or in-progress event is reported with its state instead of
-    contributing rows.
+    This answers ONE question -- SCORED eligibility -- and it is deliberately not
+    the question a fit basis asks.  The declared probability population is
+    restricted to FINAL target events, so a provisional or in-progress event is
+    reported with its state instead of contributing rows, and the same set is the
+    ORIGIN set, because a transform is only ever applied at an origin where a
+    figure is scored.  A fit basis is a different role with a different filter: its
+    candidates come from the certification
+    (:func:`fit_basis_candidates`), so this current-state answer never adds a row
+    to or removes a row from an earlier transform's basis.
     """
 
     final: list[int] = []
@@ -618,6 +661,46 @@ def _final_events(conn: sqlite3.Connection, events: Sequence[int]) -> tuple[list
         else:
             excluded.append({"event": event, "state": state, "basis": list(reasons)})
     return final, excluded
+
+
+def fit_basis_candidates(
+    anchor: wf.CertifiedAnchor,
+) -> tuple[list[int], dict[int, int], list[dict[str, Any]]]:
+    """Every APPLICABLE certified anchor target event, and its own ``xpts_v1`` run.
+
+    "Applicable" is decided by the CERTIFICATION and not by the mutable current
+    ``events`` row: the anchor bundle for the event names the certified
+    ``xpts_v1`` run, so that event's frozen prediction rows are fit-basis
+    candidates whether or not today's ``events.finished`` / ``events.data_checked``
+    still call the event FINAL.  Whether a candidate row then enters an origin's
+    basis is decided by the PE-5 point-in-time rules alone
+    (:func:`point_in_time_basis`), never by this current-state flag.
+
+    A target event whose certified bundle names no ``xpts_v1`` run has no frozen
+    prediction rows to contribute; it is returned with its reason rather than
+    silently dropped from the candidate pool or quietly treated as an empty one.
+    """
+
+    events = sorted({int(event) for event in anchor.event_ids})
+    applicable: list[int] = []
+    runs: dict[int, int] = {}
+    inapplicable: list[dict[str, Any]] = []
+    for event in events:
+        run_id = anchor.for_event(event).run_id("xpts_v1")
+        if run_id is None:
+            inapplicable.append(
+                {
+                    "event": int(event),
+                    "reason": (
+                        "the certified bundle names no xpts_v1 run for this target event, so it has no "
+                        "frozen prediction rows to contribute to a fit basis"
+                    ),
+                }
+            )
+            continue
+        applicable.append(int(event))
+        runs[int(event)] = int(run_id)
+    return applicable, runs, inapplicable
 
 
 def _event_state(conn: sqlite3.Connection, event: int) -> tuple[str, list[str]]:
@@ -840,6 +923,12 @@ def frozen_prediction_rows(
     current position listing is still evidence of what an earlier transform was
     fitted on, and the two populations are named separately wherever both are
     reported.
+
+    The ``events`` this reads are the CANDIDATES of a fit basis, and the caller
+    supplies them from the CERTIFICATION (:func:`fit_basis_candidates`) rather than
+    from the current ``events`` row: a target event that is not FINAL today was
+    still PREDICTED, and nothing about that prediction becomes untrue because the
+    current official-state flag changed afterwards.
     """
 
     wanted = sorted({int(event) for event in events})
@@ -873,14 +962,25 @@ def point_in_time_basis(
     prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]],
     cutoffs: Mapping[int, str],
     definition: sb.ProbabilityMetricDefinition,
+    origins: Sequence[int] | None = None,
 ) -> tuple[dict[int, list[pc.CalibrationObservation]], dict[int, dict[str, int]]]:
     """Each origin's fit basis: frozen prediction rows PLUS PE-5 point-in-time evidence.
 
     For every origin event ``E`` the basis is the FROZEN prediction rows of strictly
-    earlier events whose outcome is proven by an APPEND-ONLY PE-5 observation
+    earlier CANDIDATES whose outcome is proven by an APPEND-ONLY PE-5 observation
     capture to have been officially final AND captured strictly before ``E``'s
-    certified cutoff.  Three properties follow, and each is a rule rather than an
-    implementation detail:
+    certified cutoff.  The two populations are separate on purpose:
+
+    * ``prediction_rows`` is the CANDIDATE pool -- every applicable certified anchor
+      target event (see :func:`fit_basis_candidates`), which is decided by the
+      certification and NOT by today's ``events`` row;
+    * ``origins`` is the ORIGIN set -- the SCORED target events, which do keep the
+      current-state FINAL filter, because a transform is only ever applied where a
+      figure is scored.  It defaults to the candidate pool only for callers that
+      have no separate origin set.
+
+    Four properties follow, and each is a rule rather than an implementation
+    detail:
 
     * MEMBERSHIP COMES FROM THE PREDICTION, NOT FROM THE CURRENT TABLES.  The rows
       are the persisted projection rows of the earlier events' own certified runs,
@@ -888,6 +988,10 @@ def point_in_time_basis(
       ``player_gameweeks`` row that has since been removed or blanked, nor a
       scheduled-placeholder flag that has since appeared can add to or remove from
       a historical basis.
+    * CANDIDACY COMES FROM THE CERTIFICATION, NOT FROM CURRENT FINALITY.  A
+      candidate event that is no longer FINAL today still contributes the rows it
+      was predicted under, so a current-state finality edit cannot shrink a later
+      origin's basis.
     * THE POSITION IS THE PREDICTION-TIME POSITION.  The realised outcome is
       derived against the position PERSISTED WITH THE PREDICTION rather than
       against today's ``players`` row, because the question a prediction asked was
@@ -917,15 +1021,20 @@ def point_in_time_basis(
     to the order of the branches below.
     """
 
-    events = sorted({int(event) for event in prediction_rows})
-    basis: dict[int, list[pc.CalibrationObservation]] = {origin: [] for origin in events}
-    excluded: dict[int, dict[str, int]] = {origin: {} for origin in events}
-    if not events:
+    candidates = sorted({int(event) for event in prediction_rows})
+    origin_events = (
+        sorted({int(origin) for origin in origins}) if origins is not None else list(candidates)
+    )
+    basis: dict[int, list[pc.CalibrationObservation]] = {origin: [] for origin in origin_events}
+    excluded: dict[int, dict[str, int]] = {origin: {} for origin in origin_events}
+    if not origin_events:
         return basis, excluded
 
     captures: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
     for capture in ledger.observation_captures(
-        conn, grain=ledger.GRAIN_PLAYER_FIXTURE, events=events
+        conn,
+        grain=ledger.GRAIN_PLAYER_FIXTURE,
+        events=sorted(set(candidates) | set(origin_events)),
     ):
         if capture.get("fixture_id") is None:
             continue
@@ -933,9 +1042,9 @@ def point_in_time_basis(
             (int(capture["event"]), int(capture["player_id"]), int(capture["fixture_id"])), []
         ).append(capture)
 
-    for origin in events:
+    for origin in origin_events:
         cutoff = _require_cutoff(cutoffs, origin)
-        for event in (candidate for candidate in events if candidate < origin):
+        for event in (candidate for candidate in candidates if candidate < origin):
             for row in prediction_rows[event]:
                 statement = row.payload.get(definition.field)
                 if statement is None:
@@ -1122,6 +1231,7 @@ def _challenger_block(
     cutoffs: Mapping[int, str],
     definition: sb.ProbabilityMetricDefinition,
     grain: str,
+    origins: Sequence[int],
 ) -> tuple[dict[str, Any], list[sb.ProbabilityScoringRow]]:
     """The causal challenger arm: fitted transform per origin, scored at its own origin.
 
@@ -1131,17 +1241,27 @@ def _challenger_block(
     origin had no admissible transform is EXCLUDED AND COUNTED, never scored under
     a transform fitted somewhere else.
 
-    The basis and the scored population are two different roles and are named
-    separately: the basis is the FROZEN prediction rows plus point-in-time
-    evidence (what a transform was allowed to learn from), and the scored rows are
-    PE-2's declared current-state population (what the figures cover).
+    Three populations meet here and are named separately, because they answer
+    different questions and only one of them may read current state:
+
+    * the CANDIDATES, ``prediction_rows``: the frozen prediction rows of every
+      applicable certified anchor target event, decided by the CERTIFICATION;
+    * the ORIGINS, ``origins``: the SCORED target events, which keep the
+      current-state FINAL filter because a transform is only applied where a figure
+      is scored;
+    * the SCORED rows, ``rows``: PE-2's declared current-state population, which is
+      what the incumbent and challenger figures cover.
     """
 
     basis_by_origin, excluded_by_origin = point_in_time_basis(
-        conn=conn, prediction_rows=prediction_rows, cutoffs=cutoffs, definition=definition
+        conn=conn,
+        prediction_rows=prediction_rows,
+        cutoffs=cutoffs,
+        definition=definition,
+        origins=origins,
     )
     fits = causal_origins(basis_by_origin, surface=definition.metric, grain=grain)
-    origins: list[dict[str, Any]] = []
+    origin_records: list[dict[str, Any]] = []
     covered: list[sb.ProbabilityScoringRow] = []
     excluded_by_reason: dict[str, int] = {}
     # The basis exclusions, summed over the origins: the per-origin counters below
@@ -1178,7 +1298,7 @@ def _challenger_block(
         else:
             reason = str(fit.reason or pc.FIT_INSUFFICIENT_OBSERVATIONS)
             excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + len(origin_rows)
-        origins.append(record)
+        origin_records.append(record)
 
     block: dict[str, Any] = {
         "surface": str(definition.metric),
@@ -1195,20 +1315,26 @@ def _challenger_block(
             "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
             "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
             "grain": ledger.GRAIN_PLAYER_FIXTURE,
-            "membership": "frozen prediction rows of the strictly earlier events of the anchor xpts_v1 runs",
+            "membership": (
+                "frozen prediction rows of the strictly earlier candidates -- every applicable "
+                "certified anchor target event of the anchor xpts_v1 runs"
+            ),
+            "candidate_policy": FIT_BASIS_CANDIDATE_POLICY,
+            "candidate_events": [int(event) for event in sorted(prediction_rows)],
+            "origin_events": sorted(int(origin) for origin in fits),
             "position": "the position persisted with each prediction row, never the current players row",
             "strictly_before_cutoff": True,
             "exclusion_precedence": BASIS_EXCLUSION_PRECEDENCE,
             "exclusion_reasons": list(BASIS_EXCLUSION_REASONS),
         },
-        "origins": origins,
+        "origins": origin_records,
         "basis_excluded_by_reason": {
             str(key): int(value) for key, value in sorted(basis_excluded_total.items())
         },
         "excluded_by_reason": {str(key): int(value) for key, value in sorted(excluded_by_reason.items())},
     }
     block["rows_without_origin_transform"] = sum(
-        1 for row in rows if not fits[int(row.event)].available
+        1 for row in rows if not (fits.get(int(row.event)) and fits[int(row.event)].available)
     )
     return _score_challenger(block, rows, covered, fits, excluded_by_reason, grain=grain), covered
 
@@ -1437,9 +1563,10 @@ def probability_calibration_block(
     *,
     events: Sequence[int],
     xpts_runs: Mapping[int, int],
-    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]] | None = None,
-    cutoffs: Mapping[int, str] | None = None,
+    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]],
+    cutoffs: Mapping[int, str],
     excluded_events: Sequence[Mapping[str, Any]] = (),
+    inapplicable_candidates: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Every declared probability surface: diagnosis first, then any transform.
 
@@ -1447,6 +1574,14 @@ def probability_calibration_block(
     its diagnosis are computed for every surface; a challenger is built ONLY where
     the diagnosis is MISCALIBRATED, and its basis is the frozen prediction rows of
     the anchor's own runs, never the current-state tables.
+
+    ``events`` is the SCORED target event set -- the FINAL events -- and it is also
+    the ORIGIN set, because a transform is only applied where a figure is scored.
+    ``prediction_rows`` is the CANDIDATE pool and is deliberately a different set:
+    every applicable certified anchor target event, so a target event that is not
+    FINAL today still contributes the rows it was predicted under.  The two are
+    required rather than defaulted to each other, because defaulting them together
+    is exactly the conflation the phase forbids.
     """
 
     wanted = sorted({int(event) for event in events})
@@ -1458,12 +1593,8 @@ def probability_calibration_block(
     for row in scored["rows"]:
         by_metric[row.metric].append(row)
 
-    declared_cutoffs = dict(cutoffs or {})
-    frozen = (
-        dict(prediction_rows)
-        if prediction_rows is not None
-        else frozen_prediction_rows(conn, runs=xpts_runs, events=wanted)
-    )
+    declared_cutoffs = dict(cutoffs)
+    frozen = {int(event): list(rows) for event, rows in prediction_rows.items()}
     surfaces: list[dict[str, Any]] = []
     for definition in sb.PROBABILITY_METRICS:
         rows = by_metric[definition.metric]
@@ -1483,6 +1614,7 @@ def probability_calibration_block(
                 cutoffs=declared_cutoffs,
                 definition=definition,
                 grain=wf.GRAIN_PLAYER_FIXTURE,
+                origins=wanted,
             )
         else:
             challenger = _not_fitted_block(
@@ -1549,6 +1681,26 @@ def probability_calibration_block(
             "excluded": dict(population["excluded"]),
             "run_ids_by_event": int_keyed_runs(xpts_runs),
             "versions": list(population["versions"]),
+        },
+        # The two populations a fit basis separates, named here once for the whole
+        # block: what a transform was ALLOWED TO LEARN FROM (candidates, decided by
+        # the certification) and where it is APPLIED (origins = the scored events,
+        # which keep the current-state FINAL filter).
+        "fit_basis_candidates": {
+            "policy": FIT_BASIS_CANDIDATE_POLICY,
+            "candidate_events": [int(event) for event in sorted(frozen)],
+            "candidate_rows_by_event": {
+                int(event): len(rows) for event, rows in sorted(frozen.items())
+            },
+            "origin_events": list(wanted),
+            "origin_rule": (
+                "an origin is a SCORED target event; a transform is only ever applied where a figure "
+                "is scored, so an event that is not officially FINAL today is excluded and counted "
+                "rather than fitted for"
+            ),
+            "events_without_a_certified_xpts_v1_run": [
+                dict(entry) for entry in inapplicable_candidates
+            ],
         },
         "surfaces": surfaces,
     }
@@ -1823,9 +1975,8 @@ def assist_mapping_block(
     conn: sqlite3.Connection,
     *,
     events: Sequence[int],
-    xpts_runs: Mapping[int, int],
-    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]] | None = None,
-    cutoffs: Mapping[int, str] | None = None,
+    prediction_rows: Mapping[int, Sequence[FrozenPredictionRow]],
+    cutoffs: Mapping[int, str],
 ) -> dict[str, Any]:
     """The uncalibrated assist-mapping constant, as a decision PE-8 reports.
 
@@ -1835,12 +1986,17 @@ def assist_mapping_block(
     reported as a candidate; PE-8 does not re-point the constant, and it never
     silences the truthful ``FPL_ASSIST_MAPPING_UNCALIBRATED`` flag.
 
-    Each origin's fit basis is built exactly as the probability surfaces' is:
-    the FROZEN prediction rows of the strictly earlier events -- the persisted
-    ``expected_xa`` the production formula multiplies, and the position the
-    prediction was made at -- combined with the PE-5 observation capture that was
-    final and captured strictly before that origin's certified cutoff.  A row
-    whose timing cannot be proven is excluded and counted.
+    Each origin's fit basis is built exactly as the probability surfaces' is, and
+    the same separation applies: ``prediction_rows`` is the CANDIDATE pool (every
+    applicable certified anchor target event, decided by the certification), while
+    ``events`` is the SCORED/origin set (the FINAL target events, which keep the
+    current-state filter).  So a target event that has since lost its current FINAL
+    state still contributes the frozen ``expected_xa`` rows it was predicted under
+    to every later origin's basis, and it leaves the SCORED population and the
+    origin set -- which is a scored-event exclusion, not a basis edit.  The
+    realised side is the official assists column OF THE PE-5 CAPTURE that was
+    final and captured strictly before that origin's certified cutoff.  A row whose
+    timing cannot be proven is excluded and counted.
 
     ``pooled_evidence`` is the ADMISSIBLE evidence, and nothing else: every row
     that entered at least one origin's basis, counted ONCE (at the value admitted
@@ -1853,7 +2009,8 @@ def assist_mapping_block(
     """
 
     config = xpts_module.XPtsConfig()
-    declared_cutoffs = dict(cutoffs or {})
+    declared_cutoffs = dict(cutoffs)
+    wanted = sorted({int(event) for event in events})
     block: dict[str, Any] = {
         "surface": ASSIST_MAPPING_SURFACE,
         "grain": ASSIST_MAPPING_GRAIN,
@@ -1873,7 +2030,13 @@ def assist_mapping_block(
             "capture_version": ledger.OBSERVATION_CAPTURE_VERSION,
             "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
             "grain": ledger.GRAIN_PLAYER_FIXTURE,
-            "membership": "frozen prediction rows of the strictly earlier events of the anchor xpts_v1 runs",
+            "membership": (
+                "frozen prediction rows of the strictly earlier candidates -- every applicable "
+                "certified anchor target event of the anchor xpts_v1 runs"
+            ),
+            "candidate_policy": FIT_BASIS_CANDIDATE_POLICY,
+            "candidate_events": [int(event) for event in sorted(prediction_rows)],
+            "origin_events": list(wanted),
             "expected_side": "the persisted expected_xa of the frozen prediction row",
             "realised_side": "the official assists column OF THE CAPTURE, never the current table's",
             "strictly_before_cutoff": True,
@@ -1883,16 +2046,10 @@ def assist_mapping_block(
         "origins": [],
         "pooled_evidence": _pooled_evidence({}, {}, candidate_rows=0),
     }
-    wanted = sorted({int(event) for event in events})
-    frozen = (
-        {int(event): list(rows) for event, rows in prediction_rows.items()}
-        if prediction_rows is not None
-        else frozen_prediction_rows(conn, runs=xpts_runs, events=wanted)
-    )
     by_event: dict[int, list[FrozenPredictionRow]] = {
-        int(event): list(rows) for event, rows in sorted(frozen.items()) if rows
+        int(event): list(rows) for event, rows in sorted(prediction_rows.items()) if rows
     }
-    if not by_event:
+    if not wanted or not by_event:
         block["decision"] = assist_mapping_decision(block["origins"], block["pooled_evidence"])
         return block
 
@@ -1913,7 +2070,11 @@ def assist_mapping_block(
     pooled: dict[tuple[int, int, int], tuple[float, float]] = {}
     excluded_total: dict[str, int] = {}
     candidate_rows = 0
-    for origin in sorted(by_event):
+    # The origins are the SCORED events, not the candidates: the candidate pool of
+    # a target event that has since lost its current FINAL state is still read
+    # here (it is a source of rows), but it is no longer an origin a transform is
+    # applied at.
+    for origin in wanted:
         cutoff = _require_cutoff(declared_cutoffs, origin)
         basis_rows: list[pc.AssistMappingObservation] = []
         excluded: dict[str, int] = {}
@@ -1951,7 +2112,7 @@ def assist_mapping_block(
         entry: dict[str, Any] = {
             "origin_event": int(origin),
             "cutoff": cutoff,
-            "rows_at_origin": len(by_event[int(origin)]),
+            "rows_at_origin": len(by_event.get(int(origin), ())),
             "rows_admitted_at_origin": len(basis_rows),
             "basis_excluded_by_reason": {key: int(value) for key, value in sorted(excluded.items())},
             "fit": fit.as_dict(),
@@ -2325,6 +2486,9 @@ def evaluate(
 
     anchor = wf.discover_certified_anchor(conn, artifact, events=events)
     target_events = anchor.event_ids
+    # SCORED eligibility, and nothing else: which target events are officially
+    # FINAL TODAY.  This is PE-2's declared current-state population, and it
+    # decides the scored figures and the origin set a transform may be applied at.
     final_events, excluded_events = _final_events(conn, target_events)
     xpts_runs = _xpts_runs(anchor, final_events)
     monte_carlo_runs = _ancillary_runs(anchor, final_events, "monte_carlo_v1")
@@ -2332,11 +2496,18 @@ def evaluate(
     # that reached past its origin's cutoff would describe a world in which the
     # target was already known.
     cutoffs = {int(event): anchor.for_event(int(event)).cutoff for event in final_events}
-    # The FROZEN half of every fit basis, read from the immutable projection rows
-    # of the anchor's own runs: membership, the stated probability and the position
-    # a prediction was made at all come from what was persisted, never from the
-    # current fixtures / player_gameweeks / players state.
-    prediction_rows = frozen_prediction_rows(conn, runs=xpts_runs, events=final_events)
+    # FIT-BASIS CANDIDACY is a DIFFERENT question, with a different filter and a
+    # different answer: every APPLICABLE certified anchor target event, decided by
+    # the CERTIFICATION rather than by today's events row.  The FROZEN half of every
+    # fit basis is therefore read from the immutable projection rows of every such
+    # event -- even one that is not FINAL today -- so a current-state finality edit
+    # can move a scored figure and an origin, and can never add a row to or remove a
+    # row from an earlier transform's basis.  Membership of that basis is then
+    # decided by the frozen prediction and the PE-5 rules alone.
+    candidate_events, candidate_runs, inapplicable_events = fit_basis_candidates(anchor)
+    prediction_rows = frozen_prediction_rows(
+        conn, runs=candidate_runs, events=candidate_events
+    )
 
     probability_block = probability_calibration_block(
         conn,
@@ -2345,6 +2516,7 @@ def evaluate(
         prediction_rows=prediction_rows,
         cutoffs=cutoffs,
         excluded_events=excluded_events,
+        inapplicable_candidates=inapplicable_events,
     )
     expected_value = expected_value_block(
         conn, anchor=anchor, events=final_events, xpts_runs=xpts_runs
@@ -2353,7 +2525,6 @@ def evaluate(
     assist = assist_mapping_block(
         conn,
         events=final_events,
-        xpts_runs=xpts_runs,
         prediction_rows=prediction_rows,
         cutoffs=cutoffs,
     )
@@ -2375,6 +2546,10 @@ def evaluate(
             "target_events": [int(event) for event in target_events],
             "events_evaluated": [int(event) for event in final_events],
             "events_excluded": [dict(entry) for entry in excluded_events],
+            "fit_basis_candidate_events": [int(event) for event in candidate_events],
+            "fit_basis_events_without_a_certified_xpts_v1_run": [
+                dict(entry) for entry in inapplicable_events
+            ],
             "per_event_cutoffs": {int(event): cutoffs[int(event)] for event in final_events},
             "point_in_time_evidence": {
                 "ledger_version": ledger.OUTCOME_LEDGER_VERSION,
@@ -2382,9 +2557,17 @@ def evaluate(
                 "supersession_policy_version": ledger.SUPERSESSION_POLICY_VERSION,
                 "grain": ledger.GRAIN_PLAYER_FIXTURE,
                 "basis_rule": BASIS_MEMBERSHIP_POLICY,
+                "basis_candidate_rule": FIT_BASIS_CANDIDATE_POLICY,
                 "basis_membership": (
                     "the frozen prediction rows of the anchor's own xpts_v1 runs read from "
                     "player_fixture_xpts_projections, which refuses UPDATE and DELETE at storage level"
+                ),
+                "basis_candidates": (
+                    "every APPLICABLE certified anchor target event, decided by the CERTIFICATION (the "
+                    "bundle's own xpts_v1 run) and never by today's events row; events_evaluated is the "
+                    "SCORED and ORIGIN side of the same separation and keeps the current-state FINAL "
+                    "filter, so a target event that is not final today leaves the scored figures and "
+                    "the origin set without leaving -- or entering -- any earlier basis"
                 ),
                 "basis_position": (
                     "the position persisted with each prediction row; the current players row is not "
@@ -2471,16 +2654,19 @@ def claims_block() -> dict[str, Any]:
         ),
         "fit_basis": (
             "PE-5 append-only point-in-time observation captures over the FROZEN prediction rows of the "
-            "earlier events, with the position persisted with each prediction; a row whose official "
-            "finality or capture timing cannot be proven strictly before the origin's certified cutoff "
-            "is excluded and counted, a later correction cannot rewrite an earlier transform, and no "
-            "current fixtures / player_gameweeks / players state decides historical basis membership"
+            "strictly earlier CANDIDATES -- every applicable certified anchor target event, decided by "
+            "the certification and never by today's events row -- with the position persisted with each "
+            "prediction; a row whose official finality or capture timing cannot be proven strictly "
+            "before the origin's certified cutoff is excluded and counted, a later correction cannot "
+            "rewrite an earlier transform, and no current events / fixtures / player_gameweeks / players "
+            "state decides historical basis membership"
         ),
         "scored_population": (
-            "PE-2's declared current-state population, unchanged: the scored figures cover played "
-            "fixtures with a realised row that exists now and is not a scheduled placeholder, which is "
-            "what makes them reproducible against the scoreboard.  The fit basis is a different role "
-            "and is named separately wherever both appear"
+            "PE-2's declared current-state population, unchanged: the scored figures cover the FINAL "
+            "target events and their played fixtures with a realised row that exists now and is not a "
+            "scheduled placeholder, which is what makes them reproducible against the scoreboard.  The "
+            "fit basis is a different role and is named separately wherever both appear: a current "
+            "finality edit moves the scored exclusion and the origin set, and moves no basis"
         ),
         "assist_evidence": (
             "the assist-mapping pooled evidence and its declared floors rest on ADMISSIBLE point-in-time "
@@ -2511,12 +2697,14 @@ def limitations_block() -> list[str]:
         "that flag: its bias is a description, not a causal claim.",
         "A causally fitted transform is evidence for review, not a production change: PE-8 reports it "
         "and does not re-point anything.",
-        "A fit basis is built from the FROZEN prediction rows of the earlier events plus PE-5 "
-        "append-only point-in-time captures that were official and recorded strictly before the "
-        "origin's own certified cutoff, at the position the prediction was made at; a postponed result, "
-        "a late capture or an unproven timing is excluded and counted rather than assumed known, and no "
-        "change to the current fixtures / player_gameweeks / players tables can move an earlier "
-        "transform.",
+        "A fit basis is built from the FROZEN prediction rows of the strictly earlier candidates -- "
+        "every applicable certified anchor target event, decided by the certification rather than by "
+        "today's events row -- plus PE-5 append-only point-in-time captures that were official and "
+        "recorded strictly before the origin's own certified cutoff, at the position the prediction was "
+        "made at; a postponed result, a late capture or an unproven timing is excluded and counted "
+        "rather than assumed known, and no change to the current events / fixtures / player_gameweeks / "
+        "players tables can move an earlier transform.  Scored eligibility keeps the current-state FINAL "
+        "filter, so a current finality edit moves the scored figures and the origin set and no basis.",
         "A position outside a component's declared positions earns a real zero from that component, "
         "returned before the component's own outcome column is consulted, and the row is covered (the "
         "count is reported); it is not a gap in the evidence.",

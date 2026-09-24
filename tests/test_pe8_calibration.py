@@ -41,6 +41,7 @@ from fpl_brain import defcon_calibration as defcon_cal
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import monte_carlo as mc_module
 from fpl_brain import outcome_ledger as ledger
+from fpl_brain import planning
 from fpl_brain import probability_calibration as pc
 from fpl_brain import walk_forward as wf
 from fpl_brain import walk_forward_metrics as wm
@@ -3081,6 +3082,325 @@ def test_the_basis_uses_the_prediction_time_position_not_the_current_one(tmp_pat
     )
     assert scored["outcome_unavailable"] > 0, "the SCORED population does read the current position"
     assert scored["scored"] < len(BIG_PLAYERS) * 2 * len(BIG_EVENTS)
+
+
+# ---------------------------------------------------------------------------
+# Scored-event eligibility and fit-basis membership are SEPARATE questions
+# ---------------------------------------------------------------------------
+
+
+def _withdraw_current_finality(conn: sqlite3.Connection, *events: int) -> None:
+    """Take these events' CURRENT official finality away, after the evaluation.
+
+    Exactly one thing is edited: the mutable ``events`` row that
+    :func:`planning.event_data_state` reads.  The frozen prediction rows, the PE-5
+    captures and the realised ``player_gameweeks`` rows are all left exactly as
+    they were.  That is the whole point -- a SCORED figure and the ORIGIN set read
+    this row, and a fit basis must not.
+    """
+
+    with conn:
+        conn.execute(
+            "UPDATE events SET finished=0, data_checked=0 WHERE id IN (%s)"
+            % ",".join("?" for _ in events),
+            tuple(int(event) for event in events),
+        )
+
+
+def _challenger(artifact, metric):
+    return _surface(artifact, metric)["causal_challenger"]
+
+
+def _spec_versions(challenger, *, only_origins=None):
+    """Every origin's fitted version, optionally restricted to a set of origins."""
+
+    return sorted(
+        {
+            entry["fit"]["spec"]["version"]
+            for entry in challenger["origins"]
+            if entry["fit"]["spec"] is not None
+            and (only_origins is None or int(entry["origin_event"]) in only_origins)
+        }
+    )
+
+
+def _admissible_coefficients(origins, *, only_events=None):
+    """The coefficients the assist decision counts, from an artifact's own origins."""
+
+    return sorted(
+        {
+            float(entry["provenance"]["coefficient"])
+            for entry in origins
+            if entry["fit"]["available"]
+            and entry["fit"]["in_bounds"]
+            and (only_events is None or int(entry["origin_event"]) in only_events)
+        }
+    )
+
+
+def test_a_current_finality_edit_moves_the_scored_exclusion_and_no_fit_basis(tmp_path):
+    """Eligibility for a SCORED figure and membership of a FIT BASIS are separate.
+
+    Events 5 and 6 lose their CURRENT official finality after the evaluation, with
+    nothing else touched.  The SCORED side must move -- the two events leave the
+    scored population, the evaluated-event list and the origin set, and every
+    scored figure loses exactly their rows -- while the FIT side must not: every
+    surviving origin's basis digest, observation count, fitted version, spec and
+    provenance is byte-identical, because candidacy came from the CERTIFICATION and
+    admission came from PE-5, and neither ever read the current finality flag.
+    """
+
+    conn, built = _warm_world(tmp_path, name="pe8-finality")
+    try:
+        reference = _evaluate(conn, built)
+        _withdraw_current_finality(conn, 5, 6)
+        mutated = _evaluate(conn, built)
+    finally:
+        conn.close()
+
+    all_events = [int(event) for event in BIG_EVENTS]
+    withdrawn = (5, 6)
+    surviving = [event for event in all_events if event not in withdrawn]
+    rows_per_event = len(BIG_PLAYERS) * 2
+
+    # (1) The SCORED exclusion really changed: the two events are no longer
+    #     evaluable, they are reported with the state that excluded them, and every
+    #     scored figure lost exactly their rows.
+    assert reference["identity"]["events_evaluated"] == all_events
+    assert mutated["identity"]["events_evaluated"] == surviving
+    assert [entry["event"] for entry in mutated["identity"]["events_excluded"]] == list(withdrawn)
+    for entry in mutated["identity"]["events_excluded"]:
+        assert "events.finished=0" in entry["basis"]
+        assert "events.data_checked=0" in entry["basis"]
+    for metric in SURFACES:
+        before = _surface(reference, metric)["population"]
+        after = _surface(mutated, metric)["population"]
+        assert after["scored"] == before["scored"] - len(withdrawn) * rows_per_event, metric
+        assert after["population_digest"] != before["population_digest"], metric
+        assert [entry["event"] for entry in after["excluded_events"]] == list(withdrawn), metric
+    assert ce.artifact_digest(mutated) != ce.artifact_digest(reference)
+
+    # (2) ... and NOT ONE surviving origin's transform moved.  The candidate pool is
+    #     read from the certification, so withdrawing an event's current finality
+    #     cannot remove its frozen rows from a later origin's basis.
+    compared = 0
+    for metric in SURFACES:
+        before_challenger = _challenger(reference, metric)
+        after_challenger = _challenger(mutated, metric)
+        assert after_challenger["constructed"] == before_challenger["constructed"], metric
+        assert (
+            _surface(mutated, metric)["diagnosis"]["status"]
+            == _surface(reference, metric)["diagnosis"]["status"]
+        ), metric
+        if not before_challenger["constructed"]:
+            assert after_challenger["status"] == ce.STATUS_NOT_FITTED, metric
+            assert after_challenger["origins"] == []
+            continue
+        compared += 1
+        assert after_challenger["basis_evidence"]["candidate_events"] == all_events, metric
+        assert [entry["origin_event"] for entry in after_challenger["origins"]] == surviving, metric
+        before_by_origin = {
+            int(entry["origin_event"]): entry for entry in before_challenger["origins"]
+        }
+        assert set(before_by_origin) == set(all_events)
+        for entry in after_challenger["origins"]:
+            before = before_by_origin[int(entry["origin_event"])]
+            assert entry["cutoff"] == before["cutoff"], metric
+            assert entry["fit"]["basis"] == before["fit"]["basis"], (
+                f"{metric}: a current finality edit moved origin {entry['origin_event']}'s basis"
+            )
+            assert entry["fit"]["spec"] == before["fit"]["spec"], metric
+            assert entry.get("provenance") == before.get("provenance"), metric
+            assert entry["basis_excluded_by_reason"] == before["basis_excluded_by_reason"], metric
+            assert entry["fit"]["basis"]["digest"] == before["fit"]["basis"]["digest"], metric
+        # The versions in force are the same versions, minus the origin that is no
+        # longer scored: not one fitted version was re-derived or redefined.
+        assert after_challenger["versions_in_force"] == _spec_versions(
+            before_challenger, only_origins=set(surviving)
+        ), metric
+    assert compared >= 3, "the miscalibrated surfaces must still fit after the edit"
+
+    # The strongest form of the claim: the withdrawn events' frozen rows are still
+    # ADMITTED at the first surviving origin, so their rows never left a basis.
+    first_surviving = next(
+        entry for entry in _challenger(mutated, "BRIER_P_START")["origins"]
+        if int(entry["origin_event"]) == 7
+    )
+    assert first_surviving["fit"]["basis"]["events"] == [5, 6]
+    assert first_surviving["fit"]["basis"]["observations"] == 2 * rows_per_event
+    assert first_surviving["fit"]["basis"]["strictly_before_origin"] is True
+
+    # The separation is carried on the artifact by token, so a reader never has to
+    # infer which population moved.
+    assert mutated["identity"]["fit_basis_candidate_events"] == all_events
+    assert reference["identity"]["fit_basis_candidate_events"] == all_events
+    assert mutated["identity"]["fit_basis_events_without_a_certified_xpts_v1_run"] == []
+    candidates = mutated["probability_calibration"]["fit_basis_candidates"]
+    assert candidates["candidate_events"] == all_events
+    assert candidates["origin_events"] == surviving
+    assert candidates["policy"] == ce.FIT_BASIS_CANDIDATE_POLICY
+
+    # (3) The same separation on the assist mapping's POOLED evidence: the admissible
+    #     pool, its totals and the decision it supports are unchanged, because the
+    #     withdrawn events' rows are still admitted at a surviving origin.
+    before_assist = reference["assist_mapping"]
+    after_assist = mutated["assist_mapping"]
+    before_pooled = before_assist["pooled_evidence"]
+    after_pooled = after_assist["pooled_evidence"]
+    assert [entry["origin_event"] for entry in before_assist["origins"]] == all_events
+    assert [entry["origin_event"] for entry in after_assist["origins"]] == surviving
+    assert after_assist["basis_evidence"]["candidate_events"] == all_events
+    assert after_pooled["observations"] == before_pooled["observations"]
+    assert after_pooled["events"] == before_pooled["events"]
+    assert after_pooled["expected_assists_total"] == before_pooled["expected_assists_total"]
+    assert after_pooled["realised_assists_total"] == before_pooled["realised_assists_total"]
+    assert after_pooled["excluded_by_reason"] == before_pooled["excluded_by_reason"]
+    assert after_pooled["sample_interpretation"] == sb.SAMPLE_DESCRIPTIVE_ONLY
+    before_identities = _assist_identities(reference)
+    after_identities = _assist_identities(mutated)
+    assert {origin: after_identities[origin] for origin in surviving} == {
+        origin: before_identities[origin] for origin in surviving
+    }, "a current finality edit changed an earlier fitted assist coefficient"
+    # The decision is the same decision the same evidence supported, minus the
+    # origins that stopped being scored -- it is not rebuilt on different evidence.
+    assert after_assist["decision"]["outcome"] == before_assist["decision"]["outcome"]
+    assert after_assist["decision"]["promotion_performed"] is False
+    assert after_assist["decision"]["coefficient_after"] == 1.0
+    assert after_assist["decision"]["assist_mapping_calibrated_after"] is False
+    assert after_assist["decision"]["candidate_coefficients"] == _admissible_coefficients(
+        before_assist["origins"], only_events=set(surviving)
+    )
+    assert after_assist["decision"]["evidence"]["observations"] == after_pooled["observations"]
+    assert after_assist["decision"]["evidence"]["events"] == after_pooled["events"]
+
+
+def _candidate_pool(conn, built, *, origins, metric="BRIER_P_START"):
+    """The production candidate pool and one surface's basis over chosen origins.
+
+    Built the way :func:`calibration_evaluation.evaluate` builds it -- candidacy
+    from the certification, admission through PE-5 -- so the two worlds can be
+    compared row for row rather than by count.
+    """
+
+    anchor = wf.discover_certified_anchor(conn, built["artifact"], events=built["events"])
+    candidates, runs, inapplicable = ce.fit_basis_candidates(anchor)
+    rows = ce.frozen_prediction_rows(conn, runs=runs, events=candidates)
+    cutoffs = {
+        int(event): str(built["artifact"]["certified_bundles"][str(event)]["cutoff"])
+        for event in origins
+    }
+    definition = next(
+        entry for entry in sb.PROBABILITY_METRICS if entry.metric == metric
+    )
+    basis, excluded = ce.point_in_time_basis(
+        conn=conn,
+        prediction_rows=rows,
+        cutoffs=cutoffs,
+        definition=definition,
+        origins=origins,
+    )
+    observed = {
+        int(origin): (
+            tuple(
+                (int(entry.event), entry.key, float(entry.probability), float(entry.outcome))
+                for entry in basis[origin]
+            ),
+            {str(key): int(value) for key, value in sorted(excluded[origin].items())},
+        )
+        for origin in basis
+    }
+    return candidates, inapplicable, observed
+
+
+def test_the_candidate_pool_is_the_certifications_not_the_current_finality(tmp_path):
+    """Candidacy is decided by the CERTIFICATION, so a finality edit cannot touch it.
+
+    Event 5 stops being officially FINAL today.  Its frozen prediction rows are
+    still candidates -- they are what the event was PREDICTED under -- and the basis
+    built for the surviving origins from that pool is byte-identical before and
+    after the edit, down to every admitted row.
+    """
+
+    conn, built = _warm_world(tmp_path, name="pe8-candidates")
+    rows_per_event = len(BIG_PLAYERS) * 2
+    try:
+        before_candidates, before_inapplicable, before_basis = _candidate_pool(
+            conn, built, origins=[7, 8]
+        )
+        anchor = wf.discover_certified_anchor(conn, built["artifact"], events=built["events"])
+        assert anchor.for_event(5).run_id("xpts_v1") is not None
+        assert anchor.for_event(5).outcome_state == planning.EVENT_STATE_FINAL
+
+        _withdraw_current_finality(conn, 5)
+        after_state, _reasons = planning.event_data_state(conn, 5)
+        after_candidates, after_inapplicable, after_basis = _candidate_pool(
+            conn, built, origins=[7, 8]
+        )
+        # The event is NOT final any more, and the artifact says so on the scored
+        # side while the candidate side is unmoved.
+        artifact = _evaluate(conn, built)
+        frozen_rows = ce.frozen_prediction_rows(
+            conn,
+            runs={event: built["xpts_runs"][event] for event in built["events"]},
+            events=list(built["events"]),
+        )
+    finally:
+        conn.close()
+
+    assert before_candidates == [int(event) for event in BIG_EVENTS]
+    assert after_state != planning.EVENT_STATE_FINAL, (
+        "the current finality edit really did take effect"
+    )
+    assert after_candidates == before_candidates, (
+        "candidacy followed the current events row instead of the certification"
+    )
+    assert before_inapplicable == [] and after_inapplicable == []
+    assert frozen_rows[5], "the withdrawn event's frozen prediction rows are still readable"
+    assert after_basis == before_basis, (
+        "a current finality edit changed the rows a surviving origin's basis admitted"
+    )
+    # The basis is really populated, so the invariance above is not vacuous.
+    assert before_basis[7][0] and len(before_basis[7][0]) == 2 * rows_per_event
+    assert before_basis[7][1] == {}
+
+    assert artifact["identity"]["events_evaluated"] == [
+        int(event) for event in BIG_EVENTS if int(event) != 5
+    ]
+    assert [entry["event"] for entry in artifact["identity"]["events_excluded"]] == [5]
+    assert artifact["identity"]["fit_basis_candidate_events"] == [
+        int(event) for event in BIG_EVENTS
+    ]
+
+
+def test_a_target_event_without_a_certified_xpts_run_is_reported_not_silently_dropped(tmp_path):
+    """"Applicable" is the certification's word, and an inapplicable event is named.
+
+    Event 6 is still officially FINAL and still scored, but its certified bundle
+    names no ``xpts_v1`` run, so it has no frozen prediction rows to contribute to a
+    fit basis.  It is reported with its reason rather than quietly treated as an
+    empty candidate or dropped from the pool without a trace.
+    """
+
+    conn = connect_database(tmp_path / "pe8-no-run.db")
+    try:
+        built = _small_world(conn)
+        bundle = built["artifact"]["certified_bundles"]["6"]
+        bundle["runs"].pop("xpts_v1")
+        bundle["model_versions"].pop("xpts_v1", None)
+        artifact = ce.evaluate(conn, artifact=built["artifact"], events=[5, 6])
+    finally:
+        conn.close()
+
+    assert artifact["identity"]["target_events"] == [5, 6]
+    assert artifact["identity"]["events_evaluated"] == [5, 6], "finality is untouched: still scored"
+    assert artifact["identity"]["fit_basis_candidate_events"] == [5]
+    inapplicable = artifact["identity"]["fit_basis_events_without_a_certified_xpts_v1_run"]
+    assert [entry["event"] for entry in inapplicable] == [6]
+    assert "no xpts_v1 run" in inapplicable[0]["reason"]
+    candidates = artifact["probability_calibration"]["fit_basis_candidates"]
+    assert candidates["candidate_events"] == [5]
+    assert candidates["origin_events"] == [5, 6]
+    assert candidates["events_without_a_certified_xpts_v1_run"] == [dict(entry) for entry in inapplicable]
 
 
 def test_the_out_of_scope_surfaces_are_declared_rather_than_silently_skipped(world):
