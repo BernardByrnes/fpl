@@ -21,7 +21,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from . import manager_lineup, monte_carlo, transfer_state as ts
+from . import certified_bundle, manager_lineup, monte_carlo, transfer_state as ts
 from .season_rules import CHIP_NAME_KEYWORDS
 
 PHASE7B_VERSION = "route_comparator_v7b_1.0.0"
@@ -105,8 +105,101 @@ class EventBundle:
     simulations: int = 2000
     seed: int = 20260911
     planning_cutoff: str | None = None
+    #: The DATA snapshot identity this bundle was built from (the immutable
+    #: execution snapshot captured at ``planning_cutoff``), never a code fingerprint.
     source_snapshot_sha256: str | None = None
+    #: The CODE identity the certified runs came from.
+    code_snapshot_sha256: str | None = None
+    planning_context_hash: str | None = None
+    #: The model version each family's run carries, as DECLARED by the producer.
+    #: ``certified_bundle.assert_event_bundle_certified`` checks every one of them
+    #: against the version recorded on the run's own row.
     model_versions: Mapping[str, str] = field(default_factory=dict)
+    #: The canonical identity of the CERTIFIED bundle these exact run ids came from.
+    #: A bundle without it cannot be loaded: see
+    #: ``certified_bundle.assert_event_bundle_certified``.
+    certified_bundle_identity: str | None = None
+
+    def certified_runs(self) -> dict[str, int]:
+        """The bundle's exact run ids under their model-family names."""
+
+        return {
+            "minutes_v1": int(self.minutes_run_id),
+            "team_strength_v1": int(self.team_run_id),
+            "player_rates_v1": int(self.rate_run_id),
+            "xpts_v1": int(self.xpts_run_id),
+            **(
+                {}
+                if self.mc_run_id is None
+                else {"monte_carlo_v1": int(self.mc_run_id)}
+            ),
+        }
+
+    def as_identity_payload(self) -> dict:
+        """The canonical identity payload of this bundle, in its persisted shape."""
+
+        from . import certified_bundle as cb
+
+        return cb.bundle_identity_payload(
+            event=int(self.event),
+            cutoff=self.planning_cutoff,
+            runs=self.certified_runs(),
+            model_versions=self.model_versions,
+            code_snapshot_sha256=self.code_snapshot_sha256,
+            data_snapshot_sha256=self.source_snapshot_sha256,
+            planning_context_hash=self.planning_context_hash,
+        )
+
+
+def certified_event_bundle(
+    *,
+    event: int,
+    runs: Mapping[str, int],
+    cutoff: str,
+    model_versions: Mapping[str, str],
+    simulations: int = 2000,
+    seed: int = 20260911,
+    code_snapshot_sha256: str | None = None,
+    data_snapshot_sha256: str | None = None,
+    planning_context_hash: str | None = None,
+) -> EventBundle:
+    """Build an ``EventBundle`` that DECLARES its certified provenance.
+
+    The ONE constructor a producer may use to hand exact certified run ids to a
+    predictive loader: the identity is computed by the single shared algorithm, and
+    the declared model versions are the ones the certification recorded.  There is
+    deliberately no convenience default that would let a bundle reach the loader
+    without them.
+    """
+
+    from . import certified_bundle as cb
+
+    resolved_versions = {str(family): str(version) for family, version in model_versions.items()}
+    runs = {str(family): int(run_id) for family, run_id in runs.items()}
+    return EventBundle(
+        event=int(event),
+        minutes_run_id=runs["minutes_v1"],
+        team_run_id=runs["team_strength_v1"],
+        rate_run_id=runs["player_rates_v1"],
+        xpts_run_id=runs["xpts_v1"],
+        mc_run_id=runs.get("monte_carlo_v1"),
+        simulations=int(simulations),
+        seed=int(seed),
+        planning_cutoff=str(cutoff),
+        source_snapshot_sha256=data_snapshot_sha256,
+        code_snapshot_sha256=code_snapshot_sha256,
+        planning_context_hash=planning_context_hash,
+        model_versions=resolved_versions,
+        certified_bundle_identity=cb.certified_bundle_identity_for(
+            event=int(event),
+            cutoff=str(cutoff),
+            runs=runs,
+            model_versions=resolved_versions,
+            code_snapshot_sha256=code_snapshot_sha256,
+            data_snapshot_sha256=data_snapshot_sha256,
+            planning_context_hash=planning_context_hash,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +397,11 @@ def compare_routes(
             if conn is None:
                 raise RouteSpecError("compare_routes needs a connection or a world_provider")
             bundle = bundles[event]
+            # The comparator's own DB branch is a predictive-data loader too, so it
+            # crosses the SAME certification boundary: a bundle that cannot declare
+            # its certified provenance (and whose declared versions disagree with the
+            # runs it names) is refused rather than simulated.
+            certified_bundle.assert_event_bundle_certified(conn, bundle, event=int(event))
             fixtures = monte_carlo.load_fixture_inputs(
                 conn, event=event, xpts_run_id=int(bundle.xpts_run_id),
                 minutes_run_id=int(bundle.minutes_run_id), team_run_id=int(bundle.team_run_id),

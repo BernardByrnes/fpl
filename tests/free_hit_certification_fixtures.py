@@ -33,6 +33,11 @@ RUNS: dict[str, int] = {
     "minutes_v1": 101, "team_strength_v1": 102,
     "player_rates_v1": 103, "xpts_v1": 104,
 }
+#: How far apart two events' run ids sit.  Ids are globally unique in the real
+#: table, so a per-event offset of ONE would make event 6's minutes run id equal
+#: event 5's team run id -- two families claiming one row, which no real
+#: certification can produce.
+RUN_ID_STRIDE = 10
 MODEL_VERSIONS: dict[str, str] = {
     "xpts_v1": "xpts_v1.0.0", "minutes_v1": "minutes_v1.6.0",
     "team_strength_v1": "team_v1.0.0", "player_rates_v1": "rates_v6.1.0",
@@ -48,8 +53,39 @@ def runs_for(event: int) -> dict[str, int]:
     identity was stamped onto H2-H4.
     """
 
-    offset = int(event) - 5
+    offset = (int(event) - 5) * RUN_ID_STRIDE
     return {family: run_id + offset for family, run_id in RUNS.items()}
+
+
+def seed_certified_runs(
+    conn: Any, events: Sequence[int] = (5, 6, 7, 8), *, generated_at: str | None = None
+) -> dict[int, dict[str, int]]:
+    """Insert the ``projection_runs`` rows this fixture's certification DECLARES.
+
+    A certified run id is not merely a number in an artifact: it names a row in
+    ``projection_runs``, which is where a loader reads the model version the run was
+    built from -- and an absent row is a refusal, never an empty legacy run.  A
+    fixture database that declares run ids it does not carry is therefore not a
+    certified generation, so the rows are inserted here with the SAME versions,
+    cutoff and code identity the artifact declares.
+    """
+
+    stamped = str(generated_at or CUTOFF)
+    runs_by_event: dict[int, dict[str, int]] = {}
+    for event in events:
+        runs = runs_for(int(event))
+        for family, run_id in runs.items():
+            conn.execute(
+                "INSERT INTO projection_runs(id, model_family, model_version, generated_at,"
+                " planning_event, planning_context_hash, data_cutoff, status, source_snapshot_sha256)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    int(run_id), str(family), str(MODEL_VERSIONS[family]), stamped, int(event),
+                    CONTEXT_HASH, CUTOFF, "complete", CODE_SNAPSHOT,
+                ),
+            )
+        runs_by_event[int(event)] = {family: int(run_id) for family, run_id in runs.items()}
+    return runs_by_event
 
 
 def bundle(

@@ -144,6 +144,10 @@ def _seed(conn, *, prices: dict[int, int] | None = None, bank: int = 20, ft: int
             source="user_confirmed_free_hit_test_state", captured_at=CAPTURED_AT,
             event_start_free_transfers=int(ft),
         )
+        # The runs this fixture's certification DECLARES must exist: a loader reads the
+        # model version off the run's own row, so a database that names certified run
+        # ids it does not carry is not a certified generation.
+        cf.seed_certified_runs(conn)
 
 
 @pytest.fixture

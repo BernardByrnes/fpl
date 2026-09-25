@@ -822,15 +822,36 @@ def world_cache_key(*, event, bundle, config, union_ids) -> str:
 
 
 def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Path | None = None,
-                       world_provider=None):
+                       world_provider=None, certification=None):
+    """Load one event's world matrix from its CERTIFIED bundle.
+
+    The bundle is the authorisation: every run id it names must come from a
+    certification, and it must declare the model version of every family it uses.
+    ``certified_bundle.assert_event_bundle_certified`` proves that before any
+    predictive data is read -- the declared identity must bind the bundle's own run
+    ids, and each declared version must equal the version recorded on that run's own
+    row -- so a hand-assembled "latest run per family" bundle is REFUSED here rather
+    than silently simulated.  When a certification artifact is supplied, the bundle
+    must additionally be the one that artifact recorded.
+    """
+
+    from . import certified_bundle as cb
+
     if world_provider is not None:
+        # An injected world matrix is not read from a prediction run, so there is no
+        # certified run id to check here; the matrix is stamped ``injected`` so its
+        # provenance is declared rather than implied.
         matrix = world_provider(event, union_ids)
         _stamp_matrix_identity(matrix, f"injected:{int(event)}:{int(config.search_draws)}:{int(config.seed)}"
                                        f":{len(union_ids)}")
         return matrix, {"source": "injected"}
     from . import monte_carlo, manager_worlds
 
+    # Every remaining path obtains the world from this bundle's run ids -- including a
+    # cache hit, whose key is those ids -- so the bundle must prove it is the certified
+    # one before it is used.
     bundle = bundles[int(event)]
+    cb.assert_event_bundle_certified(conn, bundle, event=int(event), certification=certification)
     key = world_cache_key(event=int(event), bundle=bundle, config=config, union_ids=union_ids)
     if cache_dir is not None:
         path = Path(cache_dir) / f"{key}.json"

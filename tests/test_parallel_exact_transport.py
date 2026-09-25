@@ -30,11 +30,13 @@ from fpl_brain import manager_worlds as mw
 from fpl_brain import parallel_exact as px
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _config, _scenario, _universe
+from test_route_optimizer import _certified_bundle, _config, _scenario, _universe
 from test_transfer_state import POSITION, SQUAD_IDS
 
-BUNDLE = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3,
-                        xpts_run_id=4, mc_run_id=5)
+#: A bundle that DECLARES its certified provenance.  ``build_event_worlds`` refuses a
+#: bundle that cannot prove which certified run ids it came from, so the fixture is
+#: built the way a producer builds one, naming the model version of every family.
+BUNDLE = _certified_bundle(4)
 WORLDS = 6
 
 #: Every unlisted player scores the fixture's flat default.
@@ -380,9 +382,7 @@ def test_optimize_parallel_equals_sequential_over_real_file_transport(tmp_path):
     for event in config.events:
         _write_cache_file(tmp_path, union, config, event=int(event))
 
-    bundles = {int(event): rc.EventBundle(event=int(event), minutes_run_id=1, team_run_id=2,
-                                          rate_run_id=3, xpts_run_id=4, mc_run_id=5)
-               for event in config.events}
+    bundles = {int(event): _certified_bundle(int(event)) for event in config.events}
     scenario = _scenario()
 
     def _run(workers):

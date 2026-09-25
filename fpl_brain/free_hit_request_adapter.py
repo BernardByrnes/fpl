@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from . import certified_bundle as cb
 from . import chip_decision as cd
 from . import chip_free_hit as fh
 from .free_hit_route import FreeHitRouteError
@@ -547,17 +548,82 @@ class _CertifiedRunIds:
     """The four upstream run ids a certified bundle commits to.
 
     ``route_optimizer.world_cache_key`` names them ``minutes/team/rate/xpts``; the
-    certification schema stores the same runs under their model-family names.
+    certification schema stores the same runs under their model-family names.  The
+    certified IDENTITY and the recorded model VERSIONS are carried too, because the
+    canonical loader refuses any bundle that cannot declare which certified bundle
+    its run ids came from and which version each family's run carries.
     """
 
-    __slots__ = ("event", "minutes_run_id", "team_run_id", "rate_run_id", "xpts_run_id")
+    __slots__ = ("event", "minutes_run_id", "team_run_id", "rate_run_id", "xpts_run_id",
+                 "mc_run_id", "planning_cutoff", "model_versions", "certified_bundle_identity",
+                 "source_snapshot_sha256", "code_snapshot_sha256", "planning_context_hash")
 
-    def __init__(self, event: int, runs: Mapping[str, Any]) -> None:
+    def __init__(self, event: int, row: Mapping[str, Any]) -> None:
+        # Accepts a persisted bundle row (which carries the provenance) as well as a
+        # bare family -> run-id mapping, which carries none: the loader refuses the
+        # latter, and there is no default that would invent the missing provenance.
+        if isinstance(row.get("runs"), Mapping):
+            record: Mapping[str, Any] = row
+            runs = dict(row["runs"])
+        else:
+            record = {}
+            runs = dict(row)
         self.event = int(event)
         self.minutes_run_id = int(runs["minutes_v1"])
         self.team_run_id = int(runs["team_strength_v1"])
         self.rate_run_id = int(runs["player_rates_v1"])
         self.xpts_run_id = int(runs["xpts_v1"])
+        self.mc_run_id = None if runs.get("monte_carlo_v1") is None else int(runs["monte_carlo_v1"])
+        self.planning_cutoff = record.get("cutoff")
+        self.code_snapshot_sha256 = record.get("code_snapshot_sha256")
+        self.source_snapshot_sha256 = record.get("data_snapshot_sha256")
+        self.planning_context_hash = record.get("planning_context_hash")
+        self.model_versions = {
+            str(family): str(version)
+            for family, version in (record.get("model_versions") or {}).items()
+        }
+        self.certified_bundle_identity = str(record.get("certified_bundle_identity") or "") or (
+            cb.certified_bundle_identity_for(
+                event=int(event),
+                cutoff=self.planning_cutoff,
+                runs=self.certified_runs,
+                model_versions=self.model_versions,
+                code_snapshot_sha256=self.code_snapshot_sha256,
+                data_snapshot_sha256=self.source_snapshot_sha256,
+                planning_context_hash=self.planning_context_hash,
+            )
+        )
+
+    @property
+    def certified_runs(self) -> dict[str, int]:
+        """The exact run ids under their model-family names.
+
+        The Monte Carlo run is included when the bundle row declares one: the
+        certified identity covers EVERY family the bundle names, so omitting a
+        declared family here would compute a different identity from the one the
+        certification minted.
+        """
+
+        runs = {
+            "minutes_v1": int(self.minutes_run_id),
+            "team_strength_v1": int(self.team_run_id),
+            "player_rates_v1": int(self.rate_run_id),
+            "xpts_v1": int(self.xpts_run_id),
+        }
+        if self.mc_run_id is not None:
+            runs["monte_carlo_v1"] = int(self.mc_run_id)
+        return runs
+
+    def as_identity_payload(self) -> dict:
+        return cb.bundle_identity_payload(
+            event=int(self.event),
+            cutoff=self.planning_cutoff,
+            runs=self.certified_runs,
+            model_versions=self.model_versions,
+            code_snapshot_sha256=self.code_snapshot_sha256,
+            data_snapshot_sha256=self.source_snapshot_sha256,
+            planning_context_hash=self.planning_context_hash,
+        )
 
 
 def certified_event_bundles(authority: Any) -> dict[int, _CertifiedRunIds]:
@@ -574,7 +640,7 @@ def certified_event_bundles(authority: Any) -> dict[int, _CertifiedRunIds]:
                 f"omits run(s) {missing}; the numeric matrix cannot be loaded",
                 reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
             )
-        bundles[int(event)] = _CertifiedRunIds(int(event), runs)
+        bundles[int(event)] = _CertifiedRunIds(int(event), row)
     return bundles
 
 

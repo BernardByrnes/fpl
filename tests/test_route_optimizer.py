@@ -92,6 +92,23 @@ def _optimize(universe, state, meta, **over):
                        config=_config(**over), world_provider=_provider())
 
 
+def _certified_bundle(event=4, **over):
+    """A bundle that declares the certified provenance the loader requires.
+
+    ``build_event_worlds`` refuses a bundle that cannot prove which certified run
+    ids it came from, so the cache-path tests must construct one the way a producer
+    does: through ``route_comparator.certified_event_bundle``, with the model version
+    of every family it names.
+    """
+
+    runs = {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
+            "monte_carlo_v1": 5}
+    return rc.certified_event_bundle(
+        event=int(event), runs=runs, cutoff="2026-09-11T10:16:51Z",
+        model_versions={family: f"{family}_test" for family in runs}, **over,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Candidate pool + rescue
 # ---------------------------------------------------------------------------
@@ -591,7 +608,7 @@ def test_state_identity_still_separates_ft_bank_and_basis():
 def test_world_cache_hit_and_key_sensitivity(tmp_path):
     universe, state, meta = _universe()
     union = list(SQUAD_IDS)
-    bundle = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3, xpts_run_id=4, mc_run_id=5)
+    bundle = _certified_bundle(4)
     config = _config()
     key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union)
     payload = {"worlds": 2, "player_ids": [int(p) for p in union],
@@ -687,7 +704,7 @@ def test_a_cache_entry_without_the_bonus_block_fails_closed(tmp_path):
 
     universe, state, meta = _universe()
     union = list(SQUAD_IDS)
-    bundle = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3, xpts_run_id=4, mc_run_id=5)
+    bundle = _certified_bundle(4)
     config = _config()
     key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union)
     payload = {"worlds": 2, "player_ids": [int(p) for p in union],

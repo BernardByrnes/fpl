@@ -156,6 +156,8 @@ def build_certification_artifact(
     manager_state: Mapping[str, Any],
     model_versions: Sequence[tuple[str, str]],
     execution_started_at: Any,
+    required_versions: Mapping[str, str] | None = None,
+    code_snapshot_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Construct the authoritative certification artifact payload.
 
@@ -164,10 +166,24 @@ def build_certification_artifact(
     through ``four_gw_decision.load_certification_artifact``.  ``decision_search_permitted``
     is deliberately seeded ``None`` and filled in only by the computed authorisation
     step, so it can never be a flag that is merely asserted.
+
+    ``required_model_versions`` is the ONE declared source of the model versions a
+    certification requires (``certified_bundle.declared_required_versions``).  It is
+    recorded on the artifact so the consumer pins the same versions the producer
+    did, and a run from an unexpected version cannot certify.
     """
 
     import hashlib
 
+    declared_versions = {
+        str(family): str(version)
+        for family, version in (required_versions or certified_bundle.declared_required_versions()).items()
+    }
+    # ONE code fingerprint for the artifact AND for every certified bundle payload,
+    # computed once: the consumer recomputes each event's bundle identity from the
+    # payload's OWN declared snapshots, so if the artifact and the payload disagreed
+    # the certified identity could not round-trip.
+    code_snapshot = code_snapshot_sha256 or analytics.source_snapshot_sha256()
     return {
         "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
         "execution_run_uuid": run_uuid,
@@ -177,12 +193,16 @@ def build_certification_artifact(
         "data_snapshot_created_at": snapshot.created_at,
         "data_snapshot_path": snapshot.path,
         "data_snapshot_source_db_identity": snapshot.source_db_identity,
-        "code_snapshot_sha256": analytics.source_snapshot_sha256(),
+        "code_snapshot_sha256": code_snapshot,
         # Which code identity covered this certification, and the exact bytes of the
         # entry point whose wiring carries the history-completeness gate.  A v2
         # consumer refuses the artifact unless it declares the entry point covered,
         # so a certification minted without the gate cannot pass as current.
         "certification_wiring": fg.certification_wiring_identity(),
+        # PE-9: the model versions this certification REQUIRES.  Declared here, from
+        # the one source, so the bundle can never be certified at a version nobody
+        # pinned.
+        "required_model_versions": declared_versions,
         "certified_bundles": certified,
         "certified_bundle_identity": bundle_identity,
         "four_gw_certification_identity": "sha256:" + hashlib.sha256(
@@ -402,6 +422,11 @@ def main(argv: list[str] | None = None) -> int:
     # record the certified bundle identity for the decision engine to consume.
     certified: dict[int, dict] = {}
     bundle_identity: dict[int, str] = {}
+    required_versions = certified_bundle.declared_required_versions()
+    # ONE code fingerprint for the artifact and for every bundle payload (the same
+    # value ``build_certification_artifact`` records), so the certified identity a
+    # consumer recomputes from the payload matches the one recorded here.
+    certification_code_snapshot = analytics.source_snapshot_sha256()
     try:
         for event in events:
             record = per_event.get(str(event)) or {}
@@ -420,7 +445,17 @@ def main(argv: list[str] | None = None) -> int:
             for row in rows:
                 runs.setdefault(str(row["model_family"]), int(row["id"]))
             bundle = certified_bundle.certified_bundle_from_explicit_ids(
-                conn, event=event, cutoff=effective_cutoff, runs=runs
+                conn, event=event, cutoff=effective_cutoff, runs=runs,
+                # PE-9: every certification call site supplies the required model
+                # versions from the ONE declared source, so a run from an unexpected
+                # version is refused with UNSUPPORTED_MODEL_VERSION instead of
+                # certifying silently.
+                required_versions=required_versions,
+                data_snapshot_sha256=snapshot.data_snapshot_sha256,
+                # The code identity is recorded ON the bundle payload as well as on
+                # the artifact, so the identity the consumer recomputes from the
+                # stored payload is exactly the one minted here.
+                code_snapshot_sha256=certification_code_snapshot,
             )
             certified[str(event)] = bundle.as_dict()
             bundle_identity[str(event)] = bundle.bundle_identity()
@@ -479,6 +514,8 @@ def main(argv: list[str] | None = None) -> int:
         manager_state=manager_state,
         model_versions=model_versions,
         execution_started_at=run_identity.started_at,
+        required_versions=required_versions,
+        code_snapshot_sha256=certification_code_snapshot,
     )
     # Authorisation is computed, never asserted.
     try:
@@ -519,6 +556,35 @@ def main(argv: list[str] | None = None) -> int:
     artifact["decision_search_permitted_reasons"] = permit_reasons
     artifact["decision_search_horizon_status"] = horizon_status
     artifact["history_completeness"] = history_audit
+    # PE-9: certify the horizon AS A HORIZON, from THIS one artifact, and record the
+    # per-bundle states and the phase terminal state.  No calibration evidence exists
+    # at mint time (PE-8 consumes this artifact), so the calibration claim is not made
+    # here -- it is made, or declined, at the decision boundary where the evidence is
+    # available.  That is a state, never a refusal and never a pass.
+    try:
+        pe9 = certified_bundle.certify_decision_horizon(
+            conn,
+            certification=artifact,
+            events=events,
+            cutoff=effective_cutoff,
+            required_versions=required_versions,
+        )
+    except certified_bundle.CertificationRefused as failure:
+        document["status"] = "FAILED"
+        document["certification_refusal"] = f"{failure.token}: {'; '.join(failure.reasons)}"
+        Path(args.out).write_text(
+            json.dumps(document, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"
+        )
+        print(f"certification refused: {failure}", file=sys.stderr)
+        source_conn.close()
+        conn.close()
+        return 2
+    pe9["certification_result_identity"] = certified_bundle.certification_result_identity(pe9)
+    artifact["pe9_certification"] = pe9
+    print(
+        f"PE-9 certification: horizon={pe9['horizon_state']} phase={pe9['phase_terminal_state']} "
+        f"identity={pe9['certification_result_identity'][:24]}…"
+    )
     artifact_path = OUT_DIR / "certification_artifact.json"
     artifact_path.write_text(
         json.dumps(artifact, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"
