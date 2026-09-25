@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import certified_bundle, manager_lineup, monte_carlo, transfer_state as ts
 from .season_rules import CHIP_NAME_KEYWORDS
@@ -371,12 +371,41 @@ def compare_routes(
     scenario: PriceScenario,
     player_meta: Mapping[int, ts.PlayerMeta],
     conn=None,
-    world_provider: Callable[[int], Mapping[str, Any]] | None = None,
+    non_production_worlds: Any | None = None,
+    certification: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
     simulations: int = 2000,
     seed: int = 20260911,
     planning_cutoff: str | None = None,
 ) -> dict[str, Any]:
-    """Evaluate every explicit route in shared per-event football worlds."""
+    """Evaluate every explicit route in shared per-event football worlds.
+
+    Predictive data enters through exactly two declared doors, and the comparator
+    keeps the SAME boundary as the optimizer's loader:
+
+    * the CERTIFIED door, which requires a validation artifact.  Each event's
+      bundle must be the one the artifact recorded -- ``certified_bundle.
+      assert_event_bundle_certified`` compares the bundle's identity, event and
+      cutoff against the artifact and re-proves the recorded family / event /
+      status / cutoff / dependency closure against the run rows -- so a
+      hand-assembled "newest run per family" bundle, or one that merely hashes its
+      own run ids consistently, is REFUSED rather than simulated;
+    * the declared NON-PRODUCTION door
+      (``route_optimizer.NonProductionWorlds``), for worlds that are not read from
+      a prediction run at all.  It names who is exercising it, and it is refused
+      outright when a certification artifact is presented.
+    """
+
+    from . import route_optimizer as ro
+
+    if non_production_worlds is not None and certification is not None:
+        raise certified_bundle.CertificationRefused(
+            ro.DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN,
+            [
+                "a certification artifact authorises the certified run ids, and a non-production "
+                "world source was supplied beside it; a certified comparison never consumes "
+                "injected worlds"
+            ],
+        )
 
     events = sorted(int(event) for event in bundles)
     route_problems = validate_routes(routes, events)
@@ -388,20 +417,40 @@ def compare_routes(
             union_ids.update(int(a.in_player_id) for a in step.transfer_batch.actions)
 
     # ONE football world set per event, shared by every route.
+    non_production_matrices = (
+        non_production_worlds.matrices_or_none() if non_production_worlds is not None else None
+    )
     worlds_by_event: dict[int, Mapping[str, Any]] = {}
     worlds_generation: list[dict[str, Any]] = []
     for event in events:
-        if world_provider is not None:
-            matrix = world_provider(event)
+        if non_production_matrices is not None and int(event) in non_production_matrices:
+            matrix = non_production_matrices[int(event)]
+            ro._stamp_matrix_identity(
+                matrix,
+                f"{non_production_worlds.stamp()}|injected:{int(event)}:{int(simulations)}:"
+                f"{int(seed)}:{len(union_ids)}",
+            )
+        elif non_production_worlds is not None and non_production_worlds.provider is not None:
+            matrix = non_production_worlds.provider(event, sorted(union_ids))
+            ro._stamp_matrix_identity(
+                matrix,
+                f"{non_production_worlds.stamp()}|injected:{int(event)}:{int(simulations)}:"
+                f"{int(seed)}:{len(union_ids)}",
+            )
         else:
             if conn is None:
-                raise RouteSpecError("compare_routes needs a connection or a world_provider")
+                raise RouteSpecError(
+                    "compare_routes needs a connection or a declared non-production world source"
+                )
             bundle = bundles[event]
             # The comparator's own DB branch is a predictive-data loader too, so it
-            # crosses the SAME certification boundary: a bundle that cannot declare
-            # its certified provenance (and whose declared versions disagree with the
-            # runs it names) is refused rather than simulated.
-            certified_bundle.assert_event_bundle_certified(conn, bundle, event=int(event))
+            # crosses the SAME certification boundary: it requires the artifact, and
+            # a bundle that is not the one the artifact recorded -- or whose recorded
+            # family / event / status / cutoff / dependency closure disagrees with the
+            # run rows -- is refused rather than simulated.
+            certified_bundle.assert_event_bundle_certified(
+                conn, bundle, event=int(event), certification=certification
+            )
             fixtures = monte_carlo.load_fixture_inputs(
                 conn, event=event, xpts_run_id=int(bundle.xpts_run_id),
                 minutes_run_id=int(bundle.minutes_run_id), team_run_id=int(bundle.team_run_id),

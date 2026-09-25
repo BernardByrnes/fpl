@@ -795,6 +795,7 @@ def main(argv=None) -> int:
         stage1_result = ro.optimize(
             universe=universe, initial_state=source_state, scenario=scenario, player_meta=player_meta,
             bundles=bundles, conn=conn, config=optimizer_config, cache_dir=Path(args.cache_dir),
+            certification=certification,
             provenance={**search_provenance,
                         "discovery_certification_identity": discovery_identity,
                         "exact_evaluation_certification_identity": exact_identity},
@@ -818,7 +819,7 @@ def main(argv=None) -> int:
             universe=universe, initial_state=source_state, scenario=scenario,
             player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
             stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
-            cache_dir=Path(args.cache_dir),
+            certification=certification, cache_dir=Path(args.cache_dir),
             exact_cache=run_exact_cache, cancel_probe=cancel_probe,
             parallel_workers=parallel_workers,
         )
@@ -847,6 +848,7 @@ def main(argv=None) -> int:
                 player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
                 stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
                 prebuilt_worlds=refinement.get("prebuilt_worlds"),
+                certification=certification,
                 finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
                 exact_cache=run_exact_cache,
                 cancel_probe=cancel_probe,
@@ -1173,8 +1175,8 @@ def main(argv=None) -> int:
 
 def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundles, conn,
                        base_config, stage1_result, stage2_draws, prebuilt_worlds,
-                       finalist_partials, exact_cache=None, cancel_probe=None,
-                       parallel_workers=None):
+                       finalist_partials, certification=None, non_production_worlds=None,
+                       exact_cache=None, cancel_probe=None, parallel_workers=None):
     """The ONE bounded search-breadth escalation, as a closure over one beam width.
 
     Runs the next SUPPORTED search budget (the next beam width in
@@ -1182,6 +1184,11 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
     draw budget, in the SAME shared worlds, inheriting the Stage-1 nested
     survivors and forcing the refined finalists in so the two leaders are always
     comparable.  It never changes the objective, the pool, or the universe.
+
+    The escalation re-scores in the SAME worlds Stage 2 used, which are the
+    certified loader's own output, so it presents the same ``certification``
+    artifact that authorised them.  A caller that supplies worlds from somewhere
+    else must declare them through ``non_production_worlds``.
     """
 
     import dataclasses
@@ -1193,6 +1200,7 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
         return ro.optimize(
             universe=universe, initial_state=initial_state, scenario=scenario,
             player_meta=player_meta, bundles=bundles, conn=conn, config=config, cache_dir=None,
+            non_production_worlds=non_production_worlds, certification=certification,
             prebuilt_worlds=prebuilt_worlds, required_routes=list(finalist_partials),
             nested_prior=ro.nested_budget_view(stage1_result),
             exact_cache=exact_cache, cancel_probe=cancel_probe,

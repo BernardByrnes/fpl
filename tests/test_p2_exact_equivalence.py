@@ -22,6 +22,8 @@ import random
 
 import pytest
 
+from test_route_optimizer import _np  # noqa: E402
+
 from fpl_brain import manager_lineup as ml
 from fpl_brain import manager_worlds as mw
 from fpl_brain import route_comparator as rc
@@ -316,7 +318,7 @@ def test_window_proxy_is_unchanged_and_order_preserving():
 # ---------------------------------------------------------------------------
 
 def _search_fixture():
-    from test_route_optimizer import _config, _provider, _scenario, _universe
+    from test_route_optimizer import _config, _np, _provider, _scenario, _universe
     universe, state, meta = _universe()
     return universe, state, meta, _scenario(), _config(), _provider()
 
@@ -343,18 +345,18 @@ def test_shared_exact_cache_reuses_identical_evaluations_and_keeps_routes_identi
     universe, state, meta, scenario, config, provider = _search_fixture()
     # Fresh caches: the second call recomputes everything.
     fresh_first = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                              player_meta=meta, config=config, world_provider=provider,
+                              player_meta=meta, config=config, non_production_worlds=_np(provider),
                               exact_cache={})
     fresh_second = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                               player_meta=meta, config=config, world_provider=provider,
+                               player_meta=meta, config=config, non_production_worlds=_np(provider),
                                exact_cache={})
     # One shared cache: the second call must hit.
     shared: dict = {}
     shared_first = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                               player_meta=meta, config=config, world_provider=provider,
+                               player_meta=meta, config=config, non_production_worlds=_np(provider),
                                exact_cache=shared)
     shared_second = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                                player_meta=meta, config=config, world_provider=provider,
+                                player_meta=meta, config=config, non_production_worlds=_np(provider),
                                 exact_cache=shared)
 
     assert fresh_first["routes"] == shared_first["routes"]
@@ -382,7 +384,7 @@ def test_shared_exact_cache_reuses_identical_evaluations_and_keeps_routes_identi
 
 
 def test_world_identity_prefers_the_stamped_matrix_identity():
-    from test_route_optimizer import _config, _provider
+    from test_route_optimizer import _config
     universe, state, meta, scenario, config, provider = _search_fixture()
     matrix = {"worlds": 3, "player_ids": [1, 2], "core": {1: [0.0] * 3, 2: [0.0] * 3},
               "minutes": {1: [0.0] * 3, 2: [0.0] * 3}}

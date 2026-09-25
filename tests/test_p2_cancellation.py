@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from test_route_optimizer import _np  # noqa: E402
+
 from fpl_brain import execution
 from fpl_brain.database import connect_database
 from fpl_brain import route_optimizer as ro
@@ -56,7 +58,7 @@ class StubGuard:
 
 
 def _search_fixture():
-    from test_route_optimizer import _config, _provider, _scenario, _universe
+    from test_route_optimizer import _config, _np, _provider, _scenario, _universe
     universe, state, meta = _universe()
     return universe, state, meta, _scenario(), _config(), _provider()
 
@@ -128,7 +130,7 @@ def test_optimize_polls_per_event_and_per_promoted_route():
         calls["n"] += 1
 
     result = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                         player_meta=meta, config=config, world_provider=provider,
+                         player_meta=meta, config=config, non_production_worlds=_np(provider),
                          exact_cache={}, cancel_probe=probe)
     promoted = len(result["routes"])
     # events (worlds) + events (search levels) + promoted routes
@@ -138,9 +140,9 @@ def test_optimize_polls_per_event_and_per_promoted_route():
 def test_optimize_without_a_probe_is_identical_to_a_no_op_probe():
     universe, state, meta, scenario, config, provider = _search_fixture()
     without = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                          player_meta=meta, config=config, world_provider=provider, exact_cache={})
+                          player_meta=meta, config=config, non_production_worlds=_np(provider), exact_cache={})
     with_probe = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                             player_meta=meta, config=config, world_provider=provider,
+                             player_meta=meta, config=config, non_production_worlds=_np(provider),
                              exact_cache={}, cancel_probe=lambda: None)
     assert without["routes"] == with_probe["routes"]
     assert without["search_stats"] == with_probe["search_stats"]
@@ -162,14 +164,14 @@ def test_cancellation_during_optimize_propagates_and_leaves_no_partial_cache_ent
     cache: dict = {}
     with pytest.raises(execution.RunCancelled):
         ro.optimize(universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                    config=config, world_provider=provider, exact_cache=cache, cancel_probe=probe)
+                    config=config, non_production_worlds=_np(provider), exact_cache=cache, cancel_probe=probe)
     # Every entry that made it into the shared cache is COMPLETE: replaying with the same
     # cache must reproduce a fresh run's routes exactly (no partially scored squad).
     replay = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                         player_meta=meta, config=config, world_provider=provider,
+                         player_meta=meta, config=config, non_production_worlds=_np(provider),
                          exact_cache=cache)
     fresh = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                        player_meta=meta, config=config, world_provider=provider, exact_cache={})
+                        player_meta=meta, config=config, non_production_worlds=_np(provider), exact_cache={})
     assert replay["routes"] == fresh["routes"]
     for record in cache.values():
         assert set(record) == {"policy", "scores", "mean_gross"}
@@ -188,7 +190,7 @@ def test_cancel_before_any_evaluation_leaves_the_cache_empty():
     cache: dict = {}
     with pytest.raises(execution.RunCancelled):
         ro.optimize(universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                    config=config, world_provider=provider, exact_cache=cache, cancel_probe=probe)
+                    config=config, non_production_worlds=_np(provider), exact_cache=cache, cancel_probe=probe)
     assert cache == {}
 
 
@@ -203,7 +205,7 @@ def test_search_and_exact_evaluation_execute_no_sqlite_statements():
         conn.execute("SELECT 1").fetchone()
         statements.clear()
         ro.optimize(universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                    config=config, world_provider=provider, exact_cache={},
+                    config=config, non_production_worlds=_np(provider), exact_cache={},
                     cancel_probe=lambda: None)
         assert statements == [], statements
     finally:

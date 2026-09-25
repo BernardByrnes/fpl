@@ -459,12 +459,12 @@ def build_free_hit_request(
     save_worlds = load_certified_route_worlds(
         conn, bundles, arm="SAVE", expected_events=horizon,
         union_ids=manager.eligible_ids, config=certified.save.route_config,
-        cache_dir=world_cache_dir,
+        cache_dir=world_cache_dir, certification=authority.artifact,
     )
     play_worlds = load_certified_route_worlds(
         conn, bundles, arm="PLAY", expected_events=horizon[1:],
         union_ids=manager.eligible_ids, config=certified.play.route_config,
-        cache_dir=world_cache_dir,
+        cache_dir=world_cache_dir, certification=authority.artifact,
     )
 
     # ── A2: derive the expected start states, then CONVERT both arms HERE ─────
@@ -653,6 +653,7 @@ def load_certified_route_worlds(
     union_ids: Sequence[int],
     config: Any,
     cache_dir: Any | None = None,
+    certification: Mapping[str, Any] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Load ONE arm's route worlds from the CANONICAL matrix authority.
 
@@ -662,6 +663,12 @@ def load_certified_route_worlds(
     content-addressed cache under that key (or regenerates it from those certified
     runs), and STAMPS the result with that key.  The matrices returned here are the
     loader's own output -- there is no caller matrix anywhere on the path.
+
+    ``certification`` is the LOADED artifact the run ids were derived from, and it
+    is what authorises the load: the loader compares each event's bundle -- its
+    identity, its event and its cutoff -- against the bundle the artifact RECORDED,
+    so run ids that merely agree with each other cannot stand in for the
+    authorisation.  An absent artifact refuses; it is never defaulted.
     """
 
     from . import route_optimizer as ro
@@ -679,7 +686,8 @@ def load_certified_route_worlds(
             )
         try:
             matrix, _info = ro.build_event_worlds(
-                conn, bundles, event, union, config, cache_dir=cache_dir
+                conn, bundles, event, union, config, cache_dir=cache_dir,
+                certification=certification,
             )
         except Exception as exc:  # the canonical loader's own refusals are authoritative
             raise FreeHitAdapterError(

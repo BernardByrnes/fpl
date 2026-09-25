@@ -584,7 +584,15 @@ def main(argv=None) -> int:
         )
         comparison = rc.compare_routes(
             conn=conn, bundles={EVENT: bundle}, routes=routes, initial_state=initial_state,
-            scenario=scenario, player_meta=player_meta, world_provider=lambda _event: matrix,
+            scenario=scenario, player_meta=player_meta,
+            # The matrix was fetched by the certified loader above, so it is
+            # presented under an explicit NON-PRODUCTION declaration: this is a
+            # historical replay, and no certification artifact exists for it.
+            non_production_worlds=ro.NonProductionWorlds(
+                declaration="scripts/final_operational_refresh_gw04.py: historical GW4 replay, "
+                            "world loaded from a hand-assembled bundle",
+                matrices={EVENT: matrix},
+            ),
             simulations=SIMULATIONS, seed=SEED, planning_cutoff=FRESH_CUTOFF,
         )
         comparison["fresh_world_info"] = {**world_info, "worlds": int(matrix["worlds"]), "union_players": len(union_ids)}

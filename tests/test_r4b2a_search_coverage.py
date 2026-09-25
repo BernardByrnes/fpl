@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from test_route_optimizer import _np  # noqa: E402
+
 from fpl_brain import candidate_universe as cu
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
@@ -447,7 +449,7 @@ def test_optimize_exposes_search_coverage():
                                                           max_transfers_per_event=1,
                                                           rescue_top_k_per_position=1,
                                                           search_n_per_criterion=2),
-                         world_provider=_provider(universe))
+                         non_production_worlds=_np(_provider(universe)))
     coverage = result["search_coverage"]
     assert coverage["global_optimality_claimed"] is False
     assert coverage["k_max"] == 64

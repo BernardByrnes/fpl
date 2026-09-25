@@ -30,7 +30,13 @@ from fpl_brain import manager_worlds as mw
 from fpl_brain import parallel_exact as px
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _certified_bundle, _config, _scenario, _universe
+from test_route_optimizer import (
+    _certified_artifact,
+    _certified_bundle,
+    _config,
+    _scenario,
+    _universe,
+)
 from test_transfer_state import POSITION, SQUAD_IDS
 
 #: A bundle that DECLARES its certified provenance.  ``build_event_worlds`` refuses a
@@ -113,7 +119,10 @@ def _parent_matrix(tmp_path, universe, state, config, *, drop=()):
 
     union = _union_for(universe, state, config)
     _write_cache_file(tmp_path, union, config, drop=drop)
-    matrix, info = ro.build_event_worlds(None, {4: BUNDLE}, 4, union, config, cache_dir=tmp_path)
+    matrix, info = ro.build_event_worlds(
+        None, {4: BUNDLE}, 4, union, config, cache_dir=tmp_path,
+        certification=_certified_artifact(BUNDLE),
+    )
     assert info["source"] == "cache", info
     return matrix, union
 
@@ -383,12 +392,14 @@ def test_optimize_parallel_equals_sequential_over_real_file_transport(tmp_path):
         _write_cache_file(tmp_path, union, config, event=int(event))
 
     bundles = {int(event): _certified_bundle(int(event)) for event in config.events}
+    certification = _certified_artifact(*[bundles[int(event)] for event in config.events])
     scenario = _scenario()
 
     def _run(workers):
         return ro.optimize(universe=universe, initial_state=state, scenario=scenario,
                            player_meta=meta, bundles=bundles, conn=None, config=config,
-                           cache_dir=tmp_path, exact_cache={}, parallel_workers=workers)
+                           cache_dir=tmp_path, exact_cache={}, parallel_workers=workers,
+                           certification=certification)
 
     sequential = _run(None)
     parallel = _run(2)

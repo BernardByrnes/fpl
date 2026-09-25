@@ -6,7 +6,9 @@ import json
 
 import pytest
 
+
 from fpl_brain import candidate_universe as cu
+from fpl_brain import certified_bundle as cb
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
 from fpl_brain import route_stability as rs
@@ -79,6 +81,21 @@ def _provider(events=EVENTS, worlds=6, core=None):
     return provider
 
 
+def _np(provider, declaration=None):
+    """Wrap an injected world source in the DECLARED non-production interface.
+
+    A synthetic matrix was never loaded from a prediction run, so it may only enter
+    the optimizer under a declaration naming who is exercising that interface.  ONE
+    wrapper, so every caller declares its worlds the same way.
+    """
+
+    return ro.NonProductionWorlds(
+        declaration=declaration
+        or "test fixture: synthetic deterministic matrices, no prediction run",
+        provider=provider,
+    )
+
+
 def _config(**over):
     base = dict(events=EVENTS, search_draws=6, beam_width=8, exact_evaluation_budget=12,
                 policy_selection_worlds=6, singles_per_out=2, max_transfers_per_event=2,
@@ -89,24 +106,51 @@ def _config(**over):
 
 def _optimize(universe, state, meta, **over):
     return ro.optimize(universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
-                       config=_config(**over), world_provider=_provider())
+                       config=_config(**over), non_production_worlds=_np(_provider()))
 
 
 def _certified_bundle(event=4, **over):
     """A bundle that declares the certified provenance the loader requires.
 
     ``build_event_worlds`` refuses a bundle that cannot prove which certified run
-    ids it came from, so the cache-path tests must construct one the way a producer
-    does: through ``route_comparator.certified_event_bundle``, with the model version
-    of every family it names.
+    ids it came from, so the cache-path tests construct one the way a producer does:
+    through ``route_comparator.certified_event_bundle``, carrying the AUTHORITATIVE
+    model version of every family it names -- a version nobody pins is refused.
     """
 
     runs = {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
             "monte_carlo_v1": 5}
+    pinned = cb.declared_required_versions()
     return rc.certified_event_bundle(
         event=int(event), runs=runs, cutoff="2026-09-11T10:16:51Z",
-        model_versions={family: f"{family}_test" for family in runs}, **over,
+        model_versions={family: pinned[family] for family in runs}, **over,
     )
+
+
+def _certified_artifact(*bundles):
+    """The certification artifact that RECORDED these bundles.
+
+    A bundle that merely hashes its own run ids consistently is not an
+    authorisation: the loader compares it against the bundle the ARTIFACT recorded,
+    so a caller driving the certified path must present one.  This mints that
+    artifact in the shape the certifier writes -- through the ONE shared identity
+    algorithm -- for the bundle(s) a test already holds.
+    """
+
+    payloads = {str(int(bundle.event)): bundle.as_identity_payload() for bundle in bundles}
+    first = bundles[0]
+    return {
+        "schema": "fpl_brain.certification_artifact.v1",
+        "events": sorted(int(bundle.event) for bundle in bundles),
+        "planning_cutoff": first.planning_cutoff,
+        "data_snapshot_sha256": first.source_snapshot_sha256,
+        "code_snapshot_sha256": first.code_snapshot_sha256,
+        "required_model_versions": cb.declared_required_versions(),
+        "certified_bundles": payloads,
+        "certified_bundle_identity": {
+            event: cb.canonical_bundle_identity(payload) for event, payload in payloads.items()
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +415,7 @@ def test_bounded_optimizer_matches_exhaustive_on_tiny_problem():
     worlds = {e: provider(e, UNION) for e in EVENTS}
 
     result = ro.optimize(universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                         config=config, world_provider=provider)
+                         config=config, non_production_worlds=_np(provider))
     best_found = max(rec["supported_3gw_net_core"] for rec in result["routes"].values())
 
     def actions_for(current, event):
@@ -448,7 +492,7 @@ def _ladder(budgets=(2, 4, 8), events=EVENTS, **over):
     config = _config(events=events, **over)
     return universe, state, meta, rs.run_ladder(
         universe=universe, initial_state=state, scenario=_scenario(events), player_meta=meta,
-        base_config=config, budgets=list(budgets), world_provider=_provider(events), exact_cache={},
+        base_config=config, budgets=list(budgets), non_production_worlds=_np(_provider(events)), exact_cache={},
     )
 
 
@@ -617,7 +661,10 @@ def test_world_cache_hit_and_key_sensitivity(tmp_path):
                "expected_bonus": {str(p): 0.0 for p in union},
                "role_actionability": {str(p): False for p in union}}
     (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
-    matrix, info = ro.build_event_worlds(None, {4: bundle}, 4, union, config, cache_dir=tmp_path)
+    matrix, info = ro.build_event_worlds(
+        None, {4: bundle}, 4, union, config, cache_dir=tmp_path,
+        certification=_certified_artifact(bundle),
+    )
     assert info["source"] == "cache" and info["key"] == key
     assert matrix["core"][int(union[0])] == [1.0, 2.0]
     other_key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union + [999])
@@ -649,7 +696,7 @@ def test_no_new_predictive_runs_no_db_write_no_threshold_change():
         before = conn.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM projection_runs").fetchone()
         universe, state, meta = _universe()
         result = ro.optimize(universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
-                             config=_config(), world_provider=_provider(), conn=None, exact_cache={})
+                             config=_config(), non_production_worlds=_np(_provider()), conn=None, exact_cache={})
         assert result["world_info"][str(EVENTS[0])]["source"] == "injected"
         after = conn.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM projection_runs").fetchone()
         assert (before[0], before[1]) == (after[0], after[1]), "optimizer created a predictive run"
@@ -712,7 +759,10 @@ def test_a_cache_entry_without_the_bonus_block_fails_closed(tmp_path):
                "minutes": {str(p): [90.0, 90.0] for p in union}}
     (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(KeyError):
-        ro.build_event_worlds(None, {4: bundle}, 4, union, config, cache_dir=tmp_path)
+        ro.build_event_worlds(
+            None, {4: bundle}, 4, union, config, cache_dir=tmp_path,
+            certification=_certified_artifact(bundle),
+        )
 
 
 def test_the_bonus_is_part_of_the_world_cache_identity():

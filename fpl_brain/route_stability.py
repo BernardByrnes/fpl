@@ -216,11 +216,18 @@ def run_ladder(
     conn=None,
     prebuilt_worlds: Mapping[int, Any] | None = None,
     cache_dir=None,
-    world_provider=None,
+    non_production_worlds: Any | None = None,
+    certification: Mapping[str, Any] | None = None,
     exact_cache: dict | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Run the nested budget ladder and certify it."""
+    """Run the nested budget ladder and certify it.
+
+    Every rung crosses the same predictive-data boundary as ``ro.optimize``: the
+    ``certification`` artifact authorises the bundles' exact certified run ids, and
+    worlds that were never loaded from a prediction run must be declared through
+    ``route_optimizer.NonProductionWorlds``.
+    """
 
     import time
 
@@ -235,7 +242,8 @@ def run_ladder(
         started = time.time()
         result = ro.optimize(
             universe=universe, initial_state=initial_state, scenario=scenario, player_meta=player_meta,
-            bundles=bundles, conn=conn, config=config, cache_dir=cache_dir, world_provider=world_provider,
+            bundles=bundles, conn=conn, config=config, cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds, certification=certification,
             prebuilt_worlds=prebuilt_worlds, exact_cache=exact_cache,
             nested_prior=prior_view, required_routes=required,
         )
@@ -249,7 +257,7 @@ def run_ladder(
         prior_view = ro.nested_budget_view(result)
         prior_result = result
 
-    certification = certify(ladder, budgets)
+    search_certification = certify(ladder, budgets)
     monotonic = [ro.monotonic_check(ladder[i - 1], ladder[i]) for i in range(1, len(ladder))]
     identity = [ro.cross_budget_score_identity(ladder[i - 1], ladder[i]) for i in range(1, len(ladder))]
     return {
@@ -259,7 +267,7 @@ def run_ladder(
         "ladder_results": ladder,
         "monotonic": monotonic,
         "cross_budget_score_identity": identity,
-        "certification": certification,
+        "certification": search_certification,
         "material_threshold_core": MATERIAL_CORE,
         "no_recommendation": True,
     }

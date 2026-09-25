@@ -1006,16 +1006,20 @@ def test_19_downstream_code_cannot_rediscover_a_different_latest_run():
         )
         with pytest.raises(cb.CertificationRefused) as caught:
             ro.build_event_worlds(conn, {5: bare}, 5, [1], _optimizer_config())
-        assert caught.value.token == cb.DIAG_CERTIFICATION_BOUNDARY_REQUIRED
+        # With no artifact there is no authorisation AT ALL, which is a different
+        # fact from a bundle that cannot declare its provenance.
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
 
         # Nor can one that declares an identity which does not bind its own run ids.
         lying = rc.certified_event_bundle(
             event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
             code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+            planning_context_hash=CONTEXT_HASH,
         )
         object.__setattr__(lying, "xpts_run_id", 913)
         with pytest.raises(cb.CertificationRefused) as caught:
-            ro.build_event_worlds(conn, {5: lying}, 5, [1], _optimizer_config())
+            ro.build_event_worlds(conn, {5: lying}, 5, [1], _optimizer_config(),
+                                  certification=artifact)
         assert caught.value.token == cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT
 
         # A bundle whose declared version disagrees with the run's own row is refused.
@@ -1023,21 +1027,43 @@ def test_19_downstream_code_cannot_rediscover_a_different_latest_run():
             event=5, runs=runs[5], cutoff=CUTOFF,
             model_versions={**VERSIONS, "xpts_v1": "xpts_v1.0.0"},
             code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+            planning_context_hash=CONTEXT_HASH,
         )
         with pytest.raises(cb.CertificationRefused) as caught:
-            ro.build_event_worlds(conn, {5: wrong_version}, 5, [1], _optimizer_config())
+            ro.build_event_worlds(conn, {5: wrong_version}, 5, [1], _optimizer_config(),
+                                  certification=artifact)
         assert caught.value.token == cb.STATE_UNSUPPORTED_MODEL_VERSION
 
-        # And a certification artifact that does not record this bundle is refused.
+        # An artifact that does not record this event is a MISSING record, which is
+        # a different fact from an artifact that contradicts it.
+        certified_elsewhere = _artifact(conn, runs, events=(6,))
+        with pytest.raises(cb.CertificationRefused) as caught:
+            cb.assert_event_bundle_certified(
+                conn,
+                rc.certified_event_bundle(
+                    event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
+                    code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+                    planning_context_hash=CONTEXT_HASH,
+                ),
+                event=5,
+                certification=certified_elsewhere,
+            )
+        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
+
+        # An artifact that records THIS event as a DIFFERENT bundle contradicts the
+        # request, and the two facts carry different tokens.
+        substituted = json.loads(json.dumps(_artifact(conn, runs)))
+        substituted["certified_bundles"]["5"]["cutoff"] = OTHER_CUTOFF
         with pytest.raises(cb.CertificationArtifactContradictory):
             cb.assert_event_bundle_certified(
                 conn,
                 rc.certified_event_bundle(
                     event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
                     code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+                    planning_context_hash=CONTEXT_HASH,
                 ),
                 event=5,
-                certification=_artifact(conn, runs, events=(6,)),
+                certification=substituted,
             )
     finally:
         conn.close()
@@ -1231,23 +1257,26 @@ def test_24_chip_transfer_scoring_and_rng_behaviour_is_unchanged():
     try:
         # The RNG seed namespace and draw ordering are untouched: same inputs and
         # same config reproduce the identical matrix with and without certification.
+        artifact = _artifact(conn, runs)
         first = ro.build_event_worlds(
             conn,
             {5: rc.certified_event_bundle(
                 event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
                 code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+                planning_context_hash=CONTEXT_HASH,
                 simulations=32,
             )},
-            5, [1, 2], _optimizer_config(search_draws=32),
+            5, [1, 2], _optimizer_config(search_draws=32), certification=artifact,
         )[0]
         second = ro.build_event_worlds(
             conn,
             {5: rc.certified_event_bundle(
                 event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
                 code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+                planning_context_hash=CONTEXT_HASH,
                 simulations=32,
             )},
-            5, [1, 2], _optimizer_config(search_draws=32),
+            5, [1, 2], _optimizer_config(search_draws=32), certification=artifact,
         )[0]
         assert first["core"] == second["core"]
         assert first["minutes"] == second["minutes"]
@@ -1501,7 +1530,7 @@ def test_the_loaders_boundary_is_declared_and_does_not_accept_a_bare_id_map():
     try:
         with pytest.raises(cb.CertificationRefused) as caught:
             cb.assert_event_bundle_certified(conn, {"runs": runs[5]}, event=5)
-        assert caught.value.token == cb.DIAG_CERTIFICATION_BOUNDARY_REQUIRED
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
 
         # A certified bundle loaded with no connection is still required to declare
         # a version for every family it names.
@@ -1509,7 +1538,9 @@ def test_the_loaders_boundary_is_declared_and_does_not_accept_a_bare_id_map():
 
         partial = _CertifiedRunIds(5, {"runs": runs[5], "model_versions": {}})
         with pytest.raises(cb.CertificationRefused) as caught:
-            cb.assert_event_bundle_certified(None, partial, event=5)
+            cb.assert_event_bundle_certified(
+                None, partial, event=5, certification=_artifact(conn, runs)
+            )
         assert caught.value.token == cb.STATE_EVIDENCE_MISSING
 
         declared = _CertifiedRunIds(
@@ -1523,7 +1554,9 @@ def test_the_loaders_boundary_is_declared_and_does_not_accept_a_bare_id_map():
                 "planning_context_hash": CONTEXT_HASH,
             },
         )
-        proof = cb.assert_event_bundle_certified(conn, declared, event=5)
+        proof = cb.assert_event_bundle_certified(
+            conn, declared, event=5, certification=_artifact(conn, runs)
+        )
         assert proof["certified_bundle_identity"].startswith("sha256:")
         # The identity it declares is the ONE algorithm's identity.
         assert proof["certified_bundle_identity"] == cb.certified_bundle_identity_for(
@@ -1654,3 +1687,293 @@ def _optimizer_config(**over):
     base = dict(events=(5,), search_draws=8, seed=20260911)
     base.update(over)
     return ro.OptimizerConfig(**base)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial: a SELF-CONSISTENT bundle built from arbitrary existing runs
+# ---------------------------------------------------------------------------
+#
+# The attack this section models is the one a certification boundary exists to stop:
+# a caller assembles a bundle from run ids that EXIST, mints its identity with the
+# shared algorithm (so the identity binds its own run ids), declares the
+# authoritative model version of every family, and presents it at each boundary.  It
+# is internally perfect and it is still not the CERTIFIED bundle, so every load
+# boundary must refuse it -- including a warm cache directory, because a cache hit is
+# a predictive load like any other.
+
+
+def _alternative_world(conn, event: int, *, first_run: int = 920) -> dict[str, int]:
+    """A second, COMPLETE and COHERENT five-family world for one event.
+
+    Later reruns of every family, wired to each other, at the same cutoff, with the
+    same model versions and the same planning context as the certified generation:
+    everything a self-consistency check can see is in order.  It is simply a
+    different predictive world, which is the fact only the ARTIFACT can authorise.
+    """
+
+    with conn:
+        ids = {
+            "minutes_v1": first_run,
+            "team_strength_v1": first_run + 1,
+            "player_rates_v1": first_run + 2,
+            "xpts_v1": first_run + 3,
+            "monte_carlo_v1": first_run + 4,
+        }
+        for family, run_id in ids.items():
+            _run(conn, run_id, family, event)
+        fixture_id = int(
+            conn.execute("SELECT id FROM fixtures WHERE event=?", (int(event),)).fetchone()["id"]
+        )
+        _xpts_row(
+            conn, ids["xpts_v1"], fixture_id, event,
+            minutes_run_id=ids["minutes_v1"], team_run_id=ids["team_strength_v1"],
+            rate_run_id=ids["player_rates_v1"],
+        )
+        _mc_row(
+            conn, ids["monte_carlo_v1"], fixture_id, event,
+            xpts_run_id=ids["xpts_v1"], minutes_run_id=ids["minutes_v1"],
+            team_run_id=ids["team_strength_v1"], rate_run_id=ids["player_rates_v1"],
+        )
+    return ids
+
+
+def _self_consistent_bundle(runs, *, event: int = 5, **over):
+    """A bundle that satisfies every self-consistency property and no authorisation.
+
+    The identity is minted by the ONE shared algorithm from these exact ids, so it
+    BINDS them; the versions are the authoritative ones; the snapshots and the
+    context hash are the certified ones.  Nothing here is self-contradictory -- only
+    unrecorded.
+    """
+
+    return rc.certified_event_bundle(
+        event=int(event), runs=runs, cutoff=CUTOFF, model_versions=VERSIONS,
+        code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+        planning_context_hash=CONTEXT_HASH, **over,
+    )
+
+
+def test_adversarial_a_self_consistent_bundle_is_refused_by_the_optimizer(tmp_path):
+    """The optimizer's loader refuses a coherent but UNCERTIFIED prediction world."""
+
+    from test_route_optimizer import _scenario, _universe
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
+
+        # The bundle really is self-consistent: its identity binds its own run ids
+        # and it declares the authoritative version of every family it names.
+        assert alternative.certified_bundle_identity == cb.canonical_bundle_identity(
+            alternative.as_identity_payload()
+        )
+        assert alternative.certified_runs() != runs[5]
+
+        universe, state, meta = _universe()
+        with pytest.raises(cb.CertificationArtifactContradictory):
+            ro.optimize(
+                universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
+                bundles={5: alternative}, conn=conn,
+                config=ro.OptimizerConfig(events=(5,), search_draws=6, seed=20260911),
+                certification=artifact, cache_dir=tmp_path, exact_cache={},
+            )
+    finally:
+        conn.close()
+
+
+def test_adversarial_a_warm_cache_does_not_authorise_a_self_consistent_bundle(tmp_path):
+    """A cache HIT is a predictive load, so it crosses the boundary too.
+
+    The cache is warmed for the alternative bundle's own key -- the key a caller
+    would compute -- so a boundary that trusted the key, or that checked identity
+    after the lookup, would hand back worlds the certification never authorised.  The
+    refusal must come first.
+    """
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
+        config = _optimizer_config()
+        union = [1, 2]
+        key = ro.world_cache_key(event=5, bundle=alternative, config=config, union_ids=union)
+        payload = json.dumps({
+            "worlds": 2, "player_ids": [1, 2],
+            "core": {"1": [99.0, 99.0], "2": [99.0, 99.0]},
+            "minutes": {"1": [90.0, 90.0], "2": [90.0, 90.0]},
+            "expected_bonus": {"1": 0.0, "2": 0.0},
+            "role_actionability": {"1": False, "2": False},
+        })
+        (tmp_path / f"{key}.json").write_text(payload, encoding="utf-8")
+
+        with pytest.raises(cb.CertificationArtifactContradictory):
+            ro.build_event_worlds(
+                conn, {5: alternative}, 5, union, config, cache_dir=tmp_path,
+                certification=artifact,
+            )
+
+        # The same call with the CERTIFIED bundle is a cache hit, so the refusal
+        # above is about provenance and not about the cache being unusable.
+        certified = _self_consistent_bundle(runs[5])
+        certified_key = ro.world_cache_key(
+            event=5, bundle=certified, config=config, union_ids=union
+        )
+        (tmp_path / f"{certified_key}.json").write_text(payload, encoding="utf-8")
+        matrix, info = ro.build_event_worlds(
+            conn, {5: certified}, 5, union, config, cache_dir=tmp_path, certification=artifact,
+        )
+        assert info["source"] == "cache"
+        assert matrix["core"][1] == [99.0, 99.0]
+    finally:
+        conn.close()
+
+
+def test_adversarial_the_comparator_refuses_a_self_consistent_bundle():
+    """The comparator's DB branch is a predictive loader, so it refuses one too."""
+
+    from fpl_brain import transfer_state as ts
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
+        state = ts.RouteState(
+            event=5, players=(ts.RoutePlayer(1, "MID", 1, 50),), bank_tenths=0, free_transfers=1,
+        )
+        route = rc.TransferRoute(
+            route_id="roll",
+            steps=(rc.RouteStep(event=5, transfer_batch=ts.TransferBatch(())),),
+        )
+        with pytest.raises(cb.CertificationRefused) as caught:
+            rc.compare_routes(
+                bundles={5: alternative}, routes=[route], initial_state=state,
+                scenario=rc.flat_current_price_scenario(
+                    ts.PriceSnapshot(event=5, prices={1: 50, 2: 50}), [5]
+                ),
+                player_meta={}, conn=conn, certification=artifact,
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY
+    finally:
+        conn.close()
+
+
+def test_adversarial_free_hit_route_worlds_refuse_a_self_consistent_bundle(tmp_path):
+    """Free Hit route worlds present the artifact, so agreeing run ids are not enough."""
+
+    from fpl_brain import chip_free_hit as fh
+    from fpl_brain import free_hit_request_adapter as fha
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
+        # Built the way the adapter builds a bundle from a certified record: the row
+        # carries its own runs, versions and snapshots, so its identity binds its own
+        # run ids -- and it is still not the recorded bundle.
+        row = dict(alternative.as_identity_payload())
+        row["certified_bundle_identity"] = alternative.certified_bundle_identity
+        with pytest.raises(fha.FreeHitAdapterError) as caught:
+            fha.load_certified_route_worlds(
+                conn, {5: fha._CertifiedRunIds(5, row)}, arm="SAVE", expected_events=(5,),
+                union_ids=(1, 2), config=_optimizer_config(), cache_dir=tmp_path,
+                certification=artifact,
+            )
+        assert fh.FH_DECISION_AUTHORITY_REQUIRED in str(caught.value)
+
+        # The artifact's OWN bundle is accepted through the same call, so the refusal
+        # is about the substituted bundle and nothing else.
+        certified_row = {
+            "runs": dict(runs[5]), "cutoff": CUTOFF, "model_versions": VERSIONS,
+            "code_snapshot_sha256": CODE_SNAPSHOT, "data_snapshot_sha256": DATA_SNAPSHOT,
+            "planning_context_hash": CONTEXT_HASH,
+        }
+        matrix, _info = ro.build_event_worlds(
+            conn, {5: fha._CertifiedRunIds(5, certified_row)}, 5, (1, 2), _optimizer_config(),
+            certification=artifact,
+        )
+        assert matrix["worlds"] == 8
+    finally:
+        conn.close()
+
+
+def _defective_world(defect: str, value) -> sqlite3.Connection:
+    """The SAME run ids ``_world()`` assigns, with ONE family's evidence wrong.
+
+    A completed projection run is immutable, so a defect is never produced by
+    mutating a certified row: it is inserted the way an incoherent generation would
+    arrive in the first place.
+    """
+
+    ids = {"minutes_v1": 100, "team_strength_v1": 101, "player_rates_v1": 102,
+           "xpts_v1": 103, "monte_carlo_v1": 104}
+    conn = connect_database(":memory:")
+    _base_world(conn)
+    with conn:
+        _add_event(conn, 5)
+        _add_fixture(conn, 1000, 5, 1, 2)
+        for family, run_id in ids.items():
+            over: dict = {}
+            if family == "xpts_v1":
+                if defect == "status":
+                    over["status"] = value
+                elif defect == "planning_event":
+                    over["event"] = value
+                elif defect == "data_cutoff":
+                    over["cutoff"] = value
+                elif defect == "model_version":
+                    over["version"] = value
+            _run(conn, run_id, family, over.pop("event", 5), **over)
+        _xpts_row(
+            conn, ids["xpts_v1"], 1000, 5,
+            minutes_run_id=int(value) if defect == "dependency_edge" else ids["minutes_v1"],
+            team_run_id=ids["team_strength_v1"], rate_run_id=ids["player_rates_v1"],
+        )
+        _mc_row(
+            conn, ids["monte_carlo_v1"], 1000, 5, xpts_run_id=ids["xpts_v1"],
+            minutes_run_id=ids["minutes_v1"], team_run_id=ids["team_strength_v1"],
+            rate_run_id=ids["player_rates_v1"],
+        )
+    return conn
+
+
+def test_the_load_boundary_re_proves_the_recorded_closure_from_the_rows():
+    """A certification artifact is a CLAIM about the run rows, never a substitute.
+
+    The artifact records that these families were certified together; the load
+    boundary re-reads the rows themselves, so a family that is at another event,
+    incomplete, cut at another cutoff, re-versioned or wired to a different upstream
+    run cannot authorise a prediction.  The recorded closure is re-proven at every
+    load rather than assumed from the artifact.
+    """
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        certified = _self_consistent_bundle(runs[5])
+
+        # The artifact authorises these ids, and a generation carrying them loads.
+        matrix, info = ro.build_event_worlds(
+            conn, {5: certified}, 5, [1, 2], _optimizer_config(), certification=artifact,
+        )
+        assert info["source"] == "generated" and matrix["worlds"] == 8
+
+        for defect, value, token in (
+            ("status", "running", cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
+            ("planning_event", 6, cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
+            ("data_cutoff", OTHER_CUTOFF, cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
+            ("dependency_edge", 912, cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
+            ("model_version", "xpts_v0.0.0", cb.STATE_UNSUPPORTED_MODEL_VERSION),
+        ):
+            other = _defective_world(defect, value)
+            try:
+                with pytest.raises(cb.CertificationRefused) as caught:
+                    ro.build_event_worlds(
+                        other, {5: certified}, 5, [1, 2], _optimizer_config(),
+                        certification=artifact,
+                    )
+                assert caught.value.token == token, (defect, caught.value.token)
+            finally:
+                other.close()
+    finally:
+        conn.close()

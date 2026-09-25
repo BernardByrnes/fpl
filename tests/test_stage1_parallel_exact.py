@@ -22,7 +22,7 @@ import pytest
 
 from fpl_brain import parallel_exact as px
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _config, _provider, _scenario, _universe
+from test_route_optimizer import _config, _np, _provider, _scenario, _universe
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
@@ -72,7 +72,7 @@ def _run(universe, state, meta, scenario, config, provider, *, workers):
     cache: dict = {}
     result = ro.optimize(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        config=config, world_provider=provider, exact_cache=cache,
+        config=config, non_production_worlds=_np(provider), exact_cache=cache,
         parallel_workers=workers,
     )
     return result, cache
@@ -283,7 +283,7 @@ def test_a_worker_failure_fails_the_stage1_batch_closed(monkeypatch):
     worlds = {int(e): provider(e, [int(p.player_id) for p in state.players]) for e in (4, 5, 6, 7)}
     result = ro.optimize(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        config=config, world_provider=provider, parallel_workers=None,
+        config=config, non_production_worlds=_np(provider), parallel_workers=None,
     )
     monkeypatch.undo()
     promoted = captured.get("promoted") or []

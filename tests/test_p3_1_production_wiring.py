@@ -29,7 +29,7 @@ import pytest
 from fpl_brain import finalist_refinement as fr
 from fpl_brain import parallel_exact as px
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _config, _provider, _scenario, _universe
+from test_route_optimizer import _config, _np, _provider, _scenario, _universe
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
@@ -172,7 +172,7 @@ def spy_optimize(monkeypatch):
 
 def _stage1_result(universe, state, meta, scenario, config, provider, **over):
     return ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                       player_meta=meta, config=config, world_provider=provider, **over)
+                       player_meta=meta, config=config, non_production_worlds=_np(provider), **over)
 
 
 def test_stage2_refinement_receives_the_production_worker_count_and_cache(spy_optimize):
@@ -183,7 +183,7 @@ def test_stage2_refinement_receives_the_production_worker_count_and_cache(spy_op
     cache: dict = {}
     refinement = fr.refine_finalists(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        base_config=config, stage1_result=stage1, world_provider=provider,
+        base_config=config, stage1_result=stage1, non_production_worlds=_np(provider),
         verify_prefix=False, exact_cache=cache,
         parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
     assert spy_optimize, "the refinement must have called optimize"
@@ -208,7 +208,7 @@ def test_escalation_receives_the_same_worker_count_and_the_same_cache(spy_optimi
     # prime the cache AND capture the worlds the way the production Stage-2 refinement does
     refinement = fr.refine_finalists(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        base_config=config, stage1_result=stage1, world_provider=provider,
+        base_config=config, stage1_result=stage1, non_production_worlds=_np(provider),
         verify_prefix=False, exact_cache=cache, stage2_draws=config.search_draws,
         parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
     spy_optimize.clear()
@@ -217,6 +217,9 @@ def test_escalation_receives_the_same_worker_count_and_the_same_cache(spy_optimi
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
         bundles=None, conn=None, base_config=config, stage1_result=stage1,
         stage2_draws=config.search_draws,
+        # The same DECLARED non-production source the Stage-2 refinement used, so the
+        # escalation may consume the worlds that declaration produced.
+        non_production_worlds=_np(provider),
         prebuilt_worlds=refinement["prebuilt_worlds"], finalist_partials=partials,
         exact_cache=cache, cancel_probe=None,
         parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
@@ -243,11 +246,11 @@ def test_parallel_stage2_is_bit_identical_to_sequential_stage2():
 
     sequential = fr.refine_finalists(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        base_config=config, stage1_result=stage1, world_provider=provider,
+        base_config=config, stage1_result=stage1, non_production_worlds=_np(provider),
         verify_prefix=False, exact_cache={}, parallel_workers=None)["refined"]
     parallel = fr.refine_finalists(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        base_config=config, stage1_result=stage1, world_provider=provider,
+        base_config=config, stage1_result=stage1, non_production_worlds=_np(provider),
         verify_prefix=False, exact_cache={},
         parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)["refined"]
     assert parallel["routes"] == sequential["routes"]
@@ -290,7 +293,7 @@ def test_production_worker_count_is_a_real_pool_not_a_sequential_label(spy_optim
     stage1 = _stage1_result(universe, state, meta, scenario, config, provider)
     refinement = fr.refine_finalists(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        base_config=config, stage1_result=stage1, world_provider=provider,
+        base_config=config, stage1_result=stage1, non_production_worlds=_np(provider),
         verify_prefix=False, exact_cache={},
         parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
     reported = (refinement["refined"].get("parallel_exact") or {})

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from test_route_optimizer import _np  # noqa: E402
+
 from fpl_brain import candidate_universe as cu
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import ingest_provenance as prov
@@ -198,7 +200,7 @@ def test_D_retention_lenses_are_real_configuration():
     universe, state, meta, _ = _universe((5, 6, 7, 8))
     with pytest.raises(ValueError, match="unknown retention lens"):
         ro.optimize(universe=universe, initial_state=state, scenario=_scenario((5, 6, 7, 8)),
-                    player_meta=meta, config=bad, world_provider=_provider(universe))
+                    player_meta=meta, config=bad, non_production_worlds=_np(_provider(universe)))
 
         # Narrowing the lens set provably changes the retained set.
         many = tuple(default.retention_lenses)
@@ -265,7 +267,7 @@ def test_E_missing_world_player_fails_closed():
     with pytest.raises(ml.RouteWorldPlayerMissing, match=ml.ROUTE_WORLD_PLAYER_MISSING):
         ro.optimize(universe=universe, initial_state=state, scenario=_scenario(events),
                     player_meta=meta, config=ro.OptimizerConfig(events=events, search_draws=6),
-                    world_provider=_provider(universe, omit=(victim,)))
+                    non_production_worlds=_np(_provider(universe, omit=(victim,))))
 
 
 def test_E_policy_world_scores_fails_closed_without_a_series():
@@ -295,7 +297,7 @@ def test_F_captured_blank_player_with_explicit_zero_series_is_allowed():
                                                    exact_evaluation_budget=3, policy_selection_worlds=6,
                                                    singles_per_out=1, max_transfers_per_event=1,
                                                    rescue_top_k_per_position=1, search_n_per_criterion=2),
-                         world_provider=_provider(universe, zeros=(blank,)))
+                         non_production_worlds=_np(_provider(universe, zeros=(blank,))))
     assert result["promoted_route_count"] >= 1
 
     # And the manager layer accepts an explicit zero series for a blank player.

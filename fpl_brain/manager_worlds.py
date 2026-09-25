@@ -240,6 +240,13 @@ MATRIX_IDENTITY_KEY = "_p2_matrix_identity"
 #: memo key (a path is mutable, a content identity is not).
 MATRIX_PATH_KEY = "_p2_matrix_path"
 
+#: The CERTIFIED BUNDLE identity the matrix was loaded from, stamped by
+#: ``route_optimizer.build_event_worlds``.  It is the decodable link between a matrix
+#: in memory and the certification that authorised it, so a matrix offered to a later
+#: call as "prebuilt" can be checked against the certification artifact instead of
+#: trusted on the caller's word.
+MATRIX_CERTIFIED_BUNDLE_KEY = "_p2_certified_bundle_identity"
+
 #: Run-scoped, matrix-keyed memos.  Never persisted, never keyed on a
 #: certification identity from a different run (the key IS the certified cache
 #: identity of the matrix that is already in memory).

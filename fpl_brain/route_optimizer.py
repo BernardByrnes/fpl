@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import manager_lineup, route_comparator as rc, transfer_state as ts
 from .manager_worlds import (
+    MATRIX_CERTIFIED_BUNDLE_KEY as MANAGER_MATRIX_CERTIFIED_BUNDLE_KEY,
     MATRIX_IDENTITY_KEY as MANAGER_MATRIX_IDENTITY_KEY,
     MATRIX_PATH_KEY as MANAGER_MATRIX_PATH_KEY,
 )
@@ -33,6 +34,55 @@ from .season_rules import window_flag
 
 PHASE8B_VERSION = "route_optimizer_v8b_1.0.0"
 CACHE_SCHEMA_VERSION = "manager_worlds_cache_v3_role_actionability"
+
+#: The declared interface for worlds that were NOT loaded from a certified
+#: prediction run.  It is the ONLY way injected or prebuilt matrices may enter the
+#: optimizer: a production decision is authorised by a certification artifact, and
+#: a world source that cannot present one must say so out loud.
+DIAG_NON_PRODUCTION_WORLDS_UNDECLARED = "NON_PRODUCTION_WORLDS_UNDECLARED"
+DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN = "NON_PRODUCTION_WORLDS_FORBIDDEN"
+
+
+@dataclass(frozen=True)
+class NonProductionWorlds:
+    """The explicit non-production interface for a predictive world source.
+
+    ``declaration`` is REQUIRED and non-empty: it names who is exercising this
+    interface and why, so an injected or hand-built matrix can never be mistaken
+    for certified evidence.  Exactly one source is declared, either a ``provider``
+    (called per event) or a mapping of ``matrices``.
+
+    A call that presents a certification artifact REFUSES this interface: a
+    production load consumes the certified run ids and nothing else.
+    """
+
+    declaration: str
+    provider: Callable[..., Any] | None = None
+    matrices: Mapping[int, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not str(self.declaration or "").strip():
+            raise ValueError(
+                f"{DIAG_NON_PRODUCTION_WORLDS_UNDECLARED}: a non-production world source must "
+                "declare who is exercising it and why"
+            )
+        if self.provider is None and not self.matrices:
+            raise ValueError(
+                f"{DIAG_NON_PRODUCTION_WORLDS_UNDECLARED}: a non-production world source must "
+                "supply a provider or matrices"
+            )
+        if self.provider is not None and self.matrices:
+            raise ValueError(
+                f"{DIAG_NON_PRODUCTION_WORLDS_UNDECLARED}: a non-production world source declares "
+                "one source, not a provider AND matrices"
+            )
+
+    def matrices_or_none(self) -> Mapping[int, Any] | None:
+        return dict(self.matrices) if self.matrices else None
+
+    def stamp(self) -> str:
+        return f"non_production:{str(self.declaration).strip()}"
+
 
 CANONICAL_UNSUPPORTED_FLAG = "CANONICAL_H4_H6_UNSUPPORTED"
 CROSS_GW_FLAG = rc.CROSS_GW_FLAG
@@ -821,37 +871,72 @@ def world_cache_key(*, event, bundle, config, union_ids) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Path | None = None,
-                       world_provider=None, certification=None):
+def build_event_worlds(conn, bundles, event, union_ids, config, *,
+                       cache_dir: Path | None = None,
+                       non_production_worlds: "NonProductionWorlds | None" = None,
+                       certification: Mapping[str, Any] | None = None):
     """Load one event's world matrix from its CERTIFIED bundle.
 
-    The bundle is the authorisation: every run id it names must come from a
-    certification, and it must declare the model version of every family it uses.
-    ``certified_bundle.assert_event_bundle_certified`` proves that before any
-    predictive data is read -- the declared identity must bind the bundle's own run
-    ids, and each declared version must equal the version recorded on that run's own
-    row -- so a hand-assembled "latest run per family" bundle is REFUSED here rather
-    than silently simulated.  When a certification artifact is supplied, the bundle
-    must additionally be the one that artifact recorded.
+    There are exactly two ways in, and neither is a bare matrix parameter:
+
+    * the CERTIFIED path, which requires a validated certification artifact.  The
+      bundle must be the one the artifact recorded for this event --
+      ``certified_bundle.assert_event_bundle_certified`` compares the bundle's
+      identity, event and cutoff against the artifact and re-proves the recorded
+      family / event / status / cutoff / dependency closure against the run rows --
+      so a hand-assembled "latest run per family" bundle, or one that merely hashes
+      its own run ids consistently, is REFUSED rather than silently simulated.  This
+      covers BOTH the database load and a content-addressed cache hit, because a
+      cached matrix is a function of the certified run ids and nothing else;
+    * the declared NON-PRODUCTION interface, for worlds that are not loaded from a
+      prediction run at all.  It must name who is exercising it, and it is refused
+      outright when a certification artifact is presented.
     """
 
     from . import certified_bundle as cb
 
-    if world_provider is not None:
-        # An injected world matrix is not read from a prediction run, so there is no
-        # certified run id to check here; the matrix is stamped ``injected`` so its
-        # provenance is declared rather than implied.
-        matrix = world_provider(event, union_ids)
-        _stamp_matrix_identity(matrix, f"injected:{int(event)}:{int(config.search_draws)}:{int(config.seed)}"
-                                       f":{len(union_ids)}")
-        return matrix, {"source": "injected"}
+    if non_production_worlds is not None:
+        if certification is not None:
+            raise cb.CertificationRefused(
+                DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN,
+                [
+                    f"event {int(event)}: a certification artifact authorises the certified run ids, "
+                    "and a non-production world source was supplied beside it; a production load "
+                    "never consumes injected worlds"
+                ],
+            )
+        matrices = non_production_worlds.matrices_or_none()
+        if matrices is not None and int(event) in matrices:
+            matrix = matrices[int(event)]
+        elif non_production_worlds.provider is not None:
+            matrix = non_production_worlds.provider(event, union_ids)
+        else:
+            raise cb.CertificationRefused(
+                DIAG_NON_PRODUCTION_WORLDS_UNDECLARED,
+                [
+                    f"event {int(event)}: the declared non-production world source covers no matrix "
+                    "for this event"
+                ],
+            )
+        _stamp_matrix_identity(
+            matrix,
+            f"{non_production_worlds.stamp()}|injected:{int(event)}:{int(config.search_draws)}:"
+            f"{int(config.seed)}:{len(union_ids)}",
+        )
+        return matrix, {
+            "source": "injected",
+            "non_production": True,
+            "declaration": str(non_production_worlds.declaration),
+        }
     from . import monte_carlo, manager_worlds
 
-    # Every remaining path obtains the world from this bundle's run ids -- including a
-    # cache hit, whose key is those ids -- so the bundle must prove it is the certified
-    # one before it is used.
+    # Every remaining path obtains the world from this bundle's certified run ids --
+    # including a cache hit, whose key is those ids -- so the bundle must prove it is
+    # the CERTIFIED one, against the artifact, before any predictive data is read.
     bundle = bundles[int(event)]
-    cb.assert_event_bundle_certified(conn, bundle, event=int(event), certification=certification)
+    proof = cb.assert_event_bundle_certified(
+        conn, bundle, event=int(event), certification=certification
+    )
     key = world_cache_key(event=int(event), bundle=bundle, config=config, union_ids=union_ids)
     if cache_dir is not None:
         path = Path(cache_dir) / f"{key}.json"
@@ -863,8 +948,10 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
                       "expected_bonus": {int(k): v for k, v in raw["expected_bonus"].items()},
                       "role_actionability": {int(k): bool(v) for k, v in raw["role_actionability"].items()}}
             _stamp_matrix_identity(matrix, key)
+            _stamp_matrix_certified_bundle(matrix, proof["certified_bundle_identity"])
             _stamp_matrix_path(matrix, path)
-            return matrix, {"source": "cache", "key": key}
+            return matrix, {"source": "cache", "key": key,
+                            "certified_bundle_identity": proof["certified_bundle_identity"]}
     fixtures = monte_carlo.load_fixture_inputs(
         conn, event=int(event), xpts_run_id=int(bundle.xpts_run_id),
         minutes_run_id=int(bundle.minutes_run_id), team_run_id=int(bundle.team_run_id),
@@ -885,6 +972,7 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
         ),
     )
     _stamp_matrix_identity(matrix, key)
+    _stamp_matrix_certified_bundle(matrix, proof["certified_bundle_identity"])
     if cache_dir is not None:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         matrix_path = Path(cache_dir) / f"{key}.json"
@@ -896,7 +984,72 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *, cache_dir: Pa
             "role_actionability": {str(k): bool(v) for k, v in matrix["role_actionability"].items()},
         }), encoding="utf-8")
         _stamp_matrix_path(matrix, matrix_path)
-    return matrix, {"source": "generated", "key": key}
+    return matrix, {"source": "generated", "key": key,
+                    "certified_bundle_identity": proof["certified_bundle_identity"]}
+
+
+def certified_worlds_for_event(bundles, event, *, certification) -> dict[str, Any]:
+    """The certified bundle provenance ONE event's prebuilt matrix must carry.
+
+    ``build_event_worlds`` stamps the certified bundle identity onto every matrix it
+    loads, so a prebuilt matrix can be checked against the artifact it claims to
+    come from instead of being trusted on the caller's word.
+    """
+
+    from . import certified_bundle as cb
+
+    # The AUTHORISATION is read first: a prebuilt matrix can only be accepted
+    # against the artifact that records it, so an absent or contradictory artifact
+    # is refused before any bundle is even consulted.
+    record = cb.certified_bundle_artifact_record(certification, int(event))
+    bundle = (bundles or {}).get(int(event))
+    if bundle is None:
+        raise cb.CertificationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [
+                f"event {int(event)}: the certification records a bundle for this event but no "
+                "certified bundle was supplied; a prebuilt matrix is never accepted without one"
+            ],
+        )
+    payload = getattr(bundle, "as_identity_payload", None)
+    identity_payload = payload() if payload is not None else {}
+    recomputed = getattr(bundle, "certified_bundle_identity", None) or cb.canonical_bundle_identity(
+        identity_payload
+    )
+    if str(recomputed) != str(record["identity"]):
+        raise cb.CertificationArtifactContradictory(
+            [
+                f"event {int(event)}: the bundle is not the one the certification artifact records "
+                "for this event"
+            ]
+        )
+    return {"certified_bundle_identity": str(record["identity"]), "event": int(event)}
+
+
+def _stamp_matrix_certified_bundle(matrix, identity: str | None) -> None:
+    """Tag a world matrix with the CERTIFIED BUNDLE identity it was loaded from."""
+
+    if not identity:
+        return
+    try:
+        matrix[MANAGER_MATRIX_CERTIFIED_BUNDLE_KEY] = str(identity)
+    except (TypeError, AttributeError):
+        pass
+
+
+def _non_production_stamped(matrix, non_production_worlds: "NonProductionWorlds") -> bool:
+    """Whether a matrix carries THIS declaration's own non-production stamp.
+
+    A prebuilt matrix is accepted under a declaration only when the declaration
+    already produced it, so "a call that declares a non-production source" cannot be
+    used as a blanket permission for a matrix that arrived some other way.  The
+    stamp is the one ``build_event_worlds`` writes on this branch.
+    """
+
+    if not hasattr(matrix, "get"):
+        return False
+    stamp = str(matrix.get(MANAGER_MATRIX_IDENTITY_KEY) or "")
+    return stamp.startswith(non_production_worlds.stamp() + "|")
 
 
 def _stamp_matrix_identity(matrix, identity: str) -> None:
@@ -1154,7 +1307,7 @@ def _worlds_identity(worlds_by_event: Mapping[int, Mapping[str, Any]], bundles, 
 
     Preferred source is the identity stamped on the matrix by
     ``build_event_worlds`` (the certified cache key).  A matrix that arrived through
-    ``world_provider``, ``prebuilt_worlds`` or a test fixture may carry none; then the
+    the declared non-production interface or a test fixture may carry none; then the
     identity is derived from the certified run ids + draws + seed + capture union, which
     is exactly what ``world_cache_key`` hashes.  ``None`` means "not identifiable", in
     which case the exact cache key simply omits that component.
@@ -1184,7 +1337,8 @@ def optimize(
     conn=None,
     config: OptimizerConfig | None = None,
     cache_dir: Path | None = None,
-    world_provider=None,
+    non_production_worlds: "NonProductionWorlds | None" = None,
+    certification: Mapping[str, Any] | None = None,
     search_n_override: int | None = None,
     exact_cache: dict | None = None,
     prebuilt_worlds: Mapping[int, Any] | None = None,
@@ -1207,9 +1361,20 @@ def optimize(
     planning-context hash, certification identity, data snapshot, decision
     events) so the search artifact can name the deterministic inputs it used
     instead of recording ``None``.
+
+    World provenance follows the same boundary as the loader.  A ``certification``
+    artifact authorises the ``bundles``' run ids, and it is REQUIRED for every
+    event this call loads or regenerates.  ``prebuilt_worlds`` are accepted only
+    when they carry the certified bundle identity the artifact records for that
+    event -- the stamp ``build_event_worlds`` puts on its own output -- so a
+    hand-built matrix cannot enter a certified search.  Worlds that were never
+    loaded from a certified run must be declared through
+    :class:`NonProductionWorlds`, which names who is exercising the interface.
     """
 
     import time
+
+    from . import certified_bundle as cb
 
     config = config or OptimizerConfig()
     if search_n_override is not None:
@@ -1219,6 +1384,15 @@ def optimize(
         raise ValueError(
             "OptimizerConfig.events is empty: a decision window must be supplied explicitly "
             "(there is no GW4 default)"
+        )
+    if non_production_worlds is not None and certification is not None:
+        raise cb.CertificationRefused(
+            DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN,
+            [
+                "a certification artifact authorises the certified run ids, and a non-production "
+                "world source was supplied beside it; a certified search never consumes injected "
+                "worlds"
+            ],
         )
     rows = {int(row["player_id"]): row for row in universe["universe"]}
     owned = [int(p.player_id) for p in initial_state.players]
@@ -1238,14 +1412,68 @@ def optimize(
 
     world_info: dict[str, Any] = {}
     worlds_by_event: dict[int, Mapping[str, Any]] = {}
+    non_production_matrices = (
+        non_production_worlds.matrices_or_none() if non_production_worlds is not None else None
+    )
     for event in events:
         if cancel_probe is not None:
             cancel_probe()
-        if prebuilt_worlds is not None and event in prebuilt_worlds:
-            matrix, info = prebuilt_worlds[event], {"source": "prebuilt"}
+        if non_production_worlds is not None:
+            # The declared NON-PRODUCTION door.  A matrix supplied here, or one this
+            # declaration already produced, is used; anything else is built by the
+            # declared provider.  Nothing on this branch can be certified, and the
+            # conflict check above is what keeps the two doors from being merged.
+            if non_production_matrices is not None and event in non_production_matrices:
+                matrix = non_production_matrices[event]
+                _stamp_matrix_identity(
+                    matrix,
+                    f"{non_production_worlds.stamp()}|prebuilt:{int(event)}:"
+                    f"{int(config.search_draws)}:{int(config.seed)}:{len(union)}",
+                )
+                info = {"source": "prebuilt", "non_production": True,
+                        "declaration": str(non_production_worlds.declaration)}
+            elif (
+                prebuilt_worlds is not None
+                and event in prebuilt_worlds
+                and _non_production_stamped(prebuilt_worlds[event], non_production_worlds)
+            ):
+                # The declared source's OWN earlier output (Stage 1 of the same
+                # refinement), so its provenance is the declaration itself.
+                matrix = prebuilt_worlds[event]
+                info = {"source": "prebuilt", "non_production": True,
+                        "declaration": str(non_production_worlds.declaration)}
+            else:
+                matrix, info = build_event_worlds(
+                    conn, bundles, event, union, config, cache_dir=cache_dir,
+                    non_production_worlds=non_production_worlds,
+                )
+        elif prebuilt_worlds is not None and event in prebuilt_worlds:
+            matrix = prebuilt_worlds[event]
+            # A prebuilt matrix is the certified loader's OWN output, so it carries
+            # the certified bundle identity it was loaded from.  That stamp must be
+            # the bundle the artifact records for this event; anything else is a
+            # caller-built matrix and must go through the declared interface.
+            expected = certified_worlds_for_event(bundles, event, certification=certification)
+            stamp = (
+                matrix.get(MANAGER_MATRIX_CERTIFIED_BUNDLE_KEY) if hasattr(matrix, "get") else None
+            )
+            if str(stamp or "") != str(expected["certified_bundle_identity"]):
+                raise cb.CertificationRefused(
+                    DIAG_NON_PRODUCTION_WORLDS_UNDECLARED,
+                    [
+                        f"event {int(event)}: the prebuilt world matrix does not carry the certified "
+                        "bundle identity the certification artifact records for this event; worlds "
+                        "that were not loaded from the certified runs must be declared through "
+                        "route_optimizer.NonProductionWorlds"
+                    ],
+                )
+            info = {"source": "prebuilt",
+                    "certified_bundle_identity": expected["certified_bundle_identity"]}
         else:
-            matrix, info = build_event_worlds(conn, bundles, event, union, config,
-                                              cache_dir=cache_dir, world_provider=world_provider)
+            matrix, info = build_event_worlds(
+                conn, bundles, event, union, config, cache_dir=cache_dir,
+                certification=certification,
+            )
         worlds_by_event[event] = matrix
         world_info[str(event)] = {**info, "worlds": int(matrix["worlds"]), "union_players": len(union)}
 

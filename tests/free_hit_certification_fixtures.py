@@ -38,9 +38,15 @@ RUNS: dict[str, int] = {
 #: event 5's team run id -- two families claiming one row, which no real
 #: certification can produce.
 RUN_ID_STRIDE = 10
+#: The REAL declared versions of the frozen families, read from the ONE declared
+#: source rather than restated.  A certification that records a model version
+#: nobody pins is exactly what ``UNSUPPORTED_MODEL_VERSION`` exists to refuse, so
+#: a fixture that declared stale literals would be presenting a run no accepted
+#: model produced.
 MODEL_VERSIONS: dict[str, str] = {
-    "xpts_v1": "xpts_v1.0.0", "minutes_v1": "minutes_v1.6.0",
-    "team_strength_v1": "team_v1.0.0", "player_rates_v1": "rates_v6.1.0",
+    family: version
+    for family, version in cb.declared_required_versions().items()
+    if family in RUNS
 }
 
 
@@ -137,6 +143,9 @@ def certification_artifact(
         "certification_wiring": fg.certification_wiring_identity(),
         "certified_bundles": bundles,
         "certified_bundle_identity": declared,
+        # The certifier records the AUTHORITATIVE versions it required, from the one
+        # declared source; the load boundary cross-checks them against that source.
+        "required_model_versions": dict(cb.declared_required_versions()),
         "manager_state_identity": {"entry_id": 241392, "event": int(events[0])},
         "model_versions": [
             {"model_family": family, "model_version": version}
