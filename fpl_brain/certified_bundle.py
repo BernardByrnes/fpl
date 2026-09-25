@@ -25,6 +25,7 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 DIAG_PREDICTIVE_BUNDLE_INCOHERENT = "PREDICTIVE_BUNDLE_INCOHERENT"
@@ -561,6 +562,7 @@ class CertificationRefused(RuntimeError):
 
 DIAG_CERTIFICATION_ARTIFACT_ABSENT = "CERTIFICATION_ARTIFACT_ABSENT"
 DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY = "CERTIFICATION_ARTIFACT_CONTRADICTORY"
+DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED = "CERTIFICATION_ARTIFACT_UNVALIDATED"
 DIAG_CALIBRATION_IDENTITY_UNKNOWN = "CALIBRATION_IDENTITY_UNKNOWN"
 DIAG_CALIBRATION_WORLD_MISMATCH = "CALIBRATION_WORLD_MISMATCH"
 DIAG_CERTIFICATION_BOUNDARY_REQUIRED = "CERTIFICATION_BOUNDARY_REQUIRED"
@@ -574,6 +576,21 @@ class CertificationArtifactAbsent(CertificationRefused):
 class CertificationArtifactContradictory(CertificationRefused):
     def __init__(self, reasons: Sequence[str]) -> None:
         super().__init__(DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY, reasons)
+
+
+class CertificationArtifactUnvalidated(CertificationRefused):
+    """No AUTHORISATION: the mapping was never validated by the canonical loader.
+
+    A third fact beside absent and contradictory.  An artifact-shaped mapping that
+    carries self-consistent bundles but not the fields the loader's contract
+    requires (the schema, the causal and dependency status, the authorisation flag,
+    the completeness audit, the wiring identity, an identity that binds its own
+    bundles) is not an authorisation to load predictive data, however coherent its
+    own run ids are.
+    """
+
+    def __init__(self, reasons: Sequence[str]) -> None:
+        super().__init__(DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED, reasons)
 
 
 # --- phase terminal state ---------------------------------------------------
@@ -1483,6 +1500,212 @@ def require_certification_artifact(certification: Any) -> Mapping[str, Any]:
     return candidates[0]
 
 
+#: The mint token of a validated artifact.  ``ValidatedCertificationArtifact`` is
+#: constructible only by :func:`validate_certification_artifact`, which is the ONE
+#: function that applies the complete authorization contract; a caller that tries to
+#: mint one from a raw mapping is refused, so the type IS the authorisation.
+_CERTIFICATION_ARTIFACT_MINT = object()
+
+_IMMUTABLE_ARTIFACT_REFUSAL = (
+    "a validated certification artifact is IMMUTABLE: it is minted by "
+    "certified_bundle.validate_certification_artifact and never edited, so the bytes a "
+    "load was authorised by cannot be changed after the check"
+)
+
+
+class _ImmutableCertificationMapping(dict):
+    """A mapping that refuses every mutation, recursively frozen at mint time."""
+
+    __slots__ = ()
+
+    def _refuse_mutation(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
+
+    __setitem__ = _refuse_mutation
+    __delitem__ = _refuse_mutation
+    __ior__ = _refuse_mutation
+    clear = _refuse_mutation
+    pop = _refuse_mutation
+    popitem = _refuse_mutation
+    setdefault = _refuse_mutation
+    update = _refuse_mutation
+
+
+class _ImmutableCertificationSequence(list):
+    """A list that refuses every mutation, recursively frozen at mint time."""
+
+    __slots__ = ()
+
+    def _refuse_mutation(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
+
+    __setitem__ = _refuse_mutation
+    __delitem__ = _refuse_mutation
+    __iadd__ = _refuse_mutation
+    __imul__ = _refuse_mutation
+    append = _refuse_mutation
+    clear = _refuse_mutation
+    extend = _refuse_mutation
+    insert = _refuse_mutation
+    pop = _refuse_mutation
+    remove = _refuse_mutation
+    reverse = _refuse_mutation
+    sort = _refuse_mutation
+
+
+def _frozen_certification_value(value: Any) -> Any:
+    """A recursive COPY of a certification value that no consumer can mutate."""
+
+    if isinstance(value, Mapping):
+        return _ImmutableCertificationMapping(
+            {key: _frozen_certification_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return _ImmutableCertificationSequence(
+            [_frozen_certification_value(item) for item in value]
+        )
+    if isinstance(value, tuple):
+        return tuple(_frozen_certification_value(item) for item in value)
+    return value
+
+
+class ValidatedCertificationArtifact(_ImmutableCertificationMapping):
+    """An IMMUTABLE certification artifact that PASSED the complete contract.
+
+    This is the authorisation a predictive load consumes.  It is a mapping, so every
+    existing reader (``artifact.get(...)``, ``dict(artifact)``, ``json.dumps``) works
+    unchanged, but it cannot be minted from a raw mapping and cannot be edited after
+    minting: the artifact the boundary validated is the artifact the load reads.
+
+    ``validated_by`` names the function that applied the contract, and
+    ``validated_identity`` is the artifact's own identity recomputed from its bytes,
+    so a consumer can see WHICH contract authorised the load and for which artifact.
+    """
+
+    __slots__ = ("validated_by", "validated_identity")
+
+    def __init__(
+        self,
+        document: Mapping[str, Any] | None = None,
+        *,
+        validated_by: str = "",
+        _token: Any = None,
+    ) -> None:
+        if _token is not _CERTIFICATION_ARTIFACT_MINT:
+            raise CertificationArtifactUnvalidated(
+                [
+                    "a validated certification artifact is minted only by "
+                    "certified_bundle.validate_certification_artifact, which applies the "
+                    "complete authorization contract; this mapping was never validated"
+                ]
+            )
+        dict.__init__(
+            self,
+            {
+                key: _frozen_certification_value(value)
+                for key, value in dict(document or {}).items()
+            },
+        )
+        self.validated_by = str(validated_by)
+        self.validated_identity = str(
+            self.get("four_gw_certification_identity")
+            or self.get("certification_identity")
+            or ""
+        )
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"ValidatedCertificationArtifact(validated_by={self.validated_by!r}, "
+            f"identity={self.validated_identity[:23] + '...' if self.validated_identity else None}, "
+            f"events={list(self.get('events') or [])})"
+        )
+
+
+def validate_certification_artifact(document: Any) -> ValidatedCertificationArtifact:
+    """The CANONICAL loader-owned validation of a certification artifact.
+
+    A raw mapping is NOT an authorisation, however self-consistent its own run ids or
+    bundle identities are: the artifact must carry the fields the certification
+    loader requires before anything predictive may be read from it.  This function is
+    the ONE place that contract is applied at a load boundary:
+
+    * an already-validated artifact is returned UNCHANGED, so a caller that loaded it
+      once passes the authorisation itself;
+    * a path is read through ``four_gw_decision.load_certification_artifact`` -- the
+      production loader -- which mints the validated value;
+    * a raw mapping has the SAME contract re-run over it and is then minted, so a
+      mapping that does carry every required authorization field is accepted exactly
+      as the loader would accept its file form, and a mapping that does not is refused
+      with ``CERTIFICATION_ARTIFACT_UNVALIDATED`` (never silently trusted, never
+      defaulted, never substituted).
+
+    The returned value is IMMUTABLE and carries the identity recomputed from its own
+    bytes, so what the boundary validated is what the load reads.
+    """
+
+    if isinstance(document, ValidatedCertificationArtifact):
+        return document
+    from . import four_gw_decision as fg
+
+    if isinstance(document, (str, Path)):
+        return fg.load_certification_artifact(document)
+    if document is None:
+        raise CertificationArtifactAbsent(
+            ["a predictive load requires a certification artifact"]
+        )
+    if not isinstance(document, Mapping) or not document:
+        raise CertificationArtifactUnvalidated(
+            [
+                f"the certification artifact is {type(document).__name__}, not an artifact the "
+                "canonical loader produced"
+            ]
+        )
+    try:
+        payload = fg.validate_certification_artifact(document)
+    except CertificationRefused:
+        raise
+    except BundleIncoherent as failure:
+        # A RECORDED incoherent dependency status is a fact about the predictive
+        # world and keeps the token that fact already has; an artifact that records
+        # no status at all simply never carried an authorisation.
+        recorded = str((document or {}).get("dependency_validation") or "").upper()
+        if recorded and recorded != "COHERENT":
+            raise CertificationRefused(
+                bundle_state_from_reasons(failure.reasons), failure.reasons
+            ) from failure
+        raise CertificationArtifactUnvalidated(
+            [
+                "the certification artifact does not carry the authorisation the canonical "
+                f"loader's contract requires: {failure}"
+            ]
+        ) from failure
+    except Exception as failure:
+        detail = str(getattr(failure, "detail", failure))
+        # A mapping whose own declared records contradict each other is a
+        # CONTRADICTION, whatever else it is missing: that is a different fact from a
+        # mapping that simply never carried an authorisation, and the two carry
+        # different tokens.
+        contradicting = (
+            fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in detail
+            or fg.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY in detail
+        )
+        if contradicting:
+            raise CertificationArtifactContradictory(
+                [f"the certification artifact contradicts its own records: {detail}"]
+            ) from failure
+        raise CertificationArtifactUnvalidated(
+            [
+                "the certification artifact does not carry the authorisation the canonical "
+                f"loader's contract requires: {type(failure).__name__}: {detail}"
+            ]
+        ) from failure
+    return ValidatedCertificationArtifact(
+        payload,
+        validated_by="four_gw_decision.validate_certification_artifact",
+        _token=_CERTIFICATION_ARTIFACT_MINT,
+    )
+
+
 def bundle_identity_payload(
     *,
     event: int,
@@ -1577,10 +1800,14 @@ def certified_bundle_artifact_record(
     ``CERTIFICATION_ARTIFACT_ABSENT``, ``CERTIFICATION_ARTIFACT_CONTRADICTORY`` and
     ``EVIDENCE_MISSING`` are different facts with different tokens: a missing
     authorisation, an artifact that contradicts the request, and an artifact that
-    simply does not record this event.
+    simply does not record this event.  A raw mapping is not an authorisation either:
+    the artifact must pass the canonical loader's complete contract, so the
+    self-consistent but unauthorised mapping is refused with
+    ``CERTIFICATION_ARTIFACT_UNVALIDATED`` before any predictive data is read.
     """
 
     artifact = require_certification_artifact(certification)
+    artifact = validate_certification_artifact(artifact)
     payload = certified_bundle_payload(artifact.get("certified_bundles") or {}, int(event))
     if not payload:
         raise CertificationRefused(
@@ -1920,11 +2147,15 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
         "reference": "fpl_brain.route_optimizer.build_event_worlds caller-supplied bundles",
         "status": "CLOSED",
         "detail": (
-            "the loader REQUIRES a validation artifact: the bundle must be the one the artifact "
-            "recorded for that event (identity, event and cutoff compared against the recorded "
-            "bundle), every family it names must declare the authoritative model version, the "
-            "recorded family / event / status / cutoff / dependency closure is re-proven from the "
-            "run rows, and the check runs BEFORE the content-addressed cache is read -- so a "
+            "the loader REQUIRES a VALIDATED artifact: the artifact must pass the canonical "
+            "loader's complete contract (schema, causal and dependency status, the authorisation "
+            "flag, the completeness audit, the wiring identity and an identity that binds its own "
+            "bundles), so a raw mapping carrying self-consistent bundles but no authorisation is "
+            "refused with CERTIFICATION_ARTIFACT_UNVALIDATED.  The bundle must then be the one that "
+            "artifact recorded for that event (identity, event and cutoff compared against the "
+            "recorded bundle), every family it names must declare the authoritative model version, "
+            "the recorded family / event / status / cutoff / dependency closure is re-proven from "
+            "the run rows, and the check runs BEFORE the content-addressed cache is read -- so a "
             "self-consistent bundle built from arbitrary existing runs is refused on the database "
             "path and on a warm cache hit alike.  Worlds that were never loaded from a prediction "
             "run enter only through the declared route_optimizer.NonProductionWorlds interface, "
@@ -1935,10 +2166,15 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
         "reference": "fpl_brain.route_optimizer.optimize injected and prebuilt worlds",
         "status": "CLOSED",
         "detail": (
-            "optimize takes the same two declared doors: a certification artifact authorises the "
-            "bundles and the prebuilt matrices must carry the certified bundle identity the "
-            "artifact records, while injected worlds must be declared through "
-            "NonProductionWorlds and are refused beside an artifact"
+            "optimize takes the same two declared doors: a validated certification artifact "
+            "authorises the bundles, while injected worlds must be declared through "
+            "NonProductionWorlds and are refused beside an artifact.  A PREBUILT matrix is admitted "
+            "only through a loader-owned, content-bound capability: the matrix's canonical content "
+            "identity -- every semantic block exact evaluation consumes -- must be one this loader "
+            "ISSUED, for that event and against the certified bundle identity the artifact records "
+            "(or, on the declared door, under that same declaration).  The provenance stamp on a "
+            "matrix is caller-writable and therefore authorises nothing, so a hand-built matrix -- "
+            "including one carrying the correct copied stamp -- is refused"
         ),
     },
     {
@@ -1968,6 +2204,18 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
             "both forward the certification artifact (or the declared non-production source) into "
             "the loader and the optimizer they call, so neither can obtain a world by a route the "
             "boundary has not authorised"
+        ),
+    },
+    {
+        "reference": "fpl_brain.manager_worlds.build_manager_worlds",
+        "status": "CLOSED_BY_REFUSAL",
+        "detail": (
+            "a predictive load beside the optimizer's: it simulated the shared worlds for the "
+            "manager policy matrix straight from a hand-assembled run-id set.  It now requires a "
+            "validated certification artifact and refuses unless the run ids it is handed are the "
+            "ones that artifact recorded for the event, so scripts/build_manager_packet.py -- its "
+            "only caller, and a Phase-6A descriptive packet -- is refused rather than loading "
+            "uncertified predictions"
         ),
     },
     {
@@ -2100,11 +2348,13 @@ __all__ = [
     "CONTINUOUS_PROXY_TIE_LIMITATION",
     "CertificationArtifactAbsent",
     "CertificationArtifactContradictory",
+    "CertificationArtifactUnvalidated",
     "CertificationRefused",
     "CertifiedBundle",
     "CertifiedEventBundle",
     "DIAG_CERTIFICATION_ARTIFACT_ABSENT",
     "DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY",
+    "DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED",
     "DIAG_CERTIFICATION_BOUNDARY_REQUIRED",
     "DIAG_CALIBRATION_IDENTITY_UNKNOWN",
     "DIAG_CALIBRATION_WORLD_MISMATCH",
@@ -2144,5 +2394,7 @@ __all__ = [
     "require_certification_artifact",
     "unresolved_bypasses",
     "validate_calibration_evidence",
+    "validate_certification_artifact",
     "validate_certified_bundle",
+    "ValidatedCertificationArtifact",
 ]

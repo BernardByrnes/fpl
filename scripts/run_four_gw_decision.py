@@ -256,8 +256,11 @@ def bundle_for(event: int, runs: dict, cutoff: str, draws: int, *, conn=None, ce
         or artifact.get("data_snapshot_sha256"),
         planning_context_hash=certified.get("planning_context_hash"),
     )
+    # The LOADED artifact is passed on, not the copy made above for reading: a copy is
+    # a raw mapping again and would only be revalidated at the boundary, while the
+    # loaded value is the authorisation itself.
     cb.assert_event_bundle_certified(
-        conn, bundle, event=int(event), certification=artifact or None
+        conn, bundle, event=int(event), certification=certification or artifact or None
     )
     return bundle
 

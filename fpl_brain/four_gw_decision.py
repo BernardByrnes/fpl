@@ -549,12 +549,19 @@ def certification_identity_of(payload: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
-def load_certification_artifact(path: str | Path) -> dict[str, Any]:
-    """Load and validate a certification artifact produced by the certifier.
+def validate_certification_artifact(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The COMPLETE authorization contract, applied to an artifact mapping.
 
-    Fails closed with ``DECISION_CERTIFICATION_REQUIRED`` when the artifact is
-    absent, malformed, or does not carry the fields a decision needs.  There is no
-    fallback to latest-per-family discovery anywhere in this path.
+    Fails closed with ``DECISION_CERTIFICATION_REQUIRED`` when the mapping is
+    malformed or does not carry the fields a decision needs.  There is no fallback
+    to latest-per-family discovery anywhere in this path.
+
+    This is the contract a LOAD consumes, so it is applied to the mapping form here
+    as well as to the file form by :func:`load_certification_artifact`: a caller that
+    presents an artifact-shaped mapping instead of a loaded artifact has exactly the
+    same contract re-run over it, and one that cannot pass it is never an
+    authorisation -- however self-consistent its own run ids and bundle identities
+    are.
 
     The certification contract is versioned.  ``v2`` requires the
     history-completeness audit and the certification-wiring identity, so a
@@ -564,18 +571,10 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     inferring PASS.
     """
 
-    import json
-    from pathlib import Path as _Path
-
-    artifact_path = _Path(path)
-    if not artifact_path.exists():
+    if not isinstance(payload, Mapping):
         raise DecisionCertificationRequired(
-            f"{DIAG_CERTIFICATION_ARTIFACT_ABSENT}: no certification artifact at {artifact_path}"
+            f"the certification artifact is {type(payload).__name__}, not an object"
         )
-    try:
-        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # malformed artifact must not be silently ignored
-        raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
     if payload.get("schema") not in SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS:
         raise DecisionCertificationRequired(
             f"artifact schema {payload.get('schema')!r} is not one of "
@@ -680,6 +679,33 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
             "artifact records prior execution; it is not a clean certification"
         )
     return payload
+
+
+def load_certification_artifact(path: str | Path) -> Any:
+    """Load and validate a certification artifact produced by the certifier.
+
+    The ONE production loader: it reads the artifact's bytes, applies the complete
+    authorization contract (:func:`validate_certification_artifact`) and returns the
+    IMMUTABLE validated value -- the authorisation a predictive load consumes, whose
+    identity is recomputed from those bytes.  A raw mapping is not an authorisation,
+    so returning the payload itself would leave every caller free to present an
+    artifact-shaped mapping the contract never saw.
+    """
+
+    import json
+    from pathlib import Path as _Path
+
+    artifact_path = _Path(path)
+    if not artifact_path.exists():
+        raise DecisionCertificationRequired(
+            f"{DIAG_CERTIFICATION_ARTIFACT_ABSENT}: no certification artifact at {artifact_path}"
+        )
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # malformed artifact must not be silently ignored
+        raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
+    validate_certification_artifact(payload)
+    return cb.validate_certification_artifact(payload)
 
 
 def canonical_event_horizon(values: Iterable[Any] | None) -> tuple[int, ...]:

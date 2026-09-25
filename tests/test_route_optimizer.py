@@ -128,29 +128,54 @@ def _certified_bundle(event=4, **over):
 
 
 def _certified_artifact(*bundles):
-    """The certification artifact that RECORDED these bundles.
+    """The AUTHORISED certification artifact that RECORDED these bundles.
 
     A bundle that merely hashes its own run ids consistently is not an
     authorisation: the loader compares it against the bundle the ARTIFACT recorded,
     so a caller driving the certified path must present one.  This mints that
     artifact in the shape the certifier writes -- through the ONE shared identity
     algorithm -- for the bundle(s) a test already holds.
+
+    It carries the authorization fields the canonical loader's contract requires,
+    because a mapping without them is not an authorisation either: a predictive load
+    re-runs that contract over whatever it is handed and refuses an artifact-shaped
+    mapping that cannot satisfy it.
     """
+
+    from fpl_brain import four_gw_decision as fg
 
     payloads = {str(int(bundle.event)): bundle.as_identity_payload() for bundle in bundles}
     first = bundles[0]
-    return {
-        "schema": "fpl_brain.certification_artifact.v1",
+    artifact = {
+        "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
         "events": sorted(int(bundle.event) for bundle in bundles),
         "planning_cutoff": first.planning_cutoff,
-        "data_snapshot_sha256": first.source_snapshot_sha256,
+        # The artifact records the data identity the bundles were built under; the
+        # fixture bundles declare none, and a bundle that declares none is bounded by
+        # the certification's own snapshot rather than by an invented one.
+        "data_snapshot_sha256": first.source_snapshot_sha256 or _FIXTURE_DATA_SNAPSHOT,
         "code_snapshot_sha256": first.code_snapshot_sha256,
         "required_model_versions": cb.declared_required_versions(),
         "certified_bundles": payloads,
         "certified_bundle_identity": {
             event: cb.canonical_bundle_identity(payload) for event, payload in payloads.items()
         },
+        "certification_wiring": fg.certification_wiring_identity(),
+        "temporal_status": "CAUSAL",
+        "dependency_validation": "COHERENT",
+        "history_completeness": {"schema": "fixture", "complete": True, "reasons": []},
+        "route_search_executed": False,
+        "transfer_execution_performed": False,
+        "decision_search_permitted": True,
+        "decision_search_permitted_reasons": [],
     }
+    artifact["four_gw_certification_identity"] = fg.certification_identity_of(artifact)
+    return artifact
+
+
+#: The data snapshot identity a fixture artifact records when the fixture bundles
+#: declare none themselves (the contract requires the artifact to carry one).
+_FIXTURE_DATA_SNAPSHOT = "sha256:" + "d" * 64
 
 
 # ---------------------------------------------------------------------------

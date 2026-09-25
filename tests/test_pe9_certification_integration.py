@@ -217,6 +217,15 @@ def _artifact(conn, runs_by_event, *, cutoff=CUTOFF, events=HORIZON, code_snapsh
     The code snapshot is recorded on the artifact AND on every bundle payload, as
     ``scripts/certify_gw5_gw8.py`` does, so the identity the ``certify_*`` entry
     points recompute from a payload is the identity the artifact recorded.
+
+    The AUTHORIZATION fields are the ones the canonical loader's contract requires --
+    the schema, the causal status, the dependency coherence, the authorisation flag,
+    the completeness audit and the wiring identity.  They are not decoration: an
+    artifact-shaped mapping that carries self-consistent bundles but not these fields
+    is not an authorisation, and a predictive load re-runs the contract over it and
+    refuses it with ``CERTIFICATION_ARTIFACT_UNVALIDATED``.  A fixture that omitted
+    them would be exercising a mapping the engine never accepts, so the adversarial
+    cases below STRIP them from this one to prove the refusal.
     """
 
     bundles = {}
@@ -238,10 +247,44 @@ def _artifact(conn, runs_by_event, *, cutoff=CUTOFF, events=HORIZON, code_snapsh
         "required_model_versions": dict(VERSIONS),
         "certified_bundles": bundles,
         "certified_bundle_identity": identity,
+        "certification_wiring": fg.certification_wiring_identity(),
+        "temporal_status": "CAUSAL",
+        "dependency_validation": "COHERENT",
+        "history_completeness": {"schema": "fixture", "complete": True, "reasons": []},
+        "route_search_executed": False,
+        "transfer_execution_performed": False,
+        "decision_search_permitted": True,
+        "decision_search_permitted_reasons": [],
         "four_gw_certification_identity": "sha256:" + "c" * 64,
     }
     artifact.update(over)
     return artifact
+
+
+#: The authorization fields the canonical loader's contract requires, and whose
+#: ABSENCE must refuse a load rather than degrade it.
+AUTHORIZATION_FIELDS = (
+    "schema",
+    "temporal_status",
+    "dependency_validation",
+    "history_completeness",
+    "certification_wiring",
+    "decision_search_permitted",
+)
+
+
+def _unauthorised(artifact, *, drop=AUTHORIZATION_FIELDS):
+    """The SAME self-consistent artifact, with its authorization fields removed.
+
+    The bundles, their run ids and their identities are untouched -- so every internal
+    consistency check the artifact could make about itself still passes.  What it no
+    longer carries is the authorisation to load predictive data.
+    """
+
+    stripped = json.loads(json.dumps(artifact))
+    for field in drop:
+        stripped.pop(field, None)
+    return stripped
 
 
 # ---------------------------------------------------------------------------
@@ -1975,5 +2018,447 @@ def test_the_load_boundary_re_proves_the_recorded_closure_from_the_rows():
                 assert caught.value.token == token, (defect, caught.value.token)
             finally:
                 other.close()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Adversarial: a self-consistent artifact-shaped MAPPING with no authorisation
+# ---------------------------------------------------------------------------
+#
+# The second attack: the caller presents something that LOOKS like a certification
+# artifact -- every bundle in it is real, every identity in it binds its own run ids,
+# every declared version is the authoritative one -- and simply omits the fields the
+# canonical loader's contract requires (the state that admits the bundles, the
+# authorisation flag, the audited status, the wiring identity).  A boundary that only
+# checked the bundles would load predictive data on the strength of a mapping the
+# engine never authorised, so every predictive-load boundary applies the contract
+# itself: a validated artifact is passed through untouched, and a raw mapping has the
+# SAME contract re-run over it before anything predictive is read.
+
+
+def test_adversarial_an_unauthorised_mapping_is_refused_by_the_optimizer_and_cache(tmp_path):
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        unauthorised = _unauthorised(artifact)
+        # Self-consistent: the bundles still bind their own identities.
+        assert unauthorised["certified_bundle_identity"] == artifact["certified_bundle_identity"]
+        assert "decision_search_permitted" not in unauthorised
+
+        certified = _self_consistent_bundle(runs[5])
+        config = _optimizer_config()
+        union = [1, 2]
+
+        with pytest.raises(cb.CertificationRefused) as caught:
+            ro.build_event_worlds(
+                conn, {5: certified}, 5, union, config, certification=unauthorised,
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+
+        # A WARM cache does not authorise it either: the contract is applied before the
+        # cache is read, so a cache hit cannot stand in for the authorisation.
+        key = ro.world_cache_key(event=5, bundle=certified, config=config, union_ids=union)
+        (tmp_path / f"{key}.json").write_text(json.dumps({
+            "worlds": 2, "player_ids": [1, 2],
+            "core": {"1": [99.0, 99.0], "2": [99.0, 99.0]},
+            "minutes": {"1": [90.0, 90.0], "2": [90.0, 90.0]},
+            "expected_bonus": {"1": 0.0, "2": 0.0},
+            "role_actionability": {"1": False, "2": False},
+        }), encoding="utf-8")
+        with pytest.raises(cb.CertificationRefused) as caught:
+            ro.build_event_worlds(
+                conn, {5: certified}, 5, union, config, cache_dir=tmp_path,
+                certification=unauthorised,
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+
+        from test_route_optimizer import _scenario, _universe
+
+        universe, state, meta = _universe()
+        with pytest.raises(cb.CertificationRefused) as caught:
+            ro.optimize(
+                universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
+                bundles={5: certified}, conn=conn, config=config, cache_dir=tmp_path,
+                certification=unauthorised, exact_cache={},
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+
+        # The AUTHORISED artifact loads the same world through the same call, so the
+        # refusal above is about the missing authorisation and nothing else.
+        matrix, info = ro.build_event_worlds(
+            conn, {5: certified}, 5, union, config, cache_dir=tmp_path, certification=artifact,
+        )
+        assert info["source"] == "cache" and matrix["core"][1] == [99.0, 99.0]
+    finally:
+        conn.close()
+
+
+def test_adversarial_an_unauthorised_mapping_is_refused_by_the_comparator():
+    from fpl_brain import transfer_state as ts
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        unauthorised = _unauthorised(artifact)
+        certified = _self_consistent_bundle(runs[5])
+        state = ts.RouteState(
+            event=5, players=(ts.RoutePlayer(1, "MID", 1, 50),), bank_tenths=0, free_transfers=1,
+        )
+        route = rc.TransferRoute(
+            route_id="roll",
+            steps=(rc.RouteStep(event=5, transfer_batch=ts.TransferBatch(())),),
+        )
+        scenario = rc.flat_current_price_scenario(
+            ts.PriceSnapshot(event=5, prices={1: 50, 2: 50}), [5]
+        )
+        with pytest.raises(cb.CertificationRefused) as caught:
+            rc.compare_routes(
+                bundles={5: certified}, routes=[route], initial_state=state,
+                scenario=scenario, player_meta={}, conn=conn, certification=unauthorised,
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+
+        accepted = rc.compare_routes(
+            bundles={5: certified}, routes=[route], initial_state=state,
+            scenario=scenario, player_meta={}, conn=conn, certification=artifact,
+            simulations=4,
+        )
+        assert accepted["routes"]
+    finally:
+        conn.close()
+
+
+def test_adversarial_an_unauthorised_mapping_is_refused_by_the_free_hit_loader(tmp_path):
+    from fpl_brain import chip_free_hit as fh
+    from fpl_brain import free_hit_request_adapter as fha
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        unauthorised = _unauthorised(artifact)
+        row = {
+            "runs": dict(runs[5]), "cutoff": CUTOFF, "model_versions": VERSIONS,
+            "code_snapshot_sha256": CODE_SNAPSHOT, "data_snapshot_sha256": DATA_SNAPSHOT,
+            "planning_context_hash": CONTEXT_HASH,
+        }
+        with pytest.raises(fha.FreeHitAdapterError) as caught:
+            fha.load_certified_route_worlds(
+                conn, {5: fha._CertifiedRunIds(5, row)}, arm="SAVE", expected_events=(5,),
+                union_ids=(1, 2), config=_optimizer_config(), cache_dir=tmp_path,
+                certification=unauthorised,
+            )
+        assert fh.FH_DECISION_AUTHORITY_REQUIRED in str(caught.value)
+        assert cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED in str(caught.value)
+
+        # The authorised artifact loads the SAME certified runs through the same call.
+        matrix, _info = ro.build_event_worlds(
+            conn, {5: fha._CertifiedRunIds(5, row)}, 5, (1, 2), _optimizer_config(),
+            certification=artifact,
+        )
+        assert matrix["worlds"] == 8
+    finally:
+        conn.close()
+
+
+def test_adversarial_an_unauthorised_mapping_is_refused_by_refinement_and_stability(tmp_path):
+    """Both stages forward the artifact into the loader, so both apply the contract."""
+
+    from fpl_brain import finalist_refinement as fr
+    from fpl_brain import route_stability as rs
+    from test_route_optimizer import EVENTS, _config as _small_config, _provider, _scenario, _universe
+
+    universe, state, meta = _universe()
+    scenario = _scenario()
+    config = _small_config()
+    # The Stage-1/Stage-2 fixtures score event 4, so the certified world is event 4's.
+    conn, runs = _world(events=EVENTS)
+    try:
+        artifact = _artifact(conn, runs, events=EVENTS)
+        unauthorised = _unauthorised(artifact)
+        certified = _self_consistent_bundle(runs[int(EVENTS[0])], event=int(EVENTS[0]))
+        bundles = {int(EVENTS[0]): certified}
+
+        # Stage 1 in the declared non-production worlds, so the refinement has a
+        # Stage-1 result to refine and the ONLY thing under test is the artifact the
+        # refinement and the ladder forward to the certified loader.
+        stage1 = ro.optimize(
+            universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+            config=config, non_production_worlds=ro.NonProductionWorlds(
+                declaration="tests: pe-9 adversarial stage 1", provider=_provider()
+            ),
+        )
+        with pytest.raises(cb.CertificationRefused) as caught:
+            fr.refine_finalists(
+                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+                bundles=bundles, conn=conn, base_config=config, stage1_result=stage1,
+                stage2_draws=config.search_draws * 2, certification=unauthorised,
+                cache_dir=tmp_path, verify_prefix=False, exact_cache={},
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+
+        with pytest.raises(cb.CertificationRefused) as caught:
+            rs.run_ladder(
+                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+                base_config=config, budgets=[2], bundles=bundles, conn=conn,
+                certification=unauthorised, cache_dir=tmp_path, exact_cache={},
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+    finally:
+        conn.close()
+
+
+def test_the_validated_artifact_is_immutable_and_a_self_consistent_mapping_is_revalidated():
+    """The capability can be neither forged nor edited, and it round-trips."""
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        validated = cb.validate_certification_artifact(artifact)
+        assert isinstance(validated, cb.ValidatedCertificationArtifact)
+        # Idempotent: the authorisation itself is what a caller passes on.
+        assert cb.validate_certification_artifact(validated) is validated
+        assert validated["certified_bundles"]["5"]["runs"] == runs[5]
+
+        # Minting one from a raw mapping is refused, so the type IS the authorisation.
+        with pytest.raises(cb.CertificationArtifactUnvalidated):
+            cb.ValidatedCertificationArtifact(artifact)
+        # ... and it cannot be edited after the check.
+        with pytest.raises(TypeError):
+            validated["certified_bundles"]["5"]["runs"]["minutes_v1"] = 999
+        with pytest.raises(TypeError):
+            validated["events"] = [9]
+        with pytest.raises(TypeError):
+            validated["certified_bundles"]["5"]["cutoff"] = OTHER_CUTOFF
+        # The artifact the boundary validated is unchanged by those attempts.
+        assert validated["certified_bundles"]["5"]["cutoff"] == CUTOFF
+
+        # A raw mapping that DOES carry every authorization field is revalidated and
+        # accepted -- the contract is re-run, never assumed from the mapping's shape.
+        revalidated = cb.validate_certification_artifact(json.loads(json.dumps(artifact)))
+        assert isinstance(revalidated, cb.ValidatedCertificationArtifact)
+        assert revalidated.validated_identity == validated.validated_identity
+
+        # Dropping ONE authorization field is enough to turn it back into a mapping
+        # that is not an authorisation.
+        for field in AUTHORIZATION_FIELDS:
+            with pytest.raises(cb.CertificationArtifactUnvalidated):
+                cb.validate_certification_artifact(_unauthorised(artifact, drop=(field,)))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Adversarial: an arbitrary matrix carrying the CORRECT copied stamp
+# ---------------------------------------------------------------------------
+#
+# The third attack: a caller builds its own worlds (or edits a loaded matrix) and
+# copies the certified-bundle stamp onto them.  A stamp is caller-writable, so it
+# authorises nothing; what admits a prebuilt matrix is the loader's own record of the
+# content it produced, verified by canonical content identity and bound to the event
+# and to the certified bundle the artifact records.
+
+
+def _stamped_by_hand(matrix, identity: str):
+    """A caller-built matrix carrying the CERTIFIED bundle stamp it copied."""
+
+    from fpl_brain.manager_worlds import MATRIX_CERTIFIED_BUNDLE_KEY
+
+    stamped = {key: value for key, value in matrix.items() if not str(key).startswith("_p2_")}
+    stamped[MATRIX_CERTIFIED_BUNDLE_KEY] = str(identity)
+    return stamped
+
+
+def _certified_matrix_loads(conn, runs, artifact, tmp_path, event: int):
+    """The loader's OWN 8-world matrix for one event, plus its certified identity."""
+
+    certified = _self_consistent_bundle(runs[int(event)], event=int(event))
+    matrix, info = ro.build_event_worlds(
+        conn, {int(event): certified}, int(event), (1, 2), _optimizer_config(events=(int(event),)),
+        certification=artifact, cache_dir=tmp_path,
+    )
+    return matrix, info
+
+
+def test_adversarial_a_copied_stamp_does_not_authorise_a_matrix(tmp_path):
+    """Every door that admits a prebuilt matrix refuses a stamped hand-built one."""
+
+    from fpl_brain.manager_worlds import MATRIX_CERTIFIED_BUNDLE_KEY
+    from fpl_brain import finalist_refinement as fr
+    from fpl_brain import route_stability as rs
+    from test_route_optimizer import (
+        EVENTS, _config as _small_config, _provider, _scenario, _universe,
+    )
+
+    event = int(EVENTS[0])
+    conn, runs = _world(events=EVENTS)
+    try:
+        artifact = _artifact(conn, runs, events=EVENTS)
+        certified = _self_consistent_bundle(runs[event], event=event)
+        matrix, info = _certified_matrix_loads(conn, runs, artifact, tmp_path, event)
+        identity = info["certified_bundle_identity"]
+
+        # The loader's own output carries the stamp, and IS admitted.
+        assert str(matrix[MATRIX_CERTIFIED_BUNDLE_KEY]) == str(identity)
+
+        universe, state, meta = _universe()
+        scenario = _scenario()
+        config = _small_config()
+
+        def _optimize_with(worlds, **over):
+            return ro.optimize(
+                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+                bundles={event: certified}, conn=conn, config=ro.OptimizerConfig(
+                    events=EVENTS, search_draws=8, seed=20260911, policy_selection_worlds=6,
+                ),
+                certification=artifact, prebuilt_worlds=worlds, exact_cache={}, **over,
+            )
+
+        # (1) A hand-built matrix carrying the CORRECT copied stamp is refused.
+        hand_built = _stamped_by_hand(
+            {"worlds": 8, "player_ids": [1, 2],
+             "core": {1: [99.0] * 8, 2: [99.0] * 8},
+             "minutes": {1: [90.0] * 8, 2: [90.0] * 8},
+             "expected_bonus": {1: 0.0, 2: 0.0},
+             "role_actionability": {1: False, 2: False}},
+            identity,
+        )
+        assert str(hand_built[MATRIX_CERTIFIED_BUNDLE_KEY]) == str(identity)
+        with pytest.raises(cb.CertificationRefused) as caught:
+            _optimize_with({event: hand_built})
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+
+        # (2) EDITING a loaded matrix keeps its stamp but not its content identity.
+        edited = {key: value for key, value in matrix.items()}
+        edited["core"] = {1: [99.0] * int(edited["worlds"]), 2: [99.0] * int(edited["worlds"])}
+        assert str(edited[MATRIX_CERTIFIED_BUNDLE_KEY]) == str(identity)
+        with pytest.raises(cb.CertificationRefused) as caught:
+            _optimize_with({event: edited})
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+
+        # (3) A loaded matrix offered for a DIFFERENT event's authorisation is refused:
+        # the capability is bound to the event it was issued for.
+        with pytest.raises(cb.CertificationRefused):
+            ro.require_certified_prebuilt_matrix(
+                matrix, event=event + 1, certified_bundle_identity=str(identity)
+            )
+
+        # (4) Refinement and the stability ladder forward prebuilt worlds to the SAME
+        # door, so neither admits one either.
+        with pytest.raises(cb.CertificationRefused) as caught:
+            fr.refine_finalists(
+                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+                bundles={event: certified}, conn=conn, base_config=config,
+                stage1_result=ro.optimize(
+                    universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+                    config=config, non_production_worlds=ro.NonProductionWorlds(
+                        declaration="tests: pe-9 adversarial stage 1", provider=_provider()
+                    ),
+                ),
+                stage2_draws=config.search_draws * 2, certification=artifact,
+                prebuilt_worlds={event: hand_built}, verify_prefix=False, exact_cache={},
+            )
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+
+        with pytest.raises(cb.CertificationRefused) as caught:
+            rs.run_ladder(
+                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
+                base_config=config, budgets=[2], bundles={event: certified}, conn=conn,
+                certification=artifact, prebuilt_worlds={event: hand_built}, exact_cache={},
+            )
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+    finally:
+        conn.close()
+
+
+def test_adversarial_the_manager_world_load_requires_the_certified_run_ids():
+    """The manager policy matrix is a decision input, so its worlds cross the boundary.
+
+    ``manager_worlds.build_manager_worlds`` reads the Minutes / team-strength / xPts
+    runs and simulates the shared worlds the manager policy is scored in.  A
+    hand-assembled run-id set is refused, and so is the same set dressed in an
+    artifact-shaped mapping that carries no authorisation.
+    """
+
+    from fpl_brain import manager_worlds as mw
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        certified = runs[5]
+        with pytest.raises(cb.CertificationRefused) as caught:
+            mw.build_manager_worlds(
+                conn, planning_event=5, minutes_run_id=certified["minutes_v1"],
+                xpts_run_id=certified["xpts_v1"], team_run_id=certified["team_strength_v1"],
+                squad_ids=[1], simulations=4,
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
+
+        with pytest.raises(cb.CertificationRefused) as caught:
+            mw.build_manager_worlds(
+                conn, planning_event=5, minutes_run_id=certified["minutes_v1"],
+                xpts_run_id=certified["xpts_v1"], team_run_id=certified["team_strength_v1"],
+                squad_ids=[1], simulations=4, certification=_unauthorised(artifact),
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
+
+        # A run id the artifact did not record for this event is refused, however
+        # complete the world it names is.
+        other = _alternative_world(conn, 5)
+        with pytest.raises(cb.CertificationRefused) as caught:
+            mw.build_manager_worlds(
+                conn, planning_event=5, minutes_run_id=other["minutes_v1"],
+                xpts_run_id=other["xpts_v1"], team_run_id=other["team_strength_v1"],
+                squad_ids=[1], simulations=4, certification=artifact,
+            )
+        assert caught.value.token == cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT
+
+        # The CERTIFIED run ids load, so the refusals above are about provenance.
+        built = mw.build_manager_worlds(
+            conn, planning_event=5, minutes_run_id=certified["minutes_v1"],
+            xpts_run_id=certified["xpts_v1"], team_run_id=certified["team_strength_v1"],
+            squad_ids=[1], simulations=4, certification=artifact,
+        )
+        assert built["world_matrix"]["worlds"] == 4
+    finally:
+        conn.close()
+
+
+def test_the_loader_issued_matrix_is_content_bound_not_stamp_bound(tmp_path):
+    """The capability binds CONTENT: re-issuing the same worlds is admitted, a stamp
+    copied onto different worlds is not -- and the stamp itself plays no part."""
+
+    from test_route_optimizer import EVENTS
+
+    event = int(EVENTS[0])
+    conn, runs = _world(events=EVENTS)
+    try:
+        artifact = _artifact(conn, runs, events=EVENTS)
+        certified = _self_consistent_bundle(runs[event], event=event)
+        first, info = _certified_matrix_loads(conn, runs, artifact, tmp_path, event)
+        identity = info["certified_bundle_identity"]
+
+        # A second, INDEPENDENT load of the same certified world is issued too: the
+        # same content, produced by the same loader, is the same authorisation.
+        second, info2 = ro.build_event_worlds(
+            conn, {event: certified}, event, (1, 2), _optimizer_config(events=(event,)),
+            certification=artifact,
+        )
+        assert info2["certified_bundle_identity"] == identity
+        assert ro.issued_world_matrix(second) is not None
+        assert (
+            ro.issued_world_matrix(second).content_identity
+            == ro.issued_world_matrix(first).content_identity
+        )
+        assert ro.require_certified_prebuilt_matrix(
+            second, event=event, certified_bundle_identity=str(identity)
+        ).event == event
+
+        # A matrix with no semantic blocks at all -- the shape a caller reaches for when
+        # it only wants the stamp check to pass -- is not issued, and cannot be.
+        assert ro.issued_world_matrix({"worlds": 8, "player_ids": [1, 2]}) is None
+        assert ro.issued_world_matrix(
+            _stamped_by_hand({"worlds": 8, "player_ids": [1, 2]}, identity)
+        ) is None
     finally:
         conn.close()

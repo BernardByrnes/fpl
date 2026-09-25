@@ -138,9 +138,58 @@ def build_manager_worlds(
     seed: int = 20260911,
     occupancy_audit: bool = True,
     expected_bonus: bool = True,
+    certification: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Simulate the full frozen universe and extract the squad GW matrix."""
+    """Simulate the full frozen universe and extract the squad GW matrix.
 
+    This is a PREDICTIVE-LOAD boundary: it reads the Minutes / team-strength / xPts
+    runs and simulates the shared football worlds every manager policy is scored in,
+    so the run ids must be exactly the ones a VALIDATED certification artifact
+    recorded for this event.  A hand-assembled run-id set is refused, and so is an
+    artifact-shaped mapping that has not passed the canonical loader's contract: the
+    matrix this returns is a decision input, and no decision input is built from
+    worlds no certification authorised.
+    """
+
+    from . import certified_bundle as cb
+
+    record = cb.certified_bundle_artifact_record(certification, int(planning_event))
+    declared = {
+        "minutes_v1": int(minutes_run_id),
+        "team_strength_v1": int(team_run_id),
+        "xpts_v1": int(xpts_run_id),
+    }
+    mismatched = [
+        f"{family}: declared run {declared[family]}, certified run "
+        f"{record['runs'].get(family)!r}"
+        for family in sorted(declared)
+        if int(record["runs"].get(family, -1)) != declared[family]
+    ]
+    if mismatched:
+        raise cb.CertificationRefused(
+            cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT,
+            [
+                f"GW{int(planning_event)}: the manager worlds would be simulated from run ids the "
+                "certification did not record for this event: " + "; ".join(mismatched)
+            ],
+        )
+    # The artifact is a CLAIM about the run rows, never a substitute for them: the
+    # recorded generation is re-proven from the rows themselves at the load, exactly as
+    # the optimizer's loader does, so an incomplete, re-cut, re-versioned or differently
+    # wired family cannot authorise this simulation.  The families checked are the ones
+    # THIS load reads (:data:`certified_bundle.LOAD_REQUIRED_FAMILIES`) -- the Monte
+    # Carlo run the artifact also records is not read here, and inventing a requirement
+    # the load does not have would refuse a generation for a reason that is not its own.
+    try:
+        cb.validate_certified_bundle(
+            conn, event=int(planning_event), cutoff=str(record["cutoff"]), runs=record["runs"],
+            required_versions=cb.declared_required_versions(),
+            families=cb.LOAD_REQUIRED_FAMILIES,
+        )
+    except cb.BundleIncoherent as failure:
+        raise cb.CertificationRefused(
+            cb.bundle_state_from_reasons(failure.reasons), failure.reasons
+        ) from failure
     fixtures = monte_carlo.load_fixture_inputs(
         conn, event=int(planning_event), xpts_run_id=int(xpts_run_id),
         minutes_run_id=int(minutes_run_id), team_run_id=int(team_run_id),
