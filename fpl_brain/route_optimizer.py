@@ -68,11 +68,11 @@ class IssuedWorldMatrix:
     non_production_declaration: str | None = None
 
 
-#: Loader-owned capability registry, keyed by canonical content identity.  Process
-#: local and never persisted: a capability authorises a PREBUILT matrix inside the
-#: run that produced it, and a matrix arriving from anywhere else (another process,
+#: Loader-owned capability, keyed by canonical content identity and held INSIDE the
+#: loader that issues it (see :func:`_world_matrix_capability_authority`): process
+#: local and never persisted, because a capability authorises a PREBUILT matrix inside
+#: the run that produced it, and a matrix arriving from anywhere else (another process,
 #: another run, a caller's own simulation) is refused rather than admitted.
-_ISSUED_WORLD_MATRICES: dict[str, IssuedWorldMatrix] = {}
 
 
 @dataclass(frozen=True)
@@ -903,11 +903,11 @@ def world_cache_key(*, event, bundle, config, union_ids) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def build_event_worlds(conn, bundles, event, union_ids, config, *,
+def _load_event_worlds(conn, bundles, event, union_ids, config, *,
                        cache_dir: Path | None = None,
                        non_production_worlds: "NonProductionWorlds | None" = None,
                        certification: Mapping[str, Any] | None = None):
-    """Load one event's world matrix from its CERTIFIED bundle.
+    """The certified load itself: one event's world matrix, or a refusal.
 
     There are exactly two ways in, and neither is a bare matrix parameter:
 
@@ -926,10 +926,11 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *,
       prediction run at all.  It must name who is exercising it, and it is refused
       outright when a certification artifact is presented.
 
-    Every matrix this function returns is ISSUED to the loader's own capability
-    registry, so a later call can admit it as ``prebuilt_worlds`` on evidence --
-    canonical content identity, bound to the event and to the authorisation the
-    matrix was loaded under -- rather than on a writable stamp.
+    This body deliberately does NOT issue the loader-owned capability: only
+    ``build_event_worlds``, created beside that capability by
+    :func:`_world_matrix_capability_authority`, can.  Worlds obtained by calling this
+    body directly -- or by simulating them anywhere else -- therefore present no
+    capability and are refused as ``prebuilt_worlds``.
     """
 
     from . import certified_bundle as cb
@@ -962,10 +963,6 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *,
             f"{non_production_worlds.stamp()}|injected:{int(event)}:{int(config.search_draws)}:"
             f"{int(config.seed)}:{len(union_ids)}",
         )
-        _issue_world_matrix(
-            matrix, event=int(event), source="injected",
-            non_production_declaration=str(non_production_worlds.declaration),
-        )
         return matrix, {
             "source": "injected",
             "non_production": True,
@@ -993,12 +990,6 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *,
             _stamp_matrix_identity(matrix, key)
             _stamp_matrix_certified_bundle(matrix, proof["certified_bundle_identity"])
             _stamp_matrix_path(matrix, path)
-            # A cache hit is still THIS loader's output for those certified run ids, so
-            # it is issued exactly like a freshly generated matrix.
-            _issue_world_matrix(
-                matrix, event=int(event), source="cache",
-                certified_bundle_identity=proof["certified_bundle_identity"],
-            )
             return matrix, {"source": "cache", "key": key,
                             "certified_bundle_identity": proof["certified_bundle_identity"]}
     fixtures = monte_carlo.load_fixture_inputs(
@@ -1033,10 +1024,6 @@ def build_event_worlds(conn, bundles, event, union_ids, config, *,
             "role_actionability": {str(k): bool(v) for k, v in matrix["role_actionability"].items()},
         }), encoding="utf-8")
         _stamp_matrix_path(matrix, matrix_path)
-    _issue_world_matrix(
-        matrix, event=int(event), source="generated",
-        certified_bundle_identity=proof["certified_bundle_identity"],
-    )
     return matrix, {"source": "generated", "key": key,
                     "certified_bundle_identity": proof["certified_bundle_identity"]}
 
@@ -1133,104 +1120,189 @@ def world_matrix_content_identity(matrix: Any) -> str | None:
         return None
 
 
-def _issue_world_matrix(
-    matrix: Any,
-    *,
-    event: int,
-    source: str,
-    certified_bundle_identity: str | None = None,
-    non_production_declaration: str | None = None,
-) -> None:
-    """Record a matrix THIS module produced, so a later call can verify it.
+def _world_matrix_capability_authority():
+    """Own the loader-issued world-matrix capability for this process.
 
-    Issued on every load -- database generation and content-addressed cache read
-    alike -- because a cache hit is still this loader's output for those certified run
-    ids.
+    The capability is the loader's own record of the content it produced, and it lives
+    inside this closure: there is no module-global registry for a caller to write, and
+    no module-level issuer that can record a CERTIFIED-door capability for content of
+    the caller's choosing.  What the module exposes is READ-ONLY -- a lookup and the
+    two admission checks -- while the only function that can record a CERTIFIED-door
+    capability is the loader created below, which reaches the registry as a closure
+    variable and records exactly the matrix the load produced or read, under exactly
+    the authorisation the load presented.
+
+    A caller that injects a registry of its own (``ro._ISSUED_WORLD_MATRICES = {...}``),
+    or that calls a recorder it finds, therefore changes nothing: the admission checks
+    read this closure, and the declared-door recorder returned for
+    ``route_optimizer.optimize`` can only ever record a NON-PRODUCTION declaration --
+    never a certified bundle identity.
     """
 
-    content_identity = world_matrix_content_identity(matrix)
-    if content_identity is None:
-        return
-    _ISSUED_WORLD_MATRICES[content_identity] = IssuedWorldMatrix(
-        content_identity=content_identity,
-        event=int(event),
-        source=str(source),
-        certified_bundle_identity=(
-            None if certified_bundle_identity is None else str(certified_bundle_identity)
-        ),
-        non_production_declaration=(
-            None if non_production_declaration is None else str(non_production_declaration)
-        ),
-    )
+    issued: dict[str, IssuedWorldMatrix] = {}
 
+    def _issue(
+        matrix: Any,
+        *,
+        event: int,
+        source: str,
+        certified_bundle_identity: str | None = None,
+        non_production_declaration: str | None = None,
+    ) -> None:
+        """Record a matrix this module produced, so a later call can verify it.
 
-def issued_world_matrix(matrix: Any) -> IssuedWorldMatrix | None:
-    """The loader's own record of this matrix, by CONTENT, or ``None``.
+        Issued on every load -- database generation and content-addressed cache read
+        alike -- because a cache hit is still this loader's output for those certified
+        run ids.
+        """
 
-    A hand-built matrix, or a copy of one whose worlds were then edited, is simply
-    not in the registry: the record is keyed by what the matrix contains, and this
-    loader only ever records content it produced.
-    """
-
-    content_identity = world_matrix_content_identity(matrix)
-    if content_identity is None:
-        return None
-    return _ISSUED_WORLD_MATRICES.get(content_identity)
-
-
-def require_certified_prebuilt_matrix(
-    matrix: Any, *, event: int, certified_bundle_identity: str
-) -> IssuedWorldMatrix:
-    """Admit a PREBUILT matrix only when the LOADER issued it for this event.
-
-    The stamp ``build_event_worlds`` writes on its own output is caller-writable, so
-    it is deliberately NOT what authorises a prebuilt matrix: it records provenance
-    and nothing else.  What authorises one is the loader-owned capability -- the
-    matrix's canonical content identity, bound to the event and to the certified
-    bundle identity the certification artifact records -- so a matrix a caller built,
-    or a copy of a loaded one whose content was changed, is refused even when it
-    carries the correct copied stamp.
-    """
-
-    from . import certified_bundle as cb
-
-    issued = issued_world_matrix(matrix)
-    reasons: list[str] = []
-    if issued is None:
-        reasons.append(
-            f"event {int(event)}: the prebuilt world matrix was not issued by the certified "
-            "world loader, so its content is not the content any certification authorised"
+        content_identity = world_matrix_content_identity(matrix)
+        if content_identity is None:
+            return
+        issued[content_identity] = IssuedWorldMatrix(
+            content_identity=content_identity,
+            event=int(event),
+            source=str(source),
+            certified_bundle_identity=(
+                None if certified_bundle_identity is None else str(certified_bundle_identity)
+            ),
+            non_production_declaration=(
+                None if non_production_declaration is None else str(non_production_declaration)
+            ),
         )
-    else:
-        if int(issued.event) != int(event):
+
+    def issued_world_matrix(matrix: Any) -> IssuedWorldMatrix | None:
+        """The loader's own record of this matrix, by CONTENT, or ``None``.
+
+        A hand-built matrix, or a copy of one whose worlds were then edited, is simply
+        not in the registry: the record is keyed by what the matrix contains, and this
+        loader only ever records content it produced.
+        """
+
+        content_identity = world_matrix_content_identity(matrix)
+        if content_identity is None:
+            return None
+        return issued.get(content_identity)
+
+    def require_certified_prebuilt_matrix(
+        matrix: Any, *, event: int, certified_bundle_identity: str
+    ) -> IssuedWorldMatrix:
+        """Admit a PREBUILT matrix only when the LOADER issued it for this event.
+
+        The stamp ``build_event_worlds`` writes on its own output is caller-writable, so
+        it is deliberately NOT what authorises a prebuilt matrix: it records provenance
+        and nothing else.  What authorises one is the loader-owned capability -- the
+        matrix's canonical content identity, bound to the event and to the certified
+        bundle identity the certification artifact records -- so a matrix a caller built,
+        or a copy of a loaded one whose content was changed, is refused even when it
+        carries the correct copied stamp.
+        """
+
+        from . import certified_bundle as cb
+
+        record = issued_world_matrix(matrix)
+        reasons: list[str] = []
+        if record is None:
             reasons.append(
-                f"event {int(event)}: the prebuilt world matrix was issued for event "
-                f"{int(issued.event)}"
+                f"event {int(event)}: the prebuilt world matrix was not issued by the certified "
+                "world loader, so its content is not the content any certification authorised"
             )
-        if str(issued.certified_bundle_identity or "") != str(certified_bundle_identity):
-            reasons.append(
-                f"event {int(event)}: the prebuilt world matrix was issued against a different "
-                "certified bundle than the certification artifact records for this event"
-            )
-    if reasons:
-        raise cb.CertificationRefused(DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED, reasons)
-    return issued
+        else:
+            if int(record.event) != int(event):
+                reasons.append(
+                    f"event {int(event)}: the prebuilt world matrix was issued for event "
+                    f"{int(record.event)}"
+                )
+            if str(record.certified_bundle_identity or "") != str(certified_bundle_identity):
+                reasons.append(
+                    f"event {int(event)}: the prebuilt world matrix was issued against a different "
+                    "certified bundle than the certification artifact records for this event"
+                )
+        if reasons:
+            raise cb.CertificationRefused(DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED, reasons)
+        return record
 
+    def _declaration_issued_matrix(matrix: Any, *, event: int, declaration: str) -> bool:
+        """Whether a prebuilt matrix is THIS declared non-production source's own output.
 
-def _declaration_issued_matrix(matrix: Any, *, event: int, declaration: str) -> bool:
-    """Whether a prebuilt matrix is THIS declared non-production source's own output.
+        A declaration is not a blanket permission: the matrix must be one the loader
+        produced under that same declaration, verified by content.  A hand-built matrix
+        carrying a copied declaration stamp is not.
+        """
 
-    A declaration is not a blanket permission: the matrix must be one the loader
-    produced under that same declaration, verified by content.  A hand-built matrix
-    carrying a copied declaration stamp is not.
-    """
+        record = issued_world_matrix(matrix)
+        return bool(
+            record is not None
+            and int(record.event) == int(event)
+            and str(record.non_production_declaration or "") == str(declaration)
+        )
 
-    issued = issued_world_matrix(matrix)
-    return bool(
-        issued is not None
-        and int(issued.event) == int(event)
-        and str(issued.non_production_declaration or "") == str(declaration)
+    def _issue_declared_world_matrix(matrix: Any, *, event: int, declaration: str) -> None:
+        """Record a matrix produced under a DECLARED non-production source.
+
+        The declared door consumes caller-supplied worlds by design, so this recorder
+        grants no authority a caller does not already have: the record carries a
+        declaration and NO certified bundle identity, which is why it can never satisfy
+        :func:`require_certified_prebuilt_matrix`.
+        """
+
+        _issue(
+            matrix,
+            event=int(event),
+            source="injected",
+            non_production_declaration=str(declaration),
+        )
+
+    def build_event_worlds(
+        conn,
+        bundles,
+        event,
+        union_ids,
+        config,
+        *,
+        cache_dir: Path | None = None,
+        non_production_worlds: "NonProductionWorlds | None" = None,
+        certification: Mapping[str, Any] | None = None,
+    ):
+        """Load one event's world matrix and ISSUE the loader's capability for it.
+
+        The load itself is :func:`_load_event_worlds`; this wrapper is the only thing
+        that can record a capability, and it records exactly what the load produced or
+        read -- never content a caller supplied -- so a later call may admit the matrix
+        as ``prebuilt_worlds`` on evidence (canonical content identity, bound to the
+        event and to the authorisation the matrix was loaded under) rather than on a
+        writable stamp.
+        """
+
+        matrix, info = _load_event_worlds(
+            conn, bundles, event, union_ids, config, cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds, certification=certification,
+        )
+        _issue(
+            matrix,
+            event=int(event),
+            source=str(info.get("source") or ""),
+            certified_bundle_identity=info.get("certified_bundle_identity"),
+            non_production_declaration=info.get("declaration"),
+        )
+        return matrix, info
+
+    return (
+        build_event_worlds,
+        issued_world_matrix,
+        require_certified_prebuilt_matrix,
+        _declaration_issued_matrix,
+        _issue_declared_world_matrix,
     )
+
+
+(
+    build_event_worlds,
+    issued_world_matrix,
+    require_certified_prebuilt_matrix,
+    _declaration_issued_matrix,
+    _issue_declared_world_matrix,
+) = _world_matrix_capability_authority()
 
 
 def _stamp_matrix_certified_bundle(matrix, identity: str | None) -> None:
@@ -1630,9 +1702,9 @@ def optimize(
                     f"{non_production_worlds.stamp()}|prebuilt:{int(event)}:"
                     f"{int(config.search_draws)}:{int(config.seed)}:{len(union)}",
                 )
-                _issue_world_matrix(
-                    matrix, event=int(event), source="injected",
-                    non_production_declaration=str(non_production_worlds.declaration),
+                _issue_declared_world_matrix(
+                    matrix, event=int(event),
+                    declaration=str(non_production_worlds.declaration),
                 )
                 info = {"source": "prebuilt", "non_production": True,
                         "declaration": str(non_production_worlds.declaration)}

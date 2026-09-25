@@ -534,16 +534,25 @@ def certification_identity_of(payload: Mapping[str, Any]) -> str:
     verify it without any code-drift assumption.  That is what makes the legacy
     allowlist an identity test rather than a forgeable label: copying a recognised
     identity onto a different artifact fails this check.
+
+    The fields are read through ``certified_bundle.plain_certification_value`` so the
+    SAME bytes are hashed whether the caller holds the parsed JSON or the read-only
+    snapshot a validated artifact exposes: the fingerprint is a function of the
+    artifact's content, never of the container it arrived in.
     """
 
     import hashlib
     import json as _json
 
-    fingerprint = {
-        "cutoff": payload.get("planning_cutoff"),
-        "bundles": payload.get("certified_bundle_identity") or {},
-        "data_snapshot_sha256": payload.get("data_snapshot_sha256"),
-    }
+    from . import certified_bundle as cb
+
+    fingerprint = cb.plain_certification_value(
+        {
+            "cutoff": payload.get("planning_cutoff"),
+            "bundles": payload.get("certified_bundle_identity") or {},
+            "data_snapshot_sha256": payload.get("data_snapshot_sha256"),
+        }
+    )
     return "sha256:" + hashlib.sha256(
         _json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

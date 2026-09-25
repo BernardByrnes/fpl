@@ -36,7 +36,9 @@ def _write(tmp_path, payload=None, name="cert.json"):
 def test_A_a_real_artifact_loads_through_the_canonical_loader(tmp_path):
     path = _write(tmp_path)
     artifact = fg.load_certification_artifact(path)          # the REAL loader
-    assert artifact["events"] == [5, 6, 7, 8]
+    # The authorisation is a read-only snapshot, so its sequences are tuples; the
+    # certified horizon itself is unchanged.
+    assert list(artifact["events"]) == [5, 6, 7, 8]
 
     authority = fa.load_decision_authority(path)
     assert authority.certified_events == (5, 6, 7, 8)

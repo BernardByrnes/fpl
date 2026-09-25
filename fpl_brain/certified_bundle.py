@@ -26,6 +26,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 DIAG_PREDICTIVE_BUNDLE_INCOHERENT = "PREDICTIVE_BUNDLE_INCOHERENT"
@@ -563,6 +564,7 @@ class CertificationRefused(RuntimeError):
 DIAG_CERTIFICATION_ARTIFACT_ABSENT = "CERTIFICATION_ARTIFACT_ABSENT"
 DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY = "CERTIFICATION_ARTIFACT_CONTRADICTORY"
 DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED = "CERTIFICATION_ARTIFACT_UNVALIDATED"
+DIAG_CERTIFICATION_ARTIFACT_MUTATED = "CERTIFICATION_ARTIFACT_MUTATED"
 DIAG_CALIBRATION_IDENTITY_UNKNOWN = "CALIBRATION_IDENTITY_UNKNOWN"
 DIAG_CALIBRATION_WORLD_MISMATCH = "CALIBRATION_WORLD_MISMATCH"
 DIAG_CERTIFICATION_BOUNDARY_REQUIRED = "CERTIFICATION_BOUNDARY_REQUIRED"
@@ -591,6 +593,20 @@ class CertificationArtifactUnvalidated(CertificationRefused):
 
     def __init__(self, reasons: Sequence[str]) -> None:
         super().__init__(DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED, reasons)
+
+
+class CertificationArtifactMutated(CertificationArtifactContradictory):
+    """A VALIDATED artifact whose bytes no longer digest to its minted identity.
+
+    A fourth fact beside absent, contradictory and unvalidated: this value WAS
+    validated and was then edited.  It is a subclass of the contradictory family -- a
+    mutated authorisation contradicts its own validated bytes -- so every consumer that
+    already refuses a contradiction keeps refusing, while a consumer that wants to name
+    the tamper has this token.
+    """
+
+    def __init__(self, reasons: Sequence[str]) -> None:
+        CertificationRefused.__init__(self, DIAG_CERTIFICATION_ARTIFACT_MUTATED, reasons)
 
 
 # --- phase terminal state ---------------------------------------------------
@@ -1497,213 +1513,367 @@ def require_certification_artifact(certification: Any) -> Mapping[str, Any]:
         raise CertificationArtifactContradictory(
             [f"the certification artifact is {type(candidates[0]).__name__}, not an object"]
         )
+    if isinstance(candidates[0], ValidatedCertificationArtifact):
+        # An authorisation that was already minted has its content-bound digest
+        # re-verified here, so every consumer of "exactly one artifact per decision"
+        # gets the same byte-level check the loader boundary performs: an artifact
+        # edited after validation is refused before anything is read from it.
+        assert_certification_artifact_bytes_unchanged(candidates[0])
     return candidates[0]
 
 
-#: The mint token of a validated artifact.  ``ValidatedCertificationArtifact`` is
-#: constructible only by :func:`validate_certification_artifact`, which is the ONE
-#: function that applies the complete authorization contract; a caller that tries to
-#: mint one from a raw mapping is refused, so the type IS the authorisation.
-_CERTIFICATION_ARTIFACT_MINT = object()
+#: A validated certification artifact is the AUTHORISATION a predictive load consumes.
+#: It is built by COMPOSITION over a genuinely read-only snapshot -- a ``Mapping``
+#: facade over private dicts wrapped in ``MappingProxyType``, sequences frozen to
+#: tuples and sets to frozensets -- rather than by subclassing ``dict``/``list``.  A
+#: dict subclass only REFUSES the mutators it overrides while ``dict.__setitem__``
+#: still edits the value underneath, so subclassing is not immutability.  Nothing
+#: mutable is reachable from the snapshot, so the bytes a load was authorised by
+#: cannot be changed after the check.
+#:
+#: The mint token is a closure variable of :func:`_validated_certification_artifact_capability`
+#: and is deliberately NOT a module attribute: the class is exposed so a consumer can
+#: RECOGNISE the authorisation it was handed, but no caller can construct one through
+#: normal module access.  The only constructor is the validation function created
+#: beside the token, and it applies the complete contract before minting.
 
 _IMMUTABLE_ARTIFACT_REFUSAL = (
-    "a validated certification artifact is IMMUTABLE: it is minted by "
-    "certified_bundle.validate_certification_artifact and never edited, so the bytes a "
-    "load was authorised by cannot be changed after the check"
+    "a validated certification artifact is IMMUTABLE: it is a read-only snapshot minted by "
+    "certified_bundle.validate_certification_artifact, so the bytes a load was authorised "
+    "by cannot be changed after the check"
 )
 
 
-class _ImmutableCertificationMapping(dict):
-    """A mapping that refuses every mutation, recursively frozen at mint time."""
+def _canonical_certification_bytes(document: Mapping[str, Any]) -> bytes:
+    """The canonical byte form of an artifact's own content.
 
-    __slots__ = ()
+    ONE encoding, shared by the mint and by every re-verification, so "these bytes have
+    not changed" is a pure function of the CONTENT rather than a property of an object
+    identity a caller could keep alive.  A value the canonical encoding cannot represent
+    is refused instead of stringified: an encoding that silently stringified its input
+    could not detect a change.
+    """
 
-    def _refuse_mutation(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
+    def encode(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): encode(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [encode(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            return sorted((encode(item) for item in value), key=repr)
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        raise TypeError(
+            "a validated certification artifact must carry values the canonical digest "
+            f"can represent; found {type(value).__name__}"
+        )
 
-    __setitem__ = _refuse_mutation
-    __delitem__ = _refuse_mutation
-    __ior__ = _refuse_mutation
-    clear = _refuse_mutation
-    pop = _refuse_mutation
-    popitem = _refuse_mutation
-    setdefault = _refuse_mutation
-    update = _refuse_mutation
-
-
-class _ImmutableCertificationSequence(list):
-    """A list that refuses every mutation, recursively frozen at mint time."""
-
-    __slots__ = ()
-
-    def _refuse_mutation(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
-
-    __setitem__ = _refuse_mutation
-    __delitem__ = _refuse_mutation
-    __iadd__ = _refuse_mutation
-    __imul__ = _refuse_mutation
-    append = _refuse_mutation
-    clear = _refuse_mutation
-    extend = _refuse_mutation
-    insert = _refuse_mutation
-    pop = _refuse_mutation
-    remove = _refuse_mutation
-    reverse = _refuse_mutation
-    sort = _refuse_mutation
+    return json.dumps(
+        encode(document), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
 
 
-def _frozen_certification_value(value: Any) -> Any:
-    """A recursive COPY of a certification value that no consumer can mutate."""
+def certification_artifact_digest(document: Mapping[str, Any]) -> str:
+    """The CONTENT-BOUND digest of an artifact's own bytes, from the ONE algorithm.
+
+    Every boundary recomputes it and compares it against the identity a validated
+    artifact was minted with, so an artifact whose content changed after validation is
+    refused rather than read.
+    """
+
+    try:
+        payload = _canonical_certification_bytes(document)
+    except TypeError as failure:
+        raise CertificationArtifactUnvalidated([str(failure)]) from failure
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _readonly_certification_value(value: Any) -> Any:
+    """A recursively READ-ONLY snapshot of a certification value.
+
+    Mappings become ``MappingProxyType`` over a private dict, sequences become tuples
+    and sets become frozensets, so no mutable container is reachable from the result:
+    there is no base-class mutator to call and no ``copy``-and-edit route back into the
+    artifact the boundary validated.
+    """
 
     if isinstance(value, Mapping):
-        return _ImmutableCertificationMapping(
-            {key: _frozen_certification_value(item) for key, item in value.items()}
+        return MappingProxyType(
+            {key: _readonly_certification_value(item) for key, item in value.items()}
         )
-    if isinstance(value, list):
-        return _ImmutableCertificationSequence(
-            [_frozen_certification_value(item) for item in value]
-        )
-    if isinstance(value, tuple):
-        return tuple(_frozen_certification_value(item) for item in value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_readonly_certification_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_readonly_certification_value(item) for item in value)
     return value
 
 
-class ValidatedCertificationArtifact(_ImmutableCertificationMapping):
-    """An IMMUTABLE certification artifact that PASSED the complete contract.
+def plain_certification_value(value: Any) -> Any:
+    """A PLAIN (dict/list/scalar) copy of a certification value.
 
-    This is the authorisation a predictive load consumes.  It is a mapping, so every
-    existing reader (``artifact.get(...)``, ``dict(artifact)``, ``json.dumps``) works
-    unchanged, but it cannot be minted from a raw mapping and cannot be edited after
-    minting: the artifact the boundary validated is the artifact the load reads.
-
-    ``validated_by`` names the function that applied the contract, and
-    ``validated_identity`` is the artifact's own identity recomputed from its bytes,
-    so a consumer can see WHICH contract authorised the load and for which artifact.
+    The validated artifact is a read-only snapshot, so a consumer that must SERIALIZE
+    what it read -- an identity hash over the artifact's own fields, a persisted
+    payload -- converts through this ONE function instead of walking the snapshot
+    itself.  Conversion is lossless: it copies the CONTENT and never its container, so
+    the value a consumer hashes is the value the artifact carries.  Integer mapping
+    keys become strings, exactly as ``json`` would render them.
     """
 
-    __slots__ = ("validated_by", "validated_identity")
+    if isinstance(value, Mapping):
+        return {str(key): plain_certification_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain_certification_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((plain_certification_value(item) for item in value), key=repr)
+    return value
 
-    def __init__(
-        self,
-        document: Mapping[str, Any] | None = None,
-        *,
-        validated_by: str = "",
-        _token: Any = None,
-    ) -> None:
-        if _token is not _CERTIFICATION_ARTIFACT_MINT:
+
+def assert_certification_artifact_bytes_unchanged(artifact: Any) -> None:
+    """Refuse a validated artifact whose bytes no longer digest to its minted identity.
+
+    This is the boundary half of the authorisation contract: a validated artifact
+    carries the digest of the bytes the canonical loader validated, and every boundary
+    re-verifies it before anything predictive is read.  A mismatch means the value was
+    edited through a route the type system does not police (``object.__setattr__`` and
+    friends) after validation -- the case the digest exists to catch -- and it is
+    refused with its own token instead of being read.
+    """
+
+    recorded = getattr(artifact, "content_digest", None)
+    if not recorded:
+        raise CertificationArtifactUnvalidated(
+            [
+                "the value carries no content-bound digest, so the bytes the canonical loader "
+                "validated cannot be re-verified"
+            ]
+        )
+    recomputed = certification_artifact_digest(artifact)
+    if str(recorded) != str(recomputed):
+        raise CertificationArtifactMutated(
+            [
+                f"the validated certification artifact's bytes digest to {recomputed[:23]}..., not "
+                f"the identity it was minted under ({str(recorded)[:23]}...); an artifact edited "
+                "after validation is not the authorisation the loader issued"
+            ]
+        )
+
+
+def _validated_certification_artifact_capability() -> tuple[type, Any]:
+    """Own the ONE mint of a validated certification artifact.
+
+    The mint token is a CLOSURE variable and is never bound as a module attribute: the
+    class is exposed so a consumer can recognise the authorisation it was handed, but
+    no caller can CONSTRUCT one through normal module access.  The only constructor
+    created here is the validation function, which applies the complete contract to the
+    document before minting -- so an artifact-shaped mapping the contract has not
+    passed can never become an authorisation.
+    """
+
+    token = object()
+
+    class ValidatedCertificationArtifact(Mapping):
+        """An IMMUTABLE certification artifact that PASSED the complete contract.
+
+        This is the authorisation a predictive load consumes.  It is built by
+        COMPOSITION over a private, recursively read-only snapshot -- ``MappingProxyType``
+        for mappings, tuples for sequences -- so there is no mutable container to reach
+        and no base-class mutator that bypasses the class's own.  It is a mapping, so
+        every existing reader (``artifact.get(...)``, ``dict(artifact)``,
+        ``candidate_universe.jsonable``) works unchanged.
+
+        ``validated_by`` names the function that applied the contract,
+        ``validated_identity`` is the artifact's own identity, and ``content_digest`` is
+        the content-bound digest of the bytes that were validated -- re-verified at every
+        boundary by :func:`assert_certification_artifact_bytes_unchanged`, so a value
+        edited after minting is refused rather than read.
+        """
+
+        __slots__ = ("_document", "_content_digest", "_validated_by", "_validated_identity")
+
+        def __init__(
+            self,
+            document: Mapping[str, Any] | None = None,
+            *,
+            validated_by: str = "",
+            _token: Any = None,
+        ) -> None:
+            if _token is not token:
+                raise CertificationArtifactUnvalidated(
+                    [
+                        "a validated certification artifact is minted only by "
+                        "certified_bundle.validate_certification_artifact, which applies the "
+                        "complete authorization contract; this mapping was never validated"
+                    ]
+                )
+            snapshot = _readonly_certification_value(dict(document or {}))
+            object.__setattr__(self, "_document", snapshot)
+            object.__setattr__(self, "_content_digest", certification_artifact_digest(snapshot))
+            object.__setattr__(self, "_validated_by", str(validated_by))
+            object.__setattr__(
+                self,
+                "_validated_identity",
+                str(
+                    snapshot.get("four_gw_certification_identity")
+                    or snapshot.get("certification_identity")
+                    or ""
+                ),
+            )
+
+        # -- the read-only mapping facade ------------------------------------
+
+        def __getitem__(self, key: Any) -> Any:
+            return self._document[key]
+
+        def __iter__(self) -> Any:
+            return iter(self._document)
+
+        def __len__(self) -> int:
+            return len(self._document)
+
+        def __contains__(self, key: Any) -> bool:
+            return key in self._document
+
+        def __eq__(self, other: Any) -> Any:
+            # Equality is a property of the CONTENT, not of the object: a copy of the
+            # same bytes is the same artifact, and the canonical encoding compares a
+            # frozen tuple with the list it was parsed from.
+            if not isinstance(other, Mapping):
+                return NotImplemented
+            try:
+                return self._content_digest == certification_artifact_digest(other)
+            except CertificationRefused:
+                return NotImplemented
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
+
+        def __delattr__(self, name: str) -> None:
+            raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
+
+        def __copy__(self) -> "ValidatedCertificationArtifact":
+            return self
+
+        def __deepcopy__(self, memo: Any) -> "ValidatedCertificationArtifact":
+            return self
+
+        def __reduce__(self) -> Any:
+            # An authorisation is never reconstructed from bytes: a consumer either
+            # holds the value the loader minted or passes through the contract.
+            raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
+
+        @property
+        def validated_by(self) -> str:
+            return self._validated_by
+
+        @property
+        def validated_identity(self) -> str:
+            return self._validated_identity
+
+        @property
+        def content_digest(self) -> str:
+            return self._content_digest
+
+        def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+            return (
+                f"ValidatedCertificationArtifact(validated_by={self.validated_by!r}, "
+                f"identity="
+                f"{self.validated_identity[:23] + '...' if self.validated_identity else None}, "
+                f"events={list(self.get('events') or [])})"
+            )
+
+    def validate_certification_artifact(document: Any) -> "ValidatedCertificationArtifact":
+        """The CANONICAL loader-owned validation of a certification artifact.
+
+        A raw mapping is NOT an authorisation, however self-consistent its own run ids or
+        bundle identities are: the artifact must carry the fields the certification
+        loader requires before anything predictive may be read from it.  This function is
+        the ONE place that contract is applied at a load boundary:
+
+        * an already-validated artifact has its content-bound digest RE-VERIFIED against
+          the bytes it was minted from and is returned unchanged, so the authorisation a
+          caller loaded once is checked -- not merely trusted -- at every boundary it
+          reaches;
+        * a path is read through ``four_gw_decision.load_certification_artifact`` -- the
+          production loader -- which mints the validated value;
+        * a raw mapping has the SAME contract re-run over it and is then minted, so a
+          mapping that does carry every required authorization field is accepted exactly
+          as the loader would accept its file form, and a mapping that does not is refused
+          with ``CERTIFICATION_ARTIFACT_UNVALIDATED`` (never silently trusted, never
+          defaulted, never substituted).
+
+        The value returned is a read-only snapshot carrying the digest of its own bytes:
+        what the boundary validated is what the load reads.
+        """
+
+        from . import four_gw_decision as fg
+
+        if isinstance(document, ValidatedCertificationArtifact):
+            assert_certification_artifact_bytes_unchanged(document)
+            return document
+        if isinstance(document, (str, Path)):
+            return fg.load_certification_artifact(document)
+        if document is None:
+            raise CertificationArtifactAbsent(
+                ["a predictive load requires a certification artifact"]
+            )
+        if not isinstance(document, Mapping) or not document:
             raise CertificationArtifactUnvalidated(
                 [
-                    "a validated certification artifact is minted only by "
-                    "certified_bundle.validate_certification_artifact, which applies the "
-                    "complete authorization contract; this mapping was never validated"
+                    f"the certification artifact is {type(document).__name__}, not an artifact the "
+                    "canonical loader produced"
                 ]
             )
-        dict.__init__(
-            self,
-            {
-                key: _frozen_certification_value(value)
-                for key, value in dict(document or {}).items()
-            },
-        )
-        self.validated_by = str(validated_by)
-        self.validated_identity = str(
-            self.get("four_gw_certification_identity")
-            or self.get("certification_identity")
-            or ""
-        )
-
-    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-        return (
-            f"ValidatedCertificationArtifact(validated_by={self.validated_by!r}, "
-            f"identity={self.validated_identity[:23] + '...' if self.validated_identity else None}, "
-            f"events={list(self.get('events') or [])})"
-        )
-
-
-def validate_certification_artifact(document: Any) -> ValidatedCertificationArtifact:
-    """The CANONICAL loader-owned validation of a certification artifact.
-
-    A raw mapping is NOT an authorisation, however self-consistent its own run ids or
-    bundle identities are: the artifact must carry the fields the certification
-    loader requires before anything predictive may be read from it.  This function is
-    the ONE place that contract is applied at a load boundary:
-
-    * an already-validated artifact is returned UNCHANGED, so a caller that loaded it
-      once passes the authorisation itself;
-    * a path is read through ``four_gw_decision.load_certification_artifact`` -- the
-      production loader -- which mints the validated value;
-    * a raw mapping has the SAME contract re-run over it and is then minted, so a
-      mapping that does carry every required authorization field is accepted exactly
-      as the loader would accept its file form, and a mapping that does not is refused
-      with ``CERTIFICATION_ARTIFACT_UNVALIDATED`` (never silently trusted, never
-      defaulted, never substituted).
-
-    The returned value is IMMUTABLE and carries the identity recomputed from its own
-    bytes, so what the boundary validated is what the load reads.
-    """
-
-    if isinstance(document, ValidatedCertificationArtifact):
-        return document
-    from . import four_gw_decision as fg
-
-    if isinstance(document, (str, Path)):
-        return fg.load_certification_artifact(document)
-    if document is None:
-        raise CertificationArtifactAbsent(
-            ["a predictive load requires a certification artifact"]
-        )
-    if not isinstance(document, Mapping) or not document:
-        raise CertificationArtifactUnvalidated(
-            [
-                f"the certification artifact is {type(document).__name__}, not an artifact the "
-                "canonical loader produced"
-            ]
-        )
-    try:
-        payload = fg.validate_certification_artifact(document)
-    except CertificationRefused:
-        raise
-    except BundleIncoherent as failure:
-        # A RECORDED incoherent dependency status is a fact about the predictive
-        # world and keeps the token that fact already has; an artifact that records
-        # no status at all simply never carried an authorisation.
-        recorded = str((document or {}).get("dependency_validation") or "").upper()
-        if recorded and recorded != "COHERENT":
-            raise CertificationRefused(
-                bundle_state_from_reasons(failure.reasons), failure.reasons
+        try:
+            payload = fg.validate_certification_artifact(document)
+        except CertificationRefused:
+            raise
+        except BundleIncoherent as failure:
+            # A RECORDED incoherent dependency status is a fact about the predictive
+            # world and keeps the token that fact already has; an artifact that records
+            # no status at all simply never carried an authorisation.
+            recorded = str((document or {}).get("dependency_validation") or "").upper()
+            if recorded and recorded != "COHERENT":
+                raise CertificationRefused(
+                    bundle_state_from_reasons(failure.reasons), failure.reasons
+                ) from failure
+            raise CertificationArtifactUnvalidated(
+                [
+                    "the certification artifact does not carry the authorisation the canonical "
+                    f"loader's contract requires: {failure}"
+                ]
             ) from failure
-        raise CertificationArtifactUnvalidated(
-            [
-                "the certification artifact does not carry the authorisation the canonical "
-                f"loader's contract requires: {failure}"
-            ]
-        ) from failure
-    except Exception as failure:
-        detail = str(getattr(failure, "detail", failure))
-        # A mapping whose own declared records contradict each other is a
-        # CONTRADICTION, whatever else it is missing: that is a different fact from a
-        # mapping that simply never carried an authorisation, and the two carry
-        # different tokens.
-        contradicting = (
-            fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in detail
-            or fg.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY in detail
-        )
-        if contradicting:
-            raise CertificationArtifactContradictory(
-                [f"the certification artifact contradicts its own records: {detail}"]
+        except Exception as failure:
+            detail = str(getattr(failure, "detail", failure))
+            # A mapping whose own declared records contradict each other is a
+            # CONTRADICTION, whatever else it is missing: that is a different fact from a
+            # mapping that simply never carried an authorisation, and the two carry
+            # different tokens.
+            contradicting = (
+                fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in detail
+                or fg.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY in detail
+            )
+            if contradicting:
+                raise CertificationArtifactContradictory(
+                    [f"the certification artifact contradicts its own records: {detail}"]
+                ) from failure
+            raise CertificationArtifactUnvalidated(
+                [
+                    "the certification artifact does not carry the authorisation the canonical "
+                    f"loader's contract requires: {type(failure).__name__}: {detail}"
+                ]
             ) from failure
-        raise CertificationArtifactUnvalidated(
-            [
-                "the certification artifact does not carry the authorisation the canonical "
-                f"loader's contract requires: {type(failure).__name__}: {detail}"
-            ]
-        ) from failure
-    return ValidatedCertificationArtifact(
-        payload,
-        validated_by="four_gw_decision.validate_certification_artifact",
-        _token=_CERTIFICATION_ARTIFACT_MINT,
-    )
+        return ValidatedCertificationArtifact(
+            payload,
+            validated_by="four_gw_decision.validate_certification_artifact",
+            _token=token,
+        )
+
+    return ValidatedCertificationArtifact, validate_certification_artifact
+
+
+ValidatedCertificationArtifact, validate_certification_artifact = (
+    _validated_certification_artifact_capability()
+)
 
 
 def bundle_identity_payload(
@@ -2151,7 +2321,12 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
             "loader's complete contract (schema, causal and dependency status, the authorisation "
             "flag, the completeness audit, the wiring identity and an identity that binds its own "
             "bundles), so a raw mapping carrying self-consistent bundles but no authorisation is "
-            "refused with CERTIFICATION_ARTIFACT_UNVALIDATED.  The bundle must then be the one that "
+            "refused with CERTIFICATION_ARTIFACT_UNVALIDATED.  The authorisation itself is a "
+            "READ-ONLY snapshot -- composition over MappingProxyType and tuples, never a "
+            "dict/list subclass whose base-class mutators still edit it -- and every boundary "
+            "re-verifies the content-bound digest it was minted with, so an artifact edited after "
+            "validation is refused with CERTIFICATION_ARTIFACT_MUTATED rather than read.  The "
+            "bundle must then be the one that "
             "artifact recorded for that event (identity, event and cutoff compared against the "
             "recorded bundle), every family it names must declare the authoritative model version, "
             "the recorded family / event / status / cutoff / dependency closure is re-proven from "
@@ -2172,7 +2347,12 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
             "only through a loader-owned, content-bound capability: the matrix's canonical content "
             "identity -- every semantic block exact evaluation consumes -- must be one this loader "
             "ISSUED, for that event and against the certified bundle identity the artifact records "
-            "(or, on the declared door, under that same declaration).  The provenance stamp on a "
+            "(or, on the declared door, under that same declaration).  The capability is held "
+            "INSIDE the loader that issues it: there is no module-global writable registry and no "
+            "module-level issuer, so a caller cannot record content of its own and the two doors "
+            "cannot be merged -- a registry a caller injects is inert, and the declared-door "
+            "recorder (which the declared door, by design, needs) records no certified bundle "
+            "identity and can never satisfy the certified door.  The provenance stamp on a "
             "matrix is caller-writable and therefore authorises nothing, so a hand-built matrix -- "
             "including one carrying the correct copied stamp -- is refused"
         ),
@@ -2208,14 +2388,15 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
     },
     {
         "reference": "fpl_brain.manager_worlds.build_manager_worlds",
-        "status": "CLOSED_BY_REFUSAL",
+        "status": "CLOSED",
         "detail": (
             "a predictive load beside the optimizer's: it simulated the shared worlds for the "
             "manager policy matrix straight from a hand-assembled run-id set.  It now requires a "
             "validated certification artifact and refuses unless the run ids it is handed are the "
-            "ones that artifact recorded for the event, so scripts/build_manager_packet.py -- its "
-            "only caller, and a Phase-6A descriptive packet -- is refused rather than loading "
-            "uncertified predictions"
+            "ones that artifact recorded for the event, and its only caller -- "
+            "scripts/build_manager_packet.py, a Phase-6A descriptive packet -- loads the artifact "
+            "through the canonical loader, forwards it to the load, and validates every supplied "
+            "event and run id against the artifact's own record instead of defaulting one"
         ),
     },
     {
@@ -2348,12 +2529,14 @@ __all__ = [
     "CONTINUOUS_PROXY_TIE_LIMITATION",
     "CertificationArtifactAbsent",
     "CertificationArtifactContradictory",
+    "CertificationArtifactMutated",
     "CertificationArtifactUnvalidated",
     "CertificationRefused",
     "CertifiedBundle",
     "CertifiedEventBundle",
     "DIAG_CERTIFICATION_ARTIFACT_ABSENT",
     "DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY",
+    "DIAG_CERTIFICATION_ARTIFACT_MUTATED",
     "DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED",
     "DIAG_CERTIFICATION_BOUNDARY_REQUIRED",
     "DIAG_CALIBRATION_IDENTITY_UNKNOWN",
@@ -2371,6 +2554,7 @@ __all__ = [
     "STATE_EVIDENCE_MISSING",
     "STATE_PREDICTIVE_BUNDLE_INCOHERENT",
     "STATE_UNSUPPORTED_MODEL_VERSION",
+    "assert_certification_artifact_bytes_unchanged",
     "assert_event_bundle_certified",
     "bundle_identity_payload",
     "bundle_state_from_reasons",
@@ -2379,6 +2563,7 @@ __all__ = [
     "calibration_surface_states",
     "calibration_terminal_state",
     "calibration_tokens",
+    "certification_artifact_digest",
     "certification_result_identity",
     "certified_bundle_artifact_record",
     "certified_bundle_from_explicit_ids",
@@ -2391,6 +2576,7 @@ __all__ = [
     "disclosed_limitations",
     "disclosure_block",
     "per_event_runs_from_bundles",
+    "plain_certification_value",
     "require_certification_artifact",
     "unresolved_bypasses",
     "validate_calibration_evidence",

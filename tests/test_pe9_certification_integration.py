@@ -11,8 +11,13 @@ named for them.
 
 from __future__ import annotations
 
+import copy
 import json
+import pickle
 import sqlite3
+import sys
+from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
@@ -2248,6 +2253,191 @@ def test_the_validated_artifact_is_immutable_and_a_self_consistent_mapping_is_re
         conn.close()
 
 
+def test_a_loader_minted_artifact_cannot_be_mutated_into_an_alternate_world():
+    """The authorisation is a read-only snapshot: every mutation route is refused.
+
+    A dict/list SUBCLASS only refuses the mutators it overrides -- ``dict.__setitem__``
+    and friends still edit the value underneath -- so the authorisation is built by
+    composition over a genuinely read-only snapshot instead.  This drives every route a
+    caller has, including the base-class mutators, and proves that the artifact the
+    boundary validated is unchanged and that an ALTERNATE run set is still refused.
+    """
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        validated = cb.validate_certification_artifact(artifact)
+        digest = validated.content_digest
+        assert digest == cb.certification_artifact_digest(validated)
+
+        # -- the mapping API ---------------------------------------------------
+        for attack in (
+            lambda: validated.__setitem__("events", [9]),
+            lambda: validated.__delitem__("events"),
+            lambda: validated.update({"planning_cutoff": OTHER_CUTOFF}),
+            lambda: validated.clear(),
+            lambda: validated.pop("events"),
+            lambda: validated.popitem(),
+            lambda: validated.setdefault("events", [9]),
+            lambda: validated.__ior__({"events": [9]}),
+        ):
+            with pytest.raises((AttributeError, TypeError)):
+                attack()
+        # -- the BASE-CLASS mutators a dict subclass would leave open --------------
+        with pytest.raises(TypeError):
+            dict.__setitem__(validated, "events", [9])
+        with pytest.raises(TypeError):
+            dict.__delitem__(validated, "events")
+        with pytest.raises(TypeError):
+            dict.update(validated, {"events": [9]})
+        with pytest.raises(TypeError):
+            dict.clear(validated)
+        with pytest.raises(TypeError):
+            dict.pop(validated, "events")
+        with pytest.raises(TypeError):
+            list.append(validated["events"], 9)
+        with pytest.raises(TypeError):
+            list.__setitem__(validated["certified_bundles"]["5"]["runs"], "x", 1)
+        # -- nested containers are read-only snapshots too ------------------------
+        with pytest.raises(TypeError):
+            validated["certified_bundles"]["5"]["runs"]["minutes_v1"] = 999
+        with pytest.raises((AttributeError, TypeError)):
+            validated["certified_bundles"]["5"]["runs"].update({"minutes_v1": 999})
+        with pytest.raises((AttributeError, TypeError)):
+            validated["certified_bundles"]["5"]["runs"].clear()
+        with pytest.raises(TypeError):
+            dict.__setitem__(validated["certified_bundles"], "5", {})
+        # -- attributes, copies and pickles --------------------------------------
+        with pytest.raises((AttributeError, TypeError)):
+            validated.validated_identity = "forged"
+        with pytest.raises((AttributeError, TypeError)):
+            validated.content_digest = "sha256:" + "0" * 64
+        with pytest.raises((AttributeError, TypeError)):
+            validated._document = {}
+        with pytest.raises((AttributeError, TypeError)):
+            del validated._document
+        assert copy.copy(validated) is validated
+        assert copy.deepcopy(validated) is validated
+        with pytest.raises(TypeError):
+            pickle.loads(pickle.dumps(validated))
+
+        # Nothing above changed the bytes, and the recorded run ids are still the
+        # CERTIFIED ones.
+        assert validated.content_digest == digest
+        assert cb.certification_artifact_digest(validated) == digest
+        assert validated["certified_bundles"]["5"]["runs"]["minutes_v1"] == runs[5]["minutes_v1"]
+
+        # An ALTERNATE run set is refused through the boundary the mutations aimed at.
+        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
+        with pytest.raises(cb.CertificationRefused) as caught:
+            cb.assert_event_bundle_certified(
+                conn, alternative, event=5, certification=validated
+            )
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY
+        # ... while the CERTIFIED bundle still loads, so the refusal is about provenance
+        # and not about the attempts having broken the authorisation.
+        certified = _self_consistent_bundle(runs[5])
+        proof = cb.assert_event_bundle_certified(
+            conn, certified, event=5, certification=validated
+        )
+        assert proof["certified_bundle_identity"] == str(certified.certified_bundle_identity)
+    finally:
+        conn.close()
+
+
+def test_a_tampered_artifact_is_refused_by_its_content_bound_digest():
+    """Even a mutation that SUCCEEDS at the object level cannot authorise a load.
+
+    The digest is the second half of the immutability contract: a validated artifact
+    carries the content-bound digest of the bytes the loader validated, and every
+    boundary re-verifies it.  This edits the private state directly -- the one route the
+    read-only snapshot cannot close -- and proves the boundary refuses the result with
+    its own token instead of reading alternate run ids out of it.
+    """
+
+    from types import MappingProxyType
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        validated = cb.validate_certification_artifact(artifact)
+        cb.assert_certification_artifact_bytes_unchanged(validated)  # positive control
+        assert cb.certification_artifact_digest(validated) == validated.content_digest
+
+        # The digest gate itself: a value whose recorded digest disagrees with its own
+        # bytes is refused, and the token names the tamper.
+        class _Tampered(Mapping):
+            content_digest = "sha256:" + "0" * 64
+
+            def __init__(self, document):
+                self._document = document
+
+            def __getitem__(self, key):
+                return self._document[key]
+
+            def __iter__(self):
+                return iter(self._document)
+
+            def __len__(self):
+                return len(self._document)
+
+        with pytest.raises(cb.CertificationArtifactMutated) as caught:
+            cb.assert_certification_artifact_bytes_unchanged(_Tampered(artifact))
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_MUTATED
+        # A mutated authorisation IS a contradiction, so consumers that already refuse
+        # contradictions keep refusing it.
+        assert isinstance(caught.value, cb.CertificationArtifactContradictory)
+        # A value carrying no digest at all is not an authorisation either.
+        with pytest.raises(cb.CertificationArtifactUnvalidated):
+            cb.assert_certification_artifact_bytes_unchanged({"events": [5]})
+
+        # Now the end-to-end case: a REAL loader-minted artifact, edited through
+        # ``object.__setattr__`` to name the alternate world's runs.
+        tampered = cb.validate_certification_artifact(artifact)
+        alternate_runs = _alternative_world(conn, 5)
+        bundles = {key: dict(value) for key, value in tampered["certified_bundles"].items()}
+        bundles["5"]["runs"] = dict(alternate_runs)
+        object.__setattr__(tampered, "_document", MappingProxyType(bundles))
+        with pytest.raises(cb.CertificationRefused) as caught:
+            cb.certified_bundle_artifact_record(tampered, 5)
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_MUTATED
+        with pytest.raises(cb.CertificationRefused) as caught:
+            cb.validate_certification_artifact(tampered)
+        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_MUTATED
+    finally:
+        conn.close()
+
+
+def test_no_caller_can_mint_the_authorisation_through_module_access():
+    """The mint token is a closure variable, not a module attribute.
+
+    ``isinstance`` is never the validation: a value the contract has not passed is
+    re-validated, and the class itself cannot be constructed by a caller, so an
+    artifact-shaped mapping cannot be promoted to an authorisation by reaching for a
+    module-level token.
+    """
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        assert not hasattr(cb, "_CERTIFICATION_ARTIFACT_MINT")
+        # The exposed class refuses construction without the token that only the
+        # validation function holds...
+        with pytest.raises(cb.CertificationArtifactUnvalidated):
+            cb.ValidatedCertificationArtifact(artifact, validated_by="forged")
+        with pytest.raises(cb.CertificationArtifactUnvalidated):
+            cb.ValidatedCertificationArtifact(artifact, _token=object())
+        # ... so a raw mapping's ONLY way in is the contract, which re-runs it.
+        self_consistent = _unauthorised(artifact)
+        with pytest.raises(cb.CertificationArtifactUnvalidated):
+            cb.validate_certification_artifact(self_consistent)
+        # The value the loader DID mint is recognised, and unchanged.
+        validated = cb.validate_certification_artifact(artifact)
+        assert cb.validate_certification_artifact(validated) is validated
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Adversarial: an arbitrary matrix carrying the CORRECT copied stamp
 # ---------------------------------------------------------------------------
@@ -2460,5 +2650,165 @@ def test_the_loader_issued_matrix_is_content_bound_not_stamp_bound(tmp_path):
         assert ro.issued_world_matrix(
             _stamped_by_hand({"worlds": 8, "player_ids": [1, 2]}, identity)
         ) is None
+    finally:
+        conn.close()
+
+
+def test_adversarial_arbitrary_issuer_and_registry_injection_authorises_nothing(
+    tmp_path, monkeypatch
+):
+    """The world-matrix capability cannot be manufactured through module access.
+
+    There is no module-global registry to write and no issuing function to call with
+    content of your own: the record lives inside the loader that produced it, and the
+    module exposes read-only checks.  A caller's own registry is inert, the
+    declared-door recorder -- which does exist, because the declared door consumes
+    caller-supplied worlds by design -- can never satisfy the certified door, and the
+    load BODY, which does not issue, is refused exactly like a hand-built matrix.
+    """
+
+    from test_route_optimizer import (
+        EVENTS, _scenario, _universe,
+    )
+
+    event = int(EVENTS[0])
+    conn, runs = _world(events=EVENTS)
+    try:
+        artifact = _artifact(conn, runs, events=EVENTS)
+        certified = _self_consistent_bundle(runs[event], event=event)
+        matrix, info = _certified_matrix_loads(conn, runs, artifact, tmp_path, event)
+        identity = str(info["certified_bundle_identity"])
+        hand_built = _stamped_by_hand(
+            {"worlds": 8, "player_ids": [1, 2],
+             "core": {1: [99.0] * 8, 2: [99.0] * 8},
+             "minutes": {1: [90.0] * 8, 2: [90.0] * 8},
+             "expected_bonus": {1: 0.0, 2: 0.0},
+             "role_actionability": {1: False, 2: False}},
+            identity,
+        )
+
+        # (1) Neither attack has anything to reach: no registry, no issuer.
+        assert not hasattr(ro, "_ISSUED_WORLD_MATRICES")
+        assert not hasattr(ro, "_issue_world_matrix")
+
+        # (2) A caller can still write a registry of its own -- and it authorises
+        # nothing, because admission reads the loader's closure-held records.
+        content_identity = ro.world_matrix_content_identity(hand_built)
+        monkeypatch.setattr(
+            ro, "_ISSUED_WORLD_MATRICES",
+            {
+                content_identity: ro.IssuedWorldMatrix(
+                    content_identity=str(content_identity), event=event, source="forged",
+                    certified_bundle_identity=identity,
+                )
+            },
+            raising=False,
+        )
+        assert ro.issued_world_matrix(hand_built) is None
+        with pytest.raises(cb.CertificationRefused) as caught:
+            ro.require_certified_prebuilt_matrix(
+                hand_built, event=event, certified_bundle_identity=identity
+            )
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+
+        universe, state, meta = _universe()
+        with pytest.raises(cb.CertificationRefused) as caught:
+            ro.optimize(
+                universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
+                bundles={event: certified}, conn=conn,
+                config=ro.OptimizerConfig(events=EVENTS, search_draws=8, seed=20260911),
+                certification=artifact, prebuilt_worlds={event: hand_built}, exact_cache={},
+            )
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+
+        # (3) The declared-door recorder exists and cannot satisfy the certified door:
+        # its record carries a declaration and NO certified bundle identity.
+        ro._issue_declared_world_matrix(hand_built, event=event, declaration="tests: forged")
+        with pytest.raises(cb.CertificationRefused) as caught:
+            ro.require_certified_prebuilt_matrix(
+                hand_built, event=event, certified_bundle_identity=identity
+            )
+        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
+        # The loader's OWN matrix is admitted, so the refusals are about provenance.
+        assert ro.require_certified_prebuilt_matrix(
+            matrix, event=event, certified_bundle_identity=identity
+        ).event == event
+
+        # (4) The load BODY builds the same worlds and issues no capability at all:
+        # only the wrapper that performed a real load can.
+        body_matrix, body_info = ro._load_event_worlds(
+            conn, {event: certified}, event, (1, 2),
+            _optimizer_config(events=(event,), search_draws=6), certification=artifact,
+        )
+        assert body_info["source"] == "generated"
+        assert ro.issued_world_matrix(body_matrix) is None
+    finally:
+        conn.close()
+
+
+def test_the_manager_packet_loads_the_certification_and_validates_the_run_ids():
+    """``scripts/build_manager_packet.py`` consumes the artifact, not CLI defaults.
+
+    The command's world load is a predictive-load boundary, so the artifact is loaded
+    and forwarded and every supplied run id is validated against the ids the artifact
+    recorded for the event.  An id from a different predictive world is refused, which
+    is the difference between "the packet describes the certified generation" and "the
+    packet records whatever the operator passed in".
+    """
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import build_manager_packet as bmp
+
+    from fpl_brain import manager_worlds as mw
+
+    conn, runs = _world()
+    try:
+        artifact = _artifact(conn, runs)
+        validated = cb.validate_certification_artifact(artifact)
+
+        resolved = bmp.certified_run_ids(validated, event=5)
+        assert resolved["minutes_v1"] == runs[5]["minutes_v1"]
+        assert resolved["team_strength_v1"] == runs[5]["team_strength_v1"]
+        assert resolved["xpts_v1"] == runs[5]["xpts_v1"]
+        assert resolved["monte_carlo_v1"] == runs[5]["monte_carlo_v1"]
+
+        # The certified ids are accepted when supplied...
+        assert bmp.certified_run_ids(
+            validated, event=5, minutes_run=runs[5]["minutes_v1"], xpts_run=runs[5]["xpts_v1"],
+            team_run=runs[5]["team_strength_v1"], monte_carlo_run=runs[5]["monte_carlo_v1"],
+        ) == resolved
+        # ... and an id from another predictive world is refused, never preferred.
+        alternative = _alternative_world(conn, 5)
+        for supplied in (
+            {"minutes_run": alternative["minutes_v1"]},
+            {"xpts_run": alternative["xpts_v1"]},
+            {"team_run": alternative["team_strength_v1"]},
+            {"monte_carlo_run": alternative["monte_carlo_v1"]},
+            {"minutes_run": 999_999},
+        ):
+            with pytest.raises(bmp.CertificationMismatch):
+                bmp.certified_run_ids(validated, event=5, **supplied)
+
+        # The packet names the versions the CERTIFICATION recorded.
+        assert bmp.certified_model_versions(validated, event=5) == VERSIONS
+
+        # The ids the command resolves are exactly the ids the certified load accepts,
+        # so the forwarding is proved end to end rather than by the command's text.
+        built = mw.build_manager_worlds(
+            conn, planning_event=5, minutes_run_id=resolved["minutes_v1"],
+            xpts_run_id=resolved["xpts_v1"], team_run_id=resolved["team_strength_v1"],
+            squad_ids=[1], simulations=4, certification=validated,
+        )
+        assert built["input_run_ids"] == {
+            "minutes": runs[5]["minutes_v1"], "xpts": runs[5]["xpts_v1"],
+            "team": runs[5]["team_strength_v1"],
+        }
+
+        # And the command really loads and forwards the artifact: its event and run ids
+        # are no longer CLI defaults.
+        source = Path(bmp.__file__).read_text(encoding="utf-8")
+        assert '"--certification", required=True' in source
+        assert "load_certification_artifact" in source
+        assert "certification=certification" in source
     finally:
         conn.close()
