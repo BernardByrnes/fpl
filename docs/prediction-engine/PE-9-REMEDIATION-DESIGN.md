@@ -2,7 +2,7 @@
 
 **Status:** PROPOSED DESIGN — for Sol High adversarial design review. No implementation is authorised
 until that review reports no P1/P2 architectural blocker (`PE-9-CERTIFICATION-AMENDMENT-1.md` §12).
-**Revision 3** — closes Sol design review 1 and review 2. The production boundary is now an isolated
+**Revision 4** — closes Sol design review 3's remaining blocker: the cache now has an authoritative, service-owned expectation instead of a caller-recomputable digest. Closes Sol design review 1 and review 2. The production boundary is now an isolated
 **service process** rather than a library call; the manifest is **event-sourced and append-only** with
 **pinned payload digests**; code identity is checked **after** manifest resolution and against the
 **manifest's** snapshot; and the cache identity commits to the complete serialized matrix.
@@ -21,7 +21,8 @@ transfer, horizon or calibration change.
 | superseded manifests could reach production | §5 replay-only, and the service refuses replay for production kinds |
 | predictive values changeable beneath unchanged run metadata | §4 payload pinning; `HISTORICAL_EVIDENCE_DRIFT` |
 | code identity compared against the caller's requested snapshot, before manifest resolution | §2 step 2-3; §3.4 ordering and reference |
-| cache identity did not commit to the matrix content | §6 `cache_identity` definition |
+| cache identity did not commit to the matrix content | §6 (revision 3: content-committing `cache_identity`) |
+| cache injection: arbitrary bytes plus a recomputed public identity | §6 (revision 4: the index entry, written only when the service generated the matrix, is the authoritative expectation; a public key over caller bytes is only a label) |
 | monkey-patching excluded as a residual | §3.5 residual restated around the process boundary; §10 test rows |
 
 ## 1. The certified service process
@@ -167,19 +168,32 @@ MANIFEST_REVOKED(manifest_id, reason, at)
 
 ## 6. Cache contract
 
-`cache_identity` commits to the matrix content and the manifest:
+The cache is a performance cache, never an authorization input, and a **self-consistent digest is not
+evidence of origin**: a caller can always hash arbitrary bytes and compute any public key over them.
+The design therefore separates the public key from the authoritative expectation.
 
 ```
-cache_identity = sha256( "pe9-cache-v1" | manifest_id | bundle_identity | canonical(union_ids)
-                         | canonical(config) | sha256(serialized_matrix_bytes) )
+certified_input_key = H( "pe9-cache-v1", manifest_id, bundle_identity, canonical(union_ids),
+                         canonical(config), generation_identity )
 ```
 
-- lookup happens only after manifest resolution, code-identity verification and payload verification;
-- a hit is accepted only when the recomputed `cache_identity` matches the stored one **and** the
-  loaded bytes hash to the digest committed inside it;
-- a mismatch is a miss → regenerate; never silently "repaired".
-- `cache_dir` is a location, not authority: pointing it elsewhere can only cause misses or verified
-  hits.
+- `certified_input_key` is public and caller-computable; it is a **label**, not authorization. It names
+  the deterministic certified inputs (manifest, bundle, union, configuration, generation identity).
+- The **authoritative expectation** lives in a **service-owned cache index** in the store the service
+  writes: `certified_input_key -> matrix_digest`, where `matrix_digest = sha256(serialized matrix)`
+  is recorded **at the moment the service itself generated that matrix**. Nothing else may create an
+  index entry; the index is not in the caller-writable cache directory.
+- Lookup order, only after manifest resolution, code-identity verification and payload verification:
+  1. compute `certified_input_key` from the verified inputs;
+  2. read the index entry from the service store — **absent entry ⇒ miss**, never "accept anyway";
+  3. load the cached bytes and require `sha256(bytes) == index[certified_input_key]`;
+  4. equal ⇒ hit; unequal ⇒ miss **and** a `CACHE_CONTENT_MISMATCH` diagnostic is persisted (the
+     inconsistency is reported, never silently repaired).
+- On a miss the service regenerates the matrix from the verified certified bundle and records the new
+  `matrix_digest` in the index as part of the same certified act.
+- `cache_dir` is a location, not authority: pointing it elsewhere can only cause misses. Injecting
+  bytes there cannot produce a hit, because no caller can create the authoritative index entry that
+  would admit them.
 
 ## 7. Production entry-point inventory
 
@@ -222,7 +236,7 @@ mechanisms.
 
 **Added:** the certified service process; the append-only event-sourced manifest store with payload
 digests; the code-identity gate (after manifest resolution, against the manifest's snapshot); the
-`cache_identity` contract; the non-production replay interface.
+service-owned cache index keyed by `certified_input_key`; the non-production replay interface.
 
 **Renamed/moved:** `NonProductionWorlds` → `ReplayWorlds` in `fpl_brain/nonproduction_worlds.py`,
 reachable only from `*_replay_only` entry points and refused by the service for production kinds.
@@ -242,7 +256,7 @@ reachable only from `*_replay_only` entry points and refused by the service for 
 | arbitrary prebuilt matrix | the production surface returns no matrix and accepts none |
 | copied matrix identity/stamp | no stamp exists; identity is manifest-derived |
 | direct former issuer call / registry mutation / closure extraction | those mechanisms are deleted |
-| cache injection or byte substitution | `cache_identity` commits to the serialized matrix; bytes are hashed on read |
+| cache injection or byte substitution | the authoritative expectation is the service-owned index entry recorded at generation time; absent entry is a miss, and bytes are hashed against that expectation on read |
 | monkey-patching the caller's process | certification happens in the service; the caller supplies only serialized descriptors |
 | monkey-patching inside the service | code-identity gate vs the manifest's `code_snapshot` |
 | superseded/revoked manifest used for production | effective state computed at resolution; revoked refused; superseded is replay-only |

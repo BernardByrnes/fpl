@@ -1,7 +1,7 @@
 # PE-9 Certification Integration — Authority Amendment 1
 
 **Status:** AMENDMENT — governing authority for the PE-9 remediation. PE-9 remains **OPEN**.
-**Revision 3** — incorporates Sol High design reviews 1 and 2 (P1 blockers: in-process trust boundary;
+**Revision 4** — incorporates Sol High design reviews 1, 2 and 3 (P1 blockers: in-process trust boundary;
 manifest immutability, lifecycle and payload pinning; code-identity ordering; cache identity).
 Amends `docs/prediction-engine/PE-9-CERTIFICATION-INTEGRATION.md` (authority `d4a5b132`).
 **Issued by:** Product Owner instruction, 2026-09-26, on the evidence of Sol reviews 1–4.
@@ -143,12 +143,14 @@ Caching is allowed; caller authority is not. Production cache lookup stays **ins
 service**:
 
 1. the service resolves and revalidates the manifest (including payload digests) first;
-2. the cache identity is a digest that **commits to the complete serialized matrix content together
-   with the manifest and bundle identity** — not merely a bundle identifier;
-3. a hit must match that identity, and the loaded bytes must hash to the digest the identity commits
-   to;
-4. a mismatch (stale, tampered, wrong event) is a miss → regenerate from the certified bundle; a
-   mismatch is never "repaired" silently.
+2. the cache lookup key is a **public label** over the deterministic certified inputs (manifest,
+   bundle, union, configuration, generation identity) — it is not authorization;
+3. the **authoritative expectation** is a service-owned index entry, in the store the service writes,
+   binding that label to the exact matrix digest recorded when the service itself generated the
+   matrix; an absent entry is a miss, never an acceptance;
+4. a hit requires the loaded bytes to hash to that recorded digest; a mismatch is a miss **and** a
+   persisted `CACHE_CONTENT_MISMATCH` diagnostic — never silently "repaired". A caller-recomputable
+   hash over caller-supplied bytes proves only self-consistency and is never authority.
 
 Caller-supplied matrices, cache objects, registry entries, connections or "certified" stamps are
 never proof.
@@ -187,7 +189,7 @@ required.
 | direct former issuer call | provides NO production admission |
 | mutation of the former registry | provides NO production admission |
 | closure issuer/token extraction | provides NO production admission |
-| cache injection, or a cache whose bytes do not match its identity | REFUSED |
+| cache injection, or a cache whose bytes do not match the service-recorded digest | REFUSED; an absent index entry is a miss, and a public key over caller bytes is only a label |
 | monkey-patching a library/boundary function in the caller's process | cannot produce a certified decision: certification happens in the service process and the caller never supplies a connection or a matrix |
 | monkey-patching certification code inside the service | `CERTIFICATION_CODE_IDENTITY_MISMATCH` |
 | superseded or revoked manifest used for a production decision | REFUSED; superseded is replay-only |
