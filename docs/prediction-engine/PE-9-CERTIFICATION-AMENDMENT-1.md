@@ -1,7 +1,8 @@
 # PE-9 Certification Integration — Authority Amendment 1
 
 **Status:** AMENDMENT — governing authority for the PE-9 remediation. PE-9 remains **OPEN**.
-**Amends:** `docs/prediction-engine/PE-9-CERTIFICATION-INTEGRATION.md` (authority `d4a5b132`).
+**Revision 2** — incorporates Sol High design review 1 (two P1 blockers: no in-process trust
+boundary; no immutable authoritative manifest). Amends `docs/prediction-engine/PE-9-CERTIFICATION-INTEGRATION.md` (authority `d4a5b132`).
 **Issued by:** Product Owner instruction, 2026-09-26, on the evidence of Sol reviews 1–4.
 **Base for remediation:** `41eef48d7cf8d68ffaeeb54fdb9412cd0c04497d` (candidate tree `5f98bb9eed3c0273b18aa4c5de962536f6e86a2a`).
 
@@ -72,6 +73,54 @@ Certification is established from persisted evidence:
 
 The boundary must **reproduce or revalidate these facts at the point of use**. Passing through a
 function is not validation; only re-derivation from persisted evidence is.
+
+### 3.1 The historical certification manifest is the authority record
+
+"Persisted evidence" means an **immutable, versioned certification manifest**, not "the newest rows
+that happen to match". A manifest is an append-only record that selects and pins, for one certified
+decision world:
+
+- the exact event set and exact per-event cutoff;
+- the exact per-family run IDs, with each run's recorded version, status and cutoff at certification
+  time;
+- the authoritative required model versions;
+- the dependency edges / closure;
+- `planning_context_hash`, code snapshot identity, data snapshot identity;
+- execution / certification state and PE-8 evidence identity where it applies;
+- the certified bundle identity derived from the above;
+- the manifest's own identity and the identity of the certification act that produced it.
+
+Because it is append-only and itself identified, it cannot be rewritten by later mutation of current
+tables: a decision revalidates **against the manifest**, and a current row that no longer agrees with
+the manifest is *drift* (`HISTORICAL_EVIDENCE_DRIFT`), refused rather than silently re-resolved. Two
+manifests for the same event set are distinguished by identity, and the decision records which
+manifest it used, so a decision is reproducible after the fact.
+
+### 3.2 The trust boundary is a process boundary, not in-process secrecy
+
+No in-process mechanism — closures, private names, type identity, capabilities, registries, digests,
+or guards that an attacker can also patch — can make a matrix trustworthy *inside a process the
+attacker controls*. The amendment therefore fixes the trust boundary architecturally:
+
+1. **Certified production decisions execute in a dedicated certified entry point** (the production
+   CLI/module boundary) that performs manifest resolution, revalidation, matrix generation and
+   decision consumption in one process, and returns **decisions and their evidence**, never matrices,
+   to anything outside it.
+2. **Matrices never cross into caller-controlled code** on a production path. There is no supported
+   production call that hands a world matrix to a caller, so monkey-patching a caller cannot
+   manufacture a certified input: the certified process never reads a matrix from its caller.
+3. **Code identity is part of the evidence.** The manifest records the certification code snapshot,
+   and the certified entry point verifies the code it is actually running (source digests and loaded
+   code objects of the certification modules) against it before certifying anything; a mismatch is
+   refused (`CERTIFICATION_CODE_IDENTITY_MISMATCH`). This is detection of tampering within a process
+   whose start-up was authorised — it is **not** claimed as impossibility.
+4. An adversary able to execute arbitrary code *inside the certified process itself, before or
+   during certification*, cannot be contained by any in-process design; the amendment requires the
+   process boundary, the code-identity gate and the manifest so that such an adversary must tamper
+   with the certified process itself (a detectable, auditable act) rather than merely call a library
+   function. This is stated as the residual, and **monkey-patching is no longer excluded from the
+   threat model**: §12 requires the design review to attempt it, and §9 requires tests that exercise
+   it against the design.
 
 ## 4. Artifact semantics
 
@@ -175,6 +224,10 @@ The amended authority requires these to be permanent, executable tests:
 | legitimate internal cache hit for the same certified world | ACCEPTED |
 | Free Hit canonical path | ACCEPTED |
 | `build_manager_packet` real CLI path | ACCEPTED |
+| monkey-patched boundary/loader function in the caller's process | cannot produce a certified decision: the certified entry point runs the certification, revalidation and matrix generation itself and returns only decisions/evidence |
+| monkey-patched certification module inside the certified process | refused by the code-identity gate against the manifest's code snapshot (`CERTIFICATION_CODE_IDENTITY_MISMATCH`) |
+| current rows mutated after certification | refused/reported as `HISTORICAL_EVIDENCE_DRIFT`; the manifest identity is unchanged |
+| two candidate manifests for one event set | distinguished by identity; the decision records the manifest it used |
 
 Plus: changing mutable current tables **after** a historical certification must not rewrite the
 historical certified identity. All original 24 PE-9 hard cases are preserved.

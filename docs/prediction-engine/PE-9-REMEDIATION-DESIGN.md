@@ -2,6 +2,10 @@
 
 **Status:** PROPOSED DESIGN — for Sol High adversarial design review. No implementation is authorised
 until that review reports no P1/P2 architectural blocker (see `PE-9-CERTIFICATION-AMENDMENT-1.md` §12).
+**Revision 2** — addresses Sol High design review 1: (P1) the trust boundary is now a *process*
+boundary and monkey-patching is no longer excluded from the threat model; (P1) an immutable,
+versioned certification manifest now selects and pins the certified world instead of "matching
+current rows".
 **Base:** `41eef48d7cf8d68ffaeeb54fdb9412cd0c04497d` (repair-3 candidate, tree `5f98bb9e…`).
 **Scope:** certification/integration only. No predictive quantity, model, RNG, scoring, chip,
 transfer, horizon or calibration change.
@@ -10,96 +14,144 @@ transfer, horizon or calibration change.
 
 All production predictive loading funnels through a single module, `fpl_brain/certification_boundary.py`,
 which is the **only** place certification is established. Modules do not implement their own
-certification logic; they call this boundary and consume what it returns.
+certification logic; they call this boundary.
 
 ```python
+@dataclass(frozen=True, slots=True)
+class ManifestPolicy:
+    """Which immutable certification manifest a request is resolved against."""
+    kind: Literal["LATEST_CERTIFIED_FOR_EVENT_SET", "EXACT_ID"]
+    manifest_id: str | None = None          # required for EXACT_ID (replay / reproducibility)
+
 @dataclass(frozen=True, slots=True)
 class CertificationRequest:
     """Descriptors only: what the caller wants to decide, never what it claims is certified."""
     event: int
-    horizon: tuple[int, ...]              # exact event set, e.g. (e, e+1, e+2, e+3)
-    required_versions: tuple[tuple[str, str], ...]   # (family, authoritative version) from the model registry
+    horizon: tuple[int, ...]                # exact event set, e.g. (e, e+1, e+2, e+3)
+    required_versions: tuple[tuple[str, str], ...]
     planning_context_hash: str
     code_snapshot: str
     data_snapshot: str
+    policy: ManifestPolicy = ManifestPolicy("LATEST_CERTIFIED_FOR_EVENT_SET")
 
-class CertificationRefused(RuntimeError): ...      # carries a stable token + reasons
+@dataclass(frozen=True, slots=True)
+class CertificationManifest:
+    """The immutable authority record. Append-only; never updated in place."""
+    manifest_id: str                         # content identity of the pinned facts below
+    event_set: tuple[int, ...]
+    cutoff_by_event: Mapping[int, str]
+    runs_by_event: Mapping[int, Mapping[str, RunPin]]   # event -> family -> pinned run facts
+    required_versions: Mapping[str, str]
+    dependency_closure: Mapping[str, Mapping[str, int | None]]
+    planning_context_hash: str
+    code_snapshot: str
+    data_snapshot: str
+    bundle_identity_by_event: Mapping[int, str]
+    pe8_evidence: Mapping[str, Any] | None
+    certified_at: str
+    certifying_actor: str
+    status: Literal["CERTIFIED", "SUPERSEDED", "REVOKED"]
 
 @dataclass(frozen=True, slots=True)
 class CertifiedEvidence:
-    """What the BOUNDARY re-derived from persisted rows. Data, not authority."""
+    """What the BOUNDARY re-derived and reconciled against the manifest. Data, not authority."""
     request: CertificationRequest
-    bundle_by_event: Mapping[int, BundleIdentity]     # event -> per-family run ids + versions
-    cutoff: Mapping[int, str]
-    dependency_closure: Mapping[str, Mapping[str, int | None]]
-    snapshot: DataSnapshotIdentity
-    pe8_evidence: Mapping[str, Any] | None
-    identity: str                                     # recomputed from the above, never accepted from a caller
+    manifest: CertificationManifest
+    reconciled: Mapping[int, Mapping[str, RunFacts]]    # manifest facts vs current rows
+    drift: tuple[str, ...]                              # any historical-evidence drift, if observed
+    identity: str                                       # recomputed; never accepted from a caller
 
+def resolve_manifest(conn, request: CertificationRequest) -> CertificationManifest: ...
 def open_certified_evidence(conn, request: CertificationRequest) -> CertifiedEvidence: ...
-def revalidate_certified_evidence(conn, evidence: CertifiedEvidence) -> CertifiedEvidence: ...
 def certified_worlds(conn, evidence: CertifiedEvidence, *, event: int, union_ids, config,
                      cache_dir: Path | None = None) -> tuple[Matrix, Mapping[str, Any]]: ...
+
+def certified_decision(conn, request: CertificationRequest, *, kind: DecisionKind, **options) -> DecisionResult:
+    """The production entry point: certify, generate, decide, return DECISIONS + evidence.
+
+    The world matrix never leaves this call. This function is what production callers invoke; it is
+    the only supported path to a certified decision.
+    """
 ```
 
-The boundary takes **descriptors + a live `sqlite3.Connection`**, and nothing else. Matrices are
-produced *inside* the boundary (`certified_worlds`) and returned; no function in the design accepts a
-matrix, and none accepts an object that claims to be certified.
+The boundary takes **descriptors + a live `sqlite3.Connection`**, and nothing else. No function in the
+design accepts a matrix, and none accepts an object that claims to be certified.
 
 ## 2. Data flow (production)
 
 ```
-CLI / caller builds CertificationRequest (event, horizon, versions, planning context, snapshots)
+production CLI / module entry point (e.g. scripts/run_four_gw_decision.py, scripts/build_manager_packet.py)
         |
+        |  builds CertificationRequest from its own arguments (event, horizon, versions,
+        |  planning context, snapshots) - never from a caller-supplied object graph
         v
-open_certified_evidence(conn, request)          <- the ONLY certification act
-        |   reject unless, for every event in the horizon and every required family:
-        |     * a run row exists with the authoritative version,
-        |     * run status is COMPLETE (final, non-provisional),
-        |     * cutoff and event match the request exactly,
-        |     * dependency closure resolves to the same family/version set,
-        |     * planning_context_hash, code snapshot and data snapshot match the request,
-        |     * PE-8 evidence identity/state agrees where applicable,
-        |     * decision_search_permitted / temporal / finality gates pass;
-        |   then recompute the canonical identity from the RE-DERIVED rows
+certified_decision(conn, request, kind=...)                    <- the ONLY certification act
+        |   0. CODE IDENTITY GATE: verify the certification modules actually loaded in THIS process
+        |      against request.code_snapshot (source digests + loaded code objects);
+        |      mismatch -> CertificationRefused("CERTIFICATION_CODE_IDENTITY_MISMATCH")
+        |   1. resolve_manifest(conn, request): the immutable manifest for this event set
+        |      (LATEST_CERTIFIED_FOR_EVENT_SET, or EXACT_ID for reproducibility)
+        |   2. reconcile manifest facts against current rows: every pinned run's id, family,
+        |      version, status, cutoff, event and dependency edge must still hold; any drift is
+        |      reported and refused (HISTORICAL_EVIDENCE_DRIFT) rather than silently re-resolved
+        |   3. recompute the certified bundle identity from the MANIFEST's pinned facts
+        |      (not from "newest matching rows") and require it to equal the manifest identity
+        |   4. generate or load (cache) the world matrix internally, keyed by that identity
+        |   5. run the requested decision (search / comparator / refinement / stability / Free Hit)
         v
-CertifiedEvidence (data)
-        |
-        v
-certified_worlds(conn, evidence, event=..., union_ids=..., config=..., cache_dir=...)
-        |   1. revalidate_certified_evidence(conn, evidence)  (re-derives and compares; see §3)
-        |   2. identity <- recompute from re-derived rows
-        |   3. cache lookup keyed by that identity; on hit verify file content digest == identity
-        |   4. on miss: regenerate Monte Carlo worlds from the certified bundle, then store
-        v
-world matrix (internal)  ->  decision logic (search, comparator, refinement, stability, Free Hit)
+DecisionResult (decisions, identities, manifest_id, evidence)  -> persisted by the entry point
 ```
 
-Every consumer that needs worlds calls `certified_worlds(...)` with the evidence it holds. There is
-no other way to obtain a world matrix on a production path.
+`certified_worlds` remains available to **internal** boundary consumers (the decision steps inside
+`certified_decision`) and to non-production callers, but no production path returns a matrix to a
+caller: the production surface hands back decisions and their evidence.
 
-## 3. Why a fabricated `CertifiedEvidence` gains nothing
+## 3. Why the design resists each class of attack
 
-`CertifiedEvidence` is caller-constructible (it is a plain frozen dataclass). That is deliberate and
-harmless, because **every use re-derives from the database**:
+### 3.1 Caller-supplied objects, types, digests, capabilities
 
-- `certified_worlds` calls `revalidate_certified_evidence(conn, evidence)` first. That call ignores
-  the object's `identity` entirely: it re-runs the §2 derivation from `conn` using the object's
-  `request` descriptors, then requires the freshly derived run ids, versions, cutoff, closure,
-  snapshot identities and PE-8 state to equal what the object records. A hand-built object with
-  invented run ids cannot match a derivation the caller does not control.
-- Even a **perfectly copied** evidence record yields no advantage: the matrix is then produced by the
-  boundary from the *database*, not read out of the object. The object carries descriptors and derived
-  facts only, never the matrix. Fabricating one is equivalent to calling the boundary with the same
-  descriptors — the outcome is identical and equally certified.
-- `identity` is recomputed internally at each use. A digest supplied by a caller is never consulted,
-  so "change content and digest together" has no attack surface: there is no caller digest in the
-  authority path at all.
+`CertificationRequest` and `CertifiedEvidence` are caller-constructible frozen dataclasses, and that
+is harmless because **every entry point re-derives from the database and the manifest**:
 
-The trust root is therefore explicit and stated: **the persisted authoritative evidence in the
-database**. A process that can rewrite those rows can mislead the boundary; that is a deliberate
-scope boundary (equivalent to signing/HSM territory that the frozen authority does not require), and
-it is recorded as a residual in §9 rather than papered over.
+- `resolve_manifest` ignores any supplier of a manifest: it reads the append-only manifest store and
+  selects by policy; `EXACT_ID` must name a manifest that exists.
+- `certified_decision` re-derives run facts from the manifest's pins and reconciles them against the
+  current rows. A hand-built evidence record contributes only descriptors; its `identity` is never
+  consulted, and its claimed facts must match what the boundary derives.
+- There is no `isinstance` check, no minting constructor, no registry, no stamp and no caller digest
+  anywhere on the authority path, so there is nothing to impersonate, copy or extract.
+
+### 3.2 Reusing a valid evidence record with a different matrix
+
+The matrix is not carried in the evidence record and is not an input. `certified_decision` generates
+or loads it internally from the manifest-pinned bundle, so a caller holding a perfect evidence record
+still receives only the boundary's own matrix — or, on the production surface, only decisions.
+
+### 3.3 Monkey-patching (no longer excluded)
+
+Monkey-patching is in the threat model, and the design answers it structurally rather than by
+secrecy:
+
+- the **certified production surface returns decisions, not matrices**, and performs certification,
+  matrix generation and decision consumption inside one call, so patching a *caller* cannot inject a
+  matrix into the certified path — the certified path never reads a matrix from its caller;
+- the **code-identity gate** (step 0) verifies the certification modules actually loaded in the
+  certified process against the manifest's recorded `code_snapshot` — source bytes and loaded code
+  objects — and refuses on mismatch, so an in-process patch of the certification code is detected
+  before any certification occurs;
+- every decision records the `manifest_id`, the resolved code snapshot and the evidence used, so a
+  tampered process is auditable after the fact.
+
+### 3.4 The stated residual
+
+An adversary able to execute arbitrary code **inside the certified process before or during
+certification** — including patching the code-identity gate itself — cannot be contained by any
+in-process design. The amendment's response is to make that adversary tamper with the certified
+process, not merely call a library function: the process boundary, the manifest and the gate mean the
+only producible certified decisions come from the authorised entry point running authorised code over
+authorised evidence. The trust root is therefore explicit: **the persisted manifest store and the
+code identity of the certified entry point.** Both are auditable, and neither is a Python object
+handed around at run time.
 
 ## 4. Certified prebuilt matrices: removed, with no replacement
 
@@ -126,96 +178,110 @@ def compare_routes_replay_only(*, worlds: ReplayWorlds, ...) -> dict: ...
 
 Rules that keep it out of production:
 
-- production functions never accept `ReplayWorlds` (no parameter of that type, and the evidence
-  boundary cannot consume one — it takes descriptors and a connection);
+- production functions never accept `ReplayWorlds` (no such parameter, and the boundary cannot
+  consume one — it takes descriptors and a connection);
 - the replay entry points are separate functions, not flags on the production ones, so no production
   call site can reach them by argument;
-- every replay result is stamped `NON_PRODUCTION_REPLAY_ONLY` in its output and is refused by the
-  decision layer's persistence path (the decision/evidence writer accepts only results produced by
-  production entry points, which carry the boundary's recomputed identity);
-- a test asserts the production signature set contains no matrix-valued parameter and that calling a
-  production entry point with a `ReplayWorlds` raises `TypeError`/`CertificationRefused`.
+- every replay result is stamped `NON_PRODUCTION_REPLAY_ONLY`, and the decision/evidence writer
+  accepts only results produced by `certified_decision` (which carry a resolved `manifest_id`);
+- tests assert the production signatures contain no matrix-valued parameter and that calling a
+  production entry point with `ReplayWorlds` raises `TypeError`/`CertificationRefused`.
 
-## 5. Cache contract
+## 5. Immutable manifest lifecycle
+
+- **Creation:** `certify_horizon_bundles` / `scripts/certify_gw5_gw8.py` derive the certified world
+  from persisted runs, compute the manifest identity, and **append** the manifest with status
+  `CERTIFIED`; the store rejects update-in-place and duplicate ids.
+- **Supersession:** a newer certification for the same event set appends a new manifest; the older
+  one becomes `SUPERSEDED` but remains readable, so a historical decision can still be reproduced by
+  `EXACT_ID`.
+- **Use:** live decisions resolve `LATEST_CERTIFIED_FOR_EVENT_SET`; replay and audit resolve
+  `EXACT_ID`. Every decision records which one it used.
+- **Drift:** revalidation compares the manifest's pinned run facts with the current rows. Any
+  difference is refused and surfaced (`HISTORICAL_EVIDENCE_DRIFT`); nothing is silently re-resolved
+  and no historical identity is rewritten by later mutation of current tables.
+
+## 6. Cache contract
 
 Caching remains, entirely inside the boundary:
 
-1. `certified_worlds` re-derives the certified world (§2) — this happens on every call;
-2. the cache key **is** the internally recomputed identity;
+1. `certified_decision` resolves and reconciles the manifest first — this happens on every call;
+2. the cache key **is** the manifest-derived bundle identity;
 3. a hit is read from the cache directory and its content digest must equal that identity;
-4. a mismatch (stale, tampered, wrong event) is treated as a miss → regenerate from the certified
-   bundle; a mismatch is never "repaired" silently.
+4. a mismatch (stale, tampered, wrong event) is a miss → regenerate from the certified bundle; a
+   mismatch is never "repaired" silently.
 
 No function accepts a cache object, a matrix, or a registry entry. `cache_dir` is a location, not
 authority: pointing it elsewhere can only cause misses or *verified* hits.
 
-## 6. Production entry-point inventory (evidence revalidated at each)
+## 7. Production entry-point inventory
 
-| Entry point | Under the amendment it receives | Evidence revalidated | Refusal token |
+| Entry point | Receives | Evidence revalidated | Refusal token |
 | --- | --- | --- | --- |
-| `route_optimizer.optimize` | `CertificationRequest` (or `CertifiedEvidence` from the same call chain) + conn | inside `certified_worlds` before any world is used | `CERTIFICATION_EVIDENCE_MISMATCH` |
-| `route_optimizer.build_event_worlds` | same; the issuing wrapper and its closure are deleted | idem | idem |
-| `route_comparator.compare_routes` | same; no `non_production_worlds` on the production signature | idem | idem |
-| `finalist_refinement` (refine / escalate) | the evidence already validated by the caller's boundary call; it revalidates before refining | idem | idem |
-| `route_stability` (ladder / stability gate) | idem | idem | idem |
+| `certified_decision` (boundary) | request + conn | manifest resolved, reconciled, identity recomputed, code-identity gate | `CERTIFICATION_*` |
+| `scripts/run_four_gw_decision.py` | CLI args → request → `certified_decision` | idem; returns decisions + evidence | idem |
+| `scripts/build_manager_packet.py` | CLI args → request → `certified_decision` | idem + exact run-ID report validation | idem |
+| `route_optimizer.optimize` / `build_event_worlds` | evidence from the boundary call; no matrix parameter; issuer/closure deleted | revalidated inside the boundary before any world exists | `CERTIFICATION_EVIDENCE_MISMATCH` |
+| `route_comparator.compare_routes` | idem | idem | idem |
+| `finalist_refinement` (refine / escalate) | idem | idem | idem |
+| `route_stability` (ladder / gate) | idem | idem | idem |
 | `free_hit_request_adapter.load_certified_route_worlds` | evidence + event set | idem | idem |
-| `manager_worlds.build_manager_worlds` | evidence-derived bundle + run ids | idem | idem |
-| `scripts/build_manager_packet.py` | CLI args → `CertificationRequest` → boundary | idem + exact run-ID report validation | idem |
-| `scripts/run_four_gw_decision.py` | CLI args → `CertificationRequest` → boundary | idem | idem |
-| warm / content cache | internal to the boundary | idem | idem |
+| `manager_worlds.build_manager_worlds` | manifest-pinned bundle + run ids | idem | idem |
+| warm / content cache | internal | identity-verified on read | `CACHE_CONTENT_MISMATCH` |
 | chip paths (Free Hit, manager packet) | as above | idem | idem |
 
-## 7. `build_manager_packet.py`
+## 8. `build_manager_packet.py`
 
 Keeps its Repair-3 repair and gains the boundary call: build a `CertificationRequest` from the CLI
-arguments (event, horizon, versions, planning context, snapshots), call
-`open_certified_evidence` + `certified_worlds`, print the per-family run IDs it actually consumed,
-and fail closed on any mismatch. A real CLI/output regression test runs the command end to end and
-asserts the reported run IDs equal the boundary-derived ones.
+arguments, call `certified_decision` (or `open_certified_evidence` + `certified_worlds` for the
+packet's non-decisional output), print the per-family run IDs actually consumed and the `manifest_id`
+used, and fail closed on any mismatch. A real CLI/output regression test runs the command end to end
+and asserts the reported run IDs equal the manifest-pinned ones.
 
-## 8. What survives from `41eef48`, and what is removed
+## 9. What survives from `41eef48`, and what is removed
 
 **Survives:** required model-version enforcement; horizon certification; PE-8 evidence integration
 (no promotion); missing-upstream refusal (never a silent zero); data-snapshot validation;
-`validate_certified_bundle`; `certify_horizon_bundles`; `certified_bundle_from_explicit_ids` (used by
-the boundary and by `scripts/certify_gw5_gw8.py`); the `canonical_bundle_identity` *function*
-(demoted to a pure content function that only ever runs over boundary-derived content); the
-`build_manager_packet` repair; the adversarial test infrastructure and the 24 PE-9 hard cases; the
-provenance/bounded-dirty-work gates.
+`validate_certified_bundle`; `certify_horizon_bundles` (extended to append manifests);
+`certified_bundle_from_explicit_ids`; the `canonical_bundle_identity` *function* (demoted to a pure
+content function over boundary-derived content); the `build_manager_packet` repair; the adversarial
+test infrastructure and the 24 PE-9 hard cases; the provenance/bounded-dirty-work gates.
 
 **Removed:** `ValidatedCertificationArtifact` and its `__closure__`-captured mint token;
 `_ISSUED_WORLD_MATRICES`; `_issue_world_matrix` / `_issue` and the `build_event_worlds` closure;
 `require_certified_prebuilt_matrix`; `IssuedWorldMatrix`; `prebuilt_worlds` on every production
-signature; `certification: Mapping` parameters on production signatures; the bypass-register entries
-that describe those mechanisms (the register keeps only paths that still exist).
+signature; `certification: Mapping` parameters on production signatures; matrix-returning production
+library surfaces (production returns decisions); the bypass-register entries describing those
+mechanisms.
+
+**Added:** the manifest store and its lifecycle; the code-identity gate; `certified_decision` as the
+production surface; `resolve_manifest` / `open_certified_evidence` / `certified_worlds` as internal
+boundary API.
 
 **Renamed/moved:** `NonProductionWorlds` → `ReplayWorlds` in `fpl_brain/nonproduction_worlds.py`,
 reachable only from `*_replay_only` entry points.
 
-## 9. Adversarial test matrix (design-level refutation)
+## 10. Adversarial test matrix (design-level refutation)
 
 | Attack | Why the design refuses it |
 | --- | --- |
-| self-consistent raw artifact, incomplete contract | the boundary never accepts an artifact as authority; it derives from rows, so a raw mapping is not even an input |
+| self-consistent raw artifact, incomplete contract | never an input: authority derives from the manifest, not from a presented artifact |
 | valid artifact later mutated | same: no artifact object is an input to the authority path |
-| alternate run IDs inserted into a previous artifact | re-derivation is from rows; inserted IDs have no row support |
-| `isinstance`-compatible fake | there is no `isinstance` check anywhere in the authority path |
-| constructor/token via `__closure__` | there is no minting constructor and no closure-captured secret; a test executes the former attack and asserts the decision path still refuses |
-| content + caller digest changed together | no caller digest is consulted; identity is recomputed internally |
-| arbitrary prebuilt matrix | no production signature accepts a matrix |
-| copied matrix identity/stamp | no stamp exists; identity is recomputed |
-| direct former issuer call | the issuer is deleted; a test asserts an equivalent call cannot produce an admitted matrix |
+| alternate run IDs inserted into a previous artifact | the manifest pins the run IDs; inserted IDs contradict it |
+| `isinstance`-compatible fake | no `isinstance` check exists on the authority path |
+| constructor/token via `__closure__` | no minting constructor and no closure-captured secret exists |
+| content + caller digest changed together | no caller digest is consulted; identity is recomputed from the manifest |
+| arbitrary prebuilt matrix | no production signature accepts a matrix; the production surface returns decisions |
+| copied matrix identity/stamp | no stamp exists; identity is manifest-derived |
+| direct former issuer call | the issuer is deleted |
 | registry mutation | the registry is deleted |
 | closure issuer/token extraction | no closure issuer exists |
-| cache injection | cache content is verified against the internally recomputed identity |
-| canonical runs + valid evidence | ACCEPTED (happy path) |
+| cache injection | cache content is verified against the manifest-derived identity |
+| monkey-patched boundary/loader in the caller's process | the certified path never reads a matrix from its caller; certification, generation and decision happen inside the boundary call |
+| monkey-patched certification code inside the certified process | refused by the code-identity gate against the manifest's `code_snapshot` |
+| current rows mutated after certification | `HISTORICAL_EVIDENCE_DRIFT` refusal; manifest identity unchanged |
+| two manifests for one event set | distinguished by id; the decision records the one used |
+| canonical persisted runs + valid manifest | ACCEPTED (happy path) |
 | legitimate internal cache hit | ACCEPTED (identity-verified) |
 | Free Hit canonical path | ACCEPTED |
 | `build_manager_packet` CLI | ACCEPTED |
-| mutable current tables after a historical certification | historical certified identity is recomputed from historical rows and cannot be rewritten by later mutations of current tables |
-
-**Explicit residual (not claimed as protection):** a process able to rewrite the authoritative rows
-themselves, or able to monkey-patch the boundary module in memory, is outside this contract. The
-invariant governs authority smuggled through the supported API — objects, types, digests,
-capabilities, registries, closures, matrices, caches — not an adversary with arbitrary code execution
-in the process, which no in-process design can contain.
