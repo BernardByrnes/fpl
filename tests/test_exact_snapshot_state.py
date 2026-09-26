@@ -442,7 +442,7 @@ def test_o_certified_projection_run_ids_are_read_from_prediction_db():
     assert 'certified_runs[int(e)]["minutes_v1"]' in source
     # source tables come from the snapshot
     for call in ("cu.load_pool(source_conn)", "cu.load_fixtures_by_team(source_conn",
-                 "rc.load_player_meta(source_conn", "cu.price_snapshot_as_of(\n            source_conn"):
+                 "rc.load_player_meta(source_conn", "cu.price_snapshot_as_of(\n        source_conn"):
         assert call in source, call
     # and the legacy rediscovery support no longer feeds the search stage
     assert "support[int(e)][\"matched_runs\"]" not in source

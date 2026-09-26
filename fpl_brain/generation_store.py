@@ -29,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -60,8 +60,18 @@ DIAG_GENERATION_POINTER_UNSET = "GENERATION_POINTER_UNSET"
 DIAG_GENERATION_HORIZON_KIND_UNKNOWN = "GENERATION_HORIZON_KIND_UNKNOWN"
 DIAG_DECISION_RECORD_UNKNOWN = "UNKNOWN_DECISION_ID"
 DIAG_DECISION_RECORD_INVALID = "DECISION_RECORD_INVALID"
+DIAG_DECISION_ARTIFACT_NOT_RETAINED = "DECISION_ARTIFACT_NOT_RETAINED"
 DIAG_PRODUCTION_DESCRIPTOR_ONLY = "PRODUCTION_DESCRIPTOR_ONLY"
+DIAG_PRODUCTION_PROFILE_UNKNOWN = "PRODUCTION_DECISION_PROFILE_UNKNOWN"
 DIAG_DECISION_REPLAY_ONLY = "DECISION_REPLAY_ONLY"
+DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED = "GENERATION_PLANNING_CONTEXT_REQUIRED"
+
+#: How far the PE-8 evidence reference was actually REPRODUCED by the verifier.
+#: ``NOT_CONSULTED`` is not a failure: no calibration claim was made.  There is no
+#: third outcome: a reference that does not reproduce is a REFUSAL, so the verifier
+#: never reports a reference as verified without recomputing it.
+PE8_NOT_CONSULTED = "NOT_CONSULTED"
+PE8_IDENTITY_AND_STATE_RECOMPUTED = "IDENTITY_AND_STATE_RECOMPUTED_FROM_MANIFEST"
 
 #: A production caller must not supply any of these.  They are named so the refusal
 #: says exactly which descriptor the caller tried to smuggle into a production call.
@@ -92,6 +102,46 @@ FORBIDDEN_PRODUCTION_DESCRIPTORS: tuple[str, ...] = (
     "registry",
     "capability",
     "token",
+    # The executor door itself: a callable must not be able to arrive as a descriptor.
+    "decide",
+    "executor",
+    "decider",
+    "callback",
+    "callable",
+    "function",
+    "func",
+    "pipeline",
+    "entrypoint",
+    "runner",
+    "predictive_payload",
+    "predictive_data",
+    "dependency_mapping",
+    "dependency_map",
+    "dependencies",
+    "run_mapping",
+    "run_map",
+    "source_conn",
+    "source_connection",
+    "snapshot",
+    "snapshot_path",
+    "data_snapshot",
+    "data_snapshot_path",
+    "artifact_path",
+    "decision_artifact_path",
+    "artifact_ref",
+    "output_path",
+    "cache_object",
+    "cache_path",
+)
+
+_FOUR_GW_DECISION_PARAMETERS = frozenset(
+    {
+        "beam", "exact_evaluation_budget", "search_n_per_criterion", "singles_per_out",
+        "max_transfers_per_event", "stage2_draws", "parallel_workers",
+    }
+)
+_MANAGER_WORLD_DECISION_PARAMETERS = frozenset(
+    {"simulations", "seed", "occupancy_audit", "top_k"}
 )
 
 #: Float values are refused in identity-bearing content: a float has no single
@@ -262,6 +312,7 @@ def manifest_semantic_projection(manifest: Mapping[str, Any]) -> dict[str, Any]:
             )
         },
         "horizon_state": manifest.get("horizon_state"),
+        "last_event": manifest.get("last_event"),
         "pe8_evidence": manifest.get("pe8_evidence"),
         "disclosure": manifest.get("disclosure"),
     }
@@ -335,6 +386,7 @@ def build_generation_manifest(
     snapshot: Mapping[str, Any],
     horizon_state: str,
     horizon_length: int,
+    last_event: int,
     pe8_evidence: Mapping[str, Any],
     disclosure: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -392,6 +444,7 @@ def build_generation_manifest(
             for event, record in sorted(per_event.items(), key=lambda item: int(item[0]))
         },
         "horizon_state": str(horizon_state),
+        "last_event": int(last_event),
         "pe8_evidence": canonical_identity_value(dict(pe8_evidence)),
         "disclosure": canonical_identity_value(dict(disclosure)),
     }
@@ -442,6 +495,35 @@ def load_generation(conn: sqlite3.Connection, generation_id: str) -> CertifiedGe
                 f"generation {wanted} carries bytes that digest to {recomputed} "
                 f"(recorded {recorded}); the manifest was changed after its id was calculated"
             ]
+        )
+    snapshot = manifest.get("data_snapshot") or {}
+    try:
+        row_identity = json.loads(str(row["snapshot_source_db_identity"] or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        row_identity = None
+    row_metadata = {
+        "planning_event": int(row["planning_event"]),
+        "horizon_kind": str(row["horizon_kind"]),
+        "cutoff": str(row["cutoff"]),
+        "snapshot_path": row["snapshot_path"],
+        "snapshot_sha256": row["snapshot_sha256"],
+        "snapshot_source_db_identity": row_identity,
+    }
+    expected_metadata = {
+        "planning_event": int(manifest.get("planning_event")),
+        "horizon_kind": str(manifest.get("horizon_kind")),
+        "cutoff": str(manifest.get("cutoff")),
+        "snapshot_path": snapshot.get("path"),
+        "snapshot_sha256": snapshot.get("sha256"),
+        "snapshot_source_db_identity": snapshot.get("source_db_identity"),
+    }
+    if row_metadata != expected_metadata:
+        raise GenerationRefused(
+            DIAG_GENERATION_MANIFEST_INVALID,
+            [
+                "the generation row metadata does not match its digest-verified manifest: "
+                f"row={row_metadata!r}, manifest={expected_metadata!r}"
+            ],
         )
     return _row_to_generation(row)
 
@@ -550,41 +632,68 @@ def _dependency_closure(
     return closure
 
 
+def authoritative_code_identity() -> str:
+    """The ONE declared source of the code identity a certification requires.
+
+    ``projection_runs.source_snapshot_sha256`` records which code revision produced a
+    predictive run.  ``declared_required_versions`` is the declared source for the
+    VERSIONS a certification requires; this is the same rule for the CODE: the
+    expected identity is computed from the in-library source set, never accepted from
+    a caller and never merely recorded, so a generation can only be certified over
+    runs that the running code revision actually produced.
+    """
+
+    from . import analytics
+
+    return str(analytics.source_snapshot_sha256())
+
+
 def certify_generation(
     conn: sqlite3.Connection,
     *,
     planning_event: int,
     cutoff: str,
     runs_by_event: Mapping[int, Mapping[str, int]],
+    snapshot: Mapping[str, Any] | None,
     horizon_kind: str = HORIZON_KIND_FOUR_GW,
     events: Sequence[int] | None = None,
     horizon_length: int | None = None,
-    snapshot: Mapping[str, Any] | None = None,
     calibration: Mapping[str, Any] | None = None,
-    code_snapshot_sha256: str | None = None,
+    calibration_artifact_ref: str | Path | None = None,
+    require_calibration: bool = False,
     last_event: int | None = None,
     clock: Callable[[], str] | None = None,
+    controller: Any = None,
 ) -> CertifiedGeneration:
     """Certify a horizon and persist ONE generation, atomically.
 
     The lifecycle (amendment 2 §8):
 
-        resolve exact required predictive runs
+        acquire the existing writer lease  (``controller``, when supplied)
         -> validate each bundle with the existing canonical validators
         -> validate required model versions (authoritative in-library source only)
-        -> validate dependency closure / planning_context_hash / code snapshot
-        -> validate data snapshot identity
-        -> consult/link PE-8 evidence
+        -> validate the authoritative CODE identity against the run rows
+        -> validate dependency closure, planning_context_hash and the cutoff
+        -> validate the pinned data snapshot identity (hashed, not claimed)
+        -> consult/link the applicable PE-8 evidence
         -> apply the four-event horizon gate
-        -> construct the canonical semantic manifest
-        -> compute generation_id
+        -> construct the canonical semantic manifest and compute generation_id
         -> ONE TRANSACTION: insert generation idempotently + update current_generation
 
-    ``required_versions`` is NOT a parameter: it always comes from
-    :func:`certified_bundle.declared_required_versions`, so no caller can pin a
-    version.  A generation row exists only when certification passed; a crash before
-    commit leaves no generation and the old pointer, and re-certifying identical
-    semantic evidence resolves to the SAME ``generation_id``.
+    Three things are deliberately NOT parameters, because a caller must not be able
+    to pin them: ``required_versions`` comes from
+    :func:`certified_bundle.declared_required_versions`, the CODE identity comes from
+    :func:`authoritative_code_identity`, and the data snapshot is REQUIRED and its
+    bytes are hashed here rather than accepted as a claim.
+
+    A generation row exists only when certification passed.  The validation and the
+    generation/pointer write run inside ONE ``BEGIN IMMEDIATE`` transaction, so a
+    concurrent writer cannot interleave between the check and the persist; when an
+    ``ExecutionController`` is supplied its writer lease must be ACTIVE (the caller
+    drives this inside its own ``CERTIFY_GENERATION`` stage, so the run ledger names
+    the certification that produced the row).  A crash before commit leaves no
+    generation and the old pointer, and re-certifying identical semantic evidence
+    resolves to the SAME ``generation_id``.
     """
 
     from . import four_gw_decision as fg
@@ -595,103 +704,235 @@ def certify_generation(
             [f"{horizon_kind!r} is not a declared horizon kind ({list(HORIZON_KINDS)})"],
         )
     required_versions = cb.declared_required_versions()
+    code_identity = authoritative_code_identity()
     snapshot_block = _snapshot_identity_block(snapshot)
+    calibration_digest, calibration_file_sha256 = _calibration_file_identity(
+        calibration, calibration_artifact_ref, required=bool(require_calibration)
+    )
     resolved_events = (
         [int(event) for event in events]
         if events is not None
         else sorted(int(event) for event in runs_by_event)
     )
+    lease_run_uuid = assert_writer_lease_held(controller)
 
-    per_event: dict[int, dict[str, Any]] = {}
-    support: dict[int, dict[str, Any]] = {}
-    for event in resolved_events:
-        runs = {str(family): int(run) for family, run in (runs_by_event.get(int(event)) or {}).items()}
-        # The families this certification must cover: those a world load reads, plus
-        # every family this event's world actually declares.  A world that carries no
-        # Monte Carlo run declares none, so its absence is a DECLARED absence rather
-        # than an invented requirement -- while a family that IS declared is fully
-        # validated, dependency edges included.
-        families = _declared_families(runs, {})
-        certified = cb.certify_event_bundle(
-            conn,
-            event=int(event),
-            cutoff=str(cutoff),
-            runs=runs,
-            required_versions=required_versions,
-            data_snapshot_sha256=snapshot_block["sha256"],
-            code_snapshot_sha256=code_snapshot_sha256,
-            expected_data_snapshot_sha256=snapshot_block["sha256"],
-            calibration=calibration,
-            families=families,
-        )
-        record = certified.as_dict()
-        record["runs"] = {str(family): int(run) for family, run in certified.runs.items()}
-        record["dependency_closure"] = _dependency_closure(conn, int(event), certified.runs)
-        per_event[int(event)] = record
-        support[int(event)] = {
-            "supported": certified.state not in cb.BLOCKING_BUNDLE_STATES,
-            "data_cutoff": str(cutoff) if certified.state not in cb.BLOCKING_BUNDLE_STATES else None,
-            "missing_families": (
-                [] if certified.state not in cb.BLOCKING_BUNDLE_STATES else ["CERTIFICATION_BLOCKED"]
-            ),
-            "state": certified.state,
-            "bundle_identity": certified.bundle_identity,
-            "matched_runs": {str(k): int(v) for k, v in certified.runs.items()},
-        }
+    snapshot_conn = sqlite3.connect(
+        f"file:{Path(snapshot_block['path'])}?mode=ro", uri=True
+    )
+    try:
+        from . import four_gw_decision as fg
 
-    resolved_length = int(
-        horizon_length
-        if horizon_length is not None
-        else HORIZON_LENGTHS.get(str(horizon_kind), len(resolved_events))
-    )
-    horizon = fg.evaluate_horizon(
-        planning_event=int(resolved_events[0]) if resolved_events else int(planning_event),
-        support_by_event=support,
-        cutoff=str(cutoff),
-        length=resolved_length,
-        last_event=(
-            int(last_event) if last_event is not None else fg.season_last_event_from_db(conn)
-        ),
-    )
-    blocking_events = [int(event) for event in horizon.get("blocked_events") or []]
-    if blocking_events or str(horizon["status"]) != fg.DECISION_HORIZON_COMPLETE:
-        raise GenerationNotCertified(
+        snapshot_conn.row_factory = sqlite3.Row
+        snapshot_last_event = int(fg.season_last_event_from_db(snapshot_conn))
+    finally:
+        snapshot_conn.close()
+    if last_event is not None and int(last_event) != snapshot_last_event:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
             [
-                f"the horizon cannot be certified: {horizon['status']} (blocked events "
-                f"{blocking_events if blocking_events else 'none'})"
-            ]
-            + [
-                f"GW{int(event)}: " + "; ".join(str(reason) for reason in per_event[int(event)]["reasons"])
-                for event in blocking_events
-                if per_event.get(int(event), {}).get("reasons")
-            ]
+                f"the supplied season last event {int(last_event)} does not match the pinned "
+                f"snapshot's last event {snapshot_last_event}"
+            ],
         )
-
-    pe8_evidence = _pe8_evidence_block(calibration, per_event, resolved_events)
-    disclosure = cb.disclosure_block(calibration)
-    manifest = build_generation_manifest(
-        planning_event=int(planning_event),
-        horizon_kind=str(horizon_kind),
-        cutoff=str(cutoff),
-        events=resolved_events,
-        per_event=per_event,
-        required_model_versions=required_versions,
-        code_snapshot_sha256=code_snapshot_sha256,
-        snapshot=snapshot_block,
-        horizon_state=str(horizon["status"]),
-        horizon_length=resolved_length,
-        pe8_evidence=pe8_evidence,
-        disclosure=disclosure,
-    )
-    generation_id = generation_id_of(manifest)
-    created_at = (clock or _utc_now)()
-    # The persisted bytes ARE the semantic manifest: row metadata (created_at, the
-    # canonical snapshot column) lives in its own column and never inside the identity.
-    manifest_json = canonical_manifest_bytes(manifest).decode("utf-8")
+    resolved_last_event = snapshot_last_event
 
     from .database import write_transaction
 
+    # The validation and the persist are ONE write transaction: nothing can certify
+    # between the checks below and the row that records their outcome.
     with write_transaction(conn):
+        current_lease_run_uuid = assert_writer_lease_held(controller)
+        if current_lease_run_uuid != lease_run_uuid:
+            raise GenerationRefused(
+                DIAG_GENERATION_NOT_CERTIFIED,
+                ["the active writer lease changed before generation publication"],
+            )
+        per_event: dict[int, dict[str, Any]] = {}
+        support: dict[int, dict[str, Any]] = {}
+        resolved_runs: dict[int, dict[str, int]] = {}
+        base_bundle_identities: dict[str, str] = {}
+
+        # PE-8 evidence is bound to the same certification identity produced by the
+        # existing bundle identities.  Resolve those exact identities first; they
+        # are revalidated below together with the evidence under this transaction.
+        if calibration is not None:
+            for event in resolved_events:
+                runs = {
+                    str(family): int(run)
+                    for family, run in (runs_by_event.get(int(event)) or {}).items()
+                }
+                base = cb.certified_bundle_from_explicit_ids(
+                    conn,
+                    event=int(event),
+                    cutoff=str(cutoff),
+                    runs=runs,
+                    required_versions=required_versions,
+                    data_snapshot_sha256=snapshot_block["sha256"],
+                    code_snapshot_sha256=code_identity,
+                    expected_data_snapshot_sha256=snapshot_block["sha256"],
+                    families=_declared_families(runs, {}),
+                )
+                resolved_runs[int(event)] = runs
+                base_bundle_identities[str(int(event))] = base.bundle_identity()
+            pe8_certification_identity = _certification_identity_for_bundles(
+                cutoff=str(cutoff),
+                bundle_identities=base_bundle_identities,
+                snapshot_sha256=str(snapshot_block["sha256"]),
+            )
+        else:
+            pe8_certification_identity = None
+
+        for event in resolved_events:
+            runs = resolved_runs.get(int(event)) or {
+                str(family): int(run) for family, run in (runs_by_event.get(int(event)) or {}).items()
+            }
+            # The families this certification must cover: those a world load reads,
+            # plus every family this event's world actually declares.  A world that
+            # carries no Monte Carlo run declares none, so its absence is a DECLARED
+            # absence rather than an invented requirement -- while a family that IS
+            # declared is fully validated, dependency edges included.
+            families = _declared_families(runs, {})
+            certified = cb.certify_event_bundle(
+                conn,
+                event=int(event),
+                cutoff=str(cutoff),
+                runs=runs,
+                required_versions=required_versions,
+                data_snapshot_sha256=snapshot_block["sha256"],
+                # The AUTHORITATIVE code identity: the runs must have been produced by
+                # the running revision, so a certification cannot pin the code of a
+                # world the current code did not build.
+                code_snapshot_sha256=code_identity,
+                expected_data_snapshot_sha256=snapshot_block["sha256"],
+                calibration=calibration,
+                require_calibration=bool(require_calibration),
+                certification_identity=pe8_certification_identity,
+                families=families,
+            )
+            if certified.structural_state not in cb.BLOCKING_BUNDLE_STATES:
+                identity_failures = _run_identity_failures(
+                    conn,
+                    event=int(event),
+                    runs=certified.runs,
+                    code_identity=code_identity,
+                )
+                if identity_failures:
+                    context_failure = any("planning_context_hash" in reason for reason in identity_failures)
+                    raise GenerationRefused(
+                        DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED
+                        if context_failure
+                        else cb.STATE_EVIDENCE_MISSING,
+                        identity_failures,
+                    )
+            record = certified.as_dict()
+            record["runs"] = {str(family): int(run) for family, run in certified.runs.items()}
+            record["dependency_closure"] = _dependency_closure(conn, int(event), certified.runs)
+            per_event[int(event)] = record
+            support[int(event)] = {
+                "supported": certified.state not in cb.BLOCKING_BUNDLE_STATES,
+                "data_cutoff": str(cutoff) if certified.state not in cb.BLOCKING_BUNDLE_STATES else None,
+                "missing_families": (
+                    [] if certified.state not in cb.BLOCKING_BUNDLE_STATES else ["CERTIFICATION_BLOCKED"]
+                ),
+                "state": certified.state,
+                "bundle_identity": certified.bundle_identity,
+                "matched_runs": {str(k): int(v) for k, v in certified.runs.items()},
+            }
+
+        # The planning context is part of the predictive world: every family of an
+        # event must have been predicted under ONE declared context, and it must be
+        # DECLARED rather than absent.  A world whose context nobody recorded cannot
+        # be re-derived to a planning state, so it is refused here rather than
+        # recorded as a hole.
+        contextless = [
+            f"GW{event}: no planning_context_hash is recorded by the certified families"
+            for event in resolved_events
+            if str(per_event[int(event)].get("structural_state") or "") not in cb.BLOCKING_BUNDLE_STATES
+            and not str(per_event[int(event)].get("planning_context_hash") or "").strip()
+        ]
+        if contextless:
+            raise GenerationRefused(DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED, contextless)
+
+        resolved_length = int(
+            horizon_length
+            if horizon_length is not None
+            else HORIZON_LENGTHS.get(str(horizon_kind), len(resolved_events))
+        )
+        horizon = fg.evaluate_horizon(
+            planning_event=int(resolved_events[0]) if resolved_events else int(planning_event),
+            support_by_event=support,
+            cutoff=str(cutoff),
+            length=resolved_length,
+            last_event=resolved_last_event,
+        )
+        blocking_events = [int(event) for event in horizon.get("blocked_events") or []]
+        if blocking_events or str(horizon["status"]) != fg.DECISION_HORIZON_COMPLETE:
+            raise GenerationNotCertified(
+                [
+                    f"the horizon cannot be certified: {horizon['status']} (blocked events "
+                    f"{blocking_events if blocking_events else 'none'})"
+                ]
+                + [
+                    f"GW{int(event)}: "
+                    + "; ".join(str(reason) for reason in per_event[int(event)]["reasons"])
+                    for event in blocking_events
+                    if per_event.get(int(event), {}).get("reasons")
+                ]
+            )
+
+        pe8_evidence = _pe8_evidence_block(
+            calibration,
+            per_event,
+            resolved_events,
+            artifact_ref=str(calibration_artifact_ref) if calibration_artifact_ref else None,
+            artifact_file_sha256=calibration_file_sha256,
+            required=bool(require_calibration),
+        )
+        if calibration is not None and calibration_digest != pe8_evidence.get("artifact_digest"):
+            raise GenerationRefused(
+                cb.STATE_EVIDENCE_MISSING,
+                ["the retained PE-8 artifact digest changed during certification"],
+            )
+        refreshed_snapshot = _snapshot_identity_block(snapshot_block)
+        if refreshed_snapshot["sha256"] != snapshot_block["sha256"]:
+            raise GenerationSnapshotUnverified(
+                ["the pinned snapshot changed while generation certification was in progress"]
+            )
+        if calibration_artifact_ref is not None:
+            from . import execution_snapshot as es
+
+            if es.file_sha256(str(calibration_artifact_ref)) != calibration_file_sha256:
+                raise GenerationRefused(
+                    cb.STATE_EVIDENCE_MISSING,
+                    ["the retained PE-8 artifact changed while generation certification was in progress"],
+                )
+        if authoritative_code_identity() != code_identity:
+            raise GenerationRefused(
+                cb.STATE_EVIDENCE_MISSING,
+                ["the authoritative model code identity changed while generation certification was in progress"],
+            )
+        disclosure = cb.disclosure_block(calibration)
+        manifest = build_generation_manifest(
+            planning_event=int(planning_event),
+            horizon_kind=str(horizon_kind),
+            cutoff=str(cutoff),
+            events=resolved_events,
+            per_event=per_event,
+            required_model_versions=required_versions,
+            code_snapshot_sha256=code_identity,
+            snapshot=snapshot_block,
+            horizon_state=str(horizon["status"]),
+            horizon_length=resolved_length,
+            last_event=resolved_last_event,
+            pe8_evidence=pe8_evidence,
+            disclosure=disclosure,
+        )
+        generation_id = generation_id_of(manifest)
+        created_at = (clock or _utc_now)()
+        # The persisted bytes ARE the semantic manifest: row metadata (created_at, the
+        # canonical snapshot column) lives in its own column and never inside the identity.
+        manifest_json = canonical_manifest_bytes(manifest).decode("utf-8")
+
         conn.execute(
             "INSERT INTO generation(generation_id, manifest_json, manifest_sha256, planning_event,"
             " horizon_kind, cutoff, snapshot_path, snapshot_sha256, snapshot_source_db_identity,"
@@ -722,6 +963,34 @@ def certify_generation(
     return load_generation(conn, generation_id)
 
 
+def assert_writer_lease_held(controller: Any) -> str | None:
+    """Require the ACTIVE writer lease ``controller`` holds, or refuse with ``LeaseError``.
+
+    Amendment 2 §8 opens the certification lifecycle with "acquire existing writer
+    lease".  When a certification is driven by the execution controller it must happen
+    UNDER that lease: a certification outside the single-writer boundary could
+    interleave with another writer, and nothing would attribute it to a run.  The
+    caller records its own ``CERTIFY_GENERATION`` stage, so the generation's
+    provenance is the run ledger and the persisted row together.
+    """
+
+    if controller is None:
+        return None
+    from . import execution as ex
+
+    lease = controller.active_lease(ex.LEASE_KIND_WRITER, "sqlite-writer")
+    if lease is None:
+        raise ex.LeaseError(
+            "CERTIFICATION_WITHOUT_WRITER_LEASE: the certification controller holds no ACTIVE "
+            "writer lease, so this certification would run outside the single-writer boundary"
+        )
+    if str(lease["run_uuid"]) != str(controller.run_uuid):
+        raise ex.LeaseError(
+            "CERTIFICATION_WITHOUT_WRITER_LEASE: the ACTIVE writer lease belongs to another run"
+        )
+    return str(controller.run_uuid)
+
+
 def _utc_now() -> str:
     from .utils import utc_now
 
@@ -729,55 +998,217 @@ def _utc_now() -> str:
 
 
 def _snapshot_identity_block(snapshot: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The snapshot identity the manifest commits to.
+    """The pinned snapshot identity the manifest commits to -- REQUIRED, and VALIDATED.
 
-    ``sha256`` is HASHED BY THE CERTIFIER from the file itself, so the manifest
-    records a fact a verifier can re-derive rather than a caller's assertion -- and a
-    supplied digest that does not match the bytes on disk is REFUSED instead of
-    recorded.  A generation pins the immutable source it actually replaced, so a
-    snapshot that is absent or that hashes to something other than its claim never
-    becomes certified evidence.
+    A generation is certified against ONE immutable source database, so the snapshot
+    is not decoration: without it the certified runs cannot be re-derived from the
+    causal source, and ``sha256`` is HASHED BY THE CERTIFIER from the file itself, so
+    the manifest records a fact a verifier re-derives rather than a caller's claim.
+
+    A snapshot that is ABSENT, that names no readable file, that carries no source
+    database identity, or whose bytes do not hash to the recorded digest is REFUSED
+    here (``GENERATION_SNAPSHOT_UNVERIFIED``) instead of being recorded as ``None``.
+    A generation that pinned nothing could not be verified by anyone.
     """
 
-    snapshot = dict(snapshot or {})
+    if snapshot is None:
+        raise GenerationSnapshotUnverified(
+            [
+                "no data snapshot was supplied; a generation is certified against ONE immutable "
+                "source database and commits to the bytes it actually used, so a certification "
+                "without a pinned snapshot is not certified evidence"
+            ]
+        )
+    snapshot = dict(snapshot)
     identity = snapshot.get("source_db_identity") or snapshot.get("data_snapshot_source_db_identity")
     path = snapshot.get("path") or snapshot.get("data_snapshot_path")
     claimed = snapshot.get("sha256") or snapshot.get("data_snapshot_sha256")
-    size_bytes = snapshot.get("size_bytes") or snapshot.get("data_snapshot_size_bytes")
-    if path:
-        from . import execution_snapshot as es
+    if not path:
+        raise GenerationSnapshotUnverified(
+            [
+                "the supplied snapshot names no file; a generation pins the immutable source it "
+                "actually replaced"
+            ]
+        )
+    from . import execution_snapshot as es
 
-        snapshot_file = Path(str(path))
-        if not snapshot_file.exists():
-            raise GenerationNotCertified(
-                [
-                    f"the data snapshot {path} does not exist; a generation pins the immutable source "
-                    "it actually replaced"
-                ]
-            )
-        live = es.file_sha256(snapshot_file)
-        if claimed is not None and str(claimed) != str(live):
-            raise GenerationNotCertified(
-                [
-                    f"the data snapshot {path} hashes to {live}, not the supplied {claimed}; a "
-                    "generation commits to the bytes it actually used"
-                ]
-            )
-        claimed = str(live)
-        size_bytes = int(snapshot_file.stat().st_size)
+    snapshot_file = Path(str(path))
+    if not snapshot_file.exists():
+        raise GenerationSnapshotUnverified(
+            [
+                f"the data snapshot {path} does not exist; a generation pins the immutable source "
+                "it actually replaced"
+            ]
+        )
+    if not claimed:
+        raise GenerationSnapshotUnverified(
+            [
+                f"the data snapshot {path} carries no recorded digest; the certifier commits to the "
+                "bytes it actually used, and a claim nobody recorded cannot be re-derived"
+            ]
+        )
+    live = es.file_sha256(snapshot_file)
+    if str(claimed) != str(live):
+        raise GenerationSnapshotUnverified(
+            [
+                f"the data snapshot {path} hashes to {live}, not the supplied {claimed}; a "
+                "generation commits to the bytes it actually used"
+            ]
+        )
+    if not isinstance(identity, Mapping) or not dict(identity):
+        raise GenerationSnapshotUnverified(
+            [
+                f"the data snapshot {path} records no source database identity; a generation commits "
+                "to WHICH source database it replaced, not merely to a file digest"
+            ]
+        )
+    identity = dict(identity)
+    try:
+        actual_identity = es.source_db_identity(snapshot_file)
+    except (OSError, sqlite3.Error) as failure:
+        raise GenerationSnapshotUnverified(
+            [f"the data snapshot {path} cannot be opened as the source database it claims to be: {failure}"]
+        ) from failure
+    # ``source_db_identity`` is recorded from the live source at capture time.
+    # Re-derive the database fields that VACUUM INTO preserves from the pinned
+    # snapshot itself.  The source path and page count are intentionally excluded:
+    # the snapshot has a different path and may be compacted while keeping identical
+    # logical contents.  Its full bytes are already bound by ``live`` above.
+    identity_fields = ("schema_version", "projection_runs_count", "projection_runs_max_id")
+    missing_identity = [key for key in identity_fields if key not in identity]
+    if missing_identity:
+        raise GenerationSnapshotUnverified(
+            [f"the source identity for snapshot {path} omits {missing_identity}"]
+        )
+    mismatches = [
+        f"{key}: recorded {identity.get(key)!r}, snapshot contains {actual_identity.get(key)!r}"
+        for key in identity_fields
+        if identity.get(key) != actual_identity.get(key)
+    ]
+    if mismatches:
+        raise GenerationSnapshotUnverified(
+            ["the recorded source database identity does not reproduce from the pinned snapshot: " + "; ".join(mismatches)]
+        )
     return {
-        "path": path,
-        "sha256": None if claimed is None else str(claimed),
-        "size_bytes": None if size_bytes is None else int(size_bytes),
-        "source_db_identity": dict(identity) if isinstance(identity, Mapping) else None,
+        "path": str(path),
+        "sha256": str(live),
+        "size_bytes": int(snapshot_file.stat().st_size),
+        "source_db_identity": identity,
         "execution_run_uuid": snapshot.get("execution_run_uuid"),
     }
+
+
+def _run_identity_failures(
+    conn: sqlite3.Connection,
+    *,
+    event: int,
+    runs: Mapping[str, int],
+    code_identity: str,
+) -> list[str]:
+    """Require every consumed run to retain the same code and planning context."""
+
+    failures: list[str] = []
+    contexts: dict[str, list[str]] = {}
+    for family in _declared_families(runs, {}):
+        run_id = runs.get(family)
+        row = cb._run(conn, int(run_id)) if run_id is not None else None
+        if row is None:
+            failures.append(f"GW{event}: {family} run {run_id!r} has no persisted identity row")
+            continue
+        recorded_code = str(row["source_snapshot_sha256"] or "").strip()
+        if not recorded_code:
+            failures.append(f"GW{event}: {family} run {run_id} records no authoritative code identity")
+        elif recorded_code != str(code_identity):
+            failures.append(
+                f"GW{event}: {family} run {run_id} code identity {recorded_code!r} "
+                f"!= authoritative identity {code_identity!r}"
+            )
+        context = str(row["planning_context_hash"] or "").strip()
+        if not context:
+            failures.append(f"GW{event}: {family} run {run_id} records no planning_context_hash")
+        else:
+            contexts.setdefault(context, []).append(family)
+    if len(contexts) > 1:
+        failures.append(
+            f"GW{event}: planning_context_hash differs across certified families "
+            f"{ {value: sorted(families) for value, families in sorted(contexts.items())} }"
+        )
+    return failures
+
+
+def _calibration_file_identity(
+    calibration: Mapping[str, Any] | None,
+    artifact_ref: str | Path | None,
+    *,
+    required: bool,
+) -> tuple[str | None, str | None]:
+    """Require consulted PE-8 evidence to have a retained, matching artifact."""
+
+    if calibration is None:
+        if required:
+            raise GenerationRefused(
+                cb.STATE_EVIDENCE_MISSING,
+                ["a required PE-8 calibration evidence artifact is absent"],
+            )
+        if artifact_ref is not None:
+            raise GenerationRefused(
+                cb.STATE_EVIDENCE_MISSING,
+                ["a PE-8 artifact path was supplied without its parsed evidence"],
+            )
+        return None, None
+    if not artifact_ref:
+        raise GenerationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            ["consulted PE-8 evidence has no retained artifact reference"],
+        )
+    path = Path(str(artifact_ref))
+    if not path.is_file():
+        raise GenerationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [f"the consulted PE-8 evidence artifact {path} is not retained"],
+        )
+    from . import calibration_evaluation as ce
+    from . import execution_snapshot as es
+
+    try:
+        retained = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as failure:
+        raise GenerationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [f"the consulted PE-8 evidence artifact {path} cannot be read: {failure}"],
+        ) from failure
+    if not isinstance(retained, Mapping) or ce.artifact_digest(retained) != ce.artifact_digest(calibration):
+        raise GenerationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [f"the retained PE-8 evidence artifact {path} does not match the supplied evidence"],
+        )
+    return ce.artifact_digest(calibration), es.file_sha256(path)
+
+
+def _certification_identity_for_bundles(
+    *, cutoff: str, bundle_identities: Mapping[str, str], snapshot_sha256: str
+) -> str:
+    from . import four_gw_decision as fg
+
+    return fg.certification_identity_of(
+        {
+            "planning_cutoff": str(cutoff),
+            "certified_bundle_identity": {
+                str(event): str(identity) for event, identity in bundle_identities.items()
+            },
+            "data_snapshot_sha256": str(snapshot_sha256),
+        }
+    )
 
 
 def _pe8_evidence_block(
     calibration: Mapping[str, Any] | None,
     per_event: Mapping[int, Mapping[str, Any]],
     events: Sequence[int],
+    *,
+    artifact_ref: str | None = None,
+    artifact_file_sha256: str | None = None,
+    required: bool = False,
 ) -> dict[str, Any]:
     """PE-8 evidence as it participates in the generation manifest.
 
@@ -791,7 +1222,9 @@ def _pe8_evidence_block(
     if calibration is None:
         return {
             "consulted": False,
+            "required": bool(required),
             "identity": None,
+            "reproduction": PE8_NOT_CONSULTED,
             "terminal_state": None,
             "state": cb.STATE_EVIDENCE_LIMITED,
             "per_event_state": {
@@ -799,20 +1232,34 @@ def _pe8_evidence_block(
             },
             "refusals": [],
         }
+    declared = calibration.get("identity") or {}
+    from . import calibration_evaluation as ce
+
+    surfaces = cb.calibration_surface_states(calibration)
     return {
         "consulted": True,
+        "required": bool(required),
         "identity": cb.calibration_identity(calibration),
+        "artifact_digest": ce.artifact_digest(calibration),
+        "artifact_ref": str(artifact_ref) if artifact_ref else None,
+        "artifact_file_sha256": str(artifact_file_sha256) if artifact_file_sha256 else None,
         "schema": calibration.get("schema"),
         "evaluation_version": calibration.get("evaluation_version"),
+        # The identity's OWN declared fields travel with the reference, so an
+        # independent verifier can RECOMPUTE the identity instead of trusting the
+        # label.  Without them "the PE-8 evidence participated" would be a claim
+        # nobody could reproduce.
+        "certification_identity": declared.get("certification_identity"),
+        "planning_cutoff": declared.get("planning_cutoff"),
         "terminal_state": cb.calibration_terminal_state(calibration)["state"],
-        "state": cb.calibration_evidence_state(calibration, cb.calibration_surface_states(calibration)),
+        "state": cb.calibration_evidence_state(calibration, surfaces),
         "surfaces": [
             {
                 "surface": reading.get("surface"),
                 "state": reading.get("state"),
                 "diagnosis": reading.get("diagnosis"),
             }
-            for reading in cb.calibration_surface_states(calibration)
+            for reading in surfaces
         ],
         "per_event_state": {
             str(int(event)): str(per_event[int(event)].get("evidence_state")) for event in events
@@ -821,144 +1268,339 @@ def _pe8_evidence_block(
     }
 
 
+def reproduce_pe8_evidence(
+    evidence: Mapping[str, Any], per_event: Mapping[str, Any]
+) -> tuple[bool | None, list[str], str]:
+    """Re-derive the PE-8 evidence reference from the generation's own record.
+
+    Returns ``(reproduced, failures, boundary)``.  Two things are genuinely
+    re-derived here:
+
+    * the calibration IDENTITY, recomputed from the fields the manifest records and
+      required to equal the recorded identity; and
+    * the evidence STATE, recomputed by re-running PE-8's own roll-up over the
+      recorded surfaces and terminal state.
+
+    The boundary is stated rather than implied: PE-9 does not retain the PE-8
+    artifact itself, so the surfaces are the recorded reading and the reproduction
+    proves the reference and the roll-up, not the sample statistics behind them.
+    """
+
+    if not evidence.get("consulted"):
+        # No calibration claim was made (``EVIDENCE_LIMITED`` is a state, never a
+        # failure).  There is no reference to reproduce and none is claimed.
+        return None, [], PE8_NOT_CONSULTED
+    failures: list[str] = []
+    recomputed_identity = cb.calibration_identity(
+        {
+            "schema": evidence.get("schema"),
+            "evaluation_version": evidence.get("evaluation_version"),
+            "identity": {
+                "certification_identity": evidence.get("certification_identity"),
+                "planning_cutoff": evidence.get("planning_cutoff"),
+            },
+        }
+    )
+    if recomputed_identity is None or str(recomputed_identity) != str(evidence.get("identity")):
+        failures.append(
+            "the recorded PE-8 calibration identity does not recompute from the fields the "
+            f"manifest carries ({evidence.get('identity')} vs {recomputed_identity})"
+        )
+    recomputed_state = cb.calibration_evidence_state(
+        {"terminal_state": {"state": evidence.get("terminal_state")}},
+        [surface for surface in (evidence.get("surfaces") or []) if isinstance(surface, Mapping)],
+    )
+    if str(recomputed_state) != str(evidence.get("state")):
+        failures.append(
+            f"the recorded PE-8 evidence state {evidence.get('state')!r} does not reproduce from "
+            f"its own surfaces and terminal state ({recomputed_state!r})"
+        )
+    for event, state in sorted((evidence.get("per_event_state") or {}).items()):
+        record = (per_event or {}).get(str(event)) or {}
+        if str(record.get("evidence_state")) != str(state):
+            failures.append(
+                f"GW{event}: the PE-8 evidence block records state {state!r} but the certified "
+                f"record says {record.get('evidence_state')!r}"
+            )
+    return (not failures), failures, PE8_IDENTITY_AND_STATE_RECOMPUTED
+
+
 # ---------------------------------------------------------------------------
 # Verification (re-derivation audit)
 # ---------------------------------------------------------------------------
 
 
 def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str, Any]:
-    """Independently re-derive a generation from authoritative persisted evidence.
+    """Re-derive a generation from retained runs, snapshot, and PE-8 evidence."""
 
-    Proves, or refuses with the specific failed step:
-
-    * the persisted manifest digests to ``generation_id`` (content address holds);
-    * the pinned snapshot still exists and still hashes to the recorded identity;
-    * every exact run exists, is ``complete``, and records the manifest's version;
-    * the cutoff / event / planning-context / code-snapshot evidence is coherent;
-    * the recorded dependency closure REPRODUCES from the run rows themselves;
-    * the four-event horizon state reproduces from the certified per-event records.
-
-    A generation whose snapshot file has been deleted is refused:
-    :func:`require_snapshot_retained` documents that a snapshot referenced by a
-    surviving generation must not be garbage-collected.
-    """
-
+    from . import execution_snapshot as es
     from . import four_gw_decision as fg
 
     generation = load_generation(conn, generation_id)
     manifest = dict(generation.manifest)
     failures: list[str] = []
+    authoritative_versions = {
+        str(family): str(version) for family, version in cb.declared_required_versions().items()
+    }
+    recorded_versions = {
+        str(family): str(version)
+        for family, version in (manifest.get("required_model_versions") or {}).items()
+    }
+    if recorded_versions != authoritative_versions:
+        failures.append(
+            "the manifest's required model versions do not match the authoritative declarations "
+            f"({recorded_versions} vs {authoritative_versions})"
+        )
+    code_identity = str(manifest.get("code_snapshot_sha256") or "").strip()
+    if len(code_identity) != 64 or any(ch not in "0123456789abcdef" for ch in code_identity.lower()):
+        failures.append("the generation records no valid authoritative code identity")
 
+    snapshot = manifest.get("data_snapshot") or {}
+    snapshot_status = "MISSING"
+    try:
+        _snapshot_identity_block(snapshot)
+        snapshot_status = "VERIFIED"
+    except GenerationRefused as failure:
+        failures.extend(failure.reasons)
+
+    base_bundles: dict[int, cb.CertifiedBundle] = {}
+    dependency_ok = True
+    runs_complete = True
+    versions_ok = recorded_versions == authoritative_versions
     for event in generation.events:
-        record = (manifest.get("per_event") or {}).get(str(int(event))) or {}
+        event = int(event)
+        record = (manifest.get("per_event") or {}).get(str(event)) or {}
+        if int(record.get("event") or -1) != event:
+            failures.append(f"GW{event}: the manifest's event record does not identify GW{event}")
         runs = {str(f): int(r) for f, r in (record.get("runs") or {}).items()}
-        missing = [f for f in cb.LOAD_REQUIRED_FAMILIES if f not in runs]
+        missing = [family for family in cb.LOAD_REQUIRED_FAMILIES if family not in runs]
         if missing:
-            failures.append(f"GW{int(event)}: the manifest names no run for {sorted(missing)}")
+            failures.append(f"GW{event}: the manifest names no run for {sorted(missing)}")
+            runs_complete = False
             continue
-        rows = {family: cb._run(conn, int(run)) for family, run in runs.items()}
-        for family, row in sorted(rows.items()):
+        for family, run_id in sorted(runs.items()):
+            row = cb._run(conn, run_id)
             if row is None:
-                failures.append(
-                    f"GW{int(event)}: {family} run {runs[family]} no longer exists in the store"
-                )
+                failures.append(f"GW{event}: {family} run {run_id} no longer exists in the store")
+                runs_complete = False
                 continue
             if str(row["status"]) != "complete":
-                failures.append(
-                    f"GW{int(event)}: {family} run {runs[family]} status is {row['status']!r}, not complete"
-                )
-            declared = (record.get("model_versions") or {}).get(family)
-            if declared is not None and str(row["model_version"]) != str(declared):
-                failures.append(
-                    f"GW{int(event)}: {family} run {runs[family]} records version "
-                    f"{row['model_version']!r}, not the manifest's {declared!r}"
-                )
-            if str(row["planning_event"]) != str(int(event)):
-                failures.append(
-                    f"GW{int(event)}: {family} run {runs[family]} is planning_event "
-                    f"{row['planning_event']}"
-                )
+                failures.append(f"GW{event}: {family} run {run_id} status is {row['status']!r}, not complete")
+                runs_complete = False
+            if int(row["planning_event"]) != event:
+                failures.append(f"GW{event}: {family} run {run_id} is planning_event {row['planning_event']}")
             if str(row["data_cutoff"]) != str(generation.cutoff):
                 failures.append(
-                    f"GW{int(event)}: {family} run {runs[family]} data_cutoff "
-                    f"{row['data_cutoff']} != generation cutoff {generation.cutoff}"
+                    f"GW{event}: {family} run {run_id} data_cutoff {row['data_cutoff']} "
+                    f"!= generation cutoff {generation.cutoff}"
                 )
-        # The dependency closure must REPRODUCE from the rows, not merely be recorded.
+            declared = (record.get("model_versions") or {}).get(family)
+            expected = authoritative_versions.get(family)
+            if declared is None:
+                failures.append(f"GW{event}: {family} has no retained model-version declaration")
+                versions_ok = False
+            elif str(row["model_version"]) != str(declared):
+                failures.append(
+                    f"GW{event}: {family} run {run_id} records version {row['model_version']!r}, "
+                    f"not the manifest's {declared!r}"
+                )
+                versions_ok = False
+            if expected is not None and str(row["model_version"]) != str(expected):
+                failures.append(
+                    f"GW{event}: {family} run {run_id} version {row['model_version']!r} "
+                    f"!= authoritative version {expected!r}"
+                )
+                versions_ok = False
+
+        identity_failures = _run_identity_failures(
+            conn, event=event, runs=runs, code_identity=code_identity
+        )
+        failures.extend(identity_failures)
         try:
-            reproduced = _dependency_closure(conn, int(event), runs)
+            bundle = cb.certified_bundle_from_explicit_ids(
+                conn,
+                event=event,
+                cutoff=generation.cutoff,
+                runs=runs,
+                required_versions=authoritative_versions,
+                data_snapshot_sha256=snapshot.get("sha256"),
+                code_snapshot_sha256=code_identity,
+                expected_data_snapshot_sha256=snapshot.get("sha256"),
+                families=_declared_families(runs, record),
+            )
+            base_bundles[event] = bundle
+            if bundle.bundle_identity() != str(record.get("bundle_identity") or ""):
+                failures.append(
+                    f"GW{event}: the recorded bundle identity does not reproduce from the run rows "
+                    f"({record.get('bundle_identity')} vs {bundle.bundle_identity()})"
+                )
+            if dict(bundle.model_versions) != {
+                str(k): str(v) for k, v in (record.get("model_versions") or {}).items()
+            }:
+                failures.append(f"GW{event}: the recorded model versions do not reproduce from the run rows")
+            if bundle.planning_context_hash != record.get("planning_context_hash"):
+                failures.append(f"GW{event}: planning_context_hash does not reproduce from the run rows")
+            if not bundle.planning_context_hash:
+                failures.append(f"GW{event}: no planning_context_hash is present on the certified runs")
         except cb.BundleIncoherent as failure:
-            failures.append(f"GW{int(event)}: dependency closure is incoherent: {failure}")
-            reproduced = None
-        if reproduced is not None:
-            recorded = {
+            failures.append(f"GW{event}: " + "; ".join(failure.reasons))
+
+        try:
+            reproduced_closure = _dependency_closure(conn, event, runs)
+        except cb.BundleIncoherent as failure:
+            failures.append(f"GW{event}: dependency closure is incoherent: {failure}")
+            dependency_ok = False
+        else:
+            recorded_closure = {
                 str(family): {str(dep): int(run) for dep, run in (deps or {}).items()}
                 for family, deps in (record.get("dependency_closure") or {}).items()
             }
-            if recorded != reproduced:
+            if recorded_closure != reproduced_closure:
                 failures.append(
-                    f"GW{int(event)}: the recorded dependency closure {recorded} does not reproduce "
-                    f"from the run rows ({reproduced})"
+                    f"GW{event}: dependency closure {recorded_closure} does not reproduce "
+                    f"from run rows ({reproduced_closure})"
                 )
-        # The per-event certification is re-proven with the canonical validators.
+                dependency_ok = False
+
+    pe8 = manifest.get("pe8_evidence")
+    if not isinstance(pe8, Mapping):
+        pe8 = {}
+        failures.append("the generation has no PE-8 evidence state")
+    pe8_consulted = bool(pe8.get("consulted"))
+    pe8_required = bool(pe8.get("required"))
+    if pe8_required and not pe8_consulted:
+        failures.append("the generation requires PE-8 evidence but records that it was not consulted")
+    calibration: Mapping[str, Any] | None = None
+    pe8_artifact_verified: bool | None = None
+    if pe8_consulted:
+        artifact_ref = pe8.get("artifact_ref")
+        if not artifact_ref or not Path(str(artifact_ref)).is_file():
+            failures.append(f"the consulted PE-8 artifact {artifact_ref!r} is not retained")
+        else:
+            try:
+                calibration_payload = json.loads(Path(str(artifact_ref)).read_text(encoding="utf-8"))
+                if not isinstance(calibration_payload, Mapping):
+                    raise ValueError("artifact root is not an object")
+                calibration = calibration_payload
+                actual_file_sha = es.file_sha256(str(artifact_ref))
+                from . import calibration_evaluation as ce
+
+                actual_artifact_digest = ce.artifact_digest(calibration_payload)
+                if actual_file_sha != str(pe8.get("artifact_file_sha256")):
+                    failures.append("the retained PE-8 artifact file digest does not match the manifest")
+                if actual_artifact_digest != str(pe8.get("artifact_digest")):
+                    failures.append("the retained PE-8 artifact content digest does not match the manifest")
+                pe8_artifact_verified = (
+                    actual_file_sha == str(pe8.get("artifact_file_sha256"))
+                    and actual_artifact_digest == str(pe8.get("artifact_digest"))
+                )
+            except (OSError, json.JSONDecodeError, ValueError) as failure:
+                failures.append(f"the retained PE-8 artifact is unreadable: {failure}")
+                pe8_artifact_verified = False
+    else:
+        pe8_artifact_verified = None
+
+    reproduced_pe8_identity: str | None = None
+    if base_bundles and len(base_bundles) == len(generation.events):
+        reproduced_pe8_identity = _certification_identity_for_bundles(
+            cutoff=generation.cutoff,
+            bundle_identities={
+                str(event): bundle.bundle_identity() for event, bundle in base_bundles.items()
+            },
+            snapshot_sha256=str(snapshot.get("sha256") or ""),
+        )
+    certified_records: dict[int, dict[str, Any]] = {}
+    for event, bundle in base_bundles.items():
         try:
-            cb.validate_certified_bundle(
+            certified = cb.certify_event_bundle(
                 conn,
                 event=int(event),
-                cutoff=str(generation.cutoff),
-                runs=runs,
-                required_versions={
-                    str(k): str(v) for k, v in (manifest.get("required_model_versions") or {}).items()
-                },
-                data_snapshot_sha256=(manifest.get("data_snapshot") or {}).get("sha256"),
-                code_snapshot_sha256=manifest.get("code_snapshot_sha256"),
-                expected_data_snapshot_sha256=(manifest.get("data_snapshot") or {}).get("sha256"),
-                families=_declared_families(runs, record),
+                cutoff=generation.cutoff,
+                runs=bundle.runs,
+                required_versions=authoritative_versions,
+                data_snapshot_sha256=snapshot.get("sha256"),
+                code_snapshot_sha256=code_identity,
+                expected_data_snapshot_sha256=snapshot.get("sha256"),
+                calibration=calibration,
+                require_calibration=pe8_required,
+                certification_identity=reproduced_pe8_identity,
+                families=_declared_families(bundle.runs, (manifest.get("per_event") or {}).get(str(event)) or {}),
             )
+            certified_records[int(event)] = certified.as_dict()
+            original = (manifest.get("per_event") or {}).get(str(event)) or {}
+            for field in ("state", "structural_state", "evidence_state", "bundle_identity"):
+                if certified.as_dict().get(field) != original.get(field):
+                    failures.append(
+                        f"GW{event}: the recorded {field} {original.get(field)!r} does not reproduce "
+                        f"from retained run and PE-8 evidence ({certified.as_dict().get(field)!r})"
+                    )
+        except cb.CertificationRefused as failure:
+            failures.append(f"GW{event}: PE-8 evidence does not bind to this generation: {failure}")
         except cb.BundleIncoherent as failure:
-            failures.append(f"GW{int(event)}: " + "; ".join(failure.reasons))
+            failures.append(f"GW{event}: " + "; ".join(failure.reasons))
 
-    # Snapshot retention: the exact bytes the generation committed to must survive.
-    snapshot = manifest.get("data_snapshot") or {}
-    snapshot_status = "NOT_RECORDED"
-    if snapshot.get("sha256"):
-        snapshot_status = "VERIFIED"
-        path = snapshot.get("path")
-        if not path or not Path(str(path)).exists():
-            failures.append(
-                f"the snapshot the generation replaced ({path!r}) no longer exists; a snapshot "
-                "referenced by a surviving generation must be retained"
-            )
-            snapshot_status = "MISSING"
-        else:
-            from . import execution_snapshot as es
+    pe8_reproduced: bool | None
+    pe8_boundary: str
+    if not pe8_consulted:
+        pe8_reproduced, pe8_boundary = None, PE8_NOT_CONSULTED
+    elif calibration is None:
+        pe8_reproduced, pe8_boundary = False, "RETAINED_ARTIFACT_UNAVAILABLE"
+    else:
+        expected_pe8 = _pe8_evidence_block(
+            calibration,
+            {event: (manifest.get("per_event") or {}).get(str(event)) or {} for event in generation.events},
+            generation.events,
+            artifact_ref=str(pe8.get("artifact_ref")),
+            artifact_file_sha256=str(pe8.get("artifact_file_sha256")),
+            required=pe8_required,
+        )
+        comparable_fields = (
+            "consulted", "required", "identity", "artifact_digest", "artifact_ref",
+            "artifact_file_sha256", "schema", "evaluation_version", "certification_identity",
+            "planning_cutoff", "terminal_state", "state", "surfaces", "per_event_state",
+        )
+        summary_matches = all(pe8.get(key) == expected_pe8.get(key) for key in comparable_fields)
+        if not summary_matches:
+            failures.append("the PE-8 summary does not reproduce from its retained artifact")
+        pe8_reproduced, pe8_failures, pe8_boundary = reproduce_pe8_evidence(
+            expected_pe8, manifest.get("per_event") or {}
+        )
+        failures.extend(pe8_failures)
+        if pe8_reproduced is not None:
+            pe8_reproduced = bool(pe8_reproduced and summary_matches and pe8_artifact_verified)
 
-            live = es.file_sha256(str(path))
-            if live != str(snapshot.get("sha256")):
+    reproduced_horizon: dict[str, Any] = {"status": "UNVERIFIABLE"}
+    last_event = manifest.get("last_event")
+    if snapshot_status == "VERIFIED":
+        snapshot_conn = sqlite3.connect(f"file:{Path(str(snapshot.get('path')))}?mode=ro", uri=True)
+        try:
+            snapshot_conn.row_factory = sqlite3.Row
+            actual_last_event = int(fg.season_last_event_from_db(snapshot_conn))
+            if last_event is None or int(last_event) != actual_last_event:
                 failures.append(
-                    f"the snapshot at {path} hashes to {live}, not the generation's "
-                    f"{snapshot.get('sha256')}; a mutated snapshot is not the evidence certified"
+                    f"the recorded horizon last event {last_event!r} does not match the pinned "
+                    f"snapshot ({actual_last_event})"
                 )
-                snapshot_status = "MUTATED"
-
-    # The horizon state must reproduce from the certified per-event records.
-    support = {
-        int(event): {
-            "supported": str(
-                ((manifest.get("per_event") or {}).get(str(int(event))) or {}).get("state")
+            support = {
+                event: {
+                    "supported": str((certified_records.get(event) or {}).get("state"))
+                    not in cb.BLOCKING_BUNDLE_STATES,
+                    "data_cutoff": generation.cutoff,
+                    "missing_families": [],
+                }
+                for event in generation.events
+            }
+            reproduced_horizon = fg.evaluate_horizon(
+                planning_event=int(generation.planning_event),
+                support_by_event=support,
+                cutoff=generation.cutoff,
+                length=int(manifest.get("horizon_length") or 0),
+                last_event=actual_last_event,
             )
-            not in cb.BLOCKING_BUNDLE_STATES,
-            "data_cutoff": generation.cutoff,
-            "missing_families": [],
-        }
-        for event in generation.events
-    }
-    reproduced_horizon = fg.evaluate_horizon(
-        planning_event=int(generation.planning_event),
-        support_by_event=support,
-        cutoff=generation.cutoff,
-        length=int(manifest.get("horizon_length") or 0),
-        last_event=fg.season_last_event_from_db(conn),
-    )
+        except (sqlite3.Error, TypeError, ValueError) as failure:
+            failures.append(f"the pinned snapshot cannot reproduce the horizon: {failure}")
+        finally:
+            snapshot_conn.close()
     if str(reproduced_horizon["status"]) != str(manifest.get("horizon_state")):
         failures.append(
             f"the recorded horizon state {manifest.get('horizon_state')!r} does not reproduce "
@@ -968,7 +1610,7 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     if failures:
         raise GenerationRefused(
             cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT
-            if any("incoherent" in failure for failure in failures)
+            if any("incoherent" in failure.lower() for failure in failures)
             else DIAG_GENERATION_NOT_CERTIFIED,
             failures,
         )
@@ -982,12 +1624,24 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
         "horizon_length": int(manifest.get("horizon_length") or 0),
         "manifest_digest_matches": True,
         "runs_exist": True,
-        "runs_complete": True,
-        "versions_valid": True,
-        "dependency_closure_reproduced": True,
+        "runs_complete": runs_complete,
+        "versions_valid": versions_ok,
+        "code_identity_reproduced_from_runs": True,
+        "planning_context_reproduced_from_runs": True,
+        "bundle_identities_reproduced": True,
+        "dependency_closure_reproduced": dependency_ok,
         "snapshot_identity": snapshot_status,
-        "pe8_evidence_consulted": bool((manifest.get("pe8_evidence") or {}).get("consulted")),
-        "pe8_evidence_refs_reproduce": True,
+        "snapshot_source_identity_reproduced": True,
+        "pe8_evidence_consulted": pe8_consulted,
+        "pe8_evidence_artifact_digest_verified": pe8_artifact_verified,
+        "pe8_evidence_refs_reproduce": pe8_reproduced,
+        "pe8_evidence_reproduction": pe8_boundary,
+        "pe8_evidence_replay_boundary": (
+            "the retained PE-8 artifact file and content digests are verified; its calibration identity, "
+            "world binding, per-event states, and evidence roll-up are recomputed from that artifact"
+            if pe8_consulted
+            else "PE-8 evidence was not consulted; no PE-8 reference or reproduction is claimed"
+        ),
         "horizon_state": str(reproduced_horizon["status"]),
         "verified": True,
     }
@@ -1034,6 +1688,15 @@ def assert_generation_bundles_valid(conn: sqlite3.Connection, generation: Certif
     """
 
     authoritative = cb.declared_required_versions()
+    code_identity = str(generation.manifest.get("code_snapshot_sha256") or "").strip()
+    if not code_identity:
+        raise GenerationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [
+                f"generation {generation.generation_id} records no code identity; a certified world "
+                "that names no code revision cannot be re-derived by anyone"
+            ],
+        )
     recorded = {
         str(family): str(version)
         for family, version in (generation.manifest.get("required_model_versions") or {}).items()
@@ -1189,51 +1852,168 @@ def decision_identity_of(record: Mapping[str, Any]) -> str:
 def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any]:
     """Re-derive a production decision from the generation it attributes.
 
-    Proves: the referenced generation verifies; the record's own id recomputes from
-    its persisted fields; the manager/request digests verify against the decision
-    artifact the record references; and the predictive world re-derives.
+    Proves, or refuses with the specific failed step:
+
+    * the referenced generation verifies;
+    * the record's own id recomputes from its persisted fields;
+    * the RETAINED decision artifact's result digest recomputes to the recorded one;
+    * the manager packet and the request RECOMPUTE to the recorded digests.
+
+    A record whose artifact is not retained is NOT reported as verified: the manager
+    packet, the request and the result are exactly what that artifact holds, so
+    without it nothing about the decision can be re-derived.  That refusal is the
+    honest answer -- the alternative is the old behaviour of reporting digests
+    "verified" when no source for them existed.
 
     Where the engine does not have byte-for-byte replayable decision execution, this
-    verifies the STRONGEST frozen persisted artifact identity available and says so
-    in ``replay_boundary`` -- it does not invent determinism the engine lacks.
+    verifies the STRONGEST frozen persisted artifact identity available and names the
+    boundary in ``replay_boundary`` rather than inventing determinism.
     """
 
     record = load_engine_decision_record(conn, decision_id)
     failures: list[str] = []
-    recomputed = decision_identity_of(record)
+    try:
+        evidence_record = json.loads(str(record.get("evidence_json") or "{}"))
+        if not isinstance(evidence_record, Mapping):
+            raise ValueError("decision evidence is not an object")
+        recomputed = decision_identity_of(record)
+    except (TypeError, ValueError, json.JSONDecodeError) as failure:
+        raise GenerationRefused(
+            DIAG_DECISION_RECORD_INVALID,
+            [f"the persisted decision record evidence cannot be re-derived: {failure}"],
+        ) from failure
     if recomputed != str(decision_id):
         failures.append(
             f"the record's fields digest to {recomputed}, not the id it is stored under "
             f"({decision_id}); the record was mutated after it was written"
         )
     generation_report = verify_generation(conn, str(record["generation_id"]))
-    boundary = "PERSISTED_ARTIFACT_IDENTITY"
+    generation = load_generation(conn, str(record["generation_id"]))
     artifact_ref = record.get("decision_artifact_ref")
-    artifact_status = "NOT_REFERENCED"
-    if artifact_ref:
-        path = Path(str(artifact_ref))
-        if not path.exists():
-            failures.append(f"the decision artifact {artifact_ref} is no longer retained")
-            artifact_status = "MISSING"
-        else:
-            from . import execution_snapshot as es
+    if not artifact_ref:
+        raise GenerationRefused(
+            DIAG_DECISION_ARTIFACT_NOT_RETAINED,
+            [
+                f"decision {decision_id} references no retained decision artifact, so its manager "
+                "packet, request and result cannot be re-derived; a decision record without its "
+                "artifact is not verifiable evidence"
+            ],
+        )
+    path = Path(str(artifact_ref))
+    if not path.exists():
+        raise GenerationRefused(
+            DIAG_DECISION_ARTIFACT_NOT_RETAINED,
+            [
+                f"the decision artifact {artifact_ref} referenced by decision {decision_id} is no "
+                "longer retained; a decision whose evidence was discarded is not verifiable"
+            ],
+        )
+    from . import execution_snapshot as es
 
-            live = es.file_sha256(path)
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as failure:  # pragma: no cover - defensive
-                failures.append(f"the decision artifact {artifact_ref} is unreadable: {failure}")
-                payload = None
-            if payload is not None:
-                result_digest = result_identity_of(payload)
-                if result_digest != str(record["result_sha256"]):
-                    failures.append(
-                        "the decision artifact's result digest does not match the recorded "
-                        f"result_sha256 ({live[:16]}… vs {str(record['result_sha256'])[:16]}…)"
-                    )
-                else:
-                    artifact_status = "VERIFIED"
-                    boundary = "DECISION_ARTIFACT_RE_EXECUTED_AND_BYTE_VERIFIED"
+    artifact_digest = es.file_sha256(path)
+    recorded_artifact_digest = str(evidence_record.get("decision_artifact_file_sha256") or "")
+    if not recorded_artifact_digest or artifact_digest != recorded_artifact_digest:
+        failures.append(
+            "the retained decision artifact file digest does not match the decision record "
+            f"({artifact_digest} vs {recorded_artifact_digest or '<missing>'})"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as failure:
+        raise GenerationRefused(
+            DIAG_DECISION_RECORD_INVALID,
+            [f"the decision artifact {artifact_ref} is unreadable: {failure}"],
+        ) from failure
+    if not isinstance(payload, Mapping):
+        raise GenerationRefused(
+            DIAG_DECISION_RECORD_INVALID,
+            [f"the decision artifact {artifact_ref} does not hold a decision payload"],
+        )
+
+    result_digest = result_identity_of(payload)
+    if result_digest != str(record["result_sha256"]):
+        failures.append(
+            "the decision artifact's result digest does not match the recorded result_sha256 "
+            f"({result_digest} vs {record['result_sha256']})"
+        )
+    attribution = payload.get("attribution")
+    manager_packet_verified = False
+    request_verified = False
+    if not isinstance(attribution, Mapping):
+        failures.append(
+            "the decision artifact carries no attribution block (the manager packet and request it "
+            "consumed), so the recorded manager/request digests cannot be reproduced"
+        )
+    else:
+        manager_packet = attribution.get("manager_packet")
+        if not isinstance(manager_packet, Mapping):
+            failures.append("the decision artifact records no manager packet to reproduce")
+        elif packet_identity(manager_packet) != str(record["manager_packet_sha256"]):
+            failures.append(
+                "the artifact's manager packet does not digest to the recorded "
+                f"manager_packet_sha256 ({packet_identity(manager_packet)} vs "
+                f"{record['manager_packet_sha256']})"
+            )
+        else:
+            manager_packet_verified = True
+        request_block = attribution.get("request")
+        if not isinstance(request_block, Mapping):
+            failures.append("the decision artifact records no request object to reproduce")
+        else:
+            rebuilt = request_identity(
+                planning_event=int(record["planning_event"]),
+                horizon_kind=str(record["horizon_kind"]),
+                cutoff=str(payload.get("planning_cutoff")),
+                request=request_block,
+            )
+            if rebuilt != str(record["request_sha256"]):
+                failures.append(
+                    "the artifact's request does not digest to the recorded request_sha256 "
+                    f"({rebuilt} vs {record['request_sha256']})"
+                )
+            else:
+                request_verified = True
+
+    runner_identity = str(payload.get("runner_identity") or "")
+    if not runner_identity or runner_identity != str(record.get("runner_identity") or ""):
+        failures.append("the retained runner identity is missing or differs from the decision record")
+    runner_code_identity = str(payload.get("runner_code_identity") or "")
+    if (
+        len(runner_code_identity) != 71
+        or not runner_code_identity.startswith("sha256:")
+        or any(ch not in "0123456789abcdef" for ch in runner_code_identity[7:].lower())
+        or runner_code_identity != str(evidence_record.get("runner_code_identity") or "")
+    ):
+        failures.append("the retained runner code identity is missing or differs from the decision record")
+
+    manager_context_verified = False
+    if isinstance(attribution, Mapping) and isinstance(attribution.get("manager_packet"), Mapping):
+        manager_packet = attribution["manager_packet"]
+        recorded_context = str(payload.get("manager_context_sha256") or "")
+        try:
+            if payload.get("schema") == "fpl_brain.four_gw_decision.v1":
+                reproduced_context = _reproduce_four_gw_manager_context(generation, manager_packet)
+            else:
+                reproduced_context = _fallback_manager_context_identity(
+                    manager_packet,
+                    planning_event=int(record["planning_event"]),
+                    cutoff=generation.cutoff,
+                )
+            if not recorded_context or reproduced_context != recorded_context:
+                failures.append(
+                    "the manager context digest does not reproduce from the retained packet and "
+                    "pinned source snapshot "
+                    f"({reproduced_context} vs {recorded_context or '<missing>'})"
+                )
+            else:
+                manager_context_verified = True
+        except Exception as failure:  # evidence refusal, never an unverified success
+            failures.append(f"the manager context cannot be re-derived: {type(failure).__name__}: {failure}")
+
+    if str(evidence_record.get("runner_identity") or "") != runner_identity:
+        failures.append("the decision record evidence does not bind the retained runner identity")
+    if str(evidence_record.get("decision_artifact_file_sha256") or "") != artifact_digest:
+        failures.append("the decision record evidence does not bind the retained artifact file digest")
     if failures:
         raise GenerationRefused(DIAG_DECISION_RECORD_INVALID, failures)
     return {
@@ -1243,27 +2023,79 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
         "planning_event": int(record["planning_event"]),
         "generation_verified": bool(generation_report["verified"]),
         "record_digest_recomputed": True,
-        "manager_packet_digest_verified": True,
-        "request_digest_verified": True,
+        "manager_packet_digest_verified": bool(manager_packet_verified),
+        "manager_context_digest_verified": bool(manager_context_verified),
+        "request_digest_verified": bool(request_verified),
         "result_digest_verified": True,
-        "decision_artifact": artifact_status,
-        "replay_boundary": boundary,
+        "runner_identity_verified": True,
+        "runner_code_identity_bound": True,
+        "runner_code_identity_replay_boundary": (
+            "the code identity digest is bound by the retained decision artifact and append-only record; "
+            "the original source files are not retained as part of this decision artifact"
+        ),
+        "decision_artifact": "VERIFIED",
+        "decision_artifact_sha256": str(artifact_digest),
+        "replay_boundary": "DECISION_REPLAY_NOT_PERFORMED",
         "replay_boundary_note": (
-            "the predictive world re-derives from the persisted generation; the decision's own "
-            "derived evidence is verified by the strongest frozen persisted artifact identity the "
-            "engine retains, and full byte-for-byte decision re-execution is claimed only where the "
-            "artifact is present and its digest reproduces"
+            "the generation and manager context re-derive from retained evidence; the decision artifact "
+            "file, runner identity, code identity, manager packet, request, and result digests are verified; "
+            "the decision itself is not re-executed"
         ),
         "verified": True,
     }
 
 
+def _json_round_trip_form(value: Any) -> Any:
+    """The form a value takes after ``json.dumps`` -> ``json.loads``.
+
+    Keys become STRINGS (that is what JSON does), tuples become lists, and a value
+    JSON cannot encode is stringified.  Normalising BEFORE the encode is what makes
+    the digest of an in-memory artifact equal the digest of the same artifact read
+    back from disk -- which is exactly what the verifier does, so without this the
+    "digest" would depend on whether the artifact had been persisted yet.
+    """
+
+    if isinstance(value, Mapping):
+        return {_json_key(key): _json_round_trip_form(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_round_trip_form(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    return str(value)
+
+
+def _json_key(key: Any) -> str:
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if key is None:
+        return "null"
+    return str(key)
+
+
+def decision_result_bytes(payload: Mapping[str, Any]) -> bytes:
+    """The canonical byte form of a decision RESULT.
+
+    Deliberately different from the generation manifest's rule, and for a stated
+    reason: a decision result carries measured numbers (route scores, confidence
+    readings), and Python's JSON encoding of a float is stable under a
+    ``dumps``/``loads`` round trip, which is exactly what the verifier performs -- it
+    RELOADS the retained artifact.  The manifest rule stays float-free because a
+    manifest must be re-derivable by an independent implementation, not merely
+    re-readable by the same one.
+    """
+
+    return json.dumps(
+        _json_round_trip_form(decision_result_projection(payload)),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+
+
 def result_identity_of(payload: Mapping[str, Any]) -> str:
     """The recorded result digest of a persisted decision artifact."""
 
-    return "sha256:" + hashlib.sha256(
-        canonical_manifest_bytes(decision_result_projection(payload))
-    ).hexdigest()
+    return "sha256:" + hashlib.sha256(decision_result_bytes(payload)).hexdigest()
 
 
 def decision_result_projection(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1283,6 +2115,9 @@ def decision_result_projection(payload: Mapping[str, Any]) -> dict[str, Any]:
         "planning_cutoff": payload.get("planning_cutoff"),
         "decision_events": [int(event) for event in (payload.get("decision_events") or [])],
         "generation_id": (payload.get("provenance") or {}).get("generation_id"),
+        "runner_identity": payload.get("runner_identity"),
+        "runner_code_identity": payload.get("runner_code_identity"),
+        "manager_context_sha256": payload.get("manager_context_sha256"),
         "suppression_reasons": list(payload.get("suppression_reasons") or []),
         "decision_confidence": payload.get("decision_confidence"),
         "fixture_horizon": payload.get("fixture_horizon"),
@@ -1319,6 +2154,110 @@ def request_identity(*, planning_event: int, horizon_kind: str, cutoff: str, req
     ).hexdigest()
 
 
+def _decision_runner_code_identity(profile: DecisionProfile) -> str:
+    """Fingerprint the retained production entrypoint and the engine code it calls."""
+
+    root = Path(__file__).resolve().parents[1]
+    paths = sorted((root / "fpl_brain").glob("*.py"), key=lambda path: path.name)
+    module_name = PRODUCTION_DECISION_MODULES.get(str(profile.kind))
+    if module_name:
+        paths.append(root / module_name)
+    digest = hashlib.sha256()
+    for path in sorted(set(paths), key=lambda item: item.relative_to(root).as_posix()):
+        if not path.is_file():
+            raise GenerationRefused(
+                DIAG_PRODUCTION_PROFILE_UNKNOWN,
+                [f"the declared decision code file {path} is not available to fingerprint"],
+            )
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
+def _fallback_manager_context_identity(
+    manager_packet: Mapping[str, Any], *, planning_event: int, cutoff: str
+) -> str:
+    from . import analytics
+
+    return analytics.canonical_hash(
+        {
+            "entry_id": int(manager_packet.get("entry_id") or 0),
+            "planning_event": int(planning_event),
+            "cutoff": str(cutoff),
+            "manager_state": manager_state_from_packet(manager_packet),
+        }
+    )
+
+
+def _reproduce_four_gw_manager_context(
+    generation: CertifiedGeneration, manager_packet: Mapping[str, Any]
+) -> str:
+    """Recompute the four-GW manager-context hash from its pinned source snapshot."""
+
+    from . import analytics
+    from . import manager_worlds
+    from .planning import get_planning_context
+
+    entry_id = int(manager_packet.get("entry_id") or 0)
+    if not entry_id:
+        raise ValueError("the retained manager packet has no entry_id")
+    source_conn = _open_generation_snapshot(generation)
+    try:
+        context = get_planning_context(
+            source_conn,
+            entry_id,
+            int(generation.planning_event),
+            as_of=str(generation.cutoff),
+            season=manager_packet.get("season"),
+        )
+        source_squad = manager_worlds.resolve_squad(context, source_conn)
+        packet_squad_ids = [
+            int(pid) for pid in (manager_state_from_packet(manager_packet).get("squad_ids") or [])
+        ]
+        if packet_squad_ids and [int(pid) for pid in source_squad["squad_ids"]] != packet_squad_ids:
+            raise ValueError(
+                "the retained manager packet squad does not match the squad resolved from the pinned snapshot"
+            )
+        return analytics.canonical_hash(
+            {
+                "entry_id": entry_id,
+                "planning_event": int(generation.planning_event),
+                "cutoff": str(generation.cutoff),
+                "manager_state": context.manager_state or {},
+            }
+        )
+    finally:
+        source_conn.close()
+
+
+def _forbidden_descriptors_in(value: Any, *, path: str) -> list[str]:
+    """Every forbidden descriptor KEY found anywhere inside a production input.
+
+    The production API is descriptor-only at EVERY boundary, not just at the top
+    level: a caller that cannot pass ``cache_dir=`` as a keyword could otherwise
+    hide it inside the request mapping, and one that cannot pass ``runs=`` could
+    hide a run mapping inside the manager packet.  The check is by KEY NAME at any
+    depth, and a forbidden key refuses its entire subtree.
+    """
+
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            name = str(key)
+            here = f"{path}.{name}"
+            normalized = name.strip().casefold().replace("-", "_").replace(" ", "_")
+            if normalized in FORBIDDEN_PRODUCTION_DESCRIPTORS:
+                found.append(here)
+                continue
+            found.extend(_forbidden_descriptors_in(item, path=here))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            found.extend(_forbidden_descriptors_in(item, path=f"{path}[{index}]"))
+    return found
+
+
 def assert_descriptor_only(kwargs: Mapping[str, Any]) -> None:
     """Refuse a production call that carries a predictive descriptor.
 
@@ -1330,11 +2269,7 @@ def assert_descriptor_only(kwargs: Mapping[str, Any]) -> None:
     refused before anything is read.
     """
 
-    smuggled = sorted(
-        name
-        for name in FORBIDDEN_PRODUCTION_DESCRIPTORS
-        if name in kwargs and kwargs[name] is not None
-    )
+    smuggled = sorted(str(name) for name in kwargs)
     if smuggled:
         raise ProductionDescriptorOnly(
             [
@@ -1345,6 +2280,289 @@ def assert_descriptor_only(kwargs: Mapping[str, Any]) -> None:
         )
 
 
+def assert_no_nested_descriptors(payload: Mapping[str, Any], *, boundary: str) -> None:
+    """Refuse a prohibited descriptor hidden anywhere inside one production input."""
+
+    found = sorted(set(_forbidden_descriptors_in(payload, path=boundary)))
+    if found:
+        raise ProductionDescriptorOnly(
+            [
+                "a production decision accepts ordinary decision parameters only; "
+                f"{boundary} carries {found}. Predictive evidence, cache handles and certification "
+                "objects are resolved from the certified generation, never supplied by the caller"
+            ]
+        )
+
+
+#: The DECLARED production decision pipelines, keyed by horizon kind.  A caller
+#: selects a profile BY NAME; it cannot supply an implementation.  The four-Gameweek
+#: pipeline is the existing production runner module -- the same declared entry point
+#: whose wiring the certification identity covers -- located here by name, never by a
+#: caller-supplied path or callable.
+PRODUCTION_DECISION_MODULES: dict[str, str] = {
+    HORIZON_KIND_FOUR_GW: "scripts/run_four_gw_decision.py",
+}
+PRODUCTION_DECISION_ENTRYPOINT = "run_certified_four_gw_decision"
+
+
+@dataclass(frozen=True)
+class DecisionProfile:
+    """The ORDINARY, non-predictive parameters one production decision runs with.
+
+    ``kind`` names which declared production pipeline executes the decision.  It is
+    a NAME from :data:`PRODUCTION_DECISION_MODULES`, not an implementation: an
+    unknown kind is refused, and there is no parameter anywhere on the production
+    API that accepts a callable.  ``parameters`` carries scheduling and search
+    breadth (draw counts, beam width, worker count) -- never predictive evidence.
+    """
+
+    kind: str = HORIZON_KIND_FOUR_GW
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"kind": str(self.kind), "parameters": dict(self.parameters)}
+
+
+def resolve_decision_profile(profile: Any) -> DecisionProfile:
+    """Normalise and validate a decision profile, refusing an unknown kind."""
+
+    if profile is None:
+        return DecisionProfile()
+    if isinstance(profile, DecisionProfile):
+        resolved = profile
+    elif isinstance(profile, Mapping):
+        resolved = DecisionProfile(
+            kind=str(profile.get("kind") or HORIZON_KIND_FOUR_GW),
+            parameters=dict(profile.get("parameters") or {}),
+        )
+    else:
+        raise ProductionDescriptorOnly(
+            [
+                "a decision profile is a declared kind plus ordinary decision parameters; "
+                f"{type(profile).__name__} is not a profile"
+            ]
+        )
+    assert_no_nested_descriptors(resolved.as_dict(), boundary="profile")
+    if resolved.kind not in PRODUCTION_DECISION_MODULES and resolved.kind != HORIZON_KIND_MANAGER_WORLD:
+        raise GenerationRefused(
+            DIAG_PRODUCTION_PROFILE_UNKNOWN,
+            [
+                f"{resolved.kind!r} is not a declared production decision pipeline "
+                f"({sorted([*PRODUCTION_DECISION_MODULES, HORIZON_KIND_MANAGER_WORLD])})"
+            ],
+        )
+    allowed_parameters = (
+        _FOUR_GW_DECISION_PARAMETERS
+        if resolved.kind == HORIZON_KIND_FOUR_GW
+        else _MANAGER_WORLD_DECISION_PARAMETERS
+    )
+    unknown_parameters = sorted(set(str(key) for key in resolved.parameters) - allowed_parameters)
+    if unknown_parameters:
+        raise ProductionDescriptorOnly(
+            [
+                f"profile {resolved.kind!r} accepts only declared ordinary parameters; "
+                f"unknown parameter(s): {unknown_parameters}"
+            ]
+        )
+    return resolved
+
+
+def _declared_production_entrypoint(module_name: str) -> Callable[..., Mapping[str, Any]]:
+    """Load the DECLARED production pipeline module by its repository-relative path.
+
+    The library resolves it itself: no caller supplies the module, the path or the
+    callable, so an implementation cannot be injected through the production API.
+    """
+
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / module_name
+    spec = importlib.util.spec_from_file_location(Path(module_name).stem, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise GenerationRefused(
+            DIAG_PRODUCTION_PROFILE_UNKNOWN, [f"the declared production module {module_name} is unreadable"]
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    entrypoint = getattr(module, PRODUCTION_DECISION_ENTRYPOINT, None)
+    if not callable(entrypoint):  # pragma: no cover - defensive
+        raise GenerationRefused(
+            DIAG_PRODUCTION_PROFILE_UNKNOWN,
+            [f"{module_name} does not provide {PRODUCTION_DECISION_ENTRYPOINT}()"],
+        )
+    return entrypoint
+
+
+def manager_state_from_packet(manager_packet: Mapping[str, Any]) -> dict[str, Any]:
+    """The manager state a production caller supplied, under either spelling.
+
+    Manager state is a PERMITTED production input (amendment 2 §10), and both
+    ``manager_packet["manager_state"]`` and a flat ``manager_packet["squad_ids"]``
+    say the same thing about ONE manager.  Reading them through one helper keeps the
+    pipelines consistent -- and keeps everything PREDICTIVE out of both spellings,
+    because the descriptor check runs over the whole packet first.
+    """
+
+    nested = manager_packet.get("manager_state")
+    state = dict(nested) if isinstance(nested, Mapping) else {}
+    if manager_packet.get("squad_ids") is not None:
+        state.setdefault("squad_ids", manager_packet.get("squad_ids"))
+    return state
+
+
+def _manager_world_decision_executor(
+    *,
+    conn: sqlite3.Connection,
+    generation: CertifiedGeneration,
+    manager_packet: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    source_conn: sqlite3.Connection,
+    controller: Any = None,
+) -> dict[str, Any]:
+    """The manager-world decision: the certified fix-15 lineup, from one generation.
+
+    This pipeline lives in the library because it is assembled entirely from
+    existing frozen functions: :func:`manager_worlds.build_manager_worlds` (which
+    reads the certified run ids from the generation and refuses without one) and the
+    Phase-6A lineup ranking.  No predictive input is taken from the caller.
+    """
+
+    from . import manager_lineup as ml
+    from . import manager_worlds as mw
+
+    squad_ids = [int(pid) for pid in (manager_state_from_packet(manager_packet).get("squad_ids") or [])]
+    if len(squad_ids) != 15:
+        raise DecisionRecordInvalid(
+            [
+                "a manager-world decision needs the manager's 15 player ids in the manager packet "
+                f"(the squad is manager state); the packet names {len(squad_ids)}"
+            ]
+        )
+    built = mw.build_manager_worlds(
+        conn,
+        generation=generation,
+        planning_event=int(generation.planning_event),
+        squad_ids=squad_ids,
+        simulations=int(parameters.get("simulations", 10_000)),
+        seed=int(parameters.get("seed", 20260911)),
+        occupancy_audit=bool(parameters.get("occupancy_audit", True)),
+    )
+    positions, names = _squad_identity(source_conn, squad_ids)
+    ranked = ml.rank_policies(squad_ids, positions, built["world_matrix"], top_k=int(parameters.get("top_k", 50)))
+    top_rows = [
+        {
+            **policy.as_dict(names),
+            **{
+                key: value
+                for key, value in ml.evaluate_policy(policy, built["world_matrix"], positions).items()
+            },
+        }
+        for policy in ranked["top_policies"]
+    ]
+    return {
+        "decision": {
+            "status": "MANAGER_WORLD_EVALUATED",
+            "planning_event": int(generation.planning_event),
+            "top_policies": top_rows,
+            "skeleton_count": ranked["skeletons"],
+            "evaluated_policy_count": ranked["evaluated_policies"],
+            "no_execution": True,
+        },
+        "world_info": built.get("simulation"),
+        "manager_world": {
+            "generation_id": generation.generation_id,
+            "input_run_ids": built.get("input_run_ids"),
+            "squad_ids": squad_ids,
+            "simulation": built.get("simulation"),
+        },
+        "runner_identity": f"fpl_brain.generation_store:{mw.MANAGER_WORLDS_VERSION}",
+    }
+
+
+def _squad_identity(
+    source_conn: sqlite3.Connection, squad_ids: Sequence[int]
+) -> tuple[dict[int, str], dict[int, str]]:
+    """The squad's positions and names, read from the PINNED snapshot.
+
+    The caller supplied the squad (manager state); what each player IS -- position,
+    club, display name -- comes from the snapshot the generation pins, so a packet
+    cannot assert a position the certified source disagrees with.
+    """
+
+    from .manager_worlds import POSITION_IDS
+
+    rows = source_conn.execute(
+        "SELECT id, element_type, web_name, full_name FROM players WHERE id IN (%s)"
+        % ",".join("?" for _ in squad_ids),
+        [int(pid) for pid in squad_ids],
+    ).fetchall()
+    found = {int(row["id"]): dict(row) for row in rows}
+    positions: dict[int, str] = {}
+    names: dict[int, str] = {}
+    missing: list[int] = []
+    for pid in squad_ids:
+        row = found.get(int(pid))
+        position = POSITION_IDS.get(int(row["element_type"])) if row and row["element_type"] is not None else None
+        if not position:
+            missing.append(int(pid))
+            continue
+        positions[int(pid)] = str(position)
+        names[int(pid)] = str(
+            (row.get("full_name") or row.get("web_name") or f"Player {int(pid)}")
+        )
+    if missing:
+        raise DecisionRecordInvalid(
+            [
+                f"the pinned snapshot does not resolve a position for {missing}; a manager-world "
+                "decision is taken against the snapshot the generation pins"
+            ]
+        )
+    return positions, names
+
+
+def _decision_executor(profile: DecisionProfile) -> Callable[..., Mapping[str, Any]]:
+    """The declared executor for a profile kind.  Never a caller-supplied callable."""
+
+    if profile.kind == HORIZON_KIND_MANAGER_WORLD:
+        return _manager_world_decision_executor
+    return _declared_production_entrypoint(PRODUCTION_DECISION_MODULES[profile.kind])
+
+
+def _decision_artifact_dir(conn: sqlite3.Connection, planning_event: int) -> Path:
+    """Where a decision's artifact is RETAINED: beside the authoritative store.
+
+    The path is derived from the store itself, so a decision record's artifact
+    reference points at evidence the store owns; no caller-supplied directory can
+    move it, and no caller-supplied path can stand in for it.
+    """
+
+    location = ":memory:"
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if str(row[1]) == "main":
+                location = str(row[2]) or location
+    except sqlite3.Error:  # pragma: no cover - defensive
+        pass
+    if location and location != ":memory:":
+        base = Path(location).resolve().parent / "pe9_decisions"
+    else:
+        import tempfile
+
+        base = Path(tempfile.gettempdir()) / "fpl_pe9_decisions"
+    return base / f"gw{int(planning_event):02d}"
+
+
+def _write_decision_artifact(path: Path, artifact: Mapping[str, Any]) -> str:
+    """Persist the decision artifact ATOMICALLY, and return its path as text."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    temporary.replace(path)
+    return str(path)
+
+
 def make_decision(
     conn: sqlite3.Connection,
     manager_packet: Mapping[str, Any],
@@ -1352,9 +2570,9 @@ def make_decision(
     *,
     horizon_kind: str = HORIZON_KIND_FOUR_GW,
     generation_id: str | None = None,
-    cutoff: str | None = None,
+    profile: Any = None,
     request: Mapping[str, Any] | None = None,
-    decide: Callable[..., dict[str, Any]] | None = None,
+    controller: Any = None,
     **descriptors: Any,
 ) -> dict[str, Any]:
     """THE canonical descriptor-only production entrypoint.
@@ -1371,8 +2589,14 @@ def make_decision(
     identity; open the snapshot through the existing read-only/snapshot validation;
     re-run the existing per-event bundle validation against the pinned runs; verify
     the required versions and dependencies; build the worlds internally; execute the
-    frozen decision logic; append the ``engine_decision_record``; and return the
-    decision with its record id.
+    frozen decision logic; persist the decision artifact and append the
+    ``engine_decision_record``; and return the decision with its record id.
+
+    There is deliberately NO executor parameter: the pipeline is selected by the
+    profile's declared KIND, so a caller cannot inject decision logic.  The manager
+    packet carries manager state and the request carries ordinary decision
+    parameters -- predictive evidence, cache handles and certification objects are
+    refused wherever they appear, at any depth.
 
     The decision stays pinned to the generation selected at the START even if
     ``current_generation`` changes concurrently: the id is resolved once, and every
@@ -1380,6 +2604,44 @@ def make_decision(
     """
 
     assert_descriptor_only(descriptors)
+    packet = dict(manager_packet or {})
+    assert_no_nested_descriptors(packet, boundary="manager_packet")
+    allowed_packet_fields = {
+        "entry_id", "planning_event", "cutoff", "season", "manager_state", "squad_ids"
+    }
+    unknown_packet_fields = sorted(set(str(key) for key in packet) - allowed_packet_fields)
+    if unknown_packet_fields:
+        raise ProductionDescriptorOnly(
+            [f"manager_packet has undeclared field(s): {unknown_packet_fields}"]
+        )
+    manager_state = packet.get("manager_state")
+    if isinstance(manager_state, Mapping):
+        allowed_manager_fields = {
+            "squad_ids", "bank_tenths", "free_transfers", "event_start_free_transfers",
+            "authoritative_source",
+        }
+        unknown_manager_fields = sorted(
+            set(str(key) for key in manager_state) - allowed_manager_fields
+        )
+        if unknown_manager_fields:
+            raise ProductionDescriptorOnly(
+                [f"manager_packet.manager_state has undeclared field(s): {unknown_manager_fields}"]
+            )
+    requested = dict(request or {})
+    assert_no_nested_descriptors(requested, boundary="request")
+    unknown_request_fields = sorted(set(str(key) for key in requested) - {"tracing_id"})
+    if unknown_request_fields:
+        raise ProductionDescriptorOnly(
+            [f"request accepts only a tracing_id; received {unknown_request_fields}"]
+        )
+    resolved_profile = resolve_decision_profile(profile)
+    if str(resolved_profile.kind) != str(horizon_kind):
+        raise ProductionDescriptorOnly(
+            [
+                f"the decision profile kind {resolved_profile.kind!r} does not describe a "
+                f"{horizon_kind} generation; one decision consumes one horizon kind"
+            ]
+        )
 
     generation = resolve_generation(
         conn,
@@ -1387,43 +2649,101 @@ def make_decision(
         horizon_kind=horizon_kind,
         generation_id=generation_id,
     )
-    # Digest re-verified (load_generation), event/horizon compatibility checked
-    # (resolve_generation).  The cutoff is verified only where the caller supplied
-    # one: a descriptor-only caller normally lets the generation's own certified
-    # cutoff decide, which is the stronger posture.
-    if cutoff is not None:
-        assert_cutoff_matches(conn, generation, cutoff=str(cutoff))
+    # Digest re-verified (load_generation) and event/horizon compatibility checked
+    # (resolve_generation).  The decision's cutoff must be EXACTLY the certified one;
+    # a caller may restate it, but it may not move it.
+    declared_cutoff = packet.get("cutoff")
+    if declared_cutoff is not None:
+        assert_cutoff_matches(conn, generation, cutoff=str(declared_cutoff))
+    generation_report = verify_generation(conn, generation.generation_id)
+    if not generation_report.get("verified"):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"generation {generation.generation_id} did not pass independent verification"],
+        )
     require_snapshot_retained(generation)
-    assert_generation_bundles_valid(conn, generation)
 
-    executor = decide or _default_decision_executor
-    decision_result = executor(
-        conn=conn,
-        generation=generation,
-        manager_packet=dict(manager_packet),
-        request=dict(request or {}),
-    )
+    runner_code_identity = _decision_runner_code_identity(resolved_profile)
+    executor = _decision_executor(resolved_profile)
+    source_conn = _open_generation_snapshot(generation)
+    try:
+        decision_result = executor(
+            conn=conn,
+            generation=generation,
+            manager_packet=packet,
+            parameters=dict(resolved_profile.parameters),
+            source_conn=source_conn,
+            controller=controller,
+        )
+    finally:
+        source_conn.close()
+    if _decision_runner_code_identity(resolved_profile) != runner_code_identity:
+        raise DecisionRecordInvalid(
+            ["the declared decision code changed while the production runner was executing"]
+        )
     if not isinstance(decision_result, Mapping) or "decision" not in decision_result:
         raise DecisionRecordInvalid(
             [
-                "the decision executor did not return a decision payload; a production decision that "
-                "cannot be attributed is never recorded"
+                "the decision pipeline did not return a decision payload; a production decision "
+                "that cannot be attributed is never recorded"
             ]
         )
 
-    packet_digest = packet_identity(manager_packet)
+    packet_digest = packet_identity(packet)
     request_digest = request_identity(
         planning_event=int(planning_event),
         horizon_kind=horizon_kind,
         cutoff=generation.cutoff,
-        request=request,
+        request=requested,
     )
-    artifact = {
-        "schema": "fpl_brain.four_gw_decision.v1",
+    runner_identity = str(decision_result.get("runner_identity") or _default_runner_identity())
+    result_provenance = dict(decision_result.get("provenance") or {})
+    if resolved_profile.kind == HORIZON_KIND_FOUR_GW:
+        manager_context_sha256 = str(result_provenance.get("planning_context_hash") or "")
+        if not manager_context_sha256:
+            raise DecisionRecordInvalid(
+                ["the four-GW runner returned no resolved manager-context identity"]
+            )
+    else:
+        manager_context_sha256 = _fallback_manager_context_identity(
+            packet, planning_event=int(planning_event), cutoff=generation.cutoff
+        )
+    # The pipeline's own artwork is PUBLISHED beside the canonical identity fields:
+    # the operator-facing artifact keeps every block the production pipeline produced
+    # (search configuration, refinement, scheduling, screening) while the
+    # identity-bearing fields below are set HERE from the certified generation, so an
+    # artifact cannot describe a predictive world the generation does not.
+    artifact: dict[str, Any] = {
+        key: value
+        for key, value in dict(decision_result.get("artifact_blocks") or {}).items()
+        if key not in {"attribution", "provenance"}
+    }
+    artifact.update({
+        "schema": (
+            "fpl_brain.four_gw_decision.v1"
+            if str(generation.horizon_kind) == HORIZON_KIND_FOUR_GW
+            else "fpl_brain.manager_world_decision.v1"
+        ),
         "planning_event": int(generation.planning_event),
         "planning_cutoff": generation.cutoff,
         "decision_events": list(generation.events),
+        # The attribution block carries the EXACT manager state and request the
+        # decision consumed, so ``verify decision`` RECOMPUTES both digests from the
+        # retained artifact instead of reporting them as verified because a number
+        # was stored.
+        "attribution": {
+            "manager_packet": packet,
+            "request": requested,
+            "manager_packet_sha256": packet_digest,
+            "request_sha256": request_digest,
+            "manager_context_sha256": manager_context_sha256,
+            "decision_profile": resolved_profile.as_dict(),
+        },
+        "runner_identity": runner_identity,
+        "runner_code_identity": runner_code_identity,
+        "manager_context_sha256": manager_context_sha256,
         "provenance": {
+            **dict(decision_result.get("provenance") or {}),
             "generation_id": generation.generation_id,
             "generation_horizon_kind": generation.horizon_kind,
             "manager_packet_sha256": packet_digest,
@@ -1437,6 +2757,7 @@ def make_decision(
             "certified_runs_by_event": {
                 str(event): generation.runs_for(int(event)) for event in generation.events
             },
+            "generation_manifest": dict(generation.manifest),
             "pe8_evidence": generation.manifest.get("pe8_evidence"),
             "disclosure": generation.manifest.get("disclosure"),
         },
@@ -1447,29 +2768,42 @@ def make_decision(
         "fixture_horizon": decision_result.get("fixture_horizon"),
         "suppression_reasons": decision_result.get("suppression_reasons") or [],
         "world_info": decision_result.get("world_info"),
-    }
+        "no_execution": True,
+    })
     result_digest = result_identity_of(artifact)
+    artifact_path = _decision_artifact_dir(conn, int(generation.planning_event)) / (
+        result_digest.split(":", 1)[1][:32] + ".json"
+    )
+    artifact_ref = _write_decision_artifact(artifact_path, artifact)
+    from . import execution_snapshot as es
+
+    artifact_file_sha256 = es.file_sha256(artifact_ref)
     decision_id = append_engine_decision_record(
         conn,
         generation=generation,
         manager_packet_sha256=packet_digest,
         request_sha256=request_digest,
         result_sha256=result_digest,
-        runner_identity=decision_result.get("runner_identity") or _default_runner_identity(),
+        runner_identity=runner_identity,
         evidence={
             "schema": DECISION_RECORD_SCHEMA,
             "generation_id": generation.generation_id,
             "generation_manifest_verified": True,
+            "runner_identity": runner_identity,
+            "runner_code_identity": runner_code_identity,
+            "manager_context_sha256": manager_context_sha256,
+            "decision_artifact_file_sha256": artifact_file_sha256,
             "snapshot_identity_verified": True,
             "bundle_validation_rerun": True,
             "required_versions_verified": True,
             "dependency_closure_verified": True,
             "worlds_built_internally": True,
+            "decision_profile": resolved_profile.as_dict(),
             "calibration_consulted": bool(
                 (generation.manifest.get("pe8_evidence") or {}).get("consulted")
             ),
         },
-        decision_artifact_ref=decision_result.get("artifact_ref"),
+        decision_artifact_ref=artifact_ref,
     )
     conn.commit()
     return {
@@ -1485,6 +2819,11 @@ def make_decision(
         "decision_confidence": decision_result.get("decision_confidence"),
         "fixture_horizon": decision_result.get("fixture_horizon"),
         "result_sha256": result_digest,
+        "runner_identity": runner_identity,
+        "runner_code_identity": runner_code_identity,
+        "manager_context_sha256": manager_context_sha256,
+        "decision_artifact_ref": artifact_ref,
+        "artifact": artifact,
         "provenance": artifact["provenance"],
         "no_execution": True,
     }
@@ -1494,98 +2833,6 @@ def _default_runner_identity() -> str:
     import sys
 
     return f"{Path(sys.argv[0]).name or 'python'}:{MANIFEST_SCHEMA}"
-
-
-def _default_decision_executor(
-    *,
-    conn: sqlite3.Connection,
-    generation: CertifiedGeneration,
-    manager_packet: Mapping[str, Any],
-    request: Mapping[str, Any],
-) -> dict[str, Any]:
-    """The frozen decision logic, driven ONLY by the certified generation.
-
-    Worlds are built INTERNALLY from the generation's exact certified run ids -- the
-    caller supplied none -- and the four-Gameweek decision is assembled by the
-    existing frozen functions.  No football logic lives here.
-    """
-
-    from . import four_gw_decision as fg
-    from . import route_comparator as rc
-    from . import route_optimizer as ro
-
-    if str(generation.horizon_kind) != HORIZON_KIND_FOUR_GW:
-        raise GenerationRefused(
-            DIAG_PRODUCTION_DESCRIPTOR_ONLY,
-            [
-                f"the default production executor assembles a {HORIZON_KIND_FOUR_GW} decision; "
-                f"generation {generation.generation_id} is {generation.horizon_kind}"
-            ],
-        )
-    universe = manager_packet["universe"]
-    initial_state = manager_packet["initial_state"]
-    scenario = manager_packet["scenario"]
-    player_meta = manager_packet["player_meta"]
-    config = manager_packet.get("config") or ro.OptimizerConfig(events=tuple(generation.events))
-    source_conn = _open_generation_snapshot(generation)
-    try:
-        support = {
-            int(event): {
-                "supported": True,
-                "matched_runs": generation.runs_for(int(event)),
-                "missing_families": [],
-                "stale_families": [],
-                "data_cutoff": generation.cutoff,
-                "run_cutoffs": [generation.cutoff],
-                "bundle_identity": (
-                    (generation.manifest.get("per_event") or {}).get(str(int(event))) or {}
-                ).get("bundle_identity"),
-                "state": ((generation.manifest.get("per_event") or {}).get(str(int(event))) or {}).get(
-                    "state"
-                ),
-                "source": "certified_generation",
-            }
-            for event in generation.events
-        }
-        optimized = ro.optimize(
-            universe=universe,
-            initial_state=initial_state,
-            scenario=scenario,
-            player_meta=player_meta,
-            conn=conn,
-            generation=generation,
-            config=config,
-            cache_dir=request.get("cache_dir"),
-        )
-        routes = fg.optimizer_routes_for_decision(
-            optimized.get("routes") or {},
-            transfers_by_route={
-                route_id: {
-                    int(action["event"]): list(action.get("transfers") or [])
-                    for action in (record.get("actions") or [])
-                }
-                for route_id, record in (optimized.get("routes") or {}).items()
-            },
-        )
-        baseline = next(
-            (row["route_id"] for row in routes if not any(r.get("transfers") for r in row["per_event"])),
-            None,
-        )
-        decision = fg.evaluate_four_gw_decision(
-            planning_event=int(generation.planning_event),
-            support_by_event=support,
-            cutoff=generation.cutoff,
-            last_event=fg.season_last_event_from_db(conn),
-            routes=routes,
-            baseline_route_id=baseline,
-        )
-    finally:
-        source_conn.close()
-    return {
-        "decision": decision,
-        "world_info": optimized.get("world_info"),
-        "runner_identity": f"fpl_brain.generation_store:{ro.PHASE8B_VERSION}",
-    }
 
 
 def support_by_event(generation: CertifiedGeneration, *, cutoff: str | None = None) -> dict[int, dict[str, Any]]:
@@ -1664,8 +2911,12 @@ def _open_generation_snapshot(generation: CertifiedGeneration) -> sqlite3.Connec
 __all__ = [
     "CertifiedGeneration",
     "DECISION_RECORD_SCHEMA",
+    "DecisionProfile",
+    "DIAG_DECISION_ARTIFACT_NOT_RETAINED",
     "DIAG_DECISION_RECORD_INVALID",
     "DIAG_DECISION_RECORD_UNKNOWN",
+    "DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED",
+    "DIAG_PRODUCTION_PROFILE_UNKNOWN",
     "DIAG_GENERATION_DIGEST_MISMATCH",
     "DIAG_GENERATION_HORIZON_KIND_UNKNOWN",
     "DIAG_GENERATION_MANIFEST_INVALID",
@@ -1687,11 +2938,18 @@ __all__ = [
     "HORIZON_KIND_FOUR_GW",
     "HORIZON_KIND_MANAGER_WORLD",
     "MANIFEST_SCHEMA",
+    "PE8_IDENTITY_AND_STATE_RECOMPUTED",
+    "PE8_NOT_CONSULTED",
+    "PRODUCTION_DECISION_ENTRYPOINT",
+    "PRODUCTION_DECISION_MODULES",
     "ProductionDescriptorOnly",
     "append_engine_decision_record",
     "assert_cutoff_matches",
     "assert_descriptor_only",
     "assert_generation_bundles_valid",
+    "assert_no_nested_descriptors",
+    "assert_writer_lease_held",
+    "authoritative_code_identity",
     "build_generation_manifest",
     "canonical_identity_value",
     "canonical_manifest_bytes",
@@ -1703,10 +2961,13 @@ __all__ = [
     "load_engine_decision_record",
     "load_generation",
     "make_decision",
+    "manager_state_from_packet",
     "manifest_semantic_projection",
     "packet_identity",
     "request_identity",
+    "reproduce_pe8_evidence",
     "require_snapshot_retained",
+    "resolve_decision_profile",
     "resolve_generation",
     "result_identity_of",
     "verify_decision",

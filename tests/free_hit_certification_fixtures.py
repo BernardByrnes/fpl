@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -25,7 +26,12 @@ from fpl_brain.free_hit_decision_authority import (  # noqa: E402
 
 DATA_SNAPSHOT = "sha256:" + "d" * 64
 CUTOFF = "2026-09-16T11:00:00Z"
-CODE_SNAPSHOT = "sha256:" + "c" * 64
+#: The AUTHORITATIVE code identity: certification now requires the run rows to record
+#: the running revision, and the identity-bearing bundle payload records the same
+#: value, so a consumer recomputes exactly the identity the certifier minted.
+from fpl_brain import analytics as _analytics  # noqa: E402
+
+CODE_SNAPSHOT = _analytics.source_snapshot_sha256()
 CONTEXT_HASH = "sha256:" + "p" * 64
 #: The REAL run families the certifier records, so the canonical world-cache key
 #: (which names them minutes/team/rate/xpts) can be derived from the bundle.
@@ -109,10 +115,11 @@ def seed_certified_world(
     generation is then minted through the REAL ``generation_store.certify_generation``
     lifecycle, so what a test loads is what production would have persisted.
 
-    The snapshot identity is deliberately ABSENT for this synthetic world: there is
-    no captured source database behind it, and claiming one would be a fiction the
-    retention check would then have to be told to ignore.  A generation without a
-    pinned snapshot is honest about having none.
+    The world is synchronised with a REAL pinned snapshot file: a generation commits
+    to the immutable source it replaced, and certification refuses a world that pinned
+    nothing.  Its content is fixed, so the generation this fixture mints is the same
+    one ``world_cache_generation_id`` resolves in a throwaway store -- the cache key a
+    test writes at import time is the key its own store derives.
     """
 
     from fpl_brain import generation_store as gs
@@ -149,10 +156,66 @@ def seed_certified_world(
         runs_by_event=runs_by_event,
         events=events,
         horizon_kind=gs.HORIZON_KIND_FOUR_GW,
-        snapshot=None,
-        code_snapshot_sha256=CODE_SNAPSHOT,
+        snapshot=pinned_snapshot(conn),
     )
     return generation, runs_by_event
+
+
+#: The pinned snapshot a certified generation commits to.  It contains only the
+#: synthetic predictive source rows, so manager-state rows added by an individual
+#: consumer test do not change the generation/cache identity.
+_SNAPSHOT_DIR = Path(tempfile.mkdtemp(prefix="fpl-pe9-freehit-"))
+_SNAPSHOT_PATH = _SNAPSHOT_DIR / "source.db"
+
+
+def pinned_snapshot(database: Any) -> dict[str, Any]:
+    """Create a real, deterministic SQLite snapshot of the fixture's predictive rows."""
+
+    from fpl_brain import execution_snapshot as es
+    from fpl_brain.database import connect_database
+
+    _SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    if not _SNAPSHOT_PATH.exists():
+        snapshot = connect_database(_SNAPSHOT_PATH)
+        snapshot.execute("PRAGMA foreign_keys=OFF")
+        # This consumer fixture certifies predictive runs. Keep unrelated manager,
+        # acquisition and current-state rows out so the cache fixture and each test
+        # certify the same synthetic predictive source.
+        tables = (
+            "schema_meta",
+            "projection_runs",
+            "fixtures",
+            "player_fixture_xpts_projections",
+            "monte_carlo_distributions",
+        )
+        try:
+            for table in tables:
+                columns = [
+                    str(row[1])
+                    for row in snapshot.execute(f'PRAGMA table_info("{table}")')
+                ]
+                if not columns:
+                    continue
+                rows = database.execute(f'SELECT * FROM "{table}"').fetchall()
+                if not rows:
+                    continue
+                column_sql = ",".join(f'"{column}"' for column in columns)
+                values_sql = ",".join("?" for _ in columns)
+                snapshot.executemany(
+                    f'INSERT OR REPLACE INTO "{table}" ({column_sql}) VALUES ({values_sql})',
+                    [tuple(row) for row in rows],
+                )
+            snapshot.commit()
+            snapshot.execute("VACUUM")
+        finally:
+            snapshot.close()
+    return {
+        "path": str(_SNAPSHOT_PATH),
+        "sha256": es.file_sha256(_SNAPSHOT_PATH),
+        "size_bytes": int(_SNAPSHOT_PATH.stat().st_size),
+        "source_db_identity": es.source_db_identity(_SNAPSHOT_PATH),
+        "execution_run_uuid": "00000000-0000-0000-0000-0000000000f1",
+    }
 
 
 def world_cache_generation_id(

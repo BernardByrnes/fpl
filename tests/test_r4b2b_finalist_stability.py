@@ -579,8 +579,8 @@ def test_missing_canonical_record_suppresses_the_recommendation():
     assert suppressed["ranking"], "the route table stays available"
     source = (REPO_ROOT / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
     assert "if canonical is None:" in source
-    assert source.rindex('reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED') < source.index(
-        '(out_dir / "four_gw_decision.json").write_text(')
+    assert source.rindex('reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED') < source.rindex(
+        '"suppression_reasons": suppression_reasons,')
 
 
 def test_a_failed_escalation_fails_closed():
@@ -626,11 +626,14 @@ def test_no_best_h1_fallback_and_confidence_never_changes_the_preferred_route():
     source = (REPO_ROOT / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
     assert "DECISION_SEARCH_NOT_STABLE" in source
     assert "best_h1" not in source and "BEST_H1" not in source
-    # the suppression CALLS are applied before the artifact is written (rindex:
-    # the helper's own definition must not satisfy this)
-    write_index = source.index('(out_dir / "four_gw_decision.json").write_text(')
-    assert source.rindex("_suppress_transfer_recommendation(") < write_index
-    assert source.rindex("assess_search_stability(") < write_index
+    # suppression CALLS are applied before the artifact that carries them is
+    # assembled, and the canonical entrypoint persists that artifact only after the
+    # pipeline has returned (rindex: the helper's own definition must not satisfy this)
+    artifact_index = source.rindex('"suppression_reasons": suppression_reasons,')
+    assert source.rindex("_suppress_transfer_recommendation(") < artifact_index
+    assert source.rindex("assess_search_stability(") < artifact_index
+    store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
+    assert "artifact_ref = _write_decision_artifact(artifact_path, artifact)" in store
     # confidence is computed after the ranked decision, and the preferred route
     # comes from the decision (confidence never supplies or changes a route)
     assert source.rindex("fg.evaluate_four_gw_decision(") < source.index("classify_decision_confidence(")
@@ -806,11 +809,14 @@ def test_runner_artifact_asserts_the_refinement_and_never_advertises_a_ladder():
     assert "refinement[\"simulation_fidelity\"]" in source
     # the canonical record is published on the result the confidence code reads
     assert 'result["canonical_paired_near_tie"] = canonical' in source
-    # suppression CALLS happen before the artifact hits disk (rindex so the
-    # helper's definition cannot satisfy the check)
-    write_index = source.index('(out_dir / "four_gw_decision.json").write_text(')
-    assert source.rindex("_suppress_transfer_recommendation(") < write_index
-    assert source.rindex("assess_search_stability(") < write_index
+    # suppression CALLS are applied before the artifact that carries them is
+    # assembled, and the canonical entrypoint persists that artifact only after the
+    # pipeline has returned (rindex: the helper's own definition must not satisfy this)
+    artifact_index = source.rindex('"suppression_reasons": suppression_reasons,')
+    assert source.rindex("_suppress_transfer_recommendation(") < artifact_index
+    assert source.rindex("assess_search_stability(") < artifact_index
+    store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
+    assert "artifact_ref = _write_decision_artifact(artifact_path, artifact)" in store
     # no open-ended ladder: exactly one escalation call site
     assert source.count("escalation=_escalation_runner(") == 1
     assert source.count("rs.budget_config(") == 1

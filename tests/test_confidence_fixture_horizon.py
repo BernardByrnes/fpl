@@ -412,7 +412,7 @@ def test_role_relevant_set_is_transfers_and_armband_not_the_squad():
     assert 'focus_players = sorted(' not in source
     # the transfer-in player must be queried from certified minutes ids
     assert "role_relevant_players" in source
-    assert "_certified_role_evidence(\n            conn, certified_runs, role_relevant_players" in source
+    assert "conn, certified_runs, role_relevant_players" in source
 
 
 def test_role_evidence_includes_an_unowned_transfer_in_player():

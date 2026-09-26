@@ -928,9 +928,12 @@ def test_G_runner_gate_refuses_a_new_artifact_missing_the_audit(tmp_path):
     source = Path("scripts/run_four_gw_decision.py").read_text(encoding="utf-8")
     # The ONE predictive-world entry resolves and re-proves the certified generation.
     assert source.count("def resolve_decision_generation(") == 1
-    # The READINESS view, the production gate, and the definition itself.
-    assert source.count("resolve_decision_generation(") == 3
-    assert "gs.assert_generation_bundles_valid(conn, generation)" in source
+    # The READINESS view and the definition itself.  The DECISION no longer resolves a
+    # generation of its own: it goes through the canonical entrypoint, which resolves,
+    # re-proves and records in one place.
+    assert source.count("resolve_decision_generation(") == 2
+    assert "gs.make_decision(" in source
+    assert "gs.verify_generation(conn, generation.generation_id)" in source
     # No caller-carried certification object reaches a predictive load any more.
     assert "fg.load_certification_artifact(" not in source
     assert "fg.event_support_from_certification(" not in source

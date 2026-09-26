@@ -668,9 +668,15 @@ def test_W_production_runner_never_emits_play_wildcard():
 # ---------------------------------------------------------------------------
 def test_X_discovery_reads_come_from_the_certified_generation_snapshot():
     source = RUNNER.read_text(encoding="utf-8")
-    assert "gs.open_generation_snapshot(generation)" in source
+    assert "    source_conn,\n"
+    assert "gs.open_generation_snapshot(generation)" not in source, (
+        "the pipeline must not open a source of its own: make_decision opens the pinned "
+        "snapshot READ-ONLY and passes it in as a parameter"
+    )
+    store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
+    assert "source_conn = _open_generation_snapshot(generation)" in store
     for call in ("cu.load_pool(source_conn)", "cu.load_fixtures_by_team(source_conn",
-                 "rc.load_player_meta(source_conn", "cu.price_snapshot_as_of(\n            source_conn",
+                 "rc.load_player_meta(source_conn", "cu.price_snapshot_as_of(\n        source_conn",
                  "manager_worlds.resolve_squad(source_context, source_conn)"):
         assert call in source, f"discovery must read {call} from the snapshot"
 

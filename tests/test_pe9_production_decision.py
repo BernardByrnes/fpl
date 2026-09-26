@@ -1,0 +1,638 @@
+"""PE-9 — the production decision entrypoint and the certification gates.
+
+These are REAL integration tests, not source assertions: a synthetic 15-player world
+is certified through ``generation_store.certify_generation`` under the leased
+``ExecutionController``, and the decision is taken through
+``generation_store.make_decision`` against the PINNED snapshot that generation names.
+What is asserted is what production does -- a persisted ``engine_decision_records``
+row, a retained decision artifact beside the store, and a verifier that REPRODUCES the
+manager packet, request and result digests instead of reporting them as verified.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import sqlite3
+import threading
+from pathlib import Path
+
+import pytest
+
+import generation_fixtures as gf
+from fpl_brain import certified_bundle as cb
+from fpl_brain import execution
+from fpl_brain import generation_store as gs
+from fpl_brain.database import connect_database
+
+#: A legal 15-player squad (2 GK, 5 DEF, 5 MID, 3 FWD), which is what a manager-world
+#: decision consumes.  Manager state is a PERMITTED caller input; the predictive
+#: evidence is not.
+SQUAD = list(range(1, 16))
+POSITIONS = (
+    "GKP", "GKP", "DEF", "DEF", "DEF", "DEF", "DEF",
+    "MID", "MID", "MID", "MID", "MID", "FWD", "FWD", "FWD",
+)
+_ELEMENT_TYPE = {"GKP": 1, "DEF": 2, "MID": 3, "FWD": 4}
+FAMILIES = ("minutes_v1", "team_strength_v1", "player_rates_v1", "xpts_v1", "monte_carlo_v1")
+RUN_IDS = {family: 100 + index for index, family in enumerate(FAMILIES)}
+PROFILE = gs.DecisionProfile(
+    kind=gs.HORIZON_KIND_MANAGER_WORLD,
+    parameters={"simulations": 8, "top_k": 3, "occupancy_audit": False},
+)
+
+
+def _world(path: Path) -> gs.CertifiedGeneration:
+    """A file-backed world carrying a certified MANAGER_WORLD generation."""
+
+    conn = connect_database(path)
+    gf.base_world(conn)
+    with conn:
+        for pid in range(3, 16):
+            conn.execute(
+                "INSERT INTO players(id, web_name, team_id, element_type, is_active, first_seen_at,"
+                " last_seen_at, raw_json, updated_at)"
+                " VALUES (?,?,1,3,1,'2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','{}',"
+                "'2026-09-01T00:00:00Z')",
+                (pid, f"P{pid}"),
+            )
+        for pid, position in zip(SQUAD, POSITIONS):
+            conn.execute(
+                "UPDATE players SET element_type=? WHERE id=?", (_ELEMENT_TYPE[position], pid)
+            )
+    gf.add_event(conn, 5)
+    with conn:
+        gf.add_fixture(conn, 1000, 5, 1, 2)
+        for family, run_id in RUN_IDS.items():
+            gf.add_run(conn, run_id, family, 5)
+        for pid in SQUAD:
+            gf.add_xpts_row(
+                conn, RUN_IDS["xpts_v1"], 1000, 5, minutes_run_id=RUN_IDS["minutes_v1"],
+                team_run_id=RUN_IDS["team_strength_v1"], rate_run_id=RUN_IDS["player_rates_v1"],
+                player_id=pid,
+            )
+            gf.add_mc_row(
+                conn, RUN_IDS["monte_carlo_v1"], 1000, 5, xpts_run_id=RUN_IDS["xpts_v1"],
+                minutes_run_id=RUN_IDS["minutes_v1"], team_run_id=RUN_IDS["team_strength_v1"],
+                rate_run_id=RUN_IDS["player_rates_v1"], player_id=pid,
+            )
+    conn.commit()
+    generation = gf.certify_world(
+        conn, {5: dict(RUN_IDS)}, events=(5,),
+        horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+        # The decision READS the pinned snapshot, so the fixture pins a real copy of
+        # the store rather than a placeholder file.
+        snapshot_path=path.parent / "snapshot.db", snapshot_database=path,
+    )
+    conn.close()
+    return generation
+
+
+def _packet() -> dict:
+    return {
+        "entry_id": 1,
+        "planning_event": 5,
+        "cutoff": gf.CUTOFF,
+        "squad_ids": list(SQUAD),
+    }
+
+
+def _decision(conn, generation_id=None, **over):
+    arguments = {
+        "horizon_kind": gs.HORIZON_KIND_MANAGER_WORLD,
+        "profile": PROFILE,
+        "request": {"tracing_id": "test-pe9"},
+    }
+    packet = over.pop("packet", None) or _packet()
+    arguments.update(over)
+    return gs.make_decision(conn, packet, 5, generation_id=generation_id, **arguments)
+
+
+# ---------------------------------------------------------------------------
+# Real decisions, through the canonical entrypoint
+# ---------------------------------------------------------------------------
+
+
+def test_make_decision_resolves_the_current_generation_and_records_the_decision(tmp_path):
+    path = tmp_path / "fpl.db"
+    generation = _world(path)
+    conn = connect_database(path)
+    try:
+        outcome = _decision(conn)
+        assert outcome["generation_id"] == generation.generation_id
+        assert outcome["decision"]["status"] == "MANAGER_WORLD_EVALUATED"
+
+        # The record is PERSISTED, not narrated.
+        row = conn.execute(
+            "SELECT * FROM engine_decision_records WHERE decision_id=?",
+            (outcome["decision_record_id"],),
+        ).fetchone()
+        assert row is not None
+        assert str(row["generation_id"]) == generation.generation_id
+        assert str(row["result_sha256"]) == outcome["result_sha256"]
+
+        # The artifact is RETAINED beside the authoritative store, and it is named by
+        # the decision's own content digest.
+        artifact_path = Path(outcome["decision_artifact_ref"])
+        assert artifact_path.exists()
+        assert artifact_path.parent.name == "gw05"
+        assert outcome["result_sha256"].split(":", 1)[1][:32] in artifact_path.name
+
+        # The verifier REPRODUCES every digest from that artifact.
+        report = gs.verify_decision(conn, outcome["decision_record_id"])
+        assert report["verified"] is True
+        assert report["generation_verified"] is True
+        assert report["manager_packet_digest_verified"] is True
+        assert report["request_digest_verified"] is True
+        assert report["result_digest_verified"] is True
+        assert report["decision_artifact_sha256"]
+
+        # The predictive inputs came from the GENERATION and its pinned snapshot.
+        provenance = outcome["provenance"]
+        assert provenance["generation_id"] == generation.generation_id
+        assert provenance["snapshot"]["sha256"] == generation.snapshot["sha256"]
+        assert outcome["artifact"]["attribution"]["manager_packet"] == _packet()
+    finally:
+        conn.close()
+
+
+def test_make_decision_is_idempotent_and_never_rewrites_history(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn)
+        second = _decision(conn)
+        assert first["decision_record_id"] == second["decision_record_id"]
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_make_decision_pins_an_explicit_historical_generation(tmp_path):
+    """``generation_id`` is a SELECTOR: a historical decision re-derives from ITS row."""
+
+    path = tmp_path / "fpl.db"
+    historical = _world(path)
+    conn = connect_database(path)
+    try:
+        # A second generation over the SAME runs but a DIFFERENT pinned snapshot is a
+        # different predictive world, so the pointer moves; a later ingest cannot
+        # replace the certified ids, only add another generation.
+        newer = gf.certify_world(
+            conn, {5: dict(RUN_IDS)}, events=(5,),
+            horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+            snapshot_path=tmp_path / "second.db", snapshot_database=path,
+        )
+        assert newer.generation_id != historical.generation_id
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) == newer.generation_id
+
+        pinned = _decision(conn, historical.generation_id)
+        assert pinned["generation_id"] == historical.generation_id
+        assert pinned["provenance"]["snapshot"]["sha256"] == historical.snapshot["sha256"]
+        assert pinned["provenance"]["snapshot"]["sha256"] != newer.snapshot["sha256"]
+        assert gs.verify_decision(conn, pinned["decision_record_id"])["generation_verified"] is True
+
+        # And the CURRENT generation is a different decision record over a different
+        # world, not a rewrite of the historical one.
+        current = _decision(conn)
+        assert current["generation_id"] == newer.generation_id
+        assert current["decision_record_id"] != pinned["decision_record_id"]
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# The production API cannot be handed decision logic, evidence or handles
+# ---------------------------------------------------------------------------
+
+
+def test_make_decision_has_no_executor_parameter():
+    parameters = inspect.signature(gs.make_decision).parameters
+    assert "decide" not in parameters
+    assert "executor" not in parameters
+    assert "profile" in parameters
+    # An executor cannot be smuggled in through the descriptor door either.
+    conn = connect_database(":memory:")
+    try:
+        with pytest.raises(gs.ProductionDescriptorOnly):
+            gs.make_decision(conn, _packet(), 5, decide=lambda **kwargs: {"decision": {}})
+    finally:
+        conn.close()
+
+
+def test_a_declared_profile_kind_is_required_and_selects_the_pipeline(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        with pytest.raises(gs.GenerationRefused) as unknown:
+            _decision(conn, profile=gs.DecisionProfile(kind="ARBITRARY_PIPELINE"))
+        assert unknown.value.token == gs.DIAG_PRODUCTION_PROFILE_UNKNOWN
+        # The declared production module really is the runner, resolved by NAME.
+        assert gs.PRODUCTION_DECISION_MODULES[gs.HORIZON_KIND_FOUR_GW] == (
+            "scripts/run_four_gw_decision.py"
+        )
+        entry = Path(gs.PRODUCTION_DECISION_MODULES[gs.HORIZON_KIND_FOUR_GW])
+        assert gs.PRODUCTION_DECISION_ENTRYPOINT in (
+            Path(__file__).resolve().parents[1] / entry
+        ).read_text(encoding="utf-8")
+        # And the library really resolves it, with exactly the declared interface:
+        # the certified generation, the PINNED source, the manager packet and the
+        # ordinary parameters -- no callable, and nothing predictive.
+        resolved = gs._declared_production_entrypoint(
+            gs.PRODUCTION_DECISION_MODULES[gs.HORIZON_KIND_FOUR_GW]
+        )
+        assert callable(resolved)
+        assert set(inspect.signature(resolved).parameters) == {
+            "conn", "generation", "manager_packet", "parameters", "source_conn", "controller",
+        }
+    finally:
+        conn.close()
+
+
+def test_make_decision_refuses_a_nested_cache_handle(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        with pytest.raises(gs.ProductionDescriptorOnly) as caught:
+            _decision(conn, request={"tracing_id": "x", "cache_dir": str(tmp_path / "cache")})
+        assert "request.cache_dir" in str(caught.value)
+        with pytest.raises(gs.ProductionDescriptorOnly) as nested:
+            _decision(conn, packet={**_packet(), "cache": {"dir": str(tmp_path)}})
+        assert "manager_packet.cache" in str(nested.value)
+        with pytest.raises(gs.ProductionDescriptorOnly) as profile:
+            _decision(
+                conn,
+                profile={"kind": gs.HORIZON_KIND_MANAGER_WORLD,
+                         "parameters": {"cache_dir": str(tmp_path)}},
+            )
+        assert "profile.parameters.cache_dir" in str(profile.value)
+    finally:
+        conn.close()
+
+
+def test_make_decision_refuses_a_nested_run_mapping_or_matrix(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        for payload, where in (
+            ({"runs": {5: dict(RUN_IDS)}}, "manager_packet.runs"),
+            ({"matrix": {"worlds": 1}}, "manager_packet.matrix"),
+            ({"bundles": {"5": {}}}, "manager_packet.bundles"),
+            ({"certification": {"schema": "x"}}, "manager_packet.certification"),
+            ({"manifest_digest": "sha256:" + "0" * 64}, "manager_packet.manifest_digest"),
+        ):
+            with pytest.raises(gs.ProductionDescriptorOnly) as caught:
+                _decision(conn, packet={**_packet(), **payload})
+            assert where in str(caught.value), where
+        with pytest.raises(gs.ProductionDescriptorOnly) as nested:
+            _decision(conn, request={"tracing_id": "x", "worlds": {5: {"worlds": 1}}})
+        assert "request.worlds" in str(nested.value)
+    finally:
+        conn.close()
+
+
+def test_make_decision_refuses_an_unusable_manager_packet_or_cutoff(tmp_path):
+    path = tmp_path / "fpl.db"
+    generation = _world(path)
+    conn = connect_database(path)
+    try:
+        with pytest.raises(gs.DecisionRecordInvalid):
+            _decision(conn, packet={"planning_event": 5, "cutoff": gf.CUTOFF})
+        with pytest.raises(gs.GenerationRefused):
+            _decision(
+                conn,
+                packet={**_packet(), "cutoff": gf.OTHER_CUTOFF},
+            )
+        # An unknown generation id, and an unset pointer, are different facts.
+        with pytest.raises(gs.GenerationUnknown):
+            _decision(conn, "sha256:" + "0" * 64)
+        conn.execute("DELETE FROM current_generation")
+        with pytest.raises(gs.GenerationRefused) as pointerless:
+            _decision(conn)
+        assert pointerless.value.token == gs.DIAG_GENERATION_POINTER_UNSET
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) is None
+        assert generation.generation_id
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Certification gates: the snapshot, the code identity, the planning context
+# ---------------------------------------------------------------------------
+
+
+def _certify(conn, *, snapshot=None, runs=None, **over):
+    arguments = {
+        "planning_event": 5,
+        "cutoff": gf.CUTOFF,
+        "runs_by_event": {5: dict(runs or RUN_IDS)},
+        "events": (5,),
+        "horizon_kind": gs.HORIZON_KIND_MANAGER_WORLD,
+        "snapshot": snapshot,
+    }
+    arguments.update(over)
+    return gs.certify_generation(conn, **arguments)
+
+
+def test_certification_requires_a_pinned_snapshot(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0]
+        with pytest.raises(gs.GenerationSnapshotUnverified):
+            _certify(conn, snapshot=None)
+        with pytest.raises(gs.GenerationSnapshotUnverified) as missing:
+            _certify(conn, snapshot={"path": str(tmp_path / "absent.db"),
+                                     "sha256": "sha256:" + "a" * 64,
+                                     "source_db_identity": {"schema_version": "18"}})
+        assert "does not exist" in str(missing.value)
+        real = gf.write_snapshot(tmp_path / "live.db", database=path)
+        with pytest.raises(gs.GenerationSnapshotUnverified) as mutated:
+            _certify(conn, snapshot={**real, "sha256": "sha256:" + "b" * 64})
+        assert "hashes to" in str(mutated.value)
+        with pytest.raises(gs.GenerationSnapshotUnverified) as identityless:
+            _certify(conn, snapshot={**real, "source_db_identity": None})
+        assert "source database identity" in str(identityless.value)
+        mismatched_identity = {
+            **real,
+            "source_db_identity": {**real["source_db_identity"], "projection_runs_count": 999},
+        }
+        with pytest.raises(gs.GenerationSnapshotUnverified) as mismatched:
+            _certify(conn, snapshot=mismatched_identity)
+        assert "does not reproduce from the pinned snapshot" in str(mismatched.value)
+        # Nothing was written by any of those refusals.
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before
+        # And the same world certifies once a real identity is pinned.
+        assert _certify(conn, snapshot=real).generation_id.startswith("sha256:")
+    finally:
+        conn.close()
+
+
+def test_certification_refuses_missing_required_pe8_evidence(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0]
+        snapshot = gf.write_snapshot(tmp_path / "snapshot.db", database=path)
+        with pytest.raises(gs.GenerationRefused) as missing:
+            _certify(conn, snapshot=snapshot, require_calibration=True)
+        assert missing.value.token == cb.STATE_EVIDENCE_MISSING
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before
+    finally:
+        conn.close()
+
+
+def test_certification_requires_the_authoritative_code_identity(tmp_path):
+    """The runs must have been produced by the RUNNING code revision."""
+
+    conn = connect_database(":memory:")
+    try:
+        gf.base_world(conn)
+        gf.add_event(conn, 5)
+        with conn:
+            for family, run_id in RUN_IDS.items():
+                gf.add_run(conn, run_id, family, 5, code_snapshot="some-other-revision")
+        # xPts rows are not needed: the structural gate refuses the code identity first.
+        with pytest.raises((gs.GenerationNotCertified, gs.GenerationRefused)) as caught:
+            _certify(conn, snapshot=gf.write_snapshot(tmp_path / "s.db", database=conn))
+        assert "code snapshot" in str(caught.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_certification_requires_a_planning_context(tmp_path):
+    conn = connect_database(":memory:")
+    try:
+        gf.base_world(conn)
+        gf.add_event(conn, 5)
+        with conn:
+            for family, run_id in RUN_IDS.items():
+                gf.add_run(conn, run_id, family, 5, context_hash=None)
+        with pytest.raises(gs.GenerationRefused) as caught:
+            _certify(conn, snapshot=gf.write_snapshot(tmp_path / "s.db", database=conn))
+        assert caught.value.token == gs.DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Leases and concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_certification_runs_under_the_leased_controller(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0]
+        controller = execution.ExecutionController(conn)
+        controller.create_run(
+            planning_event=5,
+            planning_cutoff=gf.CUTOFF,
+            hard_stop_at=execution.add_seconds(controller.now_dt(), 3600),
+            label="pe9-test",
+            families=["certification"],
+        )
+        controller.start()
+        snapshot = gf.write_snapshot(tmp_path / "leased.db", database=path)
+        with pytest.raises(execution.LeaseError) as unleased:
+            _certify(conn, snapshot=snapshot, controller=controller)
+        assert "CERTIFICATION_WITHOUT_WRITER_LEASE" in str(unleased.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before
+
+        controller.acquire_run_lease()
+        writer_lease = controller.acquire_writer_lease()
+        with controller.stage("CERTIFY_GENERATION", detail={"events": [5]}):
+            generation = _certify(conn, snapshot=snapshot, controller=controller)
+        assert generation.generation_id.startswith("sha256:")
+        # The run's own ledger records the certification it performed.
+        stages = [dict(row)["stage"] if not isinstance(row, dict) else row["stage"]
+                  for row in controller.stages()]
+        assert "CERTIFY_GENERATION" in stages
+        assert controller.active_lease(execution.LEASE_KIND_WRITER, "sqlite-writer")["id"] == writer_lease
+        controller.finish(execution.RUN_COMPLETE)
+    finally:
+        conn.close()
+
+
+def test_concurrent_certification_serialises_on_one_generation(tmp_path):
+    """Two certifiers of the SAME semantic world resolve to ONE generation row."""
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    snapshot = gf.write_snapshot(tmp_path / "race.db", database=path)
+    baseline = connect_database(path)
+    before = baseline.execute("SELECT COUNT(*) FROM generation").fetchone()[0]
+    baseline.close()
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+    failures: list[BaseException] = []
+
+    def certify():
+        conn = connect_database(path)
+        try:
+            barrier.wait(timeout=30)
+            results.append(_certify(conn, snapshot=snapshot).generation_id)
+        except BaseException as failure:  # noqa: BLE001 - reported below
+            failures.append(failure)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=certify) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    try:
+        assert not failures, failures
+        assert len(set(results)) == 1
+        conn = connect_database(path)
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before + 1
+            # Both certifiers resolved the SAME semantic generation, and the pointer
+            # names it: contention cannot produce two rows for one world.
+            assert gs.current_generation_id(
+                conn, 5, gs.HORIZON_KIND_MANAGER_WORLD
+            ) == results[0]
+        finally:
+            conn.close()
+    finally:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Verification tells the truth, or refuses
+# ---------------------------------------------------------------------------
+
+
+def test_verify_decision_refuses_without_a_retained_artifact(tmp_path):
+    path = tmp_path / "fpl.db"
+    generation = _world(path)
+    conn = connect_database(path)
+    try:
+        outcome = _decision(conn)
+        record = conn.execute(
+            "SELECT * FROM engine_decision_records WHERE decision_id=?",
+            (outcome["decision_record_id"],),
+        ).fetchone()
+        assert record is not None
+
+        # A record that names no artifact cannot have its manager packet, request or
+        # result re-derived, and is refused rather than reported as verified.
+        bare = gs.append_engine_decision_record(
+            conn, generation=generation,
+            manager_packet_sha256="sha256:" + "a" * 64,
+            request_sha256="sha256:" + "b" * 64,
+            result_sha256="sha256:" + "c" * 64,
+            runner_identity="test", evidence={"schema": gs.DECISION_RECORD_SCHEMA},
+        )
+        conn.commit()
+        with pytest.raises(gs.GenerationRefused) as unreferenced:
+            gs.verify_decision(conn, bare)
+        assert unreferenced.value.token == gs.DIAG_DECISION_ARTIFACT_NOT_RETAINED
+
+        # A record whose artifact was DISCARDED is refused the same way.
+        Path(outcome["decision_artifact_ref"]).unlink()
+        with pytest.raises(gs.GenerationRefused) as discarded:
+            gs.verify_decision(conn, outcome["decision_record_id"])
+        assert discarded.value.token == gs.DIAG_DECISION_ARTIFACT_NOT_RETAINED
+    finally:
+        conn.close()
+
+
+def test_verify_decision_refuses_an_artifact_without_attribution_or_with_a_mutated_one(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        outcome = _decision(conn)
+        artifact_path = Path(outcome["decision_artifact_ref"])
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert payload["attribution"]["manager_packet"] == _packet()
+
+        # Without the attribution block there is nothing to reproduce the recorded
+        # manager/request digests FROM.
+        stripped = json.loads(json.dumps(payload))
+        stripped.pop("attribution")
+        artifact_path.write_text(json.dumps(stripped), encoding="utf-8")
+        with pytest.raises(gs.GenerationRefused) as unattributed:
+            gs.verify_decision(conn, outcome["decision_record_id"])
+        assert "no attribution block" in str(unattributed.value)
+
+        # A manager packet edited underneath its recorded digest is caught by the
+        # RECOMPUTATION, not by a label.
+        tampered = json.loads(json.dumps(payload))
+        tampered["attribution"]["manager_packet"]["entry_id"] = 999
+        artifact_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with pytest.raises(gs.GenerationRefused) as mutated:
+            gs.verify_decision(conn, outcome["decision_record_id"])
+        assert "manager_packet_sha256" in str(mutated.value)
+    finally:
+        conn.close()
+
+
+def test_verify_generation_reproduces_the_pe8_reference_or_says_it_did_not_consult_it(tmp_path):
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        generation = gs.resolve_generation(
+            conn, planning_event=5, horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD
+        )
+        report = gs.verify_generation(conn, generation.generation_id)
+        assert report["pe8_evidence_consulted"] is False
+        assert report["pe8_evidence_reproduction"] == gs.PE8_NOT_CONSULTED
+        assert report["pe8_evidence_refs_reproduce"] is None
+
+        # A consulted artifact's identity and state recompute from what the manifest
+        # records; a disagreeing state does not.
+        calibration = {
+            "schema": cb.known_calibration_versions()["schema"],
+            "evaluation_version": cb.known_calibration_versions()["evaluation_version"],
+            "identity": {
+                "certification_identity": "sha256:" + "f" * 64,
+                "planning_cutoff": gf.CUTOFF,
+            },
+            "terminal_state": {"state": "OPEN", "reasons": []},
+            "surfaces": [],
+        }
+        surface = {"surface": "minutes_60min_probability", "state": cb.STATE_CERTIFIED_COHERENT}
+        evidence = {
+            "consulted": True,
+            "identity": cb.calibration_identity(calibration),
+            "schema": calibration["schema"],
+            "evaluation_version": calibration["evaluation_version"],
+            "certification_identity": "sha256:" + "f" * 64,
+            "planning_cutoff": gf.CUTOFF,
+            "terminal_state": "OPEN",
+            "state": cb.calibration_evidence_state(calibration, [surface]),
+            "surfaces": [surface],
+            "per_event_state": {"5": cb.STATE_EVIDENCE_LIMITED},
+        }
+        reproduced, failures = gs.reproduce_pe8_evidence(
+            evidence, {"5": {"evidence_state": cb.STATE_EVIDENCE_LIMITED}}
+        )[:2]
+        assert reproduced is True and failures == []
+        broken = dict(evidence, terminal_state="READY_FOR_MERGE")
+        reproduced, failures = gs.reproduce_pe8_evidence(
+            broken, {"5": {"evidence_state": cb.STATE_EVIDENCE_LIMITED}}
+        )[:2]
+        assert reproduced is False
+        assert any("does not reproduce" in failure for failure in failures)
+        mismatched, failures = gs.reproduce_pe8_evidence(
+            evidence, {"5": {"evidence_state": cb.STATE_CERTIFIED_COHERENT}}
+        )[:2]
+        assert mismatched is False and failures
+    finally:
+        conn.close()

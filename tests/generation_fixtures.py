@@ -15,16 +15,22 @@ path production does not have.
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from fpl_brain import analytics
 from fpl_brain import certified_bundle as cb
 from fpl_brain import generation_store as gs
 from fpl_brain.database import connect_database
 
 CUTOFF = "2026-09-19T11:00:00Z"
 OTHER_CUTOFF = "2026-09-18T11:00:00Z"
-CODE_SNAPSHOT = "codehash"
+#: The AUTHORITATIVE code identity the generation store derives for itself.  A run
+#: row records which code revision produced it, and certification now REQUIRES the
+#: runs to record the running revision, so the fixtures stamp the same value the
+#: store computes instead of a literal that no code identity could reproduce.
+CODE_SNAPSHOT = analytics.source_snapshot_sha256()
 DATA_SNAPSHOT = "sha256:" + "d" * 64
 CONTEXT_HASH = "ctx"
 
@@ -238,20 +244,156 @@ def world_with_run_ids(
     return conn, {int(event): dict(runs) for event, runs in runs_by_event.items()}
 
 
-def write_snapshot(path: Path) -> dict[str, Any]:
-    """A real file the generation can pin, so retention checks have something to see."""
+#: Where a fixture's snapshot lives when the caller does not name a file.  ONE path
+#: per process, so two certifications of the SAME world resolve to the SAME
+#: generation id (that idempotence is part of what the store promises), while a
+#: caller-named path still produces a different world identity.
+_DEFAULT_SNAPSHOT = Path(tempfile.mkdtemp(prefix="fpl-pe9-fixture-")) / "snapshot.db"
+
+
+def write_snapshot(
+    path: Path, *, database: str | Path | sqlite3.Connection
+) -> dict[str, Any]:
+    """A real file the generation can pin, so retention checks have something to see.
+
+    The bytes are a deterministic function of the file NAME, so a fixture that pins a
+    different snapshot gets a different world identity -- which is what makes
+    "a second generation over the same runs but another snapshot" a different
+    generation rather than an accident of the clock.
+
+    ``database`` names an existing store to copy: a DECISION reads causal source state
+    from the pinned snapshot, so a fixture that drives one must pin a real database
+    rather than a placeholder file.
+    """
 
     from fpl_brain import execution_snapshot as es
 
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"fpl-synthetic-snapshot")
+    if path.exists():
+        path.unlink()
+    _copy_database(database, path)
+    snapshot_conn = sqlite3.connect(str(path))
+    try:
+        # Give two otherwise identical fixture snapshots distinct real database
+        # bytes, without changing any FPL tables read by the decision pipeline.
+        snapshot_conn.execute(
+            "CREATE TABLE IF NOT EXISTS __pe9_fixture_snapshot_identity(value TEXT NOT NULL)"
+        )
+        snapshot_conn.execute("DELETE FROM __pe9_fixture_snapshot_identity")
+        snapshot_conn.execute(
+            "INSERT INTO __pe9_fixture_snapshot_identity(value) VALUES (?)", (path.name,)
+        )
+        snapshot_conn.commit()
+    finally:
+        snapshot_conn.close()
+    if isinstance(database, sqlite3.Connection):
+        schema = database.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        runs = database.execute("SELECT COUNT(*), MAX(id) FROM projection_runs").fetchone()
+        identity = {
+            "path": str(path),
+            "schema_version": str(schema[0]) if schema else None,
+            "projection_runs_count": int(runs[0]),
+            "projection_runs_max_id": int(runs[1]) if runs[1] is not None else None,
+        }
+    else:
+        identity = es.source_db_identity(database)
     return {
         "path": str(path),
         "sha256": es.file_sha256(path),
         "size_bytes": int(path.stat().st_size),
-        "source_db_identity": {"path": ":memory:", "schema_version": "18"},
+        "source_db_identity": identity,
         "execution_run_uuid": "00000000-0000-0000-0000-000000000001",
     }
+
+
+def _write_default_snapshot(
+    *, database: str | Path | sqlite3.Connection
+) -> dict[str, Any]:
+    """Retain one stable default snapshot per distinct fixture database.
+
+    Many test modules certify different synthetic sources in one Python process. A
+    single reusable path lets a later fixture overwrite a still-referenced snapshot,
+    which correctly makes production verification refuse. Use the fixed default name
+    only as a staging file, then keep each byte-distinct snapshot at a digest-named
+    path. Re-certifying identical source bytes resolves to the same retained path.
+    """
+
+    from fpl_brain import execution_snapshot as es
+
+    staged = write_snapshot(_DEFAULT_SNAPSHOT, database=database)
+    digest = str(staged["sha256"])
+    retained_path = _DEFAULT_SNAPSHOT.with_name(f"snapshot-{digest}.db")
+    if retained_path.exists():
+        if es.file_sha256(retained_path) != digest:
+            raise RuntimeError(
+                f"fixture snapshot path {retained_path} exists with bytes outside its digest name"
+            )
+        _DEFAULT_SNAPSHOT.unlink()
+    else:
+        _DEFAULT_SNAPSHOT.replace(retained_path)
+    return {
+        **staged,
+        "path": str(retained_path),
+        "source_db_identity": es.source_db_identity(retained_path),
+    }
+
+
+def _copy_database(source: str | Path | sqlite3.Connection, target: Path) -> None:
+    """Create a real fixture snapshot without post-certification PE-9 rows."""
+
+    from fpl_brain.database import connect_database
+
+    target_conn = connect_database(target)
+    target_conn.execute("PRAGMA foreign_keys=OFF")
+    close_source = False
+    try:
+        if isinstance(source, sqlite3.Connection):
+            source_conn = source
+        else:
+            source_conn = sqlite3.connect(str(source))
+            source_conn.row_factory = sqlite3.Row
+            close_source = True
+        source_tables = [
+            str(row[0])
+            for row in source_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+            if not str(row[0]).startswith("sqlite_")
+            and str(row[0]) not in {"generation", "current_generation", "engine_decision_records"}
+            and not str(row[0]).startswith("execution_")
+        ]
+        target_tables = {
+            str(row[0])
+            for row in target_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        for table in source_tables:
+            if table not in target_tables:
+                continue
+            columns = [
+                str(row[1])
+                for row in source_conn.execute(f'PRAGMA table_info("{table}")')
+            ]
+            if not columns:
+                continue
+            source_rows = source_conn.execute(f'SELECT * FROM "{table}"').fetchall()
+            if not source_rows:
+                continue
+            column_sql = ",".join(f'"{column}"' for column in columns)
+            values_sql = ",".join("?" for _ in columns)
+            target_conn.executemany(
+                f'INSERT OR REPLACE INTO "{table}" ({column_sql}) VALUES ({values_sql})',
+                [tuple(row[column] for column in columns) for row in source_rows],
+            )
+        target_conn.commit()
+    finally:
+        if close_source:
+            source_conn.close()
+        target_conn.close()
 
 
 def certify_world(
@@ -263,15 +405,31 @@ def certify_world(
     cutoff: str = CUTOFF,
     horizon_kind: str = gs.HORIZON_KIND_FOUR_GW,
     snapshot_path: Path | None = None,
+    snapshot_database: str | Path | None = None,
+    calibration_artifact_ref: str | Path | None = None,
+    require_calibration: bool = False,
     calibration: Mapping[str, Any] | None = None,
 ) -> gs.CertifiedGeneration:
-    """Certify the synthetic world through the REAL generation-store lifecycle."""
+    """Certify the synthetic world through the REAL generation-store lifecycle.
+
+    The snapshot is ALWAYS pinned: a generation commits to the immutable source it
+    replaced, so a fixture that certified a world without one would be exercising a
+    lifecycle production does not have.
+    """
 
     resolved_events = [int(event) for event in (events if events is not None else runs_by_event)]
-    snapshot = write_snapshot(snapshot_path) if snapshot_path is not None else {
-        "path": None, "sha256": None, "size_bytes": None,
-        "source_db_identity": None, "execution_run_uuid": "test-run",
-    }
+    source_database = snapshot_database if snapshot_database is not None else conn
+    snapshot = (
+        write_snapshot(snapshot_path, database=source_database)
+        if snapshot_path is not None
+        else _write_default_snapshot(database=source_database)
+    )
+    if calibration is not None and calibration_artifact_ref is None:
+        calibration_artifact_ref = Path(snapshot["path"]).with_name("pe8_calibration_evidence.json")
+        Path(calibration_artifact_ref).write_text(
+            json.dumps(calibration, sort_keys=True, separators=(",", ":"), default=str),
+            encoding="utf-8",
+        )
     return gs.certify_generation(
         conn,
         planning_event=int(planning_event if planning_event is not None else resolved_events[0]),
@@ -281,7 +439,8 @@ def certify_world(
         events=resolved_events,
         snapshot=snapshot,
         calibration=calibration,
-        code_snapshot_sha256=CODE_SNAPSHOT,
+        calibration_artifact_ref=calibration_artifact_ref,
+        require_calibration=require_calibration,
         clock=lambda: "2026-09-19T11:02:00Z",
     )
 

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from fpl_brain import analytics
 from fpl_brain import certified_bundle as cb
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import generation_store as gs
@@ -31,7 +32,10 @@ from fpl_brain.database import connect_database
 
 CUTOFF = "2026-09-19T11:00:00Z"
 OTHER_CUTOFF = "2026-09-18T11:00:00Z"
-CODE_SNAPSHOT = "codehash"
+#: The AUTHORITATIVE code identity the generation store derives for itself: a
+#: certification now REQUIRES the run rows to record the running revision, and the
+#: artifact-level cases below exercise the same value the store computes.
+CODE_SNAPSHOT = analytics.source_snapshot_sha256()
 DATA_SNAPSHOT = "sha256:" + "d" * 64
 CONTEXT_HASH = "ctx"
 
@@ -1677,28 +1681,39 @@ def test_bundle_identity_ignores_required_versions_but_binds_run_ids():
         conn.close()
 
 
-def test_the_decision_runner_resolves_a_generation_and_persists_its_provenance():
-    """The production runner must consume a CERTIFIED GENERATION, descriptor-only.
+def test_the_decision_runner_routes_through_the_canonical_entrypoint():
+    """The production runner must take its DECISION through ``make_decision``.
 
-    Source-level, because exercising it end-to-end needs a full production
-    database.  What is asserted is that the runner crosses the PE-9 generation
-    boundary, that the required model versions come from the ONE declared source
-    (never from the caller), and that the generation is persisted WITH the decision
-    rather than narrated.
+    Source-level, because exercising it end-to-end needs a full production database.
+    What is asserted is that the runner crosses the PE-9 generation boundary ONCE, in
+    the canonical entrypoint, that the production pipeline it declares reads only the
+    certified generation and the pinned snapshot, that the required model versions
+    come from the ONE declared source (never from the caller), and that no
+    caller-supplied predictive descriptor or cache handle reaches a load.
     """
 
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
     source = (root / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
+    # The DECISION goes through the one canonical entrypoint, which resolves and
+    # re-proves the generation, opens the pinned snapshot read-only, selects the
+    # declared pipeline by name, and persists artifact + decision record together.
+    assert "gs.make_decision(" in source
+    assert "gs.DecisionProfile(" in source
+    assert "generation_id=readiness_generation.generation_id" in source
+    # The readiness view still resolves and re-proves the certified generation.
     assert "resolve_decision_generation(" in source
-    assert "gs.assert_generation_bundles_valid(conn, generation)" in source
+    assert "gs.verify_generation(conn, generation.generation_id)" in source
+    # The pipeline publishes the certified generation WITH the decision.
     assert '"generation_manifest": dict(generation.manifest)' in source
     assert "generation=generation" in source
     assert '"generation_id": generation.generation_id' in source
-    # No caller-supplied predictive descriptor survives on the runner's own calls.
+    # No caller-supplied predictive descriptor survives on the runner's own calls, and
+    # no cache handle is a caller input any more.
     for banned in ("bundles=bundles", "certification=certification", "prebuilt_worlds=",
-                   "--certification", "--calibration"):
+                   "--certification", "--calibration", "--cache-dir",
+                   "--escalation-cache-dir", "decode=decide", "decide="):
         assert banned not in source, banned
     # The readiness view is reconciled against the certified generation, and the
     # divergence is persisted rather than left implicit.
@@ -1709,9 +1724,10 @@ def test_the_decision_runner_resolves_a_generation_and_persists_its_provenance()
     assert "NON_PRODUCTION" in source or "NON-PRODUCTION" in source
 
     store = (root / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
-    # The required versions come from the ONE declared in-library source, never from
-    # a parameter a caller could set.
+    # The required versions and the code identity come from the ONE declared
+    # in-library source, never from a parameter a caller could set.
     assert "required_versions = cb.declared_required_versions()" in store
+    assert "code_identity = authoritative_code_identity()" in store
     assert "required_versions:" not in store.split("def certify_generation", 1)[1].split(")", 1)[0]
-
-
+    # There is no executor parameter anywhere on the production entrypoint.
+    assert "decide:" not in store.split("def make_decision", 1)[1].split(") ->", 1)[0]

@@ -119,11 +119,33 @@ def test_the_verify_decision_command_reports_verified(tmp_path, capsys):
     path, generation = _store(tmp_path)
     conn = connect_database(path)
     artifact_path = tmp_path / "four_gw_decision.json"
+    # The attribution block is what makes the recorded manager/request digests
+    # REPRODUCIBLE from the retained artifact; without it the verifier refuses.
+    packet = {"entry_id": 1, "planning_event": generation.planning_event}
+    request = {"tracing_id": "verify-command"}
+    runner_code_identity = "sha256:" + "b" * 64
+    manager_context_sha256 = gs._fallback_manager_context_identity(
+        packet, planning_event=generation.planning_event, cutoff=generation.cutoff
+    )
     artifact = {
-        "schema": "fpl_brain.four_gw_decision.v1",
+        "schema": "fpl_brain.manager_world_decision.v1",
         "planning_event": generation.planning_event,
         "planning_cutoff": generation.cutoff,
         "decision_events": list(generation.events),
+        "runner_identity": "test",
+        "runner_code_identity": runner_code_identity,
+        "manager_context_sha256": manager_context_sha256,
+        "attribution": {
+            "manager_packet": packet,
+            "request": request,
+            "manager_packet_sha256": gs.packet_identity(packet),
+            "request_sha256": gs.request_identity(
+                planning_event=generation.planning_event,
+                horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+                cutoff=generation.cutoff, request=request,
+            ),
+            "manager_context_sha256": manager_context_sha256,
+        },
         "provenance": {"generation_id": generation.generation_id},
         "decision": {"k": "v"},
         "suppression_reasons": [],
@@ -132,12 +154,22 @@ def test_the_verify_decision_command_reports_verified(tmp_path, capsys):
         "finalist_refinement": {"route_table": {"routes": {}}},
     }
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    from fpl_brain.execution_snapshot import file_sha256
+
     decision_id = gs.append_engine_decision_record(
         conn, generation=generation,
-        manager_packet_sha256="sha256:" + "a" * 64,
-        request_sha256="sha256:" + "b" * 64,
+        manager_packet_sha256=gs.packet_identity(packet),
+        request_sha256=gs.request_identity(
+            planning_event=generation.planning_event, horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+            cutoff=generation.cutoff, request=request,
+        ),
         result_sha256=gs.result_identity_of(artifact),
-        runner_identity="test", evidence={"schema": gs.DECISION_RECORD_SCHEMA},
+        runner_identity="test", evidence={
+            "schema": gs.DECISION_RECORD_SCHEMA,
+            "runner_identity": "test",
+            "runner_code_identity": runner_code_identity,
+            "decision_artifact_file_sha256": file_sha256(artifact_path),
+        },
         decision_artifact_ref=str(artifact_path),
     )
     conn.commit()

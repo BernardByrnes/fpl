@@ -625,22 +625,53 @@ def test_success_generation_verify_and_decision_verify_pass(tmp_path):
         assert report["horizon_state"] == fg.DECISION_HORIZON_COMPLETE
 
         artifact_path = tmp_path / "four_gw_decision.json"
+        # The artifact carries the ATTRIBUTION block: the exact manager state and
+        # request the decision consumed.  Without it the recorded digests have no
+        # source and ``verify decision`` refuses rather than reporting them verified.
+        packet = {"entry_id": 7, "planning_event": 5, "cutoff": CUTOFF}
+        request = {"tracing_id": "test"}
+        runner_code_identity = "sha256:" + "a" * 64
+        manager_context_sha256 = gs._fallback_manager_context_identity(
+            packet, planning_event=5, cutoff=CUTOFF
+        )
         artifact = {
-            "schema": "fpl_brain.four_gw_decision.v1",
+            "schema": "fpl_brain.manager_world_decision.v1",
             "planning_event": 5, "planning_cutoff": CUTOFF,
             "decision_events": list(HORIZON),
+            "runner_identity": "test",
+            "runner_code_identity": runner_code_identity,
+            "manager_context_sha256": manager_context_sha256,
+            "attribution": {
+                "manager_packet": packet,
+                "request": request,
+                "manager_packet_sha256": gs.packet_identity(packet),
+                "request_sha256": gs.request_identity(
+                    planning_event=5, horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+                    cutoff=CUTOFF, request=request,
+                ),
+                "manager_context_sha256": manager_context_sha256,
+            },
             "provenance": {"generation_id": generation.generation_id},
             "decision": {"k": "v"}, "suppression_reasons": [],
             "decision_confidence": None, "fixture_horizon": None,
             "finalist_refinement": {"route_table": {"routes": {}}},
         }
         artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+        from fpl_brain.execution_snapshot import file_sha256
+
         decision_id = gs.append_engine_decision_record(
             conn, generation=generation,
-            manager_packet_sha256="sha256:" + "a" * 64,
-            request_sha256="sha256:" + "b" * 64,
+            manager_packet_sha256=gs.packet_identity(packet),
+            request_sha256=gs.request_identity(
+                planning_event=5, horizon_kind=gs.HORIZON_KIND_FOUR_GW, cutoff=CUTOFF, request=request,
+            ),
             result_sha256=gs.result_identity_of(artifact),
-            runner_identity="test", evidence={"schema": gs.DECISION_RECORD_SCHEMA},
+            runner_identity="test", evidence={
+                "schema": gs.DECISION_RECORD_SCHEMA,
+                "runner_identity": "test",
+                "runner_code_identity": runner_code_identity,
+                "decision_artifact_file_sha256": file_sha256(artifact_path),
+            },
             decision_artifact_ref=str(artifact_path),
         )
         conn.commit()
@@ -649,8 +680,15 @@ def test_success_generation_verify_and_decision_verify_pass(tmp_path):
         assert verified["generation_verified"] is True
         assert verified["record_digest_recomputed"] is True
         assert verified["decision_artifact"] == "VERIFIED"
+        # Every digest is REPRODUCED from the retained artifact, not asserted.
+        assert verified["manager_packet_digest_verified"] is True
+        assert verified["manager_context_digest_verified"] is True
+        assert verified["request_digest_verified"] is True
+        assert verified["result_digest_verified"] is True
+        assert verified["runner_identity_verified"] is True
+        assert verified["runner_code_identity_bound"] is True
         # The verifier REPORTS its replay boundary instead of inventing determinism.
-        assert verified["replay_boundary"] == "DECISION_ARTIFACT_RE_EXECUTED_AND_BYTE_VERIFIED"
+        assert verified["replay_boundary"] == "DECISION_REPLAY_NOT_PERFORMED"
 
         with pytest.raises(gs.GenerationRefused) as unknown:
             gs.verify_decision(conn, "sha256:" + "9" * 64)
@@ -665,11 +703,45 @@ def test_success_generation_verify_and_decision_verify_pass(tmp_path):
         conn.close()
 
 
-def test_success_pe8_evidence_participates_without_promotion():
+def test_success_pe8_evidence_participates_without_promotion(tmp_path):
     conn, runs = _world()
     try:
-        calibration = _calibration(runs_by_event=runs)
-        generation = _generation(conn, runs, calibration=calibration)
+        snapshot = gf.write_snapshot(tmp_path / "pe8-snapshot.db", database=conn)
+        bundle_identities = {
+            str(event): cb.certified_bundle_from_explicit_ids(
+                conn,
+                event=int(event),
+                cutoff=CUTOFF,
+                runs=runs[int(event)],
+                required_versions=VERSIONS,
+                data_snapshot_sha256=snapshot["sha256"],
+                code_snapshot_sha256=CODE_SNAPSHOT,
+            ).bundle_identity()
+            for event in HORIZON
+        }
+        calibration = _calibration(
+            runs_by_event=runs,
+            certification_identity=fg.certification_identity_of(
+                {
+                    "planning_cutoff": CUTOFF,
+                    "certified_bundle_identity": bundle_identities,
+                    "data_snapshot_sha256": snapshot["sha256"],
+                }
+            ),
+        )
+        calibration_ref = Path(snapshot["path"]).with_name("pe8-calibration.json")
+        calibration_ref.write_text(json.dumps(calibration), encoding="utf-8")
+        generation = gs.certify_generation(
+            conn,
+            planning_event=5,
+            cutoff=CUTOFF,
+            runs_by_event=runs,
+            events=HORIZON,
+            snapshot=snapshot,
+            calibration=calibration,
+            calibration_artifact_ref=calibration_ref,
+            require_calibration=True,
+        )
         evidence = generation.manifest["pe8_evidence"]
         assert evidence["consulted"] is True
         assert evidence["identity"] == cb.calibration_identity(calibration)
@@ -681,6 +753,27 @@ def test_success_pe8_evidence_participates_without_promotion():
         assert generation.manifest["disclosure"]["resolution"] == "NOT_ATTEMPTED"
         assert cb.CONTINUOUS_PROXY_TIE_LIMITATION in generation.manifest["disclosure"]["carried"]
         assert generation.manifest["horizon_state"] == fg.DECISION_HORIZON_COMPLETE
+        verified = gs.verify_generation(conn, generation.generation_id)
+        assert verified["pe8_evidence_artifact_digest_verified"] is True
+        assert verified["pe8_evidence_refs_reproduce"] is True
+        wrong_world = {**calibration, "identity": {**calibration["identity"]}}
+        wrong_world["identity"]["certification_identity"] = "sha256:" + "f" * 64
+        wrong_ref = tmp_path / "pe8-calibration-wrong-world.json"
+        wrong_ref.write_text(json.dumps(wrong_world), encoding="utf-8")
+        with pytest.raises(cb.CertificationRefused) as mismatch:
+            gs.certify_generation(
+                conn,
+                planning_event=5,
+                cutoff=CUTOFF,
+                runs_by_event=runs,
+                events=HORIZON,
+                snapshot=snapshot,
+                calibration=wrong_world,
+                calibration_artifact_ref=wrong_ref,
+                require_calibration=True,
+            )
+        assert mismatch.value.token == cb.DIAG_CALIBRATION_WORLD_MISMATCH
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 1
     finally:
         conn.close()
 

@@ -32,6 +32,7 @@ from fpl_brain import (
     execution,
     execution_snapshot,
     four_gw_decision as fg,
+    generation_store as gs,
     history_completeness as hc,
 )
 from fpl_brain.config import config_path, load_config
@@ -125,6 +126,98 @@ def decide_search_permission(
         detail = history_completeness.get("reasons") or []
         reasons.append(blocker if not detail else f"{blocker} ({', '.join(str(item) for item in detail)})")
     return (not reasons), reasons
+
+
+def certified_bundle_runs(conn, *, event: int, cutoff: str) -> dict[str, int]:
+    """The run ids this event's certification consumes, proved coherent.
+
+    latest-per-family only PROPOSES a bundle; the canonical validators then prove the
+    dependency edges actually agree, which is what "latest" cannot do.  The declared
+    model versions are applied by those validators from the ONE declared source, so a
+    run from an unexpected version is refused with ``UNSUPPORTED_MODEL_VERSION``
+    instead of certifying.
+    """
+
+    rows = conn.execute(
+        "SELECT model_family, id FROM projection_runs WHERE planning_event=?"
+        " AND data_cutoff=? AND model_family IN"
+        " ('minutes_v1','team_strength_v1','player_rates_v1','xpts_v1','monte_carlo_v1')"
+        " ORDER BY id DESC",
+        (int(event), str(cutoff)),
+    ).fetchall()
+    runs: dict[str, int] = {}
+    for row in rows:
+        runs.setdefault(str(row["model_family"]), int(row["id"]))
+    return runs
+
+
+def certify_generation_under_lease(
+    conn,
+    *,
+    controller,
+    events: Sequence[int],
+    cutoff: str,
+    snapshot: Any,
+    per_event: Mapping[str, Any],
+    calibration: Mapping[str, Any] | None = None,
+    calibration_artifact_ref: str | Path | None = None,
+    require_calibration: bool = False,
+) -> tuple[dict[str, dict], dict[str, str], dict[str, str], Any]:
+    """Certify the horizon and persist ONE generation, under the run's leases.
+
+    Returns ``(certified_bundles, bundle_identities, required_versions, generation)``.
+    This is the PE-9 §8 lifecycle driven by the EXISTING controller: the writer lease
+    is held by this run (the store refuses otherwise), the pinned snapshot and the
+    authoritative code identity are validated by the store rather than asserted here,
+    and the generation/pointer transaction commits only after every gate passed.
+    """
+
+    required_versions = certified_bundle.declared_required_versions()
+    certified: dict[str, dict] = {}
+    bundle_identity: dict[str, str] = {}
+    for event in events:
+        record = per_event.get(str(event)) or {}
+        if not record.get("certified"):
+            continue
+        runs = certified_bundle_runs(conn, event=int(event), cutoff=str(cutoff))
+        bundle = certified_bundle.certified_bundle_from_explicit_ids(
+            conn, event=int(event), cutoff=str(cutoff), runs=runs,
+            required_versions=required_versions,
+            data_snapshot_sha256=snapshot.data_snapshot_sha256,
+            # The code identity is recorded ON the bundle payload as well as derived
+            # by the generation store, so the identity a consumer recomputes from the
+            # stored payload is exactly the one minted here.
+            code_snapshot_sha256=analytics.source_snapshot_sha256(),
+        )
+        certified[str(event)] = bundle.as_dict()
+        bundle_identity[str(event)] = bundle.bundle_identity()
+
+    runs_by_event = {
+        int(event): {str(family): int(run) for family, run in (row.get("runs") or {}).items()}
+        for event, row in certified.items()
+    }
+    generation = gs.certify_generation(
+        conn,
+        planning_event=int(events[0]),
+        cutoff=str(cutoff),
+        events=[int(event) for event in events],
+        runs_by_event=runs_by_event,
+        # The PINNED snapshot the run replaced: the store re-hashes the bytes and
+        # refuses a digest that does not reproduce, so the generation commits to the
+        # source it actually used.
+        snapshot={
+            "path": snapshot.path,
+            "sha256": snapshot.data_snapshot_sha256,
+            "size_bytes": snapshot.size_bytes,
+            "source_db_identity": snapshot.source_db_identity,
+            "execution_run_uuid": snapshot.execution_run_uuid,
+        },
+        calibration=calibration,
+        calibration_artifact_ref=calibration_artifact_ref,
+        require_calibration=bool(require_calibration),
+        controller=controller,
+    )
+    return certified, bundle_identity, required_versions, generation
 
 
 def certified_horizon_status(conn, artifact, events, cutoff) -> str:
@@ -249,7 +342,35 @@ def main(argv: list[str] | None = None) -> int:
                         help="horizon budget for GW6-8 (same gates, smaller draw budget)")
     parser.add_argument("--config")
     parser.add_argument("--out", default=str(OUT_DIR / "gw5_gw8_certification.json"))
+    parser.add_argument(
+        "--pe8-calibration",
+        help="optional retained PE-8 calibration artifact to bind to this exact generation",
+    )
+    parser.add_argument(
+        "--require-pe8-calibration",
+        action="store_true",
+        help="refuse certification unless a matching retained PE-8 artifact is supplied",
+    )
     args = parser.parse_args(argv)
+
+    calibration = None
+    calibration_artifact_ref = None
+    if args.pe8_calibration:
+        calibration_artifact_ref = Path(args.pe8_calibration)
+        try:
+            calibration = json.loads(calibration_artifact_ref.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as failure:
+            print(f"certification refused: PE-8 artifact cannot be read: {failure}", file=sys.stderr)
+            return 2
+        if not isinstance(calibration, Mapping):
+            print("certification refused: PE-8 artifact root must be an object", file=sys.stderr)
+            return 2
+    if args.require_pe8_calibration and calibration is None:
+        print(
+            "certification refused: --require-pe8-calibration needs --pe8-calibration",
+            file=sys.stderr,
+        )
+        return 2
 
     events = [int(part) for part in str(args.events).split(",") if part.strip()]
     if events != [5, 6, 7, 8]:
@@ -402,10 +523,61 @@ def main(argv: list[str] | None = None) -> int:
                 "certified": True,
             }
             print(f"GW{event} certified fresh at cutoff {effective_cutoff}")
+
+        # --- PE-9: certify the horizon INTO the generation store ----------------
+        # The generation is written UNDER the run's writer lease, inside the run,
+        # because a certified generation is production evidence: it must belong to
+        # the run that produced it, and validation plus the generation/pointer
+        # transaction must not interleave with another writer.  A generation row
+        # exists only when certification passed, so a failure here leaves the run
+        # FAILED with no generation and the old pointer.
+        with controller.stage("CERTIFY_GENERATION", detail={"events": list(events)}):
+            controller.check_cancel()
+            certified, bundle_identity, required_versions, generation = certify_generation_under_lease(
+                conn,
+                controller=controller,
+                events=events,
+                cutoff=effective_cutoff,
+                snapshot=snapshot,
+                per_event=per_event,
+                calibration=calibration,
+                calibration_artifact_ref=calibration_artifact_ref,
+                require_calibration=args.require_pe8_calibration,
+            )
+        document["generation_id"] = generation.generation_id
+        document["generation_manifest_sha256"] = generation.generation_id
+        print(
+            f"PE-9 certified generation: id={generation.generation_id[:24]}… "
+            f"events={list(generation.events)} snapshot={str(generation.snapshot.get('sha256'))[:16]}…"
+        )
     except execution.RunCancelled:
         controller.acknowledge_cancel()
         document["status"] = "CANCELLED"
         raise
+    except certified_bundle.BundleIncoherent as failure:
+        # A bundle that cannot be certified is RECORDED and reported, exactly as
+        # before: the run is FAILED and no generation is written.
+        controller.finish(execution.RUN_FAILED, f"BundleIncoherent: {'; '.join(failure.reasons)}")
+        document["status"] = "FAILED"
+        document["predictive_bundle_status"] = certified_bundle.DIAG_PREDICTIVE_BUNDLE_INCOHERENT
+        document["predictive_bundle_reasons"] = failure.reasons
+        document["route_search_permitted"] = False
+        Path(args.out).write_text(
+            json.dumps(document, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"
+        )
+        print(f"certification refused: {failure}", file=sys.stderr)
+        conn.close()
+        return 2
+    except (gs.GenerationRefused, certified_bundle.CertificationRefused) as failure:
+        controller.finish(execution.RUN_FAILED, str(failure))
+        document["status"] = "FAILED"
+        document["certification_refusal"] = str(failure)
+        Path(args.out).write_text(
+            json.dumps(document, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"
+        )
+        print(f"certification refused: {failure}", file=sys.stderr)
+        conn.close()
+        return 2
     except BaseException as exc:
         controller.finish(execution.RUN_FAILED, f"{type(exc).__name__}: {exc}")
         document["status"] = "FAILED"
@@ -418,58 +590,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         controller.finish(execution.RUN_COMPLETE)
 
-    # Post-run: certify each event's families as ONE coherent predictive bundle and
-    # record the certified bundle identity for the decision engine to consume.
-    certified: dict[int, dict] = {}
-    bundle_identity: dict[int, str] = {}
-    required_versions = certified_bundle.declared_required_versions()
     # ONE code fingerprint for the artifact and for every bundle payload (the same
-    # value ``build_certification_artifact`` records), so the certified identity a
-    # consumer recomputes from the payload matches the one recorded here.
+    # value the generation store derives internally), so the identity a consumer
+    # recomputes from the payload matches the one recorded here.
     certification_code_snapshot = analytics.source_snapshot_sha256()
-    try:
-        for event in events:
-            record = per_event.get(str(event)) or {}
-            if not record.get("certified"):
-                continue
-            rows = conn.execute(
-                "SELECT model_family, id FROM projection_runs WHERE planning_event=?"
-                " AND data_cutoff=? AND model_family IN"
-                " ('minutes_v1','team_strength_v1','player_rates_v1','xpts_v1','monte_carlo_v1')"
-                " ORDER BY id DESC",
-                (event, effective_cutoff),
-            ).fetchall()
-            # latest-per-family is only used to PROPOSE a bundle; validation then
-            # proves the edges actually agree, which is what "latest" cannot do.
-            runs: dict[str, int] = {}
-            for row in rows:
-                runs.setdefault(str(row["model_family"]), int(row["id"]))
-            bundle = certified_bundle.certified_bundle_from_explicit_ids(
-                conn, event=event, cutoff=effective_cutoff, runs=runs,
-                # PE-9: every certification call site supplies the required model
-                # versions from the ONE declared source, so a run from an unexpected
-                # version is refused with UNSUPPORTED_MODEL_VERSION instead of
-                # certifying silently.
-                required_versions=required_versions,
-                data_snapshot_sha256=snapshot.data_snapshot_sha256,
-                # The code identity is recorded ON the bundle payload as well as on
-                # the artifact, so the identity the consumer recomputes from the
-                # stored payload is exactly the one minted here.
-                code_snapshot_sha256=certification_code_snapshot,
-            )
-            certified[str(event)] = bundle.as_dict()
-            bundle_identity[str(event)] = bundle.bundle_identity()
-    except certified_bundle.BundleIncoherent as failure:
-        document["status"] = "FAILED"
-        document["predictive_bundle_status"] = certified_bundle.DIAG_PREDICTIVE_BUNDLE_INCOHERENT
-        document["predictive_bundle_reasons"] = failure.reasons
-        document["route_search_permitted"] = False
-        Path(args.out).write_text(
-            json.dumps(document, indent=2, sort_keys=True, default=str) + chr(10), encoding="utf-8"
-        )
-        print(f"certification refused: {failure}", file=sys.stderr)
-        conn.close()
-        return 2
 
     document["status"] = "COMPLETE"
     document["predictive_bundle_status"] = "PREDICTIVE_BUNDLE_COHERENT"
