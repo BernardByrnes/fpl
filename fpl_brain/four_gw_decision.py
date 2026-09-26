@@ -691,14 +691,14 @@ def validate_certification_artifact(payload: Mapping[str, Any]) -> Mapping[str, 
 
 
 def load_certification_artifact(path: str | Path) -> Any:
-    """Load and validate a certification artifact produced by the certifier.
+    """Load and validate a HISTORICAL certification artifact produced by the certifier.
 
-    The ONE production loader: it reads the artifact's bytes, applies the complete
-    authorization contract (:func:`validate_certification_artifact`) and returns the
-    IMMUTABLE validated value -- the authorisation a predictive load consumes, whose
-    identity is recomputed from those bytes.  A raw mapping is not an authorisation,
-    so returning the payload itself would leave every caller free to present an
-    artifact-shaped mapping the contract never saw.
+    It reads the artifact's bytes and applies the complete artifact contract
+    (:func:`validate_certification_artifact`).  The value returned is a PLAIN
+    mapping: under PE-9 amendment 2 the authority for a predictive load is a
+    persisted, content-addressed GENERATION (:mod:`fpl_brain.generation_store`), not
+    a caller-carried object, so nothing here is a capability and no production
+    predictive boundary is gated on the result.
     """
 
     import json
@@ -713,8 +713,7 @@ def load_certification_artifact(path: str | Path) -> Any:
         payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     except Exception as exc:  # malformed artifact must not be silently ignored
         raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
-    validate_certification_artifact(payload)
-    return cb.validate_certification_artifact(payload)
+    return validate_certification_artifact(payload)
 
 
 def canonical_event_horizon(values: Iterable[Any] | None) -> tuple[int, ...]:
@@ -815,12 +814,12 @@ def event_support_from_certification(
         conn,
         selected,
         cutoff=cutoff,
-        # The required model versions come from the ONE declared source, carried on
-        # the artifact by the certifier.  An artifact that declares none (a
-        # grandfathered legacy certification) simply does not pin versions, which is
-        # the same explicit, auditable posture the history-completeness contract
-        # uses -- never "the check silently did not run".
-        required_versions=certification.get("required_model_versions") or None,
+        # PE-9 gap 1: the required model versions come from the ONE declared
+        # IN-LIBRARY source and NEVER from the artifact.  Reading the artifact's own
+        # record made the caller authoritative: an artifact that declared a relaxed or
+        # absent pin would have silently un-pinned the certification.  The artifact's
+        # record is no longer consulted here at all.
+        required_versions=cb.declared_required_versions(),
         data_snapshot_sha256=certification.get("data_snapshot_sha256"),
     )
 
@@ -910,8 +909,10 @@ def event_support_from_db(
     Per-event predictive support derived from accepted projection runs, choosing
     the NEWEST same-cutoff run per family.  That silently lets a later rerun of
     one family replace the certified one, and it validates no dependency edges,
-    so it must NOT be used for a production decision.  Production must consume a
-    certification artifact via :func:`event_support_from_certification`.
+    so it must NOT be used for a production decision.  Production readiness
+    resolves the certified GENERATION instead
+    (:func:`generation_store.resolve_generation` / :func:`generation_store.support_by_event`)
+    and refuses when no generation is selected.
     """
 
     support: dict[int, dict[str, Any]] = {}

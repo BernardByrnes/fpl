@@ -70,11 +70,6 @@ def _non_production(provider):
     )
 
 
-def _bundles(events=EVENTS, simulations=6):
-    return {event: rc.EventBundle(event=event, minutes_run_id=1, team_run_id=1, rate_run_id=1,
-                                  xpts_run_id=1, mc_run_id=1, simulations=simulations) for event in events}
-
-
 def _state(*, event=4, bank=0, ft=1):
     players = tuple(ts.RoutePlayer(pid, POSITION[pid], CLUB[pid], 50) for pid in SQUAD_IDS)
     return ts.RouteState(event=event, players=players, bank_tenths=bank, free_transfers=ft)
@@ -106,7 +101,7 @@ def _compare(routes, *, matrices=None, events=EVENTS, state=None, scenario=None,
     matrices = matrices or {event: _matrix(event) for event in events}
     provider, calls = _provider(matrices)
     result = rc.compare_routes(
-        bundles=_bundles(events), routes=routes, initial_state=state or _state(ft=ft),
+        events=events, routes=routes, initial_state=state or _state(ft=ft),
         scenario=scenario or _scenario(events), player_meta=META,
         non_production_worlds=ro.NonProductionWorlds(
             declaration="test_route_comparator: synthetic deterministic matrices, no prediction run",
@@ -272,7 +267,7 @@ def test_same_squad_event_is_cached():
 def test_policy_choice_does_not_alter_football_worlds():
     matrices = {event: _matrix(event) for event in [4, 5]}
     provider, calls = _provider(matrices)
-    rc.compare_routes(bundles=_bundles([4, 5]),
+    rc.compare_routes(events=[4, 5],
                       routes=[_route("a", _roll_steps([4, 5])), _route("b", [(4, [(11, 41)]), (5, [])])],
                       initial_state=_state(), scenario=_scenario([4, 5]), player_meta=META,
                       non_production_worlds=_non_production(provider), simulations=6)
@@ -288,7 +283,7 @@ def test_routes_consume_same_event_world_matrix():
     matrices = {event: _matrix(event) for event in [4, 5]}
     provider, calls = _provider(matrices)
     routes = [_route("a", _roll_steps([4, 5])), _route("b", _roll_steps([4, 5])), _route("c", _roll_steps([4, 5]))]
-    result = rc.compare_routes(bundles=_bundles([4, 5]), routes=routes, initial_state=_state(),
+    result = rc.compare_routes(events=[4, 5], routes=routes, initial_state=_state(),
                                scenario=_scenario([4, 5]), player_meta=META,
                                non_production_worlds=_non_production(provider), simulations=6)
     assert calls["count"] == 2  # one per event, shared by 3 routes
@@ -299,10 +294,10 @@ def test_changing_transfer_sequence_does_not_alter_football_universe():
     matrices = {event: _matrix(event) for event in [4, 5, 6]}
     provider_a, calls_a = _provider(matrices)
     provider_b, calls_b = _provider(matrices)
-    rc.compare_routes(bundles=_bundles([4, 5, 6]), routes=[_route("a", _roll_steps([4, 5, 6]))],
+    rc.compare_routes(events=[4, 5, 6], routes=[_route("a", _roll_steps([4, 5, 6]))],
                       initial_state=_state(), scenario=_scenario([4, 5, 6]), player_meta=META,
                       non_production_worlds=_non_production(provider_a), simulations=6)
-    rc.compare_routes(bundles=_bundles([4, 5, 6]),
+    rc.compare_routes(events=[4, 5, 6],
                       routes=[_route("a", [(4, [(11, 41)]), (5, []), (6, [])])],
                       initial_state=_state(), scenario=_scenario([4, 5, 6]), player_meta=META,
                       non_production_worlds=_non_production(provider_b), simulations=6)

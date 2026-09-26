@@ -4,6 +4,11 @@
 Read/evaluate/interpret only.  Reuses accepted artifacts and the existing 10,000-draw
 GW4 world cache.  No model/architecture change, no search, no predictive run, no
 world regeneration, no chip, no execution.
+
+PE-9: the run ids are read from the CERTIFIED GENERATION's digest-verified manifest
+rather than from a hardcoded table, and the generation must be the certified world at
+the accepted planning cutoff.  The drill therefore cannot score a world that was not
+certified, and cannot silently construct an alternate predictive world.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import candidate_universe as cu
 from fpl_brain import final_acceptance as fa
+from fpl_brain import generation_store as gs
 from fpl_brain import manager_lineup as ml, manager_worlds
 from fpl_brain import route_comparator as rc, route_optimizer as ro
 from fpl_brain import transfer_state as ts
@@ -32,17 +38,15 @@ EPS = 1e-9
 ACCEPTED_DB_SHA = "36dd214d9f726a118fad2ad3a52c62e22e09544ce2dda2e90f4fa8d5cc1bdcd2"
 
 
-def _bundle(event):
-    runs = {4: (64, 65, 67, 70, 71), 5: (80, 81, 83, 86, 87), 6: (88, 89, 91, 94, 95)}[event]
-    return rc.EventBundle(event=event, minutes_run_id=runs[0], team_run_id=runs[1], rate_run_id=runs[2],
-                          xpts_run_id=runs[3], mc_run_id=runs[4], simulations=GW4_DRAWS, seed=20260911,
-                          planning_cutoff=PLANNING_CUTOFF)
-
-
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gw", type=int, default=4)
     parser.add_argument("--config")
+    parser.add_argument(
+        "--generation", default=None,
+        help="explicit certified generation id SELECTOR.  Omit to resolve the current_generation "
+             "pointer for this event",
+    )
     parser.add_argument("--cache-dir", default="data/cache/manager_worlds")
     args = parser.parse_args(argv)
     config = load_config(args.config)
@@ -61,6 +65,21 @@ def main(argv=None) -> int:
         phase8c = json.loads((exports / "final_acceptance" / f"gw{int(args.gw):02d}" /
                               "final_acceptance.json").read_text(encoding="utf-8"))
         route_level = {r["canonical_signature"]: r for r in phase8c["finalists"]}
+        # PE-9: the certified generation is the ONLY source of predictive run ids.
+        try:
+            generation = gs.resolve_generation(
+                conn, planning_event=int(args.gw), generation_id=args.generation
+            )
+        except gs.GenerationRefused as refusal:
+            print(f"live fire failed: {refusal}", file=sys.stderr)
+            return 6
+        gs.require_snapshot_retained(generation)
+        gs.assert_generation_bundles_valid(conn, generation)
+        if str(generation.cutoff) != PLANNING_CUTOFF:
+            print(f"LIVE_FIRE_CUTOFF_MISMATCH: the certified generation is at cutoff "
+                  f"{generation.cutoff}, not the accepted {PLANNING_CUTOFF}; refusing to score a "
+                  "different predictive world.", file=sys.stderr)
+            return 6
         rows = {int(r["player_id"]): r for r in universe["universe"]}
         def feature(pid, event, field):
             for f in rows[int(pid)]["events"]:
@@ -114,14 +133,19 @@ def main(argv=None) -> int:
         gw4_config = ro.OptimizerConfig(events=EVENTS, search_draws=GW4_DRAWS, seed=20260911,
                                         policy_selection_worlds=0)
         # Guard BEFORE any simulation: the accepted 10k cache must already exist
-        # for this exact key.  Never let build_event_worlds regenerate.
-        gw4_key = ro.world_cache_key(event=4, bundle=_bundle(4), config=gw4_config, union_ids=union)
+        # for this exact key.  Never let build_event_worlds regenerate.  The key IS
+        # the certified generation's identity for these exact run ids.
+        gw4_runs = generation.runs_for(4)
+        gw4_key = ro.world_cache_key(
+            event=4, generation_id=generation.generation_id, runs=gw4_runs,
+            config=gw4_config, union_ids=union,
+        )
         gw4_cache_path = Path(args.cache_dir) / f"{gw4_key}.json"
         if not gw4_cache_path.exists():
             print("LIVE_FIRE_SCOPE_EXPANSION_REQUIRED: the accepted 10k GW4 cache key was not found; "
                   "refusing to regenerate football worlds.", file=sys.stderr)
             return 6
-        gw4_worlds, gw4_info = ro.build_event_worlds(conn, {4: _bundle(4)}, 4, union, gw4_config,
+        gw4_worlds, gw4_info = ro.build_event_worlds(conn, generation, 4, union, gw4_config,
                                                      cache_dir=Path(args.cache_dir))
         if gw4_info.get("source") != "cache":
             print("LIVE_FIRE_SCOPE_EXPANSION_REQUIRED: the accepted 10k GW4 cache key was not found; "

@@ -30,6 +30,7 @@ from fpl_brain import analytics, candidate_universe as cu, decision_confidence a
 from fpl_brain import finalist_refinement as fr
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import certified_bundle
+from fpl_brain import generation_store as gs
 from fpl_brain import manager_worlds, route_optimizer as ro, transfer_state as ts
 from fpl_brain import execution
 from fpl_brain import ingest_provenance as provenance
@@ -225,44 +226,20 @@ def _money(tenths) -> str:
     return "n/a" if tenths is None else f"£{int(tenths) / 10:.1f}m"
 
 
-def bundle_for(event: int, runs: dict, cutoff: str, draws: int, *, conn=None, certification: dict | None = None):
-    """The CERTIFIED bundle for one event, carrying its provenance.
+def bundle_for(event: int, generation, draws: int, seed: int = SEED):
+    """The CERTIFIED bundle for one event, derived from the certified GENERATION.
 
-    The run ids come from the certification artifact, and so do the model versions
-    the bundle DECLARES: the artifact's recorded versions are declared here, and the
-    canonical identity is computed by the one shared algorithm.  A bundle that
-    cannot declare both is refused by the loader rather than simulated, so this is
-    also where the exact certified generation is proved against the artifact.
+    The run ids, the model versions and the identity all come from the generation's
+    digest-verified manifest, through the ONE shared constructor -- so this is a plain
+    data carrier for the frozen search, not an authorisation, and there is no path by
+    which a caller's own run ids could be substituted.
     """
 
-    from fpl_brain import certified_bundle as cb
     from fpl_brain import route_comparator as rc
 
-    artifact = dict(certification or {})
-    certified = (artifact.get("certified_bundles") or {}).get(str(int(event))) or {}
-    versions = dict(certified.get("model_versions") or {}) or dict(
-        artifact.get("required_model_versions") or {}
+    return rc.event_bundle_from_generation(
+        generation, int(event), simulations=int(draws), seed=int(seed)
     )
-    bundle = rc.certified_event_bundle(
-        event=int(event),
-        runs=runs,
-        cutoff=cutoff,
-        model_versions=versions,
-        simulations=int(draws),
-        seed=SEED,
-        code_snapshot_sha256=certified.get("code_snapshot_sha256")
-        or artifact.get("code_snapshot_sha256"),
-        data_snapshot_sha256=certified.get("data_snapshot_sha256")
-        or artifact.get("data_snapshot_sha256"),
-        planning_context_hash=certified.get("planning_context_hash"),
-    )
-    # The LOADED artifact is passed on, not the copy made above for reading: a copy is
-    # a raw mapping again and would only be revalidated at the boundary, while the
-    # loaded value is the authorisation itself.
-    cb.assert_event_bundle_certified(
-        conn, bundle, event=int(event), certification=certification or artifact or None
-    )
-    return bundle
 
 
 def draws_for(event: int, decision_events) -> int:
@@ -273,32 +250,28 @@ def draws_for(event: int, decision_events) -> int:
     return STAGE1_DRAWS
 
 
-def _certification_events(path) -> list[int] | None:
-    """Read the certified decision events from an artifact WITHOUT validating it.
+def resolve_decision_generation(conn, *, planning_event: int, generation_id: str | None):
+    """Resolve and re-prove the certified GENERATION this decision consumes.
 
-    Used only to resolve the authoritative planning event before the execution
-    guard exists.  Full validation still happens through
-    ``four_gw_decision.load_certification_artifact`` on the decision path.
+    Resolution, digest verification, event/horizon/cutoff checks, snapshot retention
+    and the full per-event bundle re-validation all happen inside the generation store,
+    so the runner cannot obtain a world by a route the boundary has not authorised.
     """
 
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    events = payload.get("events") or []
-    try:
-        resolved = [int(event) for event in events]
-    except (TypeError, ValueError):
-        return None
-    return resolved or None
+    generation = gs.resolve_generation(
+        conn, planning_event=int(planning_event), generation_id=generation_id,
+    )
+    gs.require_snapshot_retained(generation)
+    gs.assert_generation_bundles_valid(conn, generation)
+    return generation
 
 
-def _certified_role_evidence(conn, certified_runs, player_ids, decision_events, certification):
+def _certified_role_evidence(conn, certified_runs, player_ids, decision_events, generation):
     """Role evidence from the CERTIFIED minutes runs ONLY (R4B.2c).
 
     Reads the frozen MINUTES_V1 payloads of the exact minutes run ids named by the
-    certification bundles.  It never reads the latest minutes run, live scouting, or
-    any post-certification role evidence.
+    certified generation's manifest.  It never reads the latest minutes run, live
+    scouting, or any post-certification role evidence.
     """
 
     minutes_run_ids = sorted(
@@ -318,7 +291,7 @@ def _certified_role_evidence(conn, certified_runs, player_ids, decision_events, 
             if isinstance(block, dict):
                 evidence[pid] = block
     source = {
-        "certification_identity": certification.get("four_gw_certification_identity"),
+        "generation_id": generation.generation_id,
         "minutes_run_ids": minutes_run_ids,
         "player_ids": sorted(int(p) for p in player_ids),
         "provenance": "certified_minutes_run_only",
@@ -333,9 +306,14 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--event",
         type=int,
+        required=True,
+        help="planning Gameweek.  Required: there is no default Gameweek.",
+    )
+    parser.add_argument(
+        "--generation",
         default=None,
-        help="planning Gameweek. Omit to derive it from the certification artifact (authoritative); "
-             "if supplied it must match the certification's first event",
+        help="explicit certified generation id SELECTOR.  Omit to resolve the "
+             "current_generation pointer for this event",
     )
     parser.add_argument("--cutoff", required=True)
     parser.add_argument("--cache-dir", default="data/cache/manager_worlds")
@@ -359,16 +337,11 @@ def main(argv=None) -> int:
              "reports the count that actually ran.",
     )
     parser.add_argument(
-        "--certification",
-        help="path to the authoritative certification artifact (REQUIRED for --stage search|all)",
-    )
-    parser.add_argument(
-        "--calibration",
-        help="optional path to a PE-8 calibration evidence artifact.  PE-9 CONSULTS it at the "
-             "certification boundary: its identity, cutoff and per-event run ids must belong to the "
-             "certified bundle, and its evidence states are recorded.  Omitting it does not refuse the "
-             "decision -- it means no calibration claim is made, which is reported as EVIDENCE_LIMITED "
-             "rather than presented as a clean result.",
+        "--escalation-cache-dir",
+        default=None,
+        help="content-addressed world cache the stability escalation re-reads.  The cache is "
+             "OPTIMIZATION only: keyed on the certified generation, so a cold cache rebuilds the "
+             "same worlds rather than changing the answer.",
     )
     args = parser.parse_args(argv)
 
@@ -376,30 +349,10 @@ def main(argv=None) -> int:
     config = load_config(args.config)
 
     # --- Event safety -------------------------------------------------------
-    # The certification artifact is AUTHORITATIVE for the planning event.  There
-    # is deliberately no GW4 default: omitting --event without a certification is
-    # an error, and a supplied --event that contradicts the certification is a
-    # hard stop (DECISION_EVENT_MISMATCH).
-    cert_events = _certification_events(args.certification) if args.certification else None
-    if args.event is None:
-        if not cert_events:
-            print(
-                "decision refused: --event is required when no readable --certification artifact is "
-                "supplied (there is no default Gameweek)",
-                file=sys.stderr,
-            )
-            return 2
-        planning_event = int(cert_events[0])
-    else:
-        planning_event = int(args.event)
-        if cert_events and int(cert_events[0]) != planning_event:
-            print(
-                f"decision refused: {DIAG_DECISION_EVENT_MISMATCH}: --event {planning_event} does not "
-                f"match the certification's first event {int(cert_events[0])}; the certification is "
-                "authoritative",
-                file=sys.stderr,
-            )
-            return 2
+    # There is deliberately no GW4 default: the planning event is supplied by the
+    # operator and the certified GENERATION must agree with it, or the decision is
+    # refused (DECISION_EVENT_MISMATCH).
+    planning_event = int(args.event)
 
     conn = connect_database(config_path(config, "database"))
     entered_guard = None
@@ -430,12 +383,21 @@ def main(argv=None) -> int:
         squad = manager_worlds.resolve_squad(context, conn)
         initial_state = __import__("fpl_brain.route_comparator", fromlist=["x"]).build_route_state(conn, context, squad)
 
-        # --- Stage A: coherence of the four-event predictive bundle -----------
-        # NON-PRODUCTION readiness display only.  This legacy path picks the newest
-        # same-cutoff run per family and validates no dependency edges, so it is
-        # used for the readiness PRINT and never for the production decision below.
-        support = fg.event_support_from_db(conn, decision_events, cutoff)
-        print("readiness support source: NON-PRODUCTION latest-per-family rediscovery")
+        # --- Stage A: readiness, resolved from the CERTIFIED GENERATION ----------
+        # PE-9 gap 3: readiness resolves the certified generation/pointer.  The
+        # latest-per-family rediscovery is NOT the readiness source any more; it is
+        # kept only as an explicitly labelled NON-PRODUCTION diagnostic below.
+        try:
+            readiness_generation = resolve_decision_generation(
+                conn, planning_event=planning_event, generation_id=args.generation,
+            )
+        except (gs.GenerationRefused, certified_bundle.CertificationRefused) as failure:
+            print(f"decision refused: {failure}", file=sys.stderr)
+            return _refuse_execution(guard, 6, str(failure))
+        support = gs.support_by_event(readiness_generation)
+        print(
+            f"readiness support source: certified generation {readiness_generation.generation_id[:24]}…"
+        )
         horizon = fg.evaluate_horizon(planning_event=planning_event, support_by_event=support,
                                       cutoff=cutoff, last_event=last_event)
         bundle_artifact = {
@@ -478,30 +440,35 @@ def main(argv=None) -> int:
             print(f"  readiness complete; artifact={out_dir / 'four_gw_bundle.json'}")
             return 0
 
-        # --- Production decision gate: a certified bundle is MANDATORY ----------
-        # No fallback to latest-per-family discovery.  Without an authoritative
-        # certification artifact this refuses with DECISION_CERTIFICATION_REQUIRED.
-        if not args.certification:
+        # --- Production decision gate: a certified GENERATION is MANDATORY ------
+        # No fallback to latest-per-family discovery.  Without a resolvable certified
+        # generation this refuses: a production decision must consume a persisted,
+        # content-addressed generation, never a caller-supplied bundle mapping.
+        try:
+            generation = resolve_decision_generation(
+                conn, planning_event=planning_event, generation_id=args.generation,
+            )
+        except (gs.GenerationRefused, certified_bundle.CertificationRefused) as failure:
+            print(f"decision refused: {failure}", file=sys.stderr)
+            return _refuse_execution(guard, 6, str(failure))
+        if int(generation.planning_event) != planning_event:
             print(
-                "decision refused: DECISION_CERTIFICATION_REQUIRED: --certification <artifact> is "
-                "required for --stage search|all; a production decision must consume certified run ids",
+                f"decision refused: {DIAG_DECISION_EVENT_MISMATCH}: the certified generation is for "
+                f"GW{generation.planning_event}, not GW{planning_event}",
                 file=sys.stderr,
             )
-            return _refuse_execution(guard, 6, "DECISION_CERTIFICATION_REQUIRED: no artifact supplied")
-        try:
-            certification = fg.load_certification_artifact(args.certification)
-            certified_support = fg.event_support_from_certification(
-                conn, certification, events=decision_events, cutoff=cutoff
+            return _refuse_execution(guard, 6, DIAG_DECISION_EVENT_MISMATCH)
+        if list(generation.events) != [int(event) for event in decision_events]:
+            print(
+                f"decision refused: {DIAG_DECISION_EVENT_MISMATCH}: the certified generation covers "
+                f"{list(generation.events)}, not the decision horizon {list(decision_events)}",
+                file=sys.stderr,
             )
-        except fg.DecisionCertificationRequired as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            return _refuse_execution(guard, 6, str(failure))
-        except certified_bundle.BundleIncoherent as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            return _refuse_execution(guard, 6, str(failure))
+            return _refuse_execution(guard, 6, DIAG_DECISION_EVENT_MISMATCH)
+        certified_support = gs.support_by_event(generation)
         print(
-            f"certified bundles accepted: snapshot={str(certification.get('data_snapshot_sha256'))[:16]}… "
-            f"identity={str(certification.get('four_gw_certification_identity'))[:16]}…"
+            f"certified generation accepted: id={generation.generation_id[:24]}… "
+            f"cutoff={generation.cutoff} snapshot={str(generation.snapshot.get('sha256'))[:16]}…"
         )
         for event in decision_events:
             record = certified_support[int(event)]
@@ -510,10 +477,11 @@ def main(argv=None) -> int:
 
         # --- ONE certified generation, everywhere ------------------------------
         # Discovery/screening, exact evaluation and the decision board must all
-        # describe the SAME certified generation.  The readiness-only `support`
-        # above is a NON-PRODUCTION rediscovery and is never used for the
-        # decision.  The equivalence of the two generations actually consumed is
-        # asserted below, once the bundles exist.
+        # describe the SAME certified generation, and the readiness view above is the
+        # SAME generation, so the two published artifacts cannot describe different
+        # predictive worlds.  The NON-PRODUCTION latest-per-family rediscovery is
+        # still computed as an explicitly labelled DIAGNOSTIC and any divergence is
+        # recorded in the decision provenance.
         certified_runs = {
             int(event): certified_support[int(event)]["matched_runs"] for event in decision_events
         }
@@ -536,8 +504,12 @@ def main(argv=None) -> int:
         # worlds.  A divergence is RECORDED, not fatal: the certified run ids are
         # authoritative, and a newer same-cutoff rerun must never replace them (nor
         # block the decision by merely existing).
+        diagnostic_support = fg.event_support_from_db(conn, decision_events, cutoff)
         readiness_runs = {
-            int(e): {str(f): int(r) for f, r in (support[int(e)].get("matched_runs") or {}).items()}
+            int(e): {
+                str(f): int(r)
+                for f, r in (diagnostic_support[int(e)].get("matched_runs") or {}).items()
+            }
             for e in decision_events
         }
         readiness_divergence = {
@@ -551,7 +523,7 @@ def main(argv=None) -> int:
         }
         if readiness_divergence:
             print(
-                "readiness view reconciled: the NON-PRODUCTION latest-per-family readiness view names a "
+                "readiness diagnostic: the NON-PRODUCTION latest-per-family rediscovery names a "
                 "different generation for "
                 + ", ".join(f"GW{event}" for event in sorted(readiness_divergence))
                 + "; the certified run ids are authoritative and are what this decision consumes"
@@ -563,7 +535,7 @@ def main(argv=None) -> int:
                     f"certified={record['certified_runs']}"
                 )
         else:
-            print("readiness view reconciled: the readiness view names the certified generation for every event")
+            print("readiness diagnostic: the latest-per-family rediscovery agrees with the certified generation")
         search_provenance = {
             "planning_cutoff": cutoff,
             "planning_context_hash": analytics.canonical_hash({
@@ -572,15 +544,20 @@ def main(argv=None) -> int:
                 "cutoff": cutoff,
                 "manager_state": (context.manager_state or {}),
             }),
-            "four_gw_certification_identity": certification.get("four_gw_certification_identity"),
-            "data_snapshot_sha256": certification.get("data_snapshot_sha256"),
+            "generation_id": generation.generation_id,
+            "generation_horizon_kind": generation.horizon_kind,
+            "data_snapshot_sha256": generation.snapshot.get("sha256"),
             "decision_events": list(decision_events),
             "certified_runs_by_event": {str(e): dict(certified_runs[int(e)]) for e in decision_events},
             # The reconciliation itself is persisted, so the readiness artifact and
             # the decision artifact cannot silently disagree about which generation
             # each of them described.
-            "readiness_source": "NON_PRODUCTION_LATEST_PER_FAMILY",
-            "readiness_reconciled_against_certification": True,
+            "readiness_source": "CERTIFIED_GENERATION",
+            "readiness_generation_id": readiness_generation.generation_id,
+            # The latest-per-family rediscovery is retained ONLY as a labelled
+            # diagnostic; it is never a readiness source and never a decision input.
+            "readiness_diagnostic_source": "NON_PRODUCTION_LATEST_PER_FAMILY",
+            "readiness_reconciled_against_generation": True,
             "readiness_generation_divergence": readiness_divergence,
         }
         # The discovery/exact generation identities are added below, once the
@@ -590,9 +567,9 @@ def main(argv=None) -> int:
         import fpl_brain.route_comparator as rc
 
         # SOURCE vs PREDICTION split.  All causal source state comes from the
-        # certification's immutable snapshot; predictive rows come from the live
-        # prediction DB using ONLY the certified exact run ids.
-        source_conn = fg.open_certification_source(certification)
+        # generation's PINNED immutable snapshot; predictive rows come from the live
+        # prediction DB using ONLY the generation's certified exact run ids.
+        source_conn = gs.open_generation_snapshot(generation)
         try:
             source_context = get_planning_context(
                 source_conn, entry_id, planning_event, as_of=cutoff, season=config.get("season")
@@ -604,7 +581,7 @@ def main(argv=None) -> int:
             raise
         if [int(pid) for pid in source_squad["squad_ids"]] != [int(pid) for pid in squad["squad_ids"]]:
             print(
-                "decision refused: the certification snapshot's squad differs from the live squad; "
+                "decision refused: the generation snapshot's squad differs from the live squad; "
                 "the snapshot is the causal source for this decision",
                 file=sys.stderr,
             )
@@ -613,8 +590,7 @@ def main(argv=None) -> int:
 
         bundles = {
             int(event): bundle_for(
-                event, certified_runs[int(event)], cutoff, draws_for(event, decision_events),
-                conn=conn, certification=certification,
+                event, generation, draws_for(event, decision_events),
             )
             for event in decision_events
         }
@@ -679,76 +655,26 @@ def main(argv=None) -> int:
             source_conn.close()
             return _refuse_execution(guard, 6, DIAG_PREDICTIVE_GENERATION_MISMATCH)
 
-        # --- PE-9: certify the horizon and persist the certification result -----
-        # The horizon is certified AS a horizon, from the ONE artifact, over the exact
-        # ids the decision is about to consume.  The result carries the per-bundle
-        # states, the per-event bundle identities and model versions, the code and data
-        # snapshots and the calibration identity consulted, and it is persisted WITH
-        # the decision artifact below -- so what a later reader can verify is the
-        # authorisation, not a narrative about it.
-        calibration_artifact = None
-        if args.calibration:
-            try:
-                calibration_artifact = json.loads(
-                    Path(args.calibration).read_text(encoding="utf-8")
-                )
-            except Exception as failure:
-                print(
-                    f"decision refused: the calibration artifact at {args.calibration} could not be "
-                    f"read: {failure}",
-                    file=sys.stderr,
-                )
-                source_conn.close()
-                return _refuse_execution(guard, 6, "unreadable calibration artifact")
-        try:
-            pe9_certification = certified_bundle.certify_decision_horizon(
-                conn,
-                certification=certification,
-                events=decision_events,
-                cutoff=cutoff,
-                required_versions=certification.get("required_model_versions") or None,
-                calibration=calibration_artifact,
-                last_event=last_event,
-            )
-        except certified_bundle.CertificationRefused as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            source_conn.close()
-            return _refuse_execution(guard, 6, f"{failure.token}")
-        except certified_bundle.BundleIncoherent as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            source_conn.close()
-            return _refuse_execution(guard, 6, "certified bundle incoherent")
-        pe9_certification["certification_result_identity"] = (
-            certified_bundle.certification_result_identity(pe9_certification)
-        )
-        # The CERTIFIED horizon is the gate, not a report.  A bundle the calibration
-        # evidence could not certify is a blocked event, so one blocked event makes the
-        # required horizon incomplete and the decision is refused rather than taken on
-        # the remaining events: there is no partial-horizon transfer recommendation.
-        if pe9_certification["horizon_state"] == fg.DECISION_HORIZON_INCOMPLETE:
+        # --- PE-9: the generation IS the certificate ---------------------------
+        # The horizon gate was applied when the generation was certified, and the
+        # generation row exists only because certification PASSED: there is no mutable
+        # CERTIFIED flag to re-check here and none to be toggled.  What a later reader
+        # can verify is the persisted generation, re-derived from authoritative
+        # evidence, not a narrative about it.
+        horizon_state = str(generation.manifest.get("horizon_state"))
+        if horizon_state != fg.DECISION_HORIZON_COMPLETE:
             print(
-                f"decision refused: {fg.DECISION_HORIZON_INCOMPLETE}: PE-9 certification blocked "
-                f"event(s) {pe9_certification['horizon']['blocked_events']}; the required horizon cannot "
-                "be certified",
+                f"decision refused: {fg.DECISION_HORIZON_INCOMPLETE}: the certified generation records "
+                f"horizon state {horizon_state}",
                 file=sys.stderr,
             )
             source_conn.close()
             return _refuse_execution(guard, 6, f"{fg.DECISION_HORIZON_INCOMPLETE}")
-        for event in decision_events:
-            record = pe9_certification["per_event"][str(event)]
-            if record["bundle_identity"] != certified_support[int(event)]["bundle_identity"]:
-                print(
-                    f"decision refused: {certified_bundle.STATE_PREDICTIVE_BUNDLE_INCOHERENT}: GW{event} "
-                    "certifies to a different bundle identity than the support the decision consumed",
-                    file=sys.stderr,
-                )
-                source_conn.close()
-                return _refuse_execution(guard, 6, "certification identity mismatch")
         print(
-            f"PE-9 certification: horizon={pe9_certification['horizon_state']} "
-            f"phase={pe9_certification['phase_terminal_state']} "
-            f"states={ {event: pe9_certification['per_event'][str(event)]['state'] for event in decision_events} } "
-            f"identity={pe9_certification['certification_result_identity'][:24]}…"
+            f"PE-9 certified generation: horizon={horizon_state} "
+            f"states="
+            f"{ {event: (generation.manifest.get('per_event') or {}).get(str(event), {}).get('state') for event in decision_events} } "
+            f"id={generation.generation_id[:24]}…"
         )
         universe = cu.build_universe(
             pool=pool, events_fixtures=fixtures, xpts_rows_by_event=xpts_rows,
@@ -797,17 +723,16 @@ def main(argv=None) -> int:
         t0 = time.time()
         stage1_result = ro.optimize(
             universe=universe, initial_state=source_state, scenario=scenario, player_meta=player_meta,
-            bundles=bundles, conn=conn, config=optimizer_config, cache_dir=Path(args.cache_dir),
-            certification=certification,
+            generation=generation, conn=conn, config=optimizer_config, cache_dir=Path(args.cache_dir),
             provenance={**search_provenance,
-                        "discovery_certification_identity": discovery_identity,
-                        "exact_evaluation_certification_identity": exact_identity},
+                        "discovery_generation_identity": discovery_identity,
+                        "exact_evaluation_generation_identity": exact_identity},
             parallel_workers=parallel_workers,
         )
         search_seconds = time.time() - t0
 
         # --- R4B.2b Stage 2: FINALIST-ONLY precision refinement ----------------
-        # Same seed, same certified bundles, same route legality, same discovery
+        # Same seed, same certified generation, same route legality, same discovery
         # universe; the ONLY changed input is the shared-world draw count.  The
         # refinement also publishes the one canonical paired record below.
         t_refine = time.time()
@@ -820,9 +745,9 @@ def main(argv=None) -> int:
         run_exact_cache: dict = {}
         refinement = fr.refine_finalists(
             universe=universe, initial_state=source_state, scenario=scenario,
-            player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
+            player_meta=player_meta, generation=generation, conn=conn, base_config=optimizer_config,
             stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
-            certification=certification, cache_dir=Path(args.cache_dir),
+            cache_dir=Path(args.cache_dir),
             exact_cache=run_exact_cache, cancel_probe=cancel_probe,
             parallel_workers=parallel_workers,
         )
@@ -848,14 +773,13 @@ def main(argv=None) -> int:
             canonical_paired=refinement["canonical_paired_near_tie"],
             escalation=_escalation_runner(
                 universe=universe, initial_state=source_state, scenario=scenario,
-                player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
+                player_meta=player_meta, generation=generation, conn=conn, base_config=optimizer_config,
                 stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
-                prebuilt_worlds=refinement.get("prebuilt_worlds"),
-                certification=certification,
                 finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
                 exact_cache=run_exact_cache,
                 cancel_probe=cancel_probe,
                 parallel_workers=parallel_workers,
+                cache_dir=Path(args.escalation_cache_dir or args.cache_dir),
             ),
             config=fr.StabilityGateConfig(current_beam=int(args.beam)),
             escalated_result_sink=escalated_sink,
@@ -1020,7 +944,7 @@ def main(argv=None) -> int:
             )
 
         role_evidence, role_source = _certified_role_evidence(
-            conn, certified_runs, role_relevant_players, decision_events, certification
+            conn, certified_runs, role_relevant_players, decision_events, generation
         )
         confidence = dc.classify_decision_confidence(
             paired=paired_record,
@@ -1141,15 +1065,23 @@ def main(argv=None) -> int:
                 "refinement_cutoff": result.get("planning_cutoff"),
                 "lineup_route_id": lineup_route_id,
                 "lineup_basis": "CURRENT_GW_H1",
-                # PE-9: the certification result is persisted WITH the decision, so the
-                # authorisation this decision consumed is verifiable from the artifact
-                # itself: the artifact identity, each event's canonical bundle identity,
-                # the per-family run ids and model versions, the cutoff, the code and
-                # data snapshot identities, the planning context hash, the certification
-                # state per bundle, any calibration identity consulted, and the
-                # unresolved disclosures.
-                "certification": pe9_certification,
-                "certification_result_identity": pe9_certification["certification_result_identity"],
+                # PE-9: the certified GENERATION is persisted WITH the decision, so the
+                # evidence this decision consumed is verifiable from the artifact itself:
+                # the generation id, each event's canonical bundle identity, the
+                # per-family run ids and model versions, the cutoff, the code and data
+                # snapshot identities, the pinned snapshot, the planning context hash, the
+                # PE-8 evidence references and the disclosure block.
+                "generation_id": generation.generation_id,
+                "generation_manifest": dict(generation.manifest),
+                "snapshot": {
+                    "path": generation.snapshot.get("path"),
+                    "sha256": generation.snapshot.get("sha256"),
+                    "source_db_identity": generation.snapshot.get("source_db_identity"),
+                    "execution_run_uuid": generation.snapshot.get("execution_run_uuid"),
+                },
+                "pe8_evidence": generation.manifest.get("pe8_evidence"),
+                "disclosure": generation.manifest.get("disclosure"),
+                "identified_bypasses": certified_bundle.disclosed_bypasses(),
             },
             "discovery_completeness": discovery,
             "official_pool_identity": pool_identity,
@@ -1176,10 +1108,11 @@ def main(argv=None) -> int:
         conn.close()
 
 
-def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundles, conn,
-                       base_config, stage1_result, stage2_draws, prebuilt_worlds,
-                       finalist_partials, certification=None, non_production_worlds=None,
-                       exact_cache=None, cancel_probe=None, parallel_workers=None):
+def _escalation_runner(*, universe, initial_state, scenario, player_meta, generation, conn,
+                       base_config, stage1_result, stage2_draws,
+                       finalist_partials, non_production_worlds=None,
+                       exact_cache=None, cancel_probe=None, parallel_workers=None,
+                       cache_dir=None):
     """The ONE bounded search-breadth escalation, as a closure over one beam width.
 
     Runs the next SUPPORTED search budget (the next beam width in
@@ -1188,10 +1121,10 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
     survivors and forcing the refined finalists in so the two leaders are always
     comparable.  It never changes the objective, the pool, or the universe.
 
-    The escalation re-scores in the SAME worlds Stage 2 used, which are the
-    certified loader's own output, so it presents the same ``certification``
-    artifact that authorised them.  A caller that supplies worlds from somewhere
-    else must declare them through ``non_production_worlds``.
+    The escalation re-scores in the SAME worlds Stage 2 used, which are the certified
+    loader's own output for the SAME certified generation, reached through the same
+    content-addressed cache.  A caller that supplies worlds from somewhere else must
+    declare them through ``non_production_worlds``.
     """
 
     import dataclasses
@@ -1202,9 +1135,10 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
         )
         return ro.optimize(
             universe=universe, initial_state=initial_state, scenario=scenario,
-            player_meta=player_meta, bundles=bundles, conn=conn, config=config, cache_dir=None,
-            non_production_worlds=non_production_worlds, certification=certification,
-            prebuilt_worlds=prebuilt_worlds, required_routes=list(finalist_partials),
+            player_meta=player_meta, generation=generation, conn=conn, config=config,
+            cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds,
+            required_routes=list(finalist_partials),
             nested_prior=ro.nested_budget_view(stage1_result),
             exact_cache=exact_cache, cancel_probe=cancel_probe,
             parallel_workers=parallel_workers,

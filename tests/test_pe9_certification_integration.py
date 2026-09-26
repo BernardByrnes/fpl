@@ -23,6 +23,8 @@ import pytest
 
 from fpl_brain import certified_bundle as cb
 from fpl_brain import four_gw_decision as fg
+from fpl_brain import generation_store as gs
+from fpl_brain import replay_worlds as rw
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
 from fpl_brain.database import connect_database
@@ -160,7 +162,7 @@ def _mc_row(
     )
 
 
-def _world(events=HORIZON, *, fixtures_per_event=1, blanks=()):
+def _world(events=HORIZON, *, fixtures_per_event=1, blanks=(), versions=None):
     """A coherent five-family world for every event.  Returns (conn, runs_by_event).
 
     ``blanks`` names events that are a BLANK Gameweek: they have their five runs but
@@ -191,7 +193,12 @@ def _world(events=HORIZON, *, fixtures_per_event=1, blanks=()):
             }
             next_run += 5
             for family, run_id in ids.items():
-                _run(conn, run_id, family, event)
+                # A defect has to be present at CREATION: a completed projection run is
+                # immutable (m006), which is itself part of what PE-9 relies on.
+                _run(
+                    conn, run_id, family, event,
+                    version=None if versions is None else versions.get(family),
+                )
             for fixture_id in fixture_ids:
                 _xpts_row(
                     conn,
@@ -214,6 +221,30 @@ def _world(events=HORIZON, *, fixtures_per_event=1, blanks=()):
                 )
             runs_by_event[int(event)] = ids
     return conn, runs_by_event
+
+
+def _optimizer_config(**over):
+    base = dict(events=(5,), search_draws=8, seed=20260911)
+    base.update(over)
+    return ro.OptimizerConfig(**base)
+
+
+def _generation(conn, runs_by_event, *, events=HORIZON, cutoff=CUTOFF, snapshot_path=None,
+                calibration=None, horizon_kind=gs.HORIZON_KIND_FOUR_GW):
+    """A REAL certified generation over this module's synthetic world.
+
+    Minted through ``generation_store.certify_generation``, so the manifest, the
+    content address, the pointer and every evidence check a consumer re-derives are
+    the ones the production certification lifecycle actually persists.
+    """
+
+    import generation_fixtures as gf
+
+    return gf.certify_world(
+        conn, runs_by_event, events=events, planning_event=int(list(events)[0]),
+        cutoff=cutoff, horizon_kind=horizon_kind, snapshot_path=snapshot_path,
+        calibration=calibration,
+    )
 
 
 def _artifact(conn, runs_by_event, *, cutoff=CUTOFF, events=HORIZON, code_snapshot=CODE_SNAPSHOT, **over):
@@ -1038,15 +1069,13 @@ def test_19_downstream_code_cannot_rediscover_a_different_latest_run():
                 conn, 913, 1000, 5, minutes_run_id=912,
                 team_run_id=runs[5]["team_strength_v1"], rate_run_id=runs[5]["player_rates_v1"],
             )
-        artifact = _artifact(conn, runs)
-
-        # The certified generation keeps the ORIGINAL xPts run even though 913 is newer.
-        support = fg.event_support_from_certification(
-            conn, artifact, events=HORIZON, cutoff=CUTOFF
-        )
+        # The certified generation is minted from the ORIGINAL run ids, and it keeps
+        # them even though 913 is newer from that moment on.
+        generation = _generation(conn, runs)
+        support = gs.support_by_event(generation)
         assert support[5]["matched_runs"]["xpts_v1"] == runs[5]["xpts_v1"]
 
-        # A bare, provenance-free bundle cannot reach a predictive load.
+        # A bare mapping is not a generation and cannot reach a predictive load.
         bare = rc.EventBundle(
             event=5, minutes_run_id=runs[5]["minutes_v1"], team_run_id=runs[5]["team_strength_v1"],
             rate_run_id=runs[5]["player_rates_v1"], xpts_run_id=runs[5]["xpts_v1"],
@@ -1054,65 +1083,41 @@ def test_19_downstream_code_cannot_rediscover_a_different_latest_run():
         )
         with pytest.raises(cb.CertificationRefused) as caught:
             ro.build_event_worlds(conn, {5: bare}, 5, [1], _optimizer_config())
-        # With no artifact there is no authorisation AT ALL, which is a different
-        # fact from a bundle that cannot declare its provenance.
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
+        # With no generation there is no authority AT ALL, which is a different fact
+        # from a mapping that merely cannot declare its provenance.
+        assert caught.value.token == ro.DIAG_CERTIFIED_GENERATION_REQUIRED
 
-        # Nor can one that declares an identity which does not bind its own run ids.
-        lying = rc.certified_event_bundle(
-            event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
-            code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-            planning_context_hash=CONTEXT_HASH,
-        )
-        object.__setattr__(lying, "xpts_run_id", 913)
+        # Nor can a caller declare the run ids it prefers instead.
         with pytest.raises(cb.CertificationRefused) as caught:
-            ro.build_event_worlds(conn, {5: lying}, 5, [1], _optimizer_config(),
-                                  certification=artifact)
-        assert caught.value.token == cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT
+            ro.build_event_worlds(conn, None, 5, [1], _optimizer_config(), runs=runs[5])
+        assert caught.value.token == ro.DIAG_CERTIFIED_GENERATION_REQUIRED
 
-        # A bundle whose declared version disagrees with the run's own row is refused.
-        wrong_version = rc.certified_event_bundle(
-            event=5, runs=runs[5], cutoff=CUTOFF,
-            model_versions={**VERSIONS, "xpts_v1": "xpts_v1.0.0"},
-            code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-            planning_context_hash=CONTEXT_HASH,
-        )
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.build_event_worlds(conn, {5: wrong_version}, 5, [1], _optimizer_config(),
-                                  certification=artifact)
-        assert caught.value.token == cb.STATE_UNSUPPORTED_MODEL_VERSION
-
-        # An artifact that does not record this event is a MISSING record, which is
-        # a different fact from an artifact that contradicts it.
-        certified_elsewhere = _artifact(conn, runs, events=(6,))
-        with pytest.raises(cb.CertificationRefused) as caught:
-            cb.assert_event_bundle_certified(
-                conn,
-                rc.certified_event_bundle(
-                    event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
-                    code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-                    planning_context_hash=CONTEXT_HASH,
+        # The two doors cannot be merged: a certified load never consumes injected
+        # worlds, so presenting both is itself a refusal.
+        with pytest.raises(cb.CertificationRefused) as both:
+            ro.build_event_worlds(
+                conn, generation, 5, [1], _optimizer_config(),
+                non_production_worlds=ro.NonProductionWorlds(
+                    declaration="test_pe9: fixture worlds, no simulation",
+                    matrices={5: {"worlds": 1, "player_ids": [1], "core": {1: [0.0]},
+                                  "minutes": {1: [0.0]}, "expected_bonus": {1: 0.0},
+                                  "role_actionability": {1: False}}},
                 ),
-                event=5,
-                certification=certified_elsewhere,
             )
-        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
+        assert both.value.token == ro.DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN
 
-        # An artifact that records THIS event as a DIFFERENT bundle contradicts the
-        # request, and the two facts carry different tokens.
-        substituted = json.loads(json.dumps(_artifact(conn, runs)))
-        substituted["certified_bundles"]["5"]["cutoff"] = OTHER_CUTOFF
-        with pytest.raises(cb.CertificationArtifactContradictory):
-            cb.assert_event_bundle_certified(
-                conn,
-                rc.certified_event_bundle(
-                    event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
-                    code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-                    planning_context_hash=CONTEXT_HASH,
-                ),
-                event=5,
-                certification=substituted,
-            )
+        # A run whose RECORDED version is not the authoritative one cannot become a
+        # generation at all, so no generation row exists to load.  The world is built
+        # with that version already recorded: a completed run is immutable, so the
+        # evidence cannot be edited into a different world after the fact either.
+        other_conn, other_runs = _world(versions={"xpts_v1": "xpts_v1.0.0"})
+        try:
+            with pytest.raises(gs.GenerationNotCertified) as caught:
+                _generation(other_conn, other_runs, events=HORIZON)
+            assert cb.STATE_UNSUPPORTED_MODEL_VERSION in str(caught.value)
+            assert other_conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        finally:
+            other_conn.close()
     finally:
         conn.close()
 
@@ -1305,28 +1310,17 @@ def test_24_chip_transfer_scoring_and_rng_behaviour_is_unchanged():
     try:
         # The RNG seed namespace and draw ordering are untouched: same inputs and
         # same config reproduce the identical matrix with and without certification.
-        artifact = _artifact(conn, runs)
+        generation = _generation(conn, runs)
         first = ro.build_event_worlds(
-            conn,
-            {5: rc.certified_event_bundle(
-                event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
-                code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-                planning_context_hash=CONTEXT_HASH,
-                simulations=32,
-            )},
-            5, [1, 2], _optimizer_config(search_draws=32), certification=artifact,
+            conn, generation, 5, [1, 2], _optimizer_config(search_draws=32),
         )[0]
         second = ro.build_event_worlds(
-            conn,
-            {5: rc.certified_event_bundle(
-                event=5, runs=runs[5], cutoff=CUTOFF, model_versions=VERSIONS,
-                code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-                planning_context_hash=CONTEXT_HASH,
-                simulations=32,
-            )},
-            5, [1, 2], _optimizer_config(search_draws=32), certification=artifact,
+            conn, generation, 5, [1, 2], _optimizer_config(search_draws=32),
         )[0]
         assert first["core"] == second["core"]
+        # The generation is a PERSISTED, content-addressed identity, so the same
+        # semantic evidence re-certifies to the same id rather than to a new one.
+        assert _generation(conn, runs).generation_id == generation.generation_id
         assert first["minutes"] == second["minutes"]
 
         # The Monte Carlo seed namespace and draw ordering are unchanged by the
@@ -1378,7 +1372,9 @@ def test_phase_state_and_the_declared_bypass_register():
         assert result["identified_bypasses"] == cb.disclosed_bypasses()
         named = {entry["reference"] for entry in result["identified_bypasses"]}
         for required in (
-            "fpl_brain.route_optimizer.build_event_worlds caller-supplied bundles",
+            "fpl_brain.route_optimizer.build_event_worlds",
+            "fpl_brain.route_optimizer.optimize",
+            "fpl_brain.certified_bundle.ValidatedCertificationArtifact authority",
             "scripts/build_route_comparison.py",
             "scripts/final_operational_refresh_gw04.py",
             "scripts/gw4_current_final_board.py",
@@ -1524,15 +1520,17 @@ def test_a_material_calibration_defect_blocks_the_claim_and_the_horizon():
             for reason in result["phase_open_reasons"]
         )
 
-        # The runner consumes the certified horizon's run ids and then GATES on PE-9's
-        # horizon, so a blocked event refuses the decision instead of producing one.
+        # The runner crosses the PE-9 generation boundary and then GATES on the
+        # generation's own recorded horizon, so a blocked event refuses the decision
+        # instead of producing one.  The generation row exists ONLY when certification
+        # passed, so there is no mutable flag to re-check.
         from pathlib import Path
 
         source = (
             Path(__file__).resolve().parents[1] / "scripts" / "run_four_gw_decision.py"
         ).read_text(encoding="utf-8")
-        gate = source.index('if pe9_certification["horizon_state"] == fg.DECISION_HORIZON_INCOMPLETE')
-        assert source.index("certification_result_identity(pe9_certification)") < gate
+        gate = source.index('if horizon_state != fg.DECISION_HORIZON_COMPLETE')
+        assert source.index("resolve_decision_generation(") < gate
     finally:
         conn.close()
 
@@ -1572,44 +1570,30 @@ def test_a_certified_bundle_payload_is_read_under_either_key_spelling():
 
 
 def test_the_loaders_boundary_is_declared_and_does_not_accept_a_bare_id_map():
-    """A bundle that cannot declare provenance is refused, never substituted."""
+    """A mapping of bundles or run ids is refused, never substituted for a generation."""
 
     conn, runs = _world()
     try:
+        for smuggled in ({5: {"runs": runs[5]}}, {"runs": runs[5]}, runs[5]):
+            with pytest.raises(cb.CertificationRefused) as caught:
+                ro.build_event_worlds(conn, smuggled, 5, [1], _optimizer_config())
+            assert caught.value.token == ro.DIAG_CERTIFIED_GENERATION_REQUIRED
+
+        # The unnamed-argument form is refused too: there is no keyword by which a
+        # caller could smuggle a bundle, a matrix or a certification object in.
         with pytest.raises(cb.CertificationRefused) as caught:
-            cb.assert_event_bundle_certified(conn, {"runs": runs[5]}, event=5)
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
+            ro.build_event_worlds(conn, None, 5, [1], _optimizer_config(),
+                                  bundles={5: {"runs": runs[5]}})
+        assert "bundles" in str(caught.value)
 
-        # A certified bundle loaded with no connection is still required to declare
-        # a version for every family it names.
-        from fpl_brain.free_hit_request_adapter import _CertifiedRunIds
-
-        partial = _CertifiedRunIds(5, {"runs": runs[5], "model_versions": {}})
-        with pytest.raises(cb.CertificationRefused) as caught:
-            cb.assert_event_bundle_certified(
-                None, partial, event=5, certification=_artifact(conn, runs)
-            )
-        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
-
-        declared = _CertifiedRunIds(
-            5,
-            {
-                "runs": runs[5],
-                "cutoff": CUTOFF,
-                "model_versions": VERSIONS,
-                "code_snapshot_sha256": CODE_SNAPSHOT,
-                "data_snapshot_sha256": DATA_SNAPSHOT,
-                "planning_context_hash": CONTEXT_HASH,
-            },
-        )
-        proof = cb.assert_event_bundle_certified(
-            conn, declared, event=5, certification=_artifact(conn, runs)
-        )
-        assert proof["certified_bundle_identity"].startswith("sha256:")
-        # The identity it declares is the ONE algorithm's identity.
-        assert proof["certified_bundle_identity"] == cb.certified_bundle_identity_for(
-            event=5, cutoff=CUTOFF, runs=runs[5], model_versions=VERSIONS,
-            code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
+        # A real generation carries the ONE algorithm's per-event bundle identity.
+        generation = _generation(conn, runs)
+        record = generation.manifest["per_event"]["5"]
+        assert record["bundle_identity"] == cb.certified_bundle_identity_for(
+            event=5, cutoff=CUTOFF, runs=runs[5],
+            model_versions=generation.model_versions_by_event[5],
+            code_snapshot_sha256=CODE_SNAPSHOT,
+            data_snapshot_sha256=generation.snapshot["sha256"],
             planning_context_hash=CONTEXT_HASH,
         )
     finally:
@@ -1693,28 +1677,29 @@ def test_bundle_identity_ignores_required_versions_but_binds_run_ids():
         conn.close()
 
 
-def test_the_decision_runner_certifies_and_persists_the_certification_result():
-    """The production runner must CERTIFY the horizon and persist the result.
+def test_the_decision_runner_resolves_a_generation_and_persists_its_provenance():
+    """The production runner must consume a CERTIFIED GENERATION, descriptor-only.
 
     Source-level, because exercising it end-to-end needs a full production
-    database.  What is asserted is that the runner crosses the PE-9 boundary, that
-    the required model versions come from the ONE declared source, and that the
-    certification result is persisted WITH the decision rather than narrated.
+    database.  What is asserted is that the runner crosses the PE-9 generation
+    boundary, that the required model versions come from the ONE declared source
+    (never from the caller), and that the generation is persisted WITH the decision
+    rather than narrated.
     """
 
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
     source = (root / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
-    assert "certify_decision_horizon(" in source
-    assert '"certification": pe9_certification' in source
-    assert "certification_result_identity(" in source
-    # The required versions reach the boundary from the artifact the certifier minted.
-    assert 'certification.get("required_model_versions") or None' in source
-    # A PE-8 calibration artifact can be consulted at the boundary (gap 4), and its
-    # absence yields a STATE rather than a refusal.
-    assert '"--calibration"' in source
-    assert "calibration=calibration_artifact" in source
+    assert "resolve_decision_generation(" in source
+    assert "gs.assert_generation_bundles_valid(conn, generation)" in source
+    assert '"generation_manifest": dict(generation.manifest)' in source
+    assert "generation=generation" in source
+    assert '"generation_id": generation.generation_id' in source
+    # No caller-supplied predictive descriptor survives on the runner's own calls.
+    for banned in ("bundles=bundles", "certification=certification", "prebuilt_worlds=",
+                   "--certification", "--calibration"):
+        assert banned not in source, banned
     # The readiness view is reconciled against the certified generation, and the
     # divergence is persisted rather than left implicit.
     assert "readiness_generation_divergence" in source
@@ -1723,1092 +1708,10 @@ def test_the_decision_runner_certifies_and_persists_the_certification_result():
     # it cannot be mistaken for the certified generation.
     assert "NON_PRODUCTION" in source or "NON-PRODUCTION" in source
 
-    certifier = (root / "scripts" / "certify_gw5_gw8.py").read_text(encoding="utf-8")
-    # Every certification call site supplies the required versions and records the
-    # code identity on the bundle payload the consumer recomputes the identity from.
-    assert "required_versions=required_versions" in certifier
-    assert "code_snapshot_sha256=certification_code_snapshot" in certifier
-    assert "declared_required_versions()" in certifier
+    store = (root / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
+    # The required versions come from the ONE declared in-library source, never from
+    # a parameter a caller could set.
+    assert "required_versions = cb.declared_required_versions()" in store
+    assert "required_versions:" not in store.split("def certify_generation", 1)[1].split(")", 1)[0]
 
 
-def _optimizer_config(**over):
-    base = dict(events=(5,), search_draws=8, seed=20260911)
-    base.update(over)
-    return ro.OptimizerConfig(**base)
-
-
-# ---------------------------------------------------------------------------
-# Adversarial: a SELF-CONSISTENT bundle built from arbitrary existing runs
-# ---------------------------------------------------------------------------
-#
-# The attack this section models is the one a certification boundary exists to stop:
-# a caller assembles a bundle from run ids that EXIST, mints its identity with the
-# shared algorithm (so the identity binds its own run ids), declares the
-# authoritative model version of every family, and presents it at each boundary.  It
-# is internally perfect and it is still not the CERTIFIED bundle, so every load
-# boundary must refuse it -- including a warm cache directory, because a cache hit is
-# a predictive load like any other.
-
-
-def _alternative_world(conn, event: int, *, first_run: int = 920) -> dict[str, int]:
-    """A second, COMPLETE and COHERENT five-family world for one event.
-
-    Later reruns of every family, wired to each other, at the same cutoff, with the
-    same model versions and the same planning context as the certified generation:
-    everything a self-consistency check can see is in order.  It is simply a
-    different predictive world, which is the fact only the ARTIFACT can authorise.
-    """
-
-    with conn:
-        ids = {
-            "minutes_v1": first_run,
-            "team_strength_v1": first_run + 1,
-            "player_rates_v1": first_run + 2,
-            "xpts_v1": first_run + 3,
-            "monte_carlo_v1": first_run + 4,
-        }
-        for family, run_id in ids.items():
-            _run(conn, run_id, family, event)
-        fixture_id = int(
-            conn.execute("SELECT id FROM fixtures WHERE event=?", (int(event),)).fetchone()["id"]
-        )
-        _xpts_row(
-            conn, ids["xpts_v1"], fixture_id, event,
-            minutes_run_id=ids["minutes_v1"], team_run_id=ids["team_strength_v1"],
-            rate_run_id=ids["player_rates_v1"],
-        )
-        _mc_row(
-            conn, ids["monte_carlo_v1"], fixture_id, event,
-            xpts_run_id=ids["xpts_v1"], minutes_run_id=ids["minutes_v1"],
-            team_run_id=ids["team_strength_v1"], rate_run_id=ids["player_rates_v1"],
-        )
-    return ids
-
-
-def _self_consistent_bundle(runs, *, event: int = 5, **over):
-    """A bundle that satisfies every self-consistency property and no authorisation.
-
-    The identity is minted by the ONE shared algorithm from these exact ids, so it
-    BINDS them; the versions are the authoritative ones; the snapshots and the
-    context hash are the certified ones.  Nothing here is self-contradictory -- only
-    unrecorded.
-    """
-
-    return rc.certified_event_bundle(
-        event=int(event), runs=runs, cutoff=CUTOFF, model_versions=VERSIONS,
-        code_snapshot_sha256=CODE_SNAPSHOT, data_snapshot_sha256=DATA_SNAPSHOT,
-        planning_context_hash=CONTEXT_HASH, **over,
-    )
-
-
-def test_adversarial_a_self_consistent_bundle_is_refused_by_the_optimizer(tmp_path):
-    """The optimizer's loader refuses a coherent but UNCERTIFIED prediction world."""
-
-    from test_route_optimizer import _scenario, _universe
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
-
-        # The bundle really is self-consistent: its identity binds its own run ids
-        # and it declares the authoritative version of every family it names.
-        assert alternative.certified_bundle_identity == cb.canonical_bundle_identity(
-            alternative.as_identity_payload()
-        )
-        assert alternative.certified_runs() != runs[5]
-
-        universe, state, meta = _universe()
-        with pytest.raises(cb.CertificationArtifactContradictory):
-            ro.optimize(
-                universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
-                bundles={5: alternative}, conn=conn,
-                config=ro.OptimizerConfig(events=(5,), search_draws=6, seed=20260911),
-                certification=artifact, cache_dir=tmp_path, exact_cache={},
-            )
-    finally:
-        conn.close()
-
-
-def test_adversarial_a_warm_cache_does_not_authorise_a_self_consistent_bundle(tmp_path):
-    """A cache HIT is a predictive load, so it crosses the boundary too.
-
-    The cache is warmed for the alternative bundle's own key -- the key a caller
-    would compute -- so a boundary that trusted the key, or that checked identity
-    after the lookup, would hand back worlds the certification never authorised.  The
-    refusal must come first.
-    """
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
-        config = _optimizer_config()
-        union = [1, 2]
-        key = ro.world_cache_key(event=5, bundle=alternative, config=config, union_ids=union)
-        payload = json.dumps({
-            "worlds": 2, "player_ids": [1, 2],
-            "core": {"1": [99.0, 99.0], "2": [99.0, 99.0]},
-            "minutes": {"1": [90.0, 90.0], "2": [90.0, 90.0]},
-            "expected_bonus": {"1": 0.0, "2": 0.0},
-            "role_actionability": {"1": False, "2": False},
-        })
-        (tmp_path / f"{key}.json").write_text(payload, encoding="utf-8")
-
-        with pytest.raises(cb.CertificationArtifactContradictory):
-            ro.build_event_worlds(
-                conn, {5: alternative}, 5, union, config, cache_dir=tmp_path,
-                certification=artifact,
-            )
-
-        # The same call with the CERTIFIED bundle is a cache hit, so the refusal
-        # above is about provenance and not about the cache being unusable.
-        certified = _self_consistent_bundle(runs[5])
-        certified_key = ro.world_cache_key(
-            event=5, bundle=certified, config=config, union_ids=union
-        )
-        (tmp_path / f"{certified_key}.json").write_text(payload, encoding="utf-8")
-        matrix, info = ro.build_event_worlds(
-            conn, {5: certified}, 5, union, config, cache_dir=tmp_path, certification=artifact,
-        )
-        assert info["source"] == "cache"
-        assert matrix["core"][1] == [99.0, 99.0]
-    finally:
-        conn.close()
-
-
-def test_adversarial_the_comparator_refuses_a_self_consistent_bundle():
-    """The comparator's DB branch is a predictive loader, so it refuses one too."""
-
-    from fpl_brain import transfer_state as ts
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
-        state = ts.RouteState(
-            event=5, players=(ts.RoutePlayer(1, "MID", 1, 50),), bank_tenths=0, free_transfers=1,
-        )
-        route = rc.TransferRoute(
-            route_id="roll",
-            steps=(rc.RouteStep(event=5, transfer_batch=ts.TransferBatch(())),),
-        )
-        with pytest.raises(cb.CertificationRefused) as caught:
-            rc.compare_routes(
-                bundles={5: alternative}, routes=[route], initial_state=state,
-                scenario=rc.flat_current_price_scenario(
-                    ts.PriceSnapshot(event=5, prices={1: 50, 2: 50}), [5]
-                ),
-                player_meta={}, conn=conn, certification=artifact,
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY
-    finally:
-        conn.close()
-
-
-def test_adversarial_free_hit_route_worlds_refuse_a_self_consistent_bundle(tmp_path):
-    """Free Hit route worlds present the artifact, so agreeing run ids are not enough."""
-
-    from fpl_brain import chip_free_hit as fh
-    from fpl_brain import free_hit_request_adapter as fha
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
-        # Built the way the adapter builds a bundle from a certified record: the row
-        # carries its own runs, versions and snapshots, so its identity binds its own
-        # run ids -- and it is still not the recorded bundle.
-        row = dict(alternative.as_identity_payload())
-        row["certified_bundle_identity"] = alternative.certified_bundle_identity
-        with pytest.raises(fha.FreeHitAdapterError) as caught:
-            fha.load_certified_route_worlds(
-                conn, {5: fha._CertifiedRunIds(5, row)}, arm="SAVE", expected_events=(5,),
-                union_ids=(1, 2), config=_optimizer_config(), cache_dir=tmp_path,
-                certification=artifact,
-            )
-        assert fh.FH_DECISION_AUTHORITY_REQUIRED in str(caught.value)
-
-        # The artifact's OWN bundle is accepted through the same call, so the refusal
-        # is about the substituted bundle and nothing else.
-        certified_row = {
-            "runs": dict(runs[5]), "cutoff": CUTOFF, "model_versions": VERSIONS,
-            "code_snapshot_sha256": CODE_SNAPSHOT, "data_snapshot_sha256": DATA_SNAPSHOT,
-            "planning_context_hash": CONTEXT_HASH,
-        }
-        matrix, _info = ro.build_event_worlds(
-            conn, {5: fha._CertifiedRunIds(5, certified_row)}, 5, (1, 2), _optimizer_config(),
-            certification=artifact,
-        )
-        assert matrix["worlds"] == 8
-    finally:
-        conn.close()
-
-
-def _defective_world(defect: str, value) -> sqlite3.Connection:
-    """The SAME run ids ``_world()`` assigns, with ONE family's evidence wrong.
-
-    A completed projection run is immutable, so a defect is never produced by
-    mutating a certified row: it is inserted the way an incoherent generation would
-    arrive in the first place.
-    """
-
-    ids = {"minutes_v1": 100, "team_strength_v1": 101, "player_rates_v1": 102,
-           "xpts_v1": 103, "monte_carlo_v1": 104}
-    conn = connect_database(":memory:")
-    _base_world(conn)
-    with conn:
-        _add_event(conn, 5)
-        _add_fixture(conn, 1000, 5, 1, 2)
-        for family, run_id in ids.items():
-            over: dict = {}
-            if family == "xpts_v1":
-                if defect == "status":
-                    over["status"] = value
-                elif defect == "planning_event":
-                    over["event"] = value
-                elif defect == "data_cutoff":
-                    over["cutoff"] = value
-                elif defect == "model_version":
-                    over["version"] = value
-            _run(conn, run_id, family, over.pop("event", 5), **over)
-        _xpts_row(
-            conn, ids["xpts_v1"], 1000, 5,
-            minutes_run_id=int(value) if defect == "dependency_edge" else ids["minutes_v1"],
-            team_run_id=ids["team_strength_v1"], rate_run_id=ids["player_rates_v1"],
-        )
-        _mc_row(
-            conn, ids["monte_carlo_v1"], 1000, 5, xpts_run_id=ids["xpts_v1"],
-            minutes_run_id=ids["minutes_v1"], team_run_id=ids["team_strength_v1"],
-            rate_run_id=ids["player_rates_v1"],
-        )
-    return conn
-
-
-def test_the_load_boundary_re_proves_the_recorded_closure_from_the_rows():
-    """A certification artifact is a CLAIM about the run rows, never a substitute.
-
-    The artifact records that these families were certified together; the load
-    boundary re-reads the rows themselves, so a family that is at another event,
-    incomplete, cut at another cutoff, re-versioned or wired to a different upstream
-    run cannot authorise a prediction.  The recorded closure is re-proven at every
-    load rather than assumed from the artifact.
-    """
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        certified = _self_consistent_bundle(runs[5])
-
-        # The artifact authorises these ids, and a generation carrying them loads.
-        matrix, info = ro.build_event_worlds(
-            conn, {5: certified}, 5, [1, 2], _optimizer_config(), certification=artifact,
-        )
-        assert info["source"] == "generated" and matrix["worlds"] == 8
-
-        for defect, value, token in (
-            ("status", "running", cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
-            ("planning_event", 6, cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
-            ("data_cutoff", OTHER_CUTOFF, cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
-            ("dependency_edge", 912, cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT),
-            ("model_version", "xpts_v0.0.0", cb.STATE_UNSUPPORTED_MODEL_VERSION),
-        ):
-            other = _defective_world(defect, value)
-            try:
-                with pytest.raises(cb.CertificationRefused) as caught:
-                    ro.build_event_worlds(
-                        other, {5: certified}, 5, [1, 2], _optimizer_config(),
-                        certification=artifact,
-                    )
-                assert caught.value.token == token, (defect, caught.value.token)
-            finally:
-                other.close()
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Adversarial: a self-consistent artifact-shaped MAPPING with no authorisation
-# ---------------------------------------------------------------------------
-#
-# The second attack: the caller presents something that LOOKS like a certification
-# artifact -- every bundle in it is real, every identity in it binds its own run ids,
-# every declared version is the authoritative one -- and simply omits the fields the
-# canonical loader's contract requires (the state that admits the bundles, the
-# authorisation flag, the audited status, the wiring identity).  A boundary that only
-# checked the bundles would load predictive data on the strength of a mapping the
-# engine never authorised, so every predictive-load boundary applies the contract
-# itself: a validated artifact is passed through untouched, and a raw mapping has the
-# SAME contract re-run over it before anything predictive is read.
-
-
-def test_adversarial_an_unauthorised_mapping_is_refused_by_the_optimizer_and_cache(tmp_path):
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        unauthorised = _unauthorised(artifact)
-        # Self-consistent: the bundles still bind their own identities.
-        assert unauthorised["certified_bundle_identity"] == artifact["certified_bundle_identity"]
-        assert "decision_search_permitted" not in unauthorised
-
-        certified = _self_consistent_bundle(runs[5])
-        config = _optimizer_config()
-        union = [1, 2]
-
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.build_event_worlds(
-                conn, {5: certified}, 5, union, config, certification=unauthorised,
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-
-        # A WARM cache does not authorise it either: the contract is applied before the
-        # cache is read, so a cache hit cannot stand in for the authorisation.
-        key = ro.world_cache_key(event=5, bundle=certified, config=config, union_ids=union)
-        (tmp_path / f"{key}.json").write_text(json.dumps({
-            "worlds": 2, "player_ids": [1, 2],
-            "core": {"1": [99.0, 99.0], "2": [99.0, 99.0]},
-            "minutes": {"1": [90.0, 90.0], "2": [90.0, 90.0]},
-            "expected_bonus": {"1": 0.0, "2": 0.0},
-            "role_actionability": {"1": False, "2": False},
-        }), encoding="utf-8")
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.build_event_worlds(
-                conn, {5: certified}, 5, union, config, cache_dir=tmp_path,
-                certification=unauthorised,
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-
-        from test_route_optimizer import _scenario, _universe
-
-        universe, state, meta = _universe()
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.optimize(
-                universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
-                bundles={5: certified}, conn=conn, config=config, cache_dir=tmp_path,
-                certification=unauthorised, exact_cache={},
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-
-        # The AUTHORISED artifact loads the same world through the same call, so the
-        # refusal above is about the missing authorisation and nothing else.
-        matrix, info = ro.build_event_worlds(
-            conn, {5: certified}, 5, union, config, cache_dir=tmp_path, certification=artifact,
-        )
-        assert info["source"] == "cache" and matrix["core"][1] == [99.0, 99.0]
-    finally:
-        conn.close()
-
-
-def test_adversarial_an_unauthorised_mapping_is_refused_by_the_comparator():
-    from fpl_brain import transfer_state as ts
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        unauthorised = _unauthorised(artifact)
-        certified = _self_consistent_bundle(runs[5])
-        state = ts.RouteState(
-            event=5, players=(ts.RoutePlayer(1, "MID", 1, 50),), bank_tenths=0, free_transfers=1,
-        )
-        route = rc.TransferRoute(
-            route_id="roll",
-            steps=(rc.RouteStep(event=5, transfer_batch=ts.TransferBatch(())),),
-        )
-        scenario = rc.flat_current_price_scenario(
-            ts.PriceSnapshot(event=5, prices={1: 50, 2: 50}), [5]
-        )
-        with pytest.raises(cb.CertificationRefused) as caught:
-            rc.compare_routes(
-                bundles={5: certified}, routes=[route], initial_state=state,
-                scenario=scenario, player_meta={}, conn=conn, certification=unauthorised,
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-
-        accepted = rc.compare_routes(
-            bundles={5: certified}, routes=[route], initial_state=state,
-            scenario=scenario, player_meta={}, conn=conn, certification=artifact,
-            simulations=4,
-        )
-        assert accepted["routes"]
-    finally:
-        conn.close()
-
-
-def test_adversarial_an_unauthorised_mapping_is_refused_by_the_free_hit_loader(tmp_path):
-    from fpl_brain import chip_free_hit as fh
-    from fpl_brain import free_hit_request_adapter as fha
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        unauthorised = _unauthorised(artifact)
-        row = {
-            "runs": dict(runs[5]), "cutoff": CUTOFF, "model_versions": VERSIONS,
-            "code_snapshot_sha256": CODE_SNAPSHOT, "data_snapshot_sha256": DATA_SNAPSHOT,
-            "planning_context_hash": CONTEXT_HASH,
-        }
-        with pytest.raises(fha.FreeHitAdapterError) as caught:
-            fha.load_certified_route_worlds(
-                conn, {5: fha._CertifiedRunIds(5, row)}, arm="SAVE", expected_events=(5,),
-                union_ids=(1, 2), config=_optimizer_config(), cache_dir=tmp_path,
-                certification=unauthorised,
-            )
-        assert fh.FH_DECISION_AUTHORITY_REQUIRED in str(caught.value)
-        assert cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED in str(caught.value)
-
-        # The authorised artifact loads the SAME certified runs through the same call.
-        matrix, _info = ro.build_event_worlds(
-            conn, {5: fha._CertifiedRunIds(5, row)}, 5, (1, 2), _optimizer_config(),
-            certification=artifact,
-        )
-        assert matrix["worlds"] == 8
-    finally:
-        conn.close()
-
-
-def test_adversarial_an_unauthorised_mapping_is_refused_by_refinement_and_stability(tmp_path):
-    """Both stages forward the artifact into the loader, so both apply the contract."""
-
-    from fpl_brain import finalist_refinement as fr
-    from fpl_brain import route_stability as rs
-    from test_route_optimizer import EVENTS, _config as _small_config, _provider, _scenario, _universe
-
-    universe, state, meta = _universe()
-    scenario = _scenario()
-    config = _small_config()
-    # The Stage-1/Stage-2 fixtures score event 4, so the certified world is event 4's.
-    conn, runs = _world(events=EVENTS)
-    try:
-        artifact = _artifact(conn, runs, events=EVENTS)
-        unauthorised = _unauthorised(artifact)
-        certified = _self_consistent_bundle(runs[int(EVENTS[0])], event=int(EVENTS[0]))
-        bundles = {int(EVENTS[0]): certified}
-
-        # Stage 1 in the declared non-production worlds, so the refinement has a
-        # Stage-1 result to refine and the ONLY thing under test is the artifact the
-        # refinement and the ladder forward to the certified loader.
-        stage1 = ro.optimize(
-            universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-            config=config, non_production_worlds=ro.NonProductionWorlds(
-                declaration="tests: pe-9 adversarial stage 1", provider=_provider()
-            ),
-        )
-        with pytest.raises(cb.CertificationRefused) as caught:
-            fr.refine_finalists(
-                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                bundles=bundles, conn=conn, base_config=config, stage1_result=stage1,
-                stage2_draws=config.search_draws * 2, certification=unauthorised,
-                cache_dir=tmp_path, verify_prefix=False, exact_cache={},
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-
-        with pytest.raises(cb.CertificationRefused) as caught:
-            rs.run_ladder(
-                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                base_config=config, budgets=[2], bundles=bundles, conn=conn,
-                certification=unauthorised, cache_dir=tmp_path, exact_cache={},
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-    finally:
-        conn.close()
-
-
-def test_the_validated_artifact_is_immutable_and_a_self_consistent_mapping_is_revalidated():
-    """The capability can be neither forged nor edited, and it round-trips."""
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        validated = cb.validate_certification_artifact(artifact)
-        assert isinstance(validated, cb.ValidatedCertificationArtifact)
-        # Idempotent: the authorisation itself is what a caller passes on.
-        assert cb.validate_certification_artifact(validated) is validated
-        assert validated["certified_bundles"]["5"]["runs"] == runs[5]
-
-        # Minting one from a raw mapping is refused, so the type IS the authorisation.
-        with pytest.raises(cb.CertificationArtifactUnvalidated):
-            cb.ValidatedCertificationArtifact(artifact)
-        # ... and it cannot be edited after the check.
-        with pytest.raises(TypeError):
-            validated["certified_bundles"]["5"]["runs"]["minutes_v1"] = 999
-        with pytest.raises(TypeError):
-            validated["events"] = [9]
-        with pytest.raises(TypeError):
-            validated["certified_bundles"]["5"]["cutoff"] = OTHER_CUTOFF
-        # The artifact the boundary validated is unchanged by those attempts.
-        assert validated["certified_bundles"]["5"]["cutoff"] == CUTOFF
-
-        # A raw mapping that DOES carry every authorization field is revalidated and
-        # accepted -- the contract is re-run, never assumed from the mapping's shape.
-        revalidated = cb.validate_certification_artifact(json.loads(json.dumps(artifact)))
-        assert isinstance(revalidated, cb.ValidatedCertificationArtifact)
-        assert revalidated.validated_identity == validated.validated_identity
-
-        # Dropping ONE authorization field is enough to turn it back into a mapping
-        # that is not an authorisation.
-        for field in AUTHORIZATION_FIELDS:
-            with pytest.raises(cb.CertificationArtifactUnvalidated):
-                cb.validate_certification_artifact(_unauthorised(artifact, drop=(field,)))
-    finally:
-        conn.close()
-
-
-def test_a_loader_minted_artifact_cannot_be_mutated_into_an_alternate_world():
-    """The authorisation is a read-only snapshot: every mutation route is refused.
-
-    A dict/list SUBCLASS only refuses the mutators it overrides -- ``dict.__setitem__``
-    and friends still edit the value underneath -- so the authorisation is built by
-    composition over a genuinely read-only snapshot instead.  This drives every route a
-    caller has, including the base-class mutators, and proves that the artifact the
-    boundary validated is unchanged and that an ALTERNATE run set is still refused.
-    """
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        validated = cb.validate_certification_artifact(artifact)
-        digest = validated.content_digest
-        assert digest == cb.certification_artifact_digest(validated)
-
-        # -- the mapping API ---------------------------------------------------
-        for attack in (
-            lambda: validated.__setitem__("events", [9]),
-            lambda: validated.__delitem__("events"),
-            lambda: validated.update({"planning_cutoff": OTHER_CUTOFF}),
-            lambda: validated.clear(),
-            lambda: validated.pop("events"),
-            lambda: validated.popitem(),
-            lambda: validated.setdefault("events", [9]),
-            lambda: validated.__ior__({"events": [9]}),
-        ):
-            with pytest.raises((AttributeError, TypeError)):
-                attack()
-        # -- the BASE-CLASS mutators a dict subclass would leave open --------------
-        with pytest.raises(TypeError):
-            dict.__setitem__(validated, "events", [9])
-        with pytest.raises(TypeError):
-            dict.__delitem__(validated, "events")
-        with pytest.raises(TypeError):
-            dict.update(validated, {"events": [9]})
-        with pytest.raises(TypeError):
-            dict.clear(validated)
-        with pytest.raises(TypeError):
-            dict.pop(validated, "events")
-        with pytest.raises(TypeError):
-            list.append(validated["events"], 9)
-        with pytest.raises(TypeError):
-            list.__setitem__(validated["certified_bundles"]["5"]["runs"], "x", 1)
-        # -- nested containers are read-only snapshots too ------------------------
-        with pytest.raises(TypeError):
-            validated["certified_bundles"]["5"]["runs"]["minutes_v1"] = 999
-        with pytest.raises((AttributeError, TypeError)):
-            validated["certified_bundles"]["5"]["runs"].update({"minutes_v1": 999})
-        with pytest.raises((AttributeError, TypeError)):
-            validated["certified_bundles"]["5"]["runs"].clear()
-        with pytest.raises(TypeError):
-            dict.__setitem__(validated["certified_bundles"], "5", {})
-        # -- attributes, copies and pickles --------------------------------------
-        with pytest.raises((AttributeError, TypeError)):
-            validated.validated_identity = "forged"
-        with pytest.raises((AttributeError, TypeError)):
-            validated.content_digest = "sha256:" + "0" * 64
-        with pytest.raises((AttributeError, TypeError)):
-            validated._document = {}
-        with pytest.raises((AttributeError, TypeError)):
-            del validated._document
-        assert copy.copy(validated) is validated
-        assert copy.deepcopy(validated) is validated
-        with pytest.raises(TypeError):
-            pickle.loads(pickle.dumps(validated))
-
-        # Nothing above changed the bytes, and the recorded run ids are still the
-        # CERTIFIED ones.
-        assert validated.content_digest == digest
-        assert cb.certification_artifact_digest(validated) == digest
-        assert validated["certified_bundles"]["5"]["runs"]["minutes_v1"] == runs[5]["minutes_v1"]
-
-        # An ALTERNATE run set is refused through the boundary the mutations aimed at.
-        alternative = _self_consistent_bundle(_alternative_world(conn, 5))
-        with pytest.raises(cb.CertificationRefused) as caught:
-            cb.assert_event_bundle_certified(
-                conn, alternative, event=5, certification=validated
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY
-        # ... while the CERTIFIED bundle still loads, so the refusal is about provenance
-        # and not about the attempts having broken the authorisation.
-        certified = _self_consistent_bundle(runs[5])
-        proof = cb.assert_event_bundle_certified(
-            conn, certified, event=5, certification=validated
-        )
-        assert proof["certified_bundle_identity"] == str(certified.certified_bundle_identity)
-    finally:
-        conn.close()
-
-
-def test_a_tampered_artifact_is_refused_by_its_content_bound_digest():
-    """Even a mutation that SUCCEEDS at the object level cannot authorise a load.
-
-    The digest is the second half of the immutability contract: a validated artifact
-    carries the content-bound digest of the bytes the loader validated, and every
-    boundary re-verifies it.  This edits the private state directly -- the one route the
-    read-only snapshot cannot close -- and proves the boundary refuses the result with
-    its own token instead of reading alternate run ids out of it.
-    """
-
-    from types import MappingProxyType
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        validated = cb.validate_certification_artifact(artifact)
-        cb.assert_certification_artifact_bytes_unchanged(validated)  # positive control
-        assert cb.certification_artifact_digest(validated) == validated.content_digest
-
-        # The digest gate itself: a value whose recorded digest disagrees with its own
-        # bytes is refused, and the token names the tamper.
-        class _Tampered(Mapping):
-            content_digest = "sha256:" + "0" * 64
-
-            def __init__(self, document):
-                self._document = document
-
-            def __getitem__(self, key):
-                return self._document[key]
-
-            def __iter__(self):
-                return iter(self._document)
-
-            def __len__(self):
-                return len(self._document)
-
-        with pytest.raises(cb.CertificationArtifactMutated) as caught:
-            cb.assert_certification_artifact_bytes_unchanged(_Tampered(artifact))
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_MUTATED
-        # A mutated authorisation IS a contradiction, so consumers that already refuse
-        # contradictions keep refusing it.
-        assert isinstance(caught.value, cb.CertificationArtifactContradictory)
-        # A value carrying no digest at all is not an authorisation either.
-        with pytest.raises(cb.CertificationArtifactUnvalidated):
-            cb.assert_certification_artifact_bytes_unchanged({"events": [5]})
-
-        # Now the end-to-end case: a REAL loader-minted artifact, edited through
-        # ``object.__setattr__`` to name the alternate world's runs.
-        tampered = cb.validate_certification_artifact(artifact)
-        alternate_runs = _alternative_world(conn, 5)
-        bundles = {key: dict(value) for key, value in tampered["certified_bundles"].items()}
-        bundles["5"]["runs"] = dict(alternate_runs)
-        object.__setattr__(tampered, "_document", MappingProxyType(bundles))
-        with pytest.raises(cb.CertificationRefused) as caught:
-            cb.certified_bundle_artifact_record(tampered, 5)
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_MUTATED
-        with pytest.raises(cb.CertificationRefused) as caught:
-            cb.validate_certification_artifact(tampered)
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_MUTATED
-    finally:
-        conn.close()
-
-
-def test_no_caller_can_mint_the_authorisation_through_module_access():
-    """The mint token is a closure variable, not a module attribute.
-
-    ``isinstance`` is never the validation: a value the contract has not passed is
-    re-validated, and the class itself cannot be constructed by a caller, so an
-    artifact-shaped mapping cannot be promoted to an authorisation by reaching for a
-    module-level token.
-    """
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        assert not hasattr(cb, "_CERTIFICATION_ARTIFACT_MINT")
-        # The exposed class refuses construction without the token that only the
-        # validation function holds...
-        with pytest.raises(cb.CertificationArtifactUnvalidated):
-            cb.ValidatedCertificationArtifact(artifact, validated_by="forged")
-        with pytest.raises(cb.CertificationArtifactUnvalidated):
-            cb.ValidatedCertificationArtifact(artifact, _token=object())
-        # ... so a raw mapping's ONLY way in is the contract, which re-runs it.
-        self_consistent = _unauthorised(artifact)
-        with pytest.raises(cb.CertificationArtifactUnvalidated):
-            cb.validate_certification_artifact(self_consistent)
-        # The value the loader DID mint is recognised, and unchanged.
-        validated = cb.validate_certification_artifact(artifact)
-        assert cb.validate_certification_artifact(validated) is validated
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Adversarial: an arbitrary matrix carrying the CORRECT copied stamp
-# ---------------------------------------------------------------------------
-#
-# The third attack: a caller builds its own worlds (or edits a loaded matrix) and
-# copies the certified-bundle stamp onto them.  A stamp is caller-writable, so it
-# authorises nothing; what admits a prebuilt matrix is the loader's own record of the
-# content it produced, verified by canonical content identity and bound to the event
-# and to the certified bundle the artifact records.
-
-
-def _stamped_by_hand(matrix, identity: str):
-    """A caller-built matrix carrying the CERTIFIED bundle stamp it copied."""
-
-    from fpl_brain.manager_worlds import MATRIX_CERTIFIED_BUNDLE_KEY
-
-    stamped = {key: value for key, value in matrix.items() if not str(key).startswith("_p2_")}
-    stamped[MATRIX_CERTIFIED_BUNDLE_KEY] = str(identity)
-    return stamped
-
-
-def _certified_matrix_loads(conn, runs, artifact, tmp_path, event: int):
-    """The loader's OWN 8-world matrix for one event, plus its certified identity."""
-
-    certified = _self_consistent_bundle(runs[int(event)], event=int(event))
-    matrix, info = ro.build_event_worlds(
-        conn, {int(event): certified}, int(event), (1, 2), _optimizer_config(events=(int(event),)),
-        certification=artifact, cache_dir=tmp_path,
-    )
-    return matrix, info
-
-
-def test_adversarial_a_copied_stamp_does_not_authorise_a_matrix(tmp_path):
-    """Every door that admits a prebuilt matrix refuses a stamped hand-built one."""
-
-    from fpl_brain.manager_worlds import MATRIX_CERTIFIED_BUNDLE_KEY
-    from fpl_brain import finalist_refinement as fr
-    from fpl_brain import route_stability as rs
-    from test_route_optimizer import (
-        EVENTS, _config as _small_config, _provider, _scenario, _universe,
-    )
-
-    event = int(EVENTS[0])
-    conn, runs = _world(events=EVENTS)
-    try:
-        artifact = _artifact(conn, runs, events=EVENTS)
-        certified = _self_consistent_bundle(runs[event], event=event)
-        matrix, info = _certified_matrix_loads(conn, runs, artifact, tmp_path, event)
-        identity = info["certified_bundle_identity"]
-
-        # The loader's own output carries the stamp, and IS admitted.
-        assert str(matrix[MATRIX_CERTIFIED_BUNDLE_KEY]) == str(identity)
-
-        universe, state, meta = _universe()
-        scenario = _scenario()
-        config = _small_config()
-
-        def _optimize_with(worlds, **over):
-            return ro.optimize(
-                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                bundles={event: certified}, conn=conn, config=ro.OptimizerConfig(
-                    events=EVENTS, search_draws=8, seed=20260911, policy_selection_worlds=6,
-                ),
-                certification=artifact, prebuilt_worlds=worlds, exact_cache={}, **over,
-            )
-
-        # (1) A hand-built matrix carrying the CORRECT copied stamp is refused.
-        hand_built = _stamped_by_hand(
-            {"worlds": 8, "player_ids": [1, 2],
-             "core": {1: [99.0] * 8, 2: [99.0] * 8},
-             "minutes": {1: [90.0] * 8, 2: [90.0] * 8},
-             "expected_bonus": {1: 0.0, 2: 0.0},
-             "role_actionability": {1: False, 2: False}},
-            identity,
-        )
-        assert str(hand_built[MATRIX_CERTIFIED_BUNDLE_KEY]) == str(identity)
-        with pytest.raises(cb.CertificationRefused) as caught:
-            _optimize_with({event: hand_built})
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-
-        # (2) EDITING a loaded matrix keeps its stamp but not its content identity.
-        edited = {key: value for key, value in matrix.items()}
-        edited["core"] = {1: [99.0] * int(edited["worlds"]), 2: [99.0] * int(edited["worlds"])}
-        assert str(edited[MATRIX_CERTIFIED_BUNDLE_KEY]) == str(identity)
-        with pytest.raises(cb.CertificationRefused) as caught:
-            _optimize_with({event: edited})
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-
-        # (3) A loaded matrix offered for a DIFFERENT event's authorisation is refused:
-        # the capability is bound to the event it was issued for.
-        with pytest.raises(cb.CertificationRefused):
-            ro.require_certified_prebuilt_matrix(
-                matrix, event=event + 1, certified_bundle_identity=str(identity)
-            )
-
-        # (4) Refinement and the stability ladder forward prebuilt worlds to the SAME
-        # door, so neither admits one either.
-        with pytest.raises(cb.CertificationRefused) as caught:
-            fr.refine_finalists(
-                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                bundles={event: certified}, conn=conn, base_config=config,
-                stage1_result=ro.optimize(
-                    universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                    config=config, non_production_worlds=ro.NonProductionWorlds(
-                        declaration="tests: pe-9 adversarial stage 1", provider=_provider()
-                    ),
-                ),
-                stage2_draws=config.search_draws * 2, certification=artifact,
-                prebuilt_worlds={event: hand_built}, verify_prefix=False, exact_cache={},
-            )
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-
-        with pytest.raises(cb.CertificationRefused) as caught:
-            rs.run_ladder(
-                universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-                base_config=config, budgets=[2], bundles={event: certified}, conn=conn,
-                certification=artifact, prebuilt_worlds={event: hand_built}, exact_cache={},
-            )
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-    finally:
-        conn.close()
-
-
-def test_adversarial_the_manager_world_load_requires_the_certified_run_ids():
-    """The manager policy matrix is a decision input, so its worlds cross the boundary.
-
-    ``manager_worlds.build_manager_worlds`` reads the Minutes / team-strength / xPts
-    runs and simulates the shared worlds the manager policy is scored in.  A
-    hand-assembled run-id set is refused, and so is the same set dressed in an
-    artifact-shaped mapping that carries no authorisation.
-    """
-
-    from fpl_brain import manager_worlds as mw
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        certified = runs[5]
-        with pytest.raises(cb.CertificationRefused) as caught:
-            mw.build_manager_worlds(
-                conn, planning_event=5, minutes_run_id=certified["minutes_v1"],
-                xpts_run_id=certified["xpts_v1"], team_run_id=certified["team_strength_v1"],
-                squad_ids=[1], simulations=4,
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
-
-        with pytest.raises(cb.CertificationRefused) as caught:
-            mw.build_manager_worlds(
-                conn, planning_event=5, minutes_run_id=certified["minutes_v1"],
-                xpts_run_id=certified["xpts_v1"], team_run_id=certified["team_strength_v1"],
-                squad_ids=[1], simulations=4, certification=_unauthorised(artifact),
-            )
-        assert caught.value.token == cb.DIAG_CERTIFICATION_ARTIFACT_UNVALIDATED
-
-        # A run id the artifact did not record for this event is refused, however
-        # complete the world it names is.
-        other = _alternative_world(conn, 5)
-        with pytest.raises(cb.CertificationRefused) as caught:
-            mw.build_manager_worlds(
-                conn, planning_event=5, minutes_run_id=other["minutes_v1"],
-                xpts_run_id=other["xpts_v1"], team_run_id=other["team_strength_v1"],
-                squad_ids=[1], simulations=4, certification=artifact,
-            )
-        assert caught.value.token == cb.STATE_PREDICTIVE_BUNDLE_INCOHERENT
-
-        # The CERTIFIED run ids load, so the refusals above are about provenance.
-        built = mw.build_manager_worlds(
-            conn, planning_event=5, minutes_run_id=certified["minutes_v1"],
-            xpts_run_id=certified["xpts_v1"], team_run_id=certified["team_strength_v1"],
-            squad_ids=[1], simulations=4, certification=artifact,
-        )
-        assert built["world_matrix"]["worlds"] == 4
-    finally:
-        conn.close()
-
-
-def test_the_loader_issued_matrix_is_content_bound_not_stamp_bound(tmp_path):
-    """The capability binds CONTENT: re-issuing the same worlds is admitted, a stamp
-    copied onto different worlds is not -- and the stamp itself plays no part."""
-
-    from test_route_optimizer import EVENTS
-
-    event = int(EVENTS[0])
-    conn, runs = _world(events=EVENTS)
-    try:
-        artifact = _artifact(conn, runs, events=EVENTS)
-        certified = _self_consistent_bundle(runs[event], event=event)
-        first, info = _certified_matrix_loads(conn, runs, artifact, tmp_path, event)
-        identity = info["certified_bundle_identity"]
-
-        # A second, INDEPENDENT load of the same certified world is issued too: the
-        # same content, produced by the same loader, is the same authorisation.
-        second, info2 = ro.build_event_worlds(
-            conn, {event: certified}, event, (1, 2), _optimizer_config(events=(event,)),
-            certification=artifact,
-        )
-        assert info2["certified_bundle_identity"] == identity
-        assert ro.issued_world_matrix(second) is not None
-        assert (
-            ro.issued_world_matrix(second).content_identity
-            == ro.issued_world_matrix(first).content_identity
-        )
-        assert ro.require_certified_prebuilt_matrix(
-            second, event=event, certified_bundle_identity=str(identity)
-        ).event == event
-
-        # A matrix with no semantic blocks at all -- the shape a caller reaches for when
-        # it only wants the stamp check to pass -- is not issued, and cannot be.
-        assert ro.issued_world_matrix({"worlds": 8, "player_ids": [1, 2]}) is None
-        assert ro.issued_world_matrix(
-            _stamped_by_hand({"worlds": 8, "player_ids": [1, 2]}, identity)
-        ) is None
-    finally:
-        conn.close()
-
-
-def test_adversarial_arbitrary_issuer_and_registry_injection_authorises_nothing(
-    tmp_path, monkeypatch
-):
-    """The world-matrix capability cannot be manufactured through module access.
-
-    There is no module-global registry to write and no issuing function to call with
-    content of your own: the record lives inside the loader that produced it, and the
-    module exposes read-only checks.  A caller's own registry is inert, the
-    declared-door recorder -- which does exist, because the declared door consumes
-    caller-supplied worlds by design -- can never satisfy the certified door, and the
-    load BODY, which does not issue, is refused exactly like a hand-built matrix.
-    """
-
-    from test_route_optimizer import (
-        EVENTS, _scenario, _universe,
-    )
-
-    event = int(EVENTS[0])
-    conn, runs = _world(events=EVENTS)
-    try:
-        artifact = _artifact(conn, runs, events=EVENTS)
-        certified = _self_consistent_bundle(runs[event], event=event)
-        matrix, info = _certified_matrix_loads(conn, runs, artifact, tmp_path, event)
-        identity = str(info["certified_bundle_identity"])
-        hand_built = _stamped_by_hand(
-            {"worlds": 8, "player_ids": [1, 2],
-             "core": {1: [99.0] * 8, 2: [99.0] * 8},
-             "minutes": {1: [90.0] * 8, 2: [90.0] * 8},
-             "expected_bonus": {1: 0.0, 2: 0.0},
-             "role_actionability": {1: False, 2: False}},
-            identity,
-        )
-
-        # (1) Neither attack has anything to reach: no registry, no issuer.
-        assert not hasattr(ro, "_ISSUED_WORLD_MATRICES")
-        assert not hasattr(ro, "_issue_world_matrix")
-
-        # (2) A caller can still write a registry of its own -- and it authorises
-        # nothing, because admission reads the loader's closure-held records.
-        content_identity = ro.world_matrix_content_identity(hand_built)
-        monkeypatch.setattr(
-            ro, "_ISSUED_WORLD_MATRICES",
-            {
-                content_identity: ro.IssuedWorldMatrix(
-                    content_identity=str(content_identity), event=event, source="forged",
-                    certified_bundle_identity=identity,
-                )
-            },
-            raising=False,
-        )
-        assert ro.issued_world_matrix(hand_built) is None
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.require_certified_prebuilt_matrix(
-                hand_built, event=event, certified_bundle_identity=identity
-            )
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-
-        universe, state, meta = _universe()
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.optimize(
-                universe=universe, initial_state=state, scenario=_scenario(), player_meta=meta,
-                bundles={event: certified}, conn=conn,
-                config=ro.OptimizerConfig(events=EVENTS, search_draws=8, seed=20260911),
-                certification=artifact, prebuilt_worlds={event: hand_built}, exact_cache={},
-            )
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-
-        # (3) The declared-door recorder exists and cannot satisfy the certified door:
-        # its record carries a declaration and NO certified bundle identity.
-        ro._issue_declared_world_matrix(hand_built, event=event, declaration="tests: forged")
-        with pytest.raises(cb.CertificationRefused) as caught:
-            ro.require_certified_prebuilt_matrix(
-                hand_built, event=event, certified_bundle_identity=identity
-            )
-        assert caught.value.token == ro.DIAG_WORLD_MATRIX_NOT_LOADER_ISSUED
-        # The loader's OWN matrix is admitted, so the refusals are about provenance.
-        assert ro.require_certified_prebuilt_matrix(
-            matrix, event=event, certified_bundle_identity=identity
-        ).event == event
-
-        # (4) The load BODY builds the same worlds and issues no capability at all:
-        # only the wrapper that performed a real load can.
-        body_matrix, body_info = ro._load_event_worlds(
-            conn, {event: certified}, event, (1, 2),
-            _optimizer_config(events=(event,), search_draws=6), certification=artifact,
-        )
-        assert body_info["source"] == "generated"
-        assert ro.issued_world_matrix(body_matrix) is None
-    finally:
-        conn.close()
-
-
-def test_the_manager_packet_loads_the_certification_and_validates_the_run_ids():
-    """``scripts/build_manager_packet.py`` consumes the artifact, not CLI defaults.
-
-    The command's world load is a predictive-load boundary, so the artifact is loaded
-    and forwarded and every supplied run id is validated against the ids the artifact
-    recorded for the event.  An id from a different predictive world is refused, which
-    is the difference between "the packet describes the certified generation" and "the
-    packet records whatever the operator passed in".
-    """
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-    import build_manager_packet as bmp
-
-    from fpl_brain import manager_worlds as mw
-
-    conn, runs = _world()
-    try:
-        artifact = _artifact(conn, runs)
-        validated = cb.validate_certification_artifact(artifact)
-
-        resolved = bmp.certified_run_ids(validated, event=5)
-        assert resolved["minutes_v1"] == runs[5]["minutes_v1"]
-        assert resolved["team_strength_v1"] == runs[5]["team_strength_v1"]
-        assert resolved["xpts_v1"] == runs[5]["xpts_v1"]
-        assert resolved["monte_carlo_v1"] == runs[5]["monte_carlo_v1"]
-
-        # The certified ids are accepted when supplied...
-        assert bmp.certified_run_ids(
-            validated, event=5, minutes_run=runs[5]["minutes_v1"], xpts_run=runs[5]["xpts_v1"],
-            team_run=runs[5]["team_strength_v1"], monte_carlo_run=runs[5]["monte_carlo_v1"],
-        ) == resolved
-        # ... and an id from another predictive world is refused, never preferred.
-        alternative = _alternative_world(conn, 5)
-        for supplied in (
-            {"minutes_run": alternative["minutes_v1"]},
-            {"xpts_run": alternative["xpts_v1"]},
-            {"team_run": alternative["team_strength_v1"]},
-            {"monte_carlo_run": alternative["monte_carlo_v1"]},
-            {"minutes_run": 999_999},
-        ):
-            with pytest.raises(bmp.CertificationMismatch):
-                bmp.certified_run_ids(validated, event=5, **supplied)
-
-        # The packet names the versions the CERTIFICATION recorded.
-        assert bmp.certified_model_versions(validated, event=5) == VERSIONS
-
-        # The ids the command resolves are exactly the ids the certified load accepts,
-        # so the forwarding is proved end to end rather than by the command's text.
-        built = mw.build_manager_worlds(
-            conn, planning_event=5, minutes_run_id=resolved["minutes_v1"],
-            xpts_run_id=resolved["xpts_v1"], team_run_id=resolved["team_strength_v1"],
-            squad_ids=[1], simulations=4, certification=validated,
-        )
-        assert built["input_run_ids"] == {
-            "minutes": runs[5]["minutes_v1"], "xpts": runs[5]["xpts_v1"],
-            "team": runs[5]["team_strength_v1"],
-        }
-
-        # And the command really loads and forwards the artifact: its event and run ids
-        # are no longer CLI defaults.
-        source = Path(bmp.__file__).read_text(encoding="utf-8")
-        assert '"--certification", required=True' in source
-        assert "load_certification_artifact" in source
-        assert "certification=certification" in source
-    finally:
-        conn.close()

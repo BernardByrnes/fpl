@@ -290,7 +290,10 @@ def test_stage2_uses_the_declared_higher_draw_budget_and_the_same_inputs():
     report = fr.refine_finalists(
         universe=sentinel_universe, initial_state=_partial("X").state,
         scenario="SCENARIO", player_meta={41: "META"}, base_config=base_config,
-        stage1_result=stage1, prebuilt_worlds={5: {"worlds": 10_000, "player_ids": []}},
+        stage1_result=stage1,
+        # The declared NON-PRODUCTION door: this fixture supplies worlds that were never
+        # loaded from a certified generation, and it says so out loud.
+        non_production_worlds=_np({5: {"worlds": 10_000, "player_ids": []}}),
         verify_prefix=False, optimizer=optimizer,
     )
     assert len(optimizer.calls) == 1
@@ -323,7 +326,7 @@ def test_stage2_refinement_creates_no_predictive_run():
         universe={"universe": [], "replacement_edges": []}, initial_state=_partial("X").state,
         scenario=None, player_meta={}, base_config=ro.OptimizerConfig(events=EVENTS, seed=1),
         stage1_result=stage1, conn=_WriteForbidden(),
-        prebuilt_worlds={5: {"worlds": 10_000, "player_ids": []}},
+        non_production_worlds=_np({5: {"worlds": 10_000, "player_ids": []}}),
         verify_prefix=False, optimizer=optimizer,
     )
     source = (REPO_ROOT / "fpl_brain" / "finalist_refinement.py").read_text(encoding="utf-8")
@@ -762,9 +765,9 @@ def test_escalation_runner_uses_the_next_beam_width_at_the_stage2_draws(monkeypa
     stage1["level_survivors"] = ["sentinel-levels"]
     run = runner._escalation_runner(
         universe={"universe": []}, initial_state=_partial("X").state, scenario=None,
-        player_meta={}, bundles={5: object()}, conn=None, base_config=base_config,
+        player_meta={}, generation=None, conn=None, base_config=base_config,
         stage1_result=stage1, stage2_draws=fr.STAGE2_DRAWS,
-        prebuilt_worlds={5: {"worlds": 10_000, "player_ids": []}}, finalist_partials=[a, b],
+        finalist_partials=[a, b],
     )
     run(12)
     config = captured["config"]
@@ -774,9 +777,20 @@ def test_escalation_runner_uses_the_next_beam_width_at_the_stage2_draws(monkeypa
     assert config.events == EVENTS
     assert captured["required_routes"] == [a, b]
     assert captured["nested_prior"]["level_survivors"] == ["sentinel-levels"]
-    assert captured["prebuilt_worlds"][5]["worlds"] == 10_000
     # and the ladder is bounded: there is no way to ask for a second escalation
     assert rs.next_ladder_budget(12) == 24
+
+
+def _np(matrices):
+    """The DECLARED non-production door: these worlds were never loaded from a
+    certified generation, and the declaration says who is exercising the interface."""
+
+    from fpl_brain import route_optimizer as ro
+
+    return ro.NonProductionWorlds(
+        declaration="test_r4b2b_finalist_stability: synthetic worlds, no certified generation",
+        matrices=matrices,
+    )
 
 
 SEED_SENTINEL = 424242

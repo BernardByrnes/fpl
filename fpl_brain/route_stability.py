@@ -212,25 +212,25 @@ def run_ladder(
     player_meta: Mapping[int, Any],
     base_config: ro.OptimizerConfig,
     budgets: Sequence[int] = LADDER_BUDGETS,
-    bundles: Mapping[int, Any] | None = None,
+    generation: Any = None,
     conn=None,
-    prebuilt_worlds: Mapping[int, Any] | None = None,
     cache_dir=None,
     non_production_worlds: Any | None = None,
-    certification: Mapping[str, Any] | None = None,
     exact_cache: dict | None = None,
     progress: Callable[[str], None] | None = None,
+    **descriptors: Any,
 ) -> dict[str, Any]:
     """Run the nested budget ladder and certify it.
 
     Every rung crosses the same predictive-data boundary as ``ro.optimize``: the
-    ``certification`` artifact authorises the bundles' exact certified run ids, and
-    worlds that were never loaded from a prediction run must be declared through
+    certified ``generation`` names the exact certified run ids, and worlds that were
+    never loaded from a prediction run must be declared through
     ``route_optimizer.NonProductionWorlds``.
     """
 
     import time
 
+    ro.refuse_predictive_descriptors(descriptors, caller="route_stability.run_ladder")
     exact_cache = exact_cache if exact_cache is not None else {}
     ladder: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
@@ -242,9 +242,9 @@ def run_ladder(
         started = time.time()
         result = ro.optimize(
             universe=universe, initial_state=initial_state, scenario=scenario, player_meta=player_meta,
-            bundles=bundles, conn=conn, config=config, cache_dir=cache_dir,
-            non_production_worlds=non_production_worlds, certification=certification,
-            prebuilt_worlds=prebuilt_worlds, exact_cache=exact_cache,
+            generation=generation, conn=conn, config=config, cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds,
+            exact_cache=exact_cache,
             nested_prior=prior_view, required_routes=required,
         )
         result["ladder_budget"] = int(budget)

@@ -162,23 +162,21 @@ def test_K_search_view_criteria_agree_between_the_two_implementations():
 # C — Monte Carlo cache identity
 # ---------------------------------------------------------------------------
 def test_C_mc_model_version_change_invalidates_world_cache(monkeypatch):
-    class Bundle:
-        minutes_run_id = 1
-        team_run_id = 2
-        rate_run_id = 3
-        xpts_run_id = 4
-        mc_run_id = 5
-
+    runs = {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
+            "monte_carlo_v1": 5}
     cfg = ro.OptimizerConfig(events=(5, 6, 7, 8), search_draws=100)
-    before = ro.world_cache_key(event=5, bundle=Bundle(), config=cfg, union_ids=[1, 2, 3])
+    before = ro.world_cache_key(event=5, generation_id="sha256:" + "a" * 64, runs=runs,
+                                config=cfg, union_ids=[1, 2, 3])
 
     monkeypatch.setattr(monte_carlo, "MONTE_CARLO_MODEL_VERSION", "mc_TEST_BUMP")
-    after = ro.world_cache_key(event=5, bundle=Bundle(), config=cfg, union_ids=[1, 2, 3])
+    after = ro.world_cache_key(event=5, generation_id="sha256:" + "a" * 64, runs=runs,
+                               config=cfg, union_ids=[1, 2, 3])
     assert before != after, "a Monte Carlo model change must change the cache identity"
 
     # The authoritative constant is what feeds the key.
     monkeypatch.undo()
-    again = ro.world_cache_key(event=5, bundle=Bundle(), config=cfg, union_ids=[1, 2, 3])
+    again = ro.world_cache_key(event=5, generation_id="sha256:" + "a" * 64, runs=runs,
+                               config=cfg, union_ids=[1, 2, 3])
     assert again == before
 
 
@@ -553,39 +551,46 @@ def test_R_blank_gameweek_is_an_explicit_zero_not_a_missing_projection():
 # ---------------------------------------------------------------------------
 # T — conflicting --event vs certification
 # ---------------------------------------------------------------------------
-def test_T_conflicting_event_against_certification_fails(tmp_path):
-    import importlib.util
+def test_T_conflicting_event_against_the_certified_generation_fails():
+    """A generation for another event never becomes this decision's world.
 
-    spec = importlib.util.spec_from_file_location("r4b1_runner", RUNNER)
-    runner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner)
+    PE-9 amendment 2 made ``generation_id`` a SELECTOR, not a capability, so there is
+    no artifact file to contradict: the generation is resolved from the store and its
+    event, horizon and cutoff must equal the decision's, or the decision is refused.
+    This checks that the binding is enforced where a caller could otherwise point a
+    decision at a world it does not belong to.
+    """
 
-    artifact = tmp_path / "certification_artifact.json"
-    artifact.write_text(json.dumps({
-        "schema": "fpl_brain.certification_artifact.v1",
-        "events": [5, 6, 7, 8],
-        "planning_cutoff": "2026-09-12T19:20:00Z",
-        "data_snapshot_sha256": "deadbeef",
-        "certified_bundles": {},
-        "four_gw_certification_identity": "sha256:abc",
-    }), encoding="utf-8")
+    import generation_fixtures as gf
+    from fpl_brain import generation_store as gs
 
-    assert runner._certification_events(artifact) == [5, 6, 7, 8]
-    # The mismatch check happens BEFORE any database connection, so this returns
-    # a refusal code without touching the live database.
-    code = runner.main(["--stage", "search", "--cutoff", "2026-09-12T19:20:00Z",
-                        "--event", "4", "--certification", str(artifact)])
-    assert code == 2
+    conn, runs = gf.synthetic_world(events=(5, 6, 7, 8))
+    generation = gf.certify_world(conn, runs, events=(5, 6, 7, 8), planning_event=5)
+    assert list(generation.events) == [5, 6, 7, 8]
+
+    # The selector is bound to its own event: asking for GW4 with a GW5 generation is
+    # a contradiction, and the store refuses it rather than re-pointing the world.
+    with pytest.raises(gs.GenerationRefused):
+        gs.resolve_generation(conn, planning_event=4, generation_id=generation.generation_id)
+
+    # An unknown generation id is likewise refused, never defaulted.
+    with pytest.raises(gs.GenerationUnknown):
+        gs.resolve_generation(conn, planning_event=5, generation_id="sha256:" + "0" * 64)
+
+    # And a horizon that is not the certified one is refused by the store's own check.
+    assert gs.support_by_event(generation)[5]["bundle_identity"]
 
 
-def test_T_no_event_and_no_certification_is_refused():
+def test_T_no_event_and_no_generation_is_refused():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("r4b1_runner2", RUNNER)
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
-    code = runner.main(["--stage", "search", "--cutoff", "2026-09-12T19:20:00Z"])
-    assert code == 2
+    # The planning event is REQUIRED: there is no default Gameweek, so argparse
+    # refuses before any database connection is opened.
+    with pytest.raises(SystemExit):
+        runner.main(["--stage", "search", "--cutoff", "2026-09-12T19:20:00Z"])
 
 
 # ---------------------------------------------------------------------------
@@ -661,9 +666,9 @@ def test_W_production_runner_never_emits_play_wildcard():
 # ---------------------------------------------------------------------------
 # X / Y — production wiring assertions
 # ---------------------------------------------------------------------------
-def test_X_discovery_reads_come_from_the_certification_snapshot():
+def test_X_discovery_reads_come_from_the_certified_generation_snapshot():
     source = RUNNER.read_text(encoding="utf-8")
-    assert "fg.open_certification_source(certification)" in source
+    assert "gs.open_generation_snapshot(generation)" in source
     for call in ("cu.load_pool(source_conn)", "cu.load_fixtures_by_team(source_conn",
                  "rc.load_player_meta(source_conn", "cu.price_snapshot_as_of(\n            source_conn",
                  "manager_worlds.resolve_squad(source_context, source_conn)"):

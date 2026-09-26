@@ -148,6 +148,7 @@ def _seed(conn, *, prices: dict[int, int] | None = None, bank: int = 20, ft: int
         # model version off the run's own row, so a database that names certified run
         # ids it does not carry is not a certified generation.
         cf.seed_certified_runs(conn)
+        cf.seed_certified_world(conn)
 
 
 @pytest.fixture
@@ -293,7 +294,16 @@ def _arm_inputs(*, play_scores=(1.0, 1.0, 1.0), save_scores=(1.0, 1.0, 1.0)):
 #: A canonical world cache populated for the certified events, so the loader is
 #: exercised for real rather than stubbed.
 WORLD_CACHE = Path(tempfile.mkdtemp())
-cf.write_world_cache(WORLD_CACHE, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE)
+# The cache is keyed on the CERTIFIED GENERATION, so the id is resolved from the
+# fixture's own synthetic world before any test database exists -- certification is a
+# pure function of the semantic evidence, which is what makes that possible.
+WORLD_CACHE_GENERATION_ID = cf.world_cache_generation_id(
+    events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3)
+)
+cf.write_world_cache(
+    WORLD_CACHE, generation_id=WORLD_CACHE_GENERATION_ID,
+    events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE,
+)
 
 
 def _permanent() -> fh.FreeHitPermanentState:
@@ -828,7 +838,7 @@ def test_B2_an_absent_cache_regenerates_from_the_certified_runs(conn):
     from fpl_brain import route_optimizer as ro
     for event in (EVENT, EVENT + 1, EVENT + 2, EVENT + 3):
         assert (empty_cache / f"{ro.world_cache_key(
-            event=event, bundle=ad._CertifiedRunIds(event, cf.runs_for(event)),
+            event=event, generation_id=WORLD_CACHE_GENERATION_ID, runs=cf.runs_for(event),
             config=ro.OptimizerConfig(policy_selection_worlds=12),
             union_ids=tuple(int(p) for p in UNIVERSE),
         )}.json").exists(), f"event {event} was not materialised under its certified key"
@@ -847,7 +857,10 @@ def test_B3_a_cache_for_another_universe_is_simply_never_read(conn):
 
     _seed(conn)
     foreign = Path(tempfile.mkdtemp())
-    cf.write_world_cache(foreign, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE[:5])
+    cf.write_world_cache(
+        foreign, generation_id=WORLD_CACHE_GENERATION_ID, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3),
+        union=UNIVERSE[:5],
+    )
     before = {p.name for p in foreign.iterdir()}
     request = ad.build_free_hit_request(
         _state(conn), _certified(), conn=conn, certification_path=CERT_PATH,
@@ -870,13 +883,14 @@ def test_B4_the_loaded_matrix_is_the_canonical_one_for_the_certified_bundle(conn
     )
     from fpl_brain import route_optimizer as ro
     expected_key = cf.write_world_cache(
-        Path(tempfile.mkdtemp()), events=(EVENT,), union=UNIVERSE,
+        Path(tempfile.mkdtemp()), generation_id=WORLD_CACHE_GENERATION_ID,
+        events=(EVENT,), union=UNIVERSE,
     )[EVENT]
     # The value loaded is the one written under the canonical key for the certified
     # bundle: a caller-supplied matrix could never have produced it.
     assert expected_key == ro.world_cache_key(
-        event=EVENT, bundle=ad._CertifiedRunIds(EVENT, cf.runs_for(EVENT)),
-        config=request.save_route.events and ro.OptimizerConfig(policy_selection_worlds=12),
+        event=EVENT, generation_id=WORLD_CACHE_GENERATION_ID, runs=cf.runs_for(EVENT),
+        config=ro.OptimizerConfig(policy_selection_worlds=12),
         union_ids=tuple(int(p) for p in UNIVERSE),
     )
     assert request.save_route.value() > 0.0
@@ -933,7 +947,9 @@ def test_per_event_A_a_distinct_per_event_certificate_builds_and_evaluates(conn)
 
     path = cf.write_artifact(Path(tempfile.mkdtemp()), artifact, name="distinct.json")
     cache = Path(tempfile.mkdtemp())
-    cf.write_world_cache(cache, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE)
+    cf.write_world_cache(
+        cache, generation_id=WORLD_CACHE_GENERATION_ID, events=(EVENT, EVENT + 1, EVENT + 2, EVENT + 3), union=UNIVERSE,
+    )
     request = ad.build_free_hit_request(
         _state(conn), _certified(), conn=conn, certification_path=path, world_cache_dir=cache,
     )
@@ -973,7 +989,7 @@ def test_per_event_D_each_events_certified_runs_drive_its_own_world_key(conn):
     config = fx_config()
     keys = {
         event: ro.world_cache_key(
-            event=event, bundle=ad._CertifiedRunIds(event, cf.runs_for(event)),
+            event=event, generation_id=WORLD_CACHE_GENERATION_ID, runs=cf.runs_for(event),
             config=config, union_ids=tuple(int(p) for p in UNIVERSE),
         )
         for event in (EVENT, EVENT + 1, EVENT + 2, EVENT + 3)
@@ -982,7 +998,7 @@ def test_per_event_D_each_events_certified_runs_drive_its_own_world_key(conn):
     # Deriving H2's key from H1's runs is a DIFFERENT key, so the wrong bundle
     # cannot silently select H2's matrix.
     wrong = ro.world_cache_key(
-        event=EVENT + 1, bundle=ad._CertifiedRunIds(EVENT, cf.runs_for(EVENT)),
+        event=EVENT + 1, generation_id=WORLD_CACHE_GENERATION_ID, runs=cf.runs_for(EVENT),
         config=config, union_ids=tuple(int(p) for p in UNIVERSE),
     )
     assert wrong != keys[EVENT + 1]
@@ -996,17 +1012,15 @@ def test_per_event_F_swapping_two_events_certified_runs_changes_both_keys(conn):
     config = fx_config()
     union = tuple(int(p) for p in UNIVERSE)
     original = {
-        e: ro.world_cache_key(event=e, bundle=ad._CertifiedRunIds(e, cf.runs_for(e)),
-                              config=config, union_ids=union)
+        e: ro.world_cache_key(event=e, generation_id=WORLD_CACHE_GENERATION_ID,
+                              runs=cf.runs_for(e), config=config, union_ids=union)
         for e in (EVENT + 1, EVENT + 2)
     }
     swapped = {
-        EVENT + 1: ro.world_cache_key(event=EVENT + 1,
-                                      bundle=ad._CertifiedRunIds(EVENT + 1, cf.runs_for(EVENT + 2)),
-                                      config=config, union_ids=union),
-        EVENT + 2: ro.world_cache_key(event=EVENT + 2,
-                                      bundle=ad._CertifiedRunIds(EVENT + 2, cf.runs_for(EVENT + 1)),
-                                      config=config, union_ids=union),
+        EVENT + 1: ro.world_cache_key(event=EVENT + 1, generation_id=WORLD_CACHE_GENERATION_ID,
+                                      runs=cf.runs_for(EVENT + 2), config=config, union_ids=union),
+        EVENT + 2: ro.world_cache_key(event=EVENT + 2, generation_id=WORLD_CACHE_GENERATION_ID,
+                                      runs=cf.runs_for(EVENT + 1), config=config, union_ids=union),
     }
     assert swapped[EVENT + 1] != original[EVENT + 1]
     assert swapped[EVENT + 2] != original[EVENT + 2]

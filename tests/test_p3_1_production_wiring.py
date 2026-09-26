@@ -215,13 +215,13 @@ def test_escalation_receives_the_same_worker_count_and_the_same_cache(spy_optimi
 
     escalation = runner._escalation_runner(
         universe=universe, initial_state=state, scenario=scenario, player_meta=meta,
-        bundles=None, conn=None, base_config=config, stage1_result=stage1,
+        generation=None, conn=None, base_config=config, stage1_result=stage1,
         stage2_draws=config.search_draws,
         # The same DECLARED non-production source the Stage-2 refinement used, so the
         # escalation may consume the worlds that declaration produced.
         non_production_worlds=_np(provider),
-        prebuilt_worlds=refinement["prebuilt_worlds"], finalist_partials=partials,
-        exact_cache=cache, cancel_probe=None,
+        finalist_partials=partials,
+        exact_cache=cache, cancel_probe=None, cache_dir=None,
         parallel_workers=runner.PRODUCTION_PARALLEL_EXACT_WORKERS)
     result = escalation(12)
     assert spy_optimize, "the escalation must have called optimize"

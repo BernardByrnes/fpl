@@ -389,6 +389,12 @@ def test_8b_code_and_data_snapshot_are_distinct_concepts():
 # ---------------------------------------------------------------------------
 
 
+#: The AUTHORITATIVE declared versions, read from the one in-library source: PE-9 gap 1
+#: made the required versions come from that source and never from the artifact, so a
+#: world recorded under stale literals is a run nobody pins.
+DECLARED_VERSIONS = cb.declared_required_versions()
+
+
 def _bundle_world(conn):
     """Five families for GW5 with correct and incorrect DAG wiring available."""
 
@@ -400,33 +406,37 @@ def _bundle_world(conn):
             (run_id, family, version, event, cutoff, status),
         )
 
+    declared = DECLARED_VERSIONS
     _base_world(conn)
     with conn:
-        run(1, "minutes_v1", "minutes_v1.6.0")
-        run(2, "team_strength_v1", "team_strength_v1.0.0")
-        run(3, "player_rates_v1", "player_rates_v1.0.0")
-        run(4, "xpts_v1", "xpts_v1.4.1")
-        run(5, "monte_carlo_v1", "mc_v1.3.0")
+        run(1, "minutes_v1", declared["minutes_v1"])
+        run(2, "team_strength_v1", declared["team_strength_v1"])
+        run(3, "player_rates_v1", declared["player_rates_v1"])
+        run(4, "xpts_v1", declared["xpts_v1"])
+        run(5, "monte_carlo_v1", declared["monte_carlo_v1"])
         # a NEWER same-cutoff rerun of xpts, wired to a different minutes run
-        run(6, "minutes_v1", "minutes_v1.6.0")
-        run(7, "xpts_v1", "xpts_v1.4.1")
+        run(6, "minutes_v1", declared["minutes_v1"])
+        run(7, "xpts_v1", declared["xpts_v1"])
         conn.execute(
             "INSERT INTO player_fixture_xpts_projections(projection_run_id, player_id, fixture_id, event,"
             " team_id, opponent_id, position, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, scoring_rules_version, generated_at)"
-            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}','xpts_v1.4.1','v1','2026-09-12T19:01:00Z')"
+            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}',?,'v1','2026-09-12T19:01:00Z')",
+            (declared["xpts_v1"],),
         )
         conn.execute(
             "INSERT INTO player_fixture_xpts_projections(projection_run_id, player_id, fixture_id, event,"
             " team_id, opponent_id, position, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, scoring_rules_version, generated_at)"
-            " VALUES (7,1,48,5,1,2,'MID',6,2,3,'{}','xpts_v1.4.1','v1','2026-09-12T19:01:00Z')"
+            " VALUES (7,1,48,5,1,2,'MID',6,2,3,'{}',?,'v1','2026-09-12T19:01:00Z')",
+            (declared["xpts_v1"],),
         )
         conn.execute(
             "INSERT INTO monte_carlo_distributions(projection_run_id, player_id, fixture_id, event, team_id,"
             " opponent_id, position, xpts_run_id, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, generated_at)"
-            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}','mc_v1.3.0','2026-09-12T19:01:00Z')"
+            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}',?,'2026-09-12T19:01:00Z')",
+            (declared["monte_carlo_v1"],),
         )
     return conn
 
@@ -451,11 +461,14 @@ def test_10_exact_coherent_bundle_passes_and_has_an_identity(tmp_path):
     bundle = cb.certified_bundle_from_explicit_ids(
         conn, event=5, cutoff="2026-09-12T19:00:00Z",
         runs={"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4, "monte_carlo_v1": 5},
-        required_versions={"minutes_v1": "minutes_v1.6.0", "monte_carlo_v1": "mc_v1.3.0"},
+        required_versions={
+            "minutes_v1": DECLARED_VERSIONS["minutes_v1"],
+            "monte_carlo_v1": DECLARED_VERSIONS["monte_carlo_v1"],
+        },
     )
     assert bundle.bundle_identity().startswith("sha256:")
     assert bundle.runs["xpts_v1"] == 4
-    assert bundle.model_versions["monte_carlo_v1"] == "mc_v1.3.0"
+    assert bundle.model_versions["monte_carlo_v1"] == DECLARED_VERSIONS["monte_carlo_v1"]
     conn.close()
 
 

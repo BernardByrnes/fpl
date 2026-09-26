@@ -94,6 +94,110 @@ def seed_certified_runs(
     return runs_by_event
 
 
+def seed_certified_world(
+    conn: Any,
+    events: Sequence[int] = (5, 6, 7, 8),
+    *,
+    cutoff: str = CUTOFF,
+    certify: bool = True,
+):
+    """Seed the rows a CERTIFIED GENERATION re-proves, then certify one.
+
+    ``seed_certified_runs`` inserts the ``projection_runs`` rows the certification
+    declares; a generation additionally re-proves the dependency closure from the
+    ROWS, so the fixture world also needs the fixture, xPts and Monte Carlo rows.  A
+    generation is then minted through the REAL ``generation_store.certify_generation``
+    lifecycle, so what a test loads is what production would have persisted.
+
+    The snapshot identity is deliberately ABSENT for this synthetic world: there is
+    no captured source database behind it, and claiming one would be a fiction the
+    retention check would then have to be told to ignore.  A generation without a
+    pinned snapshot is honest about having none.
+    """
+
+    from fpl_brain import generation_store as gs
+
+    events = tuple(int(event) for event in events)
+    runs_by_event: dict[int, dict[str, int]] = {}
+    fixtures_by_event: dict[int, int] = {}
+    with conn:
+        for event in events:
+            runs = runs_for(event)
+            fixture_id = 5000 + event
+            fixtures_by_event[event] = fixture_id
+            conn.execute(
+                "INSERT OR IGNORE INTO fixtures(id, event, team_h, team_a, kickoff_time, finished,"
+                " started, raw_json, updated_at) VALUES (?,?,?,?,?,0,0,'{}',?)",
+                (fixture_id, event, 100, 101, f"2026-09-{event + 11:02d}T14:00:00Z", CUTOFF),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO player_fixture_xpts_projections(projection_run_id, player_id,"
+                " fixture_id, event, team_id, opponent_id, position, minutes_run_id, team_run_id,"
+                " rate_run_id, payload_json, model_version, scoring_rules_version, generated_at)"
+                " VALUES (?,?,?,?,100,101,'MID',?,?,?,'{}','xpts_v1','v1',?)",
+                (int(runs["xpts_v1"]), 1, fixture_id, event, int(runs["minutes_v1"]),
+                 int(runs["team_strength_v1"]), int(runs["player_rates_v1"]), CUTOFF),
+            )
+            runs_by_event[event] = {family: int(run_id) for family, run_id in runs.items()}
+    if not certify:
+        return None, runs_by_event
+
+    generation = gs.certify_generation(
+        conn,
+        planning_event=events[0],
+        cutoff=str(cutoff),
+        runs_by_event=runs_by_event,
+        events=events,
+        horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+        snapshot=None,
+        code_snapshot_sha256=CODE_SNAPSHOT,
+    )
+    return generation, runs_by_event
+
+
+def world_cache_generation_id(
+    events: Sequence[int] = (5, 6, 7, 8), *, cutoff: str = CUTOFF
+) -> str:
+    """The generation id this fixture's synthetic world resolves to.
+
+    Minted in a THROWAWAY in-memory store over exactly the same rows, so a cache
+    written at import time (before any test database exists) is keyed on the SAME
+    generation a test's own store will certify.  The certification is a pure function
+    of the semantic evidence, which is what makes that possible.
+    """
+
+    from fpl_brain.database import connect_database
+
+    conn = connect_database(":memory:")
+    try:
+        base_world(conn)
+        events = tuple(int(event) for event in events)
+        seed_certified_runs(conn, events)
+        generation, _runs = seed_certified_world(conn, events, cutoff=cutoff)
+        return generation.generation_id
+    finally:
+        conn.close()
+
+
+def base_world(conn: Any) -> None:
+    """The minimum world rows ``seed_certified_runs`` needs to be insertable."""
+
+    with conn:
+        for event in range(1, 39):
+            conn.execute(
+                "INSERT OR IGNORE INTO events(id, name, deadline_time, finished, raw_json, updated_at)"
+                " VALUES (?,?,?,?, '{}', ?)",
+                (event, f"GW{event}", f"2026-09-{event + 11:02d}T12:30:00Z", 1 if event < 5 else 0,
+                 CUTOFF),
+            )
+        for team_id in (100, 101):
+            conn.execute(
+                "INSERT OR IGNORE INTO teams(id, name, short_name, raw_json, updated_at)"
+                " VALUES (?,?,?, '{}', ?)",
+                (team_id, f"Team {team_id}", f"T{team_id}", CUTOFF),
+            )
+
+
 def bundle(
     event: int, *, cutoff: str = CUTOFF, snapshot: str = DATA_SNAPSHOT,
     code: str = CODE_SNAPSHOT, context: str = CONTEXT_HASH,
@@ -188,15 +292,16 @@ def identity_for(bundle_row: Mapping[str, Any]) -> Any:
 
 
 def write_world_cache(
-    cache_dir, *, events: Sequence[int], union: Sequence[int], scores: Mapping[int, float] | None = None,
+    cache_dir, *, generation_id: str, events: Sequence[int], union: Sequence[int],
+    scores: Mapping[int, float] | None = None,
     worlds: int = 24, per_event_scores: Mapping[int, float] | None = None,
     bonus: Mapping[int, float] | None = None,
 ):
     """Populate the CANONICAL world cache so the loader can be exercised for real.
 
     Each matrix is written under the exact ``world_cache_key`` derived from the
-    certified run ids, the config and the capture union -- the same key
-    ``route_optimizer.build_event_worlds`` computes and stamps.  This is the only
+    CERTIFIED GENERATION, its run ids, the config and the capture union -- the same
+    key ``route_optimizer.build_event_worlds`` computes and stamps.  This is the only
     way to obtain a matrix the production adapter will accept.
     """
 
@@ -216,9 +321,11 @@ def write_world_cache(
         event = int(event)
         from fpl_brain.free_hit_request_adapter import _CertifiedRunIds
 
-        bundle = _CertifiedRunIds(event, runs_for(event))
         config = ro.OptimizerConfig(policy_selection_worlds=12)
-        key = ro.world_cache_key(event=event, bundle=bundle, config=config, union_ids=union)
+        key = ro.world_cache_key(
+            event=event, generation_id=str(generation_id), runs=runs_for(event),
+            config=config, union_ids=union,
+        )
         value = float(per_event_scores.get(event, scores.get("default", 1.0)))
         matrix = {
             "worlds": int(worlds),
@@ -231,6 +338,17 @@ def write_world_cache(
             "expected_bonus": {str(p): float(per_event_bonus.get(p, 0.0)) for p in union},
             "role_actionability": {str(p): False for p in union},
         }
+        # PE-9 amendment 2 section 12: a cache HIT must be provable, so the entry
+        # carries the content digest of the matrix it holds.  Without it the loader
+        # (correctly) treats the file as a MISS and re-simulates the synthetic world.
+        matrix[ro.CACHE_CONTENT_DIGEST_KEY] = ro.world_matrix_content_identity({
+            "worlds": matrix["worlds"],
+            "player_ids": [int(p) for p in matrix["player_ids"]],
+            "core": {int(k): v for k, v in matrix["core"].items()},
+            "minutes": {int(k): v for k, v in matrix["minutes"].items()},
+            "expected_bonus": {int(k): v for k, v in matrix["expected_bonus"].items()},
+            "role_actionability": {int(k): bool(v) for k, v in matrix["role_actionability"].items()},
+        })
         (cache_dir / f"{key}.json").write_text(json.dumps(matrix), encoding="utf-8")
         keys[event] = key
     return keys
@@ -242,11 +360,13 @@ def identity_for_event(event: int, **overrides) -> Any:
     return identity_for(bundle(int(event), **overrides))
 
 
-def bundle_key(event: int, *, config, union) -> str:
-    """The canonical world-cache key for one event's certified bundle."""
+def bundle_key(event: int, *, config, union, generation_id: str | None = None) -> str:
+    """The canonical world-cache key for one event's certified GENERATION."""
 
     from fpl_brain import route_optimizer as ro
-    from fpl_brain.free_hit_request_adapter import _CertifiedRunIds
 
-    return ro.world_cache_key(event=int(event), bundle=_CertifiedRunIds(int(event), runs_for(int(event))),
-                              config=config, union_ids=tuple(int(p) for p in union))
+    return ro.world_cache_key(
+        event=int(event), generation_id=str(generation_id or world_cache_generation_id()),
+        runs=runs_for(int(event)), config=config,
+        union_ids=tuple(int(p) for p in union),
+    )

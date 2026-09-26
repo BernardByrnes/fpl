@@ -351,6 +351,40 @@ def validate_certified_bundle(
                     f"but the bundle declares {expected}"
                 )
 
+    # PE-9 gap 6: a PARTIAL double gameweek must not silently understate a player.
+    # xPts and the Monte Carlo run describe the same event, so they must cover the
+    # SAME fixture population: a Monte Carlo run holding rows for only one leg of a
+    # double gameweek would simulate a player with fewer fixtures than the certified
+    # xPts evidence declares, and nothing downstream would see it as missing.
+    if not blank_event:
+        xpts_run = runs.get("xpts_v1")
+        mc_run = runs.get("monte_carlo_v1")
+        if xpts_run is not None and mc_run is not None:
+            xpts_fixtures = {
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT fixture_id FROM player_fixture_xpts_projections"
+                    " WHERE projection_run_id=?",
+                    (int(xpts_run),),
+                )
+            }
+            mc_fixtures = {
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT fixture_id FROM monte_carlo_distributions"
+                    " WHERE projection_run_id=?",
+                    (int(mc_run),),
+                )
+            }
+            if xpts_fixtures != mc_fixtures:
+                reasons.append(
+                    f"xpts_v1 run {int(xpts_run)} records fixture(s) "
+                    f"{sorted(xpts_fixtures - mc_fixtures)} that monte_carlo_v1 run "
+                    f"{int(mc_run)} does not ({sorted(mc_fixtures - xpts_fixtures)} the other way); "
+                    "a partial double gameweek is refused rather than simulated as if the player "
+                    "had fewer fixtures"
+                )
+
     if required_versions:
         for family, wanted in required_versions.items():
             got = versions.get(family)
@@ -416,11 +450,17 @@ def certified_bundle_from_explicit_ids(
     code_snapshot_sha256: str | None = None,
     required_versions: Mapping[str, str] | None = None,
     expected_data_snapshot_sha256: str | None = None,
+    families: Sequence[str] | None = None,
 ) -> CertifiedBundle:
     """Certify an explicitly supplied bundle (the decision engine's entry point).
 
     There is deliberately no "discover the latest run per family" helper here:
     silent rediscovery is exactly the failure mode this module exists to prevent.
+
+    ``families`` names the families this certification must cover.  The default is the
+    whole declared graph; a caller certifying a world that legitimately carries no
+    Monte Carlo run passes the families it declares, so an ABSENT family is a declared
+    absence rather than an invented requirement.
     """
 
     return validate_certified_bundle(
@@ -432,6 +472,7 @@ def certified_bundle_from_explicit_ids(
         data_snapshot_sha256=data_snapshot_sha256,
         code_snapshot_sha256=code_snapshot_sha256,
         expected_data_snapshot_sha256=expected_data_snapshot_sha256,
+        families=families,
     )
 
 
@@ -1134,6 +1175,7 @@ def certify_event_bundle(
     calibration: Mapping[str, Any] | None = None,
     require_calibration: bool = False,
     certification_identity: str | None = None,
+    families: Sequence[str] | None = None,
 ) -> CertifiedEventBundle:
     """Certify ONE event's bundle structurally, then read its evidence.
 
@@ -1160,6 +1202,7 @@ def certify_event_bundle(
             data_snapshot_sha256=data_snapshot_sha256,
             code_snapshot_sha256=code_snapshot_sha256,
             expected_data_snapshot_sha256=expected_data_snapshot_sha256,
+            families=families,
         )
     except BundleIncoherent as failure:
         structural_state = bundle_state_from_reasons(failure.reasons)
@@ -1424,7 +1467,7 @@ def certify_decision_horizon(
     unresolved = [
         dict(entry)
         for entry in identified_bypasses
-        if str(entry.get("status")) not in {"CLOSED", "CLOSED_BY_REFUSAL"}
+        if str(entry.get("status")) not in RESOLVED_BYPASS_STATUSES
     ]
     if unresolved:
         open_reasons.append(
@@ -1513,45 +1556,56 @@ def require_certification_artifact(certification: Any) -> Mapping[str, Any]:
         raise CertificationArtifactContradictory(
             [f"the certification artifact is {type(candidates[0]).__name__}, not an object"]
         )
-    if isinstance(candidates[0], ValidatedCertificationArtifact):
-        # An authorisation that was already minted has its content-bound digest
-        # re-verified here, so every consumer of "exactly one artifact per decision"
-        # gets the same byte-level check the loader boundary performs: an artifact
-        # edited after validation is refused before anything is read from it.
-        assert_certification_artifact_bytes_unchanged(candidates[0])
     return candidates[0]
 
 
-#: A validated certification artifact is the AUTHORISATION a predictive load consumes.
-#: It is built by COMPOSITION over a genuinely read-only snapshot -- a ``Mapping``
-#: facade over private dicts wrapped in ``MappingProxyType``, sequences frozen to
-#: tuples and sets to frozensets -- rather than by subclassing ``dict``/``list``.  A
-#: dict subclass only REFUSES the mutators it overrides while ``dict.__setitem__``
-#: still edits the value underneath, so subclassing is not immutability.  Nothing
-#: mutable is reachable from the snapshot, so the bytes a load was authorised by
-#: cannot be changed after the check.
-#:
-#: The mint token is a closure variable of :func:`_validated_certification_artifact_capability`
-#: and is deliberately NOT a module attribute: the class is exposed so a consumer can
-#: RECOGNISE the authorisation it was handed, but no caller can construct one through
-#: normal module access.  The only constructor is the validation function created
-#: beside the token, and it applies the complete contract before minting.
+# ---------------------------------------------------------------------------
+# Removed authority mechanisms (PE-9 amendment 2 §5)
+# ---------------------------------------------------------------------------
+#
+# This module no longer carries a ``ValidatedCertificationArtifact`` -- neither the
+# class nor its closure-captured mint token -- because amendment 2 §2 places that
+# mechanism explicitly OUTSIDE the threat model: PE-9 does not defend against
+# arbitrary hostile code already executing inside the trusted Python process, and
+# it does not claim to make in-process Python objects unforgeable.
+#
+# What replaced it is stronger AND simpler: the authority is now a PERSISTED,
+# CONTENT-ADDRESSED GENERATION whose exact provenance is independently re-derivable
+# from authoritative persisted evidence (see :mod:`fpl_brain.generation_store`).
+# ``generation_id`` is a SELECTOR, not a capability.  What authorises a predictive
+# load is the persisted manifest plus the pinned run rows and snapshot it names.
+#
+# The functions below are kept because they remain genuinely useful -- a canonical
+# content digest is how a caller compares two artifact-shaped payloads, and a
+# read-only copy is how a consumer serializes what it read -- but they confer NO
+# authority and nothing on a production path is gated on them.
 
-_IMMUTABLE_ARTIFACT_REFUSAL = (
-    "a validated certification artifact is IMMUTABLE: it is a read-only snapshot minted by "
-    "certified_bundle.validate_certification_artifact, so the bytes a load was authorised "
-    "by cannot be changed after the check"
-)
+
+
+def plain_certification_value(value: Any) -> Any:
+    """A PLAIN (dict/list/scalar) copy of a certification value.
+
+    Conversion is lossless: it copies the CONTENT and never its container.
+    Integer mapping keys become strings, exactly as ``json`` would render them.
+    """
+
+    if isinstance(value, Mapping):
+        return {str(key): plain_certification_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain_certification_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((plain_certification_value(item) for item in value), key=repr)
+    return value
 
 
 def _canonical_certification_bytes(document: Mapping[str, Any]) -> bytes:
     """The canonical byte form of an artifact's own content.
 
-    ONE encoding, shared by the mint and by every re-verification, so "these bytes have
-    not changed" is a pure function of the CONTENT rather than a property of an object
-    identity a caller could keep alive.  A value the canonical encoding cannot represent
-    is refused instead of stringified: an encoding that silently stringified its input
-    could not detect a change.
+    ONE encoding, shared by every producer and consumer, so "these bytes" is a pure
+    function of the CONTENT rather than a property of an object identity a caller
+    could keep alive.  A value the canonical encoding cannot represent is refused
+    instead of stringified: an encoding that silently stringified its input could not
+    detect a change.
     """
 
     def encode(value: Any) -> Any:
@@ -1564,7 +1618,7 @@ def _canonical_certification_bytes(document: Mapping[str, Any]) -> bytes:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
         raise TypeError(
-            "a validated certification artifact must carry values the canonical digest "
+            "a certification artifact must carry values the canonical digest "
             f"can represent; found {type(value).__name__}"
         )
 
@@ -1576,9 +1630,10 @@ def _canonical_certification_bytes(document: Mapping[str, Any]) -> bytes:
 def certification_artifact_digest(document: Mapping[str, Any]) -> str:
     """The CONTENT-BOUND digest of an artifact's own bytes, from the ONE algorithm.
 
-    Every boundary recomputes it and compares it against the identity a validated
-    artifact was minted with, so an artifact whose content changed after validation is
-    refused rather than read.
+    A DIAGNOSTIC and comparison tool: it reports whether two payloads carry the same
+    content.  It authorises nothing -- amendment 2 removed caller-carried
+    certification digests from production paths, because a digest a caller computed
+    is not evidence of anything.
     """
 
     try:
@@ -1586,294 +1641,6 @@ def certification_artifact_digest(document: Mapping[str, Any]) -> str:
     except TypeError as failure:
         raise CertificationArtifactUnvalidated([str(failure)]) from failure
     return "sha256:" + hashlib.sha256(payload).hexdigest()
-
-
-def _readonly_certification_value(value: Any) -> Any:
-    """A recursively READ-ONLY snapshot of a certification value.
-
-    Mappings become ``MappingProxyType`` over a private dict, sequences become tuples
-    and sets become frozensets, so no mutable container is reachable from the result:
-    there is no base-class mutator to call and no ``copy``-and-edit route back into the
-    artifact the boundary validated.
-    """
-
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {key: _readonly_certification_value(item) for key, item in value.items()}
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_readonly_certification_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_readonly_certification_value(item) for item in value)
-    return value
-
-
-def plain_certification_value(value: Any) -> Any:
-    """A PLAIN (dict/list/scalar) copy of a certification value.
-
-    The validated artifact is a read-only snapshot, so a consumer that must SERIALIZE
-    what it read -- an identity hash over the artifact's own fields, a persisted
-    payload -- converts through this ONE function instead of walking the snapshot
-    itself.  Conversion is lossless: it copies the CONTENT and never its container, so
-    the value a consumer hashes is the value the artifact carries.  Integer mapping
-    keys become strings, exactly as ``json`` would render them.
-    """
-
-    if isinstance(value, Mapping):
-        return {str(key): plain_certification_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [plain_certification_value(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        return sorted((plain_certification_value(item) for item in value), key=repr)
-    return value
-
-
-def assert_certification_artifact_bytes_unchanged(artifact: Any) -> None:
-    """Refuse a validated artifact whose bytes no longer digest to its minted identity.
-
-    This is the boundary half of the authorisation contract: a validated artifact
-    carries the digest of the bytes the canonical loader validated, and every boundary
-    re-verifies it before anything predictive is read.  A mismatch means the value was
-    edited through a route the type system does not police (``object.__setattr__`` and
-    friends) after validation -- the case the digest exists to catch -- and it is
-    refused with its own token instead of being read.
-    """
-
-    recorded = getattr(artifact, "content_digest", None)
-    if not recorded:
-        raise CertificationArtifactUnvalidated(
-            [
-                "the value carries no content-bound digest, so the bytes the canonical loader "
-                "validated cannot be re-verified"
-            ]
-        )
-    recomputed = certification_artifact_digest(artifact)
-    if str(recorded) != str(recomputed):
-        raise CertificationArtifactMutated(
-            [
-                f"the validated certification artifact's bytes digest to {recomputed[:23]}..., not "
-                f"the identity it was minted under ({str(recorded)[:23]}...); an artifact edited "
-                "after validation is not the authorisation the loader issued"
-            ]
-        )
-
-
-def _validated_certification_artifact_capability() -> tuple[type, Any]:
-    """Own the ONE mint of a validated certification artifact.
-
-    The mint token is a CLOSURE variable and is never bound as a module attribute: the
-    class is exposed so a consumer can recognise the authorisation it was handed, but
-    no caller can CONSTRUCT one through normal module access.  The only constructor
-    created here is the validation function, which applies the complete contract to the
-    document before minting -- so an artifact-shaped mapping the contract has not
-    passed can never become an authorisation.
-    """
-
-    token = object()
-
-    class ValidatedCertificationArtifact(Mapping):
-        """An IMMUTABLE certification artifact that PASSED the complete contract.
-
-        This is the authorisation a predictive load consumes.  It is built by
-        COMPOSITION over a private, recursively read-only snapshot -- ``MappingProxyType``
-        for mappings, tuples for sequences -- so there is no mutable container to reach
-        and no base-class mutator that bypasses the class's own.  It is a mapping, so
-        every existing reader (``artifact.get(...)``, ``dict(artifact)``,
-        ``candidate_universe.jsonable``) works unchanged.
-
-        ``validated_by`` names the function that applied the contract,
-        ``validated_identity`` is the artifact's own identity, and ``content_digest`` is
-        the content-bound digest of the bytes that were validated -- re-verified at every
-        boundary by :func:`assert_certification_artifact_bytes_unchanged`, so a value
-        edited after minting is refused rather than read.
-        """
-
-        __slots__ = ("_document", "_content_digest", "_validated_by", "_validated_identity")
-
-        def __init__(
-            self,
-            document: Mapping[str, Any] | None = None,
-            *,
-            validated_by: str = "",
-            _token: Any = None,
-        ) -> None:
-            if _token is not token:
-                raise CertificationArtifactUnvalidated(
-                    [
-                        "a validated certification artifact is minted only by "
-                        "certified_bundle.validate_certification_artifact, which applies the "
-                        "complete authorization contract; this mapping was never validated"
-                    ]
-                )
-            snapshot = _readonly_certification_value(dict(document or {}))
-            object.__setattr__(self, "_document", snapshot)
-            object.__setattr__(self, "_content_digest", certification_artifact_digest(snapshot))
-            object.__setattr__(self, "_validated_by", str(validated_by))
-            object.__setattr__(
-                self,
-                "_validated_identity",
-                str(
-                    snapshot.get("four_gw_certification_identity")
-                    or snapshot.get("certification_identity")
-                    or ""
-                ),
-            )
-
-        # -- the read-only mapping facade ------------------------------------
-
-        def __getitem__(self, key: Any) -> Any:
-            return self._document[key]
-
-        def __iter__(self) -> Any:
-            return iter(self._document)
-
-        def __len__(self) -> int:
-            return len(self._document)
-
-        def __contains__(self, key: Any) -> bool:
-            return key in self._document
-
-        def __eq__(self, other: Any) -> Any:
-            # Equality is a property of the CONTENT, not of the object: a copy of the
-            # same bytes is the same artifact, and the canonical encoding compares a
-            # frozen tuple with the list it was parsed from.
-            if not isinstance(other, Mapping):
-                return NotImplemented
-            try:
-                return self._content_digest == certification_artifact_digest(other)
-            except CertificationRefused:
-                return NotImplemented
-
-        def __setattr__(self, name: str, value: Any) -> None:
-            raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
-
-        def __delattr__(self, name: str) -> None:
-            raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
-
-        def __copy__(self) -> "ValidatedCertificationArtifact":
-            return self
-
-        def __deepcopy__(self, memo: Any) -> "ValidatedCertificationArtifact":
-            return self
-
-        def __reduce__(self) -> Any:
-            # An authorisation is never reconstructed from bytes: a consumer either
-            # holds the value the loader minted or passes through the contract.
-            raise TypeError(_IMMUTABLE_ARTIFACT_REFUSAL)
-
-        @property
-        def validated_by(self) -> str:
-            return self._validated_by
-
-        @property
-        def validated_identity(self) -> str:
-            return self._validated_identity
-
-        @property
-        def content_digest(self) -> str:
-            return self._content_digest
-
-        def __repr__(self) -> str:  # pragma: no cover - diagnostics only
-            return (
-                f"ValidatedCertificationArtifact(validated_by={self.validated_by!r}, "
-                f"identity="
-                f"{self.validated_identity[:23] + '...' if self.validated_identity else None}, "
-                f"events={list(self.get('events') or [])})"
-            )
-
-    def validate_certification_artifact(document: Any) -> "ValidatedCertificationArtifact":
-        """The CANONICAL loader-owned validation of a certification artifact.
-
-        A raw mapping is NOT an authorisation, however self-consistent its own run ids or
-        bundle identities are: the artifact must carry the fields the certification
-        loader requires before anything predictive may be read from it.  This function is
-        the ONE place that contract is applied at a load boundary:
-
-        * an already-validated artifact has its content-bound digest RE-VERIFIED against
-          the bytes it was minted from and is returned unchanged, so the authorisation a
-          caller loaded once is checked -- not merely trusted -- at every boundary it
-          reaches;
-        * a path is read through ``four_gw_decision.load_certification_artifact`` -- the
-          production loader -- which mints the validated value;
-        * a raw mapping has the SAME contract re-run over it and is then minted, so a
-          mapping that does carry every required authorization field is accepted exactly
-          as the loader would accept its file form, and a mapping that does not is refused
-          with ``CERTIFICATION_ARTIFACT_UNVALIDATED`` (never silently trusted, never
-          defaulted, never substituted).
-
-        The value returned is a read-only snapshot carrying the digest of its own bytes:
-        what the boundary validated is what the load reads.
-        """
-
-        from . import four_gw_decision as fg
-
-        if isinstance(document, ValidatedCertificationArtifact):
-            assert_certification_artifact_bytes_unchanged(document)
-            return document
-        if isinstance(document, (str, Path)):
-            return fg.load_certification_artifact(document)
-        if document is None:
-            raise CertificationArtifactAbsent(
-                ["a predictive load requires a certification artifact"]
-            )
-        if not isinstance(document, Mapping) or not document:
-            raise CertificationArtifactUnvalidated(
-                [
-                    f"the certification artifact is {type(document).__name__}, not an artifact the "
-                    "canonical loader produced"
-                ]
-            )
-        try:
-            payload = fg.validate_certification_artifact(document)
-        except CertificationRefused:
-            raise
-        except BundleIncoherent as failure:
-            # A RECORDED incoherent dependency status is a fact about the predictive
-            # world and keeps the token that fact already has; an artifact that records
-            # no status at all simply never carried an authorisation.
-            recorded = str((document or {}).get("dependency_validation") or "").upper()
-            if recorded and recorded != "COHERENT":
-                raise CertificationRefused(
-                    bundle_state_from_reasons(failure.reasons), failure.reasons
-                ) from failure
-            raise CertificationArtifactUnvalidated(
-                [
-                    "the certification artifact does not carry the authorisation the canonical "
-                    f"loader's contract requires: {failure}"
-                ]
-            ) from failure
-        except Exception as failure:
-            detail = str(getattr(failure, "detail", failure))
-            # A mapping whose own declared records contradict each other is a
-            # CONTRADICTION, whatever else it is missing: that is a different fact from a
-            # mapping that simply never carried an authorisation, and the two carry
-            # different tokens.
-            contradicting = (
-                fg.DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH in detail
-                or fg.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY in detail
-            )
-            if contradicting:
-                raise CertificationArtifactContradictory(
-                    [f"the certification artifact contradicts its own records: {detail}"]
-                ) from failure
-            raise CertificationArtifactUnvalidated(
-                [
-                    "the certification artifact does not carry the authorisation the canonical "
-                    f"loader's contract requires: {type(failure).__name__}: {detail}"
-                ]
-            ) from failure
-        return ValidatedCertificationArtifact(
-            payload,
-            validated_by="four_gw_decision.validate_certification_artifact",
-            _token=token,
-        )
-
-    return ValidatedCertificationArtifact, validate_certification_artifact
-
-
-ValidatedCertificationArtifact, validate_certification_artifact = (
-    _validated_certification_artifact_capability()
-)
 
 
 def bundle_identity_payload(
@@ -1954,294 +1721,6 @@ def certified_bundle_identity_for(
     )
 
 
-def certified_bundle_artifact_record(
-    certification: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
-    event: int,
-) -> dict[str, Any]:
-    """The artifact's recorded CERTIFIED bundle for ONE event, or a refusal.
-
-    This is the half of the boundary only the ARTIFACT can answer: which bundle the
-    certification committed to, for which event, with which family set, which
-    cutoff and which identity.  Reading it in ONE place is what stops a
-    caller-minted, self-consistent hash from standing in for an authorisation, and
-    it also stops an artifact that recorded a REFUSAL (or a non-coherent predictive
-    bundle) from authorising a load.
-
-    ``CERTIFICATION_ARTIFACT_ABSENT``, ``CERTIFICATION_ARTIFACT_CONTRADICTORY`` and
-    ``EVIDENCE_MISSING`` are different facts with different tokens: a missing
-    authorisation, an artifact that contradicts the request, and an artifact that
-    simply does not record this event.  A raw mapping is not an authorisation either:
-    the artifact must pass the canonical loader's complete contract, so the
-    self-consistent but unauthorised mapping is refused with
-    ``CERTIFICATION_ARTIFACT_UNVALIDATED`` before any predictive data is read.
-    """
-
-    artifact = require_certification_artifact(certification)
-    artifact = validate_certification_artifact(artifact)
-    payload = certified_bundle_payload(artifact.get("certified_bundles") or {}, int(event))
-    if not payload:
-        raise CertificationRefused(
-            STATE_EVIDENCE_MISSING,
-            [
-                f"the certification artifact records no certified bundle for event {int(event)}; "
-                "an event the certification did not commit to is never loaded"
-            ],
-        )
-    recorded_event = payload.get("event")
-    if recorded_event is None or int(recorded_event) != int(event):
-        raise CertificationArtifactContradictory(
-            [
-                f"the bundle recorded under event {int(event)} was certified for event "
-                f"{recorded_event!r}; a bundle is bound to its own event, not to a container key"
-            ]
-        )
-    runs = {str(family): int(run_id) for family, run_id in (payload.get("runs") or {}).items()}
-    if not runs:
-        raise CertificationRefused(
-            STATE_EVIDENCE_MISSING,
-            [f"the bundle certified for event {int(event)} names no projection run"],
-        )
-    missing = [family for family in LOAD_REQUIRED_FAMILIES if family not in runs]
-    if missing:
-        raise CertificationRefused(
-            STATE_EVIDENCE_MISSING,
-            [
-                f"the bundle certified for event {int(event)} names no run for {sorted(missing)}; "
-                "a world load is authorised by the exact certified run ids of the families it "
-                "reads, and a load is never authorised by a partial record"
-            ],
-        )
-    cutoff = payload.get("cutoff") or artifact.get("planning_cutoff")
-    if not cutoff:
-        raise CertificationRefused(
-            STATE_EVIDENCE_MISSING,
-            [f"the certification records no data cutoff for event {int(event)}"],
-        )
-    # A certification STATUS authorises a load only when it is a non-blocking one.
-    # The certified bundle payloads the certifier writes carry no status (they are
-    # the validated bundle itself), so an ABSENT status is "not recorded" rather
-    # than a defect; a RECORDED blocking one is a refusal, never a cached hit.
-    recorded_states = [
-        str(payload.get("state") or ""),
-        str(artifact.get("predictive_bundle_status") or ""),
-    ]
-    blocking = [state for state in recorded_states if state in BLOCKING_BUNDLE_STATES]
-    if blocking:
-        raise CertificationRefused(
-            blocking[0],
-            [
-                f"the certification records {blocking[0]} for event {int(event)}"
-                + (
-                    ": " + "; ".join(str(reason) for reason in (payload.get("reasons") or []))
-                    if payload.get("reasons")
-                    else ""
-                )
-            ],
-        )
-    return {
-        "event": int(event),
-        "payload": dict(payload),
-        "identity": canonical_bundle_identity(payload),
-        "runs": runs,
-        "model_versions": {
-            str(family): str(version)
-            for family, version in (payload.get("model_versions") or {}).items()
-        },
-        "cutoff": str(cutoff),
-        "state": next((state for state in recorded_states if state), None),
-        "artifact_identity": artifact.get("four_gw_certification_identity"),
-    }
-
-
-def assert_event_bundle_certified(
-    conn: sqlite3.Connection | None,
-    bundle: Any,
-    *,
-    event: int,
-    certification: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
-    required_versions: Mapping[str, str] | None = None,
-) -> dict[str, Any]:
-    """Prove a routing/decision bundle is the CERTIFIED one before it is loaded.
-
-    This is the downstream half of the contract: ``route_optimizer`` turns a bundle
-    into simulated worlds, so the bundle must BE the one the certification
-    committed to -- never a caller's rediscovery of "the latest run per family",
-    and never a self-consistent identity a caller minted.  A validated
-    certification artifact is therefore REQUIRED here, on every database load and
-    on every content-addressed cache hit: a bundle that cannot present the
-    authorisation is REFUSED, never defaulted, substituted or silently reloaded.
-
-    What is enforced, in the order that keeps the most specific token:
-
-    * the bundle declares a certified identity at all, and that identity BINDS its
-      own run ids (the shared algorithm, not a caller's hash);
-    * every family it names declares a model version, and each declared version is
-      the AUTHORITATIVE required version of that frozen family -- with the
-      artifact's own ``required_model_versions`` cross-checked against that same
-      source, so a certification minted under some other pin is refused;
-    * the artifact's recorded bundle for this event exists, was recorded FOR this
-      event, names the run of every family the load reads
-      (:data:`LOAD_REQUIRED_FAMILIES`), carries a cutoff, and is not a recorded
-      refusal;
-    * the bundle's identity, event and cutoff are the artifact's recorded ones;
-    * where the run rows are present in this database, the recorded closure is
-      re-proven from the rows themselves -- family, planning event, ``status ==
-      complete``, exact data cutoff and the xPts/Monte Carlo dependency edges --
-      because a certification artifact is a claim about those rows, not a
-      substitute for them.
-    """
-
-    record = certified_bundle_artifact_record(certification, int(event))
-    payload = getattr(bundle, "as_identity_payload", None)
-    if payload is None:
-        raise CertificationRefused(
-            DIAG_CERTIFICATION_BOUNDARY_REQUIRED,
-            [
-                f"event {int(event)}: the bundle cannot declare its certified identity; a bundle "
-                "without certification provenance is never loaded"
-            ],
-        )
-    identity_payload = payload()
-    declared_identity = getattr(bundle, "certified_bundle_identity", None)
-    if not declared_identity:
-        raise CertificationRefused(
-            DIAG_CERTIFICATION_BOUNDARY_REQUIRED,
-            [
-                f"event {int(event)}: the bundle declares no certified_bundle_identity; the exact "
-                "certified run ids are the only authorisation to load predictive data"
-            ],
-        )
-    recomputed = canonical_bundle_identity(identity_payload)
-    if str(declared_identity) != recomputed:
-        raise CertificationRefused(
-            STATE_PREDICTIVE_BUNDLE_INCOHERENT,
-            [
-                f"event {int(event)}: the declared certified_bundle_identity "
-                f"{str(declared_identity)[:23]}... does not bind the bundle's own ids (recomputed "
-                f"{recomputed[:23]}...)"
-            ],
-        )
-    declared_versions = dict(getattr(bundle, "model_versions", None) or {})
-    runs = {str(family): int(run_id) for family, run_id in (identity_payload.get("runs") or {}).items()}
-    missing = sorted(set(runs) - set(declared_versions))
-    if missing:
-        raise CertificationRefused(
-            STATE_EVIDENCE_MISSING,
-            [
-                f"event {int(event)}: the bundle names run(s) for {', '.join(missing)} but declares "
-                "no model version for them; certified provenance requires every family's version"
-            ],
-        )
-
-    # The AUTHORITATIVE required versions.  Every certification call site records
-    # them from ``declared_required_versions``; the loader enforces the same values
-    # and cross-checks the artifact's own record against them, so a bundle from an
-    # unexpected version -- or a certification minted under a version nobody pins --
-    # cannot be loaded.
-    versions = {
-        str(family): str(version)
-        for family, version in dict(required_versions or declared_required_versions()).items()
-    }
-    artifact_pins = {
-        str(family): str(version)
-        for family, version in (
-            dict(certification or {}).get("required_model_versions") or {}
-        ).items()
-    }
-    for family, pinned in sorted(artifact_pins.items()):
-        wanted = versions.get(family)
-        if wanted is not None and str(pinned) != str(wanted):
-            raise CertificationRefused(
-                STATE_UNSUPPORTED_MODEL_VERSION,
-                [
-                    f"event {int(event)}: the certification requires {family} {pinned!r}, which is "
-                    f"not the authoritative version {wanted!r}"
-                ],
-            )
-    for family, wanted in sorted(versions.items()):
-        declared = declared_versions.get(family)
-        if declared is not None and str(declared) != str(wanted):
-            raise CertificationRefused(
-                STATE_UNSUPPORTED_MODEL_VERSION,
-                [
-                    f"event {int(event)}: {family} version {declared!r} != required {wanted!r}"
-                ],
-            )
-
-    declared_cutoff = identity_payload.get("cutoff")
-    if declared_cutoff is not None and str(declared_cutoff) != str(record["cutoff"]):
-        raise CertificationArtifactContradictory(
-            [
-                f"event {int(event)}: the bundle declares cutoff {declared_cutoff} but the "
-                f"certification recorded {record['cutoff']}"
-            ]
-        )
-    if str(declared_identity) != str(record["identity"]):
-        raise CertificationArtifactContradictory(
-            [
-                f"event {int(event)}: the bundle's identity {str(declared_identity)[:23]}... is not "
-                f"the one the certification artifact records ({str(record['identity'])[:23]}...); a "
-                "self-consistent identity is not an authorisation"
-            ]
-        )
-
-    verified_against_runs = False
-    if conn is not None:
-        # The version each run RECORDS is the ground truth, read from the rows in one
-        # place.  A family whose row is not in this database (a certified generation
-        # loaded from its content-addressed cache, or a fixture world) is simply not
-        # returned, and the DECLARED provenance is what authorises that load: the
-        # strict "the run must exist" gate belongs to the certification path, which
-        # proves it against the run rows it certifies.
-        rows = {family: _run(conn, int(run_id)) for family, run_id in record["runs"].items()}
-        present = sorted(family for family, row in rows.items() if row is not None)
-        if present:
-            # Where the rows ARE here, the RECORDED closure is re-proven from them:
-            # family and planning event identity, ``status == complete``, the exact
-            # data cutoff and the xPts / Monte Carlo dependency edges.  A
-            # certification artifact is a CLAIM about those rows, never a substitute
-            # for them.
-            verified_against_runs = True
-            try:
-                validate_certified_bundle(
-                    conn,
-                    event=int(event),
-                    cutoff=str(record["cutoff"]),
-                    runs=record["runs"],
-                    required_versions=versions,
-                    data_snapshot_sha256=identity_payload.get("data_snapshot_sha256"),
-                    code_snapshot_sha256=identity_payload.get("code_snapshot_sha256"),
-                    expected_data_snapshot_sha256=(dict(certification or {}).get("data_snapshot_sha256")),
-                    families=present,
-                )
-            except BundleIncoherent as failure:
-                raise CertificationRefused(
-                    bundle_state_from_reasons(failure.reasons), failure.reasons
-                ) from failure
-        else:
-            for family, recorded in sorted(recorded_model_versions(conn, record["runs"]).items()):
-                run_id = record["runs"][family]
-                if recorded != str(declared_versions[family]):
-                    raise CertificationRefused(
-                        STATE_UNSUPPORTED_MODEL_VERSION,
-                        [
-                            f"event {int(event)}: {family} run {int(run_id)} recorded {recorded!r}, "
-                            f"but the bundle declares {declared_versions[family]!r}"
-                        ],
-                    )
-    return {
-        "event": int(event),
-        "certified_bundle_identity": str(declared_identity),
-        "model_versions": {str(k): str(v) for k, v in declared_versions.items()},
-        "required_model_versions": versions,
-        "certification_artifact_identity": record["artifact_identity"],
-        "certification_state": record["state"],
-        "data_cutoff": str(record["cutoff"]),
-        "verified_against_runs": verified_against_runs,
-        "verified_against_certification": True,
-    }
-
-
 def certification_result_identity(payload: Mapping[str, Any]) -> str:
     """The persisted certification result's OWN identity.
 
@@ -2298,7 +1777,11 @@ def certification_result_identity(payload: Mapping[str, Any]) -> str:
 #
 # CLOSED
 #   The bypass can no longer be exercised: the consumer's entry point refuses a
-#   bundle that cannot prove it is the certified one.
+#   load that cannot present a certified generation.
+# REMOVED
+#   The mechanism the entry described is GONE from the codebase rather than merely
+#   blocked.  It is kept in the register so a reader of an older artifact can see
+#   what happened to it.
 # CLOSED_BY_REFUSAL
 #   The consumer still RESOLVES runs by latest-per-family, but the hand-assembled
 #   bundle it feeds to the boundary is refused there, so no uncertified run id can
@@ -2309,81 +1792,76 @@ def certification_result_identity(payload: Mapping[str, Any]) -> str:
 #   property of the artefact and not a bypass: the missing value is labelled and
 #   reported, never silently accepted as a prediction.
 
+#: The statuses under which a disclosed bypass no longer blocks the phase: it was
+#: closed at the boundary, closed by the boundary's refusal, or the mechanism it
+#: described was removed from the codebase outright.
+RESOLVED_BYPASS_STATUSES: frozenset[str] = frozenset({"CLOSED", "CLOSED_BY_REFUSAL", "REMOVED"})
+
 DISCLOSED_BYPASS_REFERENCE = "reference"
 DISCLOSED_BYPASS_STATUS = "status"
 
 CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
     {
-        "reference": "fpl_brain.route_optimizer.build_event_worlds caller-supplied bundles",
+        "reference": "fpl_brain.route_optimizer.build_event_worlds",
         "status": "CLOSED",
         "detail": (
-            "the loader REQUIRES a VALIDATED artifact: the artifact must pass the canonical "
-            "loader's complete contract (schema, causal and dependency status, the authorisation "
-            "flag, the completeness audit, the wiring identity and an identity that binds its own "
-            "bundles), so a raw mapping carrying self-consistent bundles but no authorisation is "
-            "refused with CERTIFICATION_ARTIFACT_UNVALIDATED.  The authorisation itself is a "
-            "READ-ONLY snapshot -- composition over MappingProxyType and tuples, never a "
-            "dict/list subclass whose base-class mutators still edit it -- and every boundary "
-            "re-verifies the content-bound digest it was minted with, so an artifact edited after "
-            "validation is refused with CERTIFICATION_ARTIFACT_MUTATED rather than read.  The "
-            "bundle must then be the one that "
-            "artifact recorded for that event (identity, event and cutoff compared against the "
-            "recorded bundle), every family it names must declare the authoritative model version, "
-            "the recorded family / event / status / cutoff / dependency closure is re-proven from "
-            "the run rows, and the check runs BEFORE the content-addressed cache is read -- so a "
-            "self-consistent bundle built from arbitrary existing runs is refused on the database "
-            "path and on a warm cache hit alike.  Worlds that were never loaded from a prediction "
-            "run enter only through the declared route_optimizer.NonProductionWorlds interface, "
-            "which is refused outright when an artifact is presented"
+            "the loader takes a certified GENERATION object, not bundles and not a "
+            "certification artifact.  There is no caller bundle mapping, no caller run-id "
+            "mapping and no prebuilt-matrix parameter on the certified door at all: the "
+            "generation's manifest is digest-verified at load (recomputing "
+            "sha256(canonical_semantic_manifest) must reproduce generation_id), its event and "
+            "horizon kind are matched, its exact cutoff is required, its pinned snapshot is "
+            "re-hashed, and every event's recorded family / status / cutoff / dependency "
+            "closure is re-proven with the EXISTING canonical validators against the run rows "
+            "before a single predictive value is read.  The check runs BEFORE the "
+            "content-addressed cache is read, so a self-consistent bundle built from "
+            "arbitrary existing runs is refused on the database path and on a warm cache hit "
+            "alike.  Worlds that were never loaded from a certified generation enter only "
+            "through the declared route_optimizer.NonProductionWorlds interface or the "
+            "structurally separate fpl_brain.replay_worlds module"
         ),
     },
     {
-        "reference": "fpl_brain.route_optimizer.optimize injected and prebuilt worlds",
+        "reference": "fpl_brain.route_optimizer.optimize",
         "status": "CLOSED",
         "detail": (
-            "optimize takes the same two declared doors: a validated certification artifact "
-            "authorises the bundles, while injected worlds must be declared through "
-            "NonProductionWorlds and are refused beside an artifact.  A PREBUILT matrix is admitted "
-            "only through a loader-owned, content-bound capability: the matrix's canonical content "
-            "identity -- every semantic block exact evaluation consumes -- must be one this loader "
-            "ISSUED, for that event and against the certified bundle identity the artifact records "
-            "(or, on the declared door, under that same declaration).  The capability is held "
-            "INSIDE the loader that issues it: there is no module-global writable registry and no "
-            "module-level issuer, so a caller cannot record content of its own and the two doors "
-            "cannot be merged -- a registry a caller injects is inert, and the declared-door "
-            "recorder (which the declared door, by design, needs) records no certified bundle "
-            "identity and can never satisfy the certified door.  The provenance stamp on a "
-            "matrix is caller-writable and therefore authorises nothing, so a hand-built matrix -- "
-            "including one carrying the correct copied stamp -- is refused"
+            "optimize takes the same two declared doors and nothing else: a certified "
+            "generation, or a declared non-production source.  The caller-prebuilt matrix and "
+            "prebuilt-worlds parameters are GONE -- a matrix a caller happens to hold has no "
+            "route in -- and the matrix-stamp / loader-issued-capability machinery they needed "
+            "was removed as authority (amendment 2 section 5).  Ordinary reuse of the SAME "
+            "worlds across stages is the content-addressed cache's job, keyed on "
+            "generation_id, which is strictly optimization: deleting the entire cache changes "
+            "nothing but the time it takes to rebuild"
         ),
     },
     {
         "reference": "fpl_brain.route_comparator.compare_routes direct DB branch",
         "status": "CLOSED",
         "detail": (
-            "the comparator's own predictive-data load crosses the same boundary and now requires "
-            "the artifact; a bundle that is not the recorded one -- or whose recorded closure "
-            "disagrees with the run rows -- is refused instead of simulated, and an injected world "
-            "must be declared through route_optimizer.NonProductionWorlds"
+            "the comparator's own predictive-data load crosses the same boundary and now "
+            "requires a certified generation; the bundles it simulates are DERIVED from that "
+            "generation's manifest, so there is no bundle parameter for a caller to fill in, "
+            "and an injected world must be declared through route_optimizer.NonProductionWorlds"
         ),
     },
     {
         "reference": "fpl_brain.free_hit_request_adapter.load_certified_route_worlds",
         "status": "CLOSED",
         "detail": (
-            "the Free Hit route-world load presents the LOADED artifact (carried on the decision "
-            "authority derived from it) to the canonical loader, so the certified run ids it takes "
-            "from the artifact's bundle map are compared against the artifact's own recorded "
-            "bundles and a substituted, self-consistent bundle is refused"
+            "the Free Hit route-world load forwards the decision authority's certified "
+            "GENERATION to the canonical loader, so the run ids it simulates are the ones the "
+            "generation's digest-verified manifest records and a substituted mapping is refused"
         ),
     },
     {
         "reference": "fpl_brain.finalist_refinement.refine_finalists and route_stability.run_ladder",
         "status": "CLOSED",
         "detail": (
-            "both forward the certification artifact (or the declared non-production source) into "
-            "the loader and the optimizer they call, so neither can obtain a world by a route the "
-            "boundary has not authorised"
+            "both forward the certified generation into the loader and the optimizer they call, "
+            "so neither can obtain a world by a route the boundary has not authorised.  The "
+            "cross-stage prebuilt-matrix reuse they used to perform is now the content-addressed "
+            "cache's job (keyed on generation_id), which is optimization rather than authority"
         ),
     },
     {
@@ -2391,70 +1869,74 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
         "status": "CLOSED",
         "detail": (
             "a predictive load beside the optimizer's: it simulated the shared worlds for the "
-            "manager policy matrix straight from a hand-assembled run-id set.  It now requires a "
-            "validated certification artifact and refuses unless the run ids it is handed are the "
-            "ones that artifact recorded for the event, and its only caller -- "
-            "scripts/build_manager_packet.py, a Phase-6A descriptive packet -- loads the artifact "
-            "through the canonical loader, forwards it to the load, and validates every supplied "
-            "event and run id against the artifact's own record instead of defaulting one"
+            "manager policy matrix straight from a hand-assembled run-id set.  It now takes a "
+            "certified generation, and the run ids it simulates are READ from that generation's "
+            "manifest -- there is no run-id parameter left to substitute"
         ),
     },
     {
         "reference": "scripts/build_route_comparison.py",
-        "status": "CLOSED_BY_REFUSAL",
+        "status": "CLOSED",
         "detail": (
-            "still resolves runs with newest-id-per-family, but the hand-built bundle it passes to "
-            "compare_routes is refused at the boundary, so no uncertified run reaches a load"
+            "the newest-id-per-family rediscovery was REMOVED: the script resolves a certified "
+            "GENERATION (explicit --generation, or the current_generation pointer, which refuses "
+            "when unset) and simulates only its certified run ids -- so a newer same-cutoff rerun "
+            "can no longer substitute for the certified world"
         ),
     },
     {
         "reference": "scripts/build_route_optimizer.py and scripts/build_route_stability.py",
         "status": "CLOSED_BY_REFUSAL",
         "detail": (
-            "both hand-assemble EventBundles from hardcoded run ids and call build_event_worlds; the "
-            "loader refuses them for want of an authorisation, so the prebuilt matrices they would "
-            "feed to optimize are never produced"
+            "both hand-assemble run ids and ask for worlds; the loader refuses them for want of a "
+            "certified generation, so none of the matrices they would have built is ever produced"
         ),
     },
     {
         "reference": "scripts/build_final_acceptance.py and scripts/recertify_final_acceptance.py",
         "status": "CLOSED_BY_REFUSAL",
         "detail": (
-            "hand-assembled EventBundles refused by build_event_worlds; the acceptance and "
-            "re-certification replays are not rewritten here"
+            "hand-assembled run ids refused by the loader; the acceptance and re-certification "
+            "replays are not rewritten here"
         ),
     },
     {
         "reference": "scripts/final_operational_refresh_gw04.py",
-        "status": "CLOSED_BY_REFUSAL",
+        "status": "CLOSED",
         "detail": (
-            "still builds a hand-assembled EventBundle, which build_event_worlds now refuses; the "
-            "script's own event_support_from_db readiness horizon is not consumed by any decision, "
-            "and the matrix it would have re-used is presented under an explicit non-production "
-            "declaration rather than as certified evidence"
+            "the hand-assembled run-id set was REMOVED: the script resolves a certified GENERATION, "
+            "reads the run ids and model versions from its digest-verified manifest, refuses a "
+            "supplied run id that is not the certified one, takes its readiness horizon from the "
+            "generation (no event_support_from_db), and simulates worlds only through the certified "
+            "door on both the world load and the route comparison"
         ),
     },
     {
         "reference": "scripts/gw4_current_final_board.py",
-        "status": "CLOSED_BY_REFUSAL",
-        "detail": "hand-assembled EventBundle refused by build_event_worlds",
+        "status": "CLOSED",
+        "detail": (
+            "the hardcoded run-id table was REMOVED: the script resolves a certified GENERATION and "
+            "requires its certified cutoff, so the board can only describe the world that was "
+            "certified"
+        ),
     },
     {
         "reference": "scripts/live_fire_gw04.py",
-        "status": "CLOSED_BY_REFUSAL",
+        "status": "CLOSED",
         "detail": (
-            "hand-assembled EventBundle with hardcoded run ids refused by build_event_worlds; the "
-            "script is a historical GW4 replay and is not rewritten here"
+            "the hardcoded run-id table was REMOVED: the drill resolves the certified GENERATION at "
+            "the accepted planning cutoff, simulates only its certified run ids, and refuses any "
+            "other cutoff -- a historical GW4 replay that scores certified evidence only"
         ),
     },
     {
         "reference": "scripts/run_four_gw_decision.py event_support_from_db readiness path",
         "status": "CLOSED",
         "detail": (
-            "the readiness view stays a declared NON-PRODUCTION rediscovery and is never consumed by "
-            "the decision, which loads only certified run ids and refuses if the discovery and "
-            "exact-evaluation generations differ; PE-9 additionally RECONCILES the two published "
-            "views, recording any divergence in the persisted decision provenance instead of leaving "
+            "the readiness view stays a declared NON-PRODUCTION rediscovery and is never consumed "
+            "by the decision, which resolves a certified GENERATION and refuses if the discovery "
+            "and exact-evaluation generations differ; the two published views are reconciled and "
+            "any divergence is recorded in the persisted decision provenance instead of leaving "
             "the readiness artifact and the decision artifact free to disagree"
         ),
     },
@@ -2462,12 +1944,28 @@ CLOSED_BYPASS_DISCLOSURES: tuple[Mapping[str, str], ...] = (
         "reference": "fpl_brain.monte_carlo.load_fixture_inputs 'or {}' upstream lookup",
         "status": "CLOSED",
         "detail": (
-            "an absent Minutes run now refuses with INPUT_RUN_ABSENT; reading it as empty metadata "
-            "parsed the version as (0,0,0) and silently selected the legacy primitive-reconstruction "
-            "path for a run whose metadata was never read"
+            "an absent Minutes run refuses with INPUT_RUN_ABSENT; reading it as empty metadata "
+            "parsed the version as (0,0,0) and silently selected the legacy "
+            "primitive-reconstruction path for a run whose metadata was never read"
+        ),
+    },
+    {
+        "reference": "fpl_brain.certified_bundle.ValidatedCertificationArtifact authority",
+        "status": "REMOVED",
+        "detail": (
+            "REMOVED as authority by amendment 2 section 5, not repaired.  The class, its "
+            "closure-captured mint token, the isinstance-based trust in "
+            "require_certification_artifact and the caller-prebuilt matrix capability registry "
+            "(IssuedWorldMatrix / _ISSUED_WORLD_MATRICES / _issue / "
+            "require_certified_prebuilt_matrix) are gone, together with the matrix stamp "
+            "_p2_certified_bundle_identity.  The threat model excludes arbitrary hostile code "
+            "already executing inside the trusted Python process, so 'unforgeable in-process "
+            "Python objects' was never a claim PE-9 could make; the authority is now persisted, "
+            "content-addressed generation evidence that an independent verifier re-derives"
         ),
     },
 )
+
 
 DISCLOSED_LIMITATION_REFERENCES: tuple[Mapping[str, str], ...] = (
     {
@@ -2517,7 +2015,7 @@ def unresolved_bypasses() -> list[dict[str, str]]:
     return [
         dict(entry)
         for entry in CLOSED_BYPASS_DISCLOSURES
-        if str(entry.get("status")) not in {"CLOSED", "CLOSED_BY_REFUSAL"}
+        if str(entry.get("status")) not in RESOLVED_BYPASS_STATUSES
     ]
 
 
@@ -2554,8 +2052,6 @@ __all__ = [
     "STATE_EVIDENCE_MISSING",
     "STATE_PREDICTIVE_BUNDLE_INCOHERENT",
     "STATE_UNSUPPORTED_MODEL_VERSION",
-    "assert_certification_artifact_bytes_unchanged",
-    "assert_event_bundle_certified",
     "bundle_identity_payload",
     "bundle_state_from_reasons",
     "calibration_evidence_state",
@@ -2565,7 +2061,6 @@ __all__ = [
     "calibration_tokens",
     "certification_artifact_digest",
     "certification_result_identity",
-    "certified_bundle_artifact_record",
     "certified_bundle_from_explicit_ids",
     "certified_bundle_payload",
     "certify_decision_horizon",
@@ -2580,7 +2075,5 @@ __all__ = [
     "require_certification_artifact",
     "unresolved_bypasses",
     "validate_calibration_evidence",
-    "validate_certification_artifact",
     "validate_certified_bundle",
-    "ValidatedCertificationArtifact",
 ]

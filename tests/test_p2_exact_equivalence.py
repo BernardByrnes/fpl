@@ -389,21 +389,35 @@ def test_world_identity_prefers_the_stamped_matrix_identity():
     matrix = {"worlds": 3, "player_ids": [1, 2], "core": {1: [0.0] * 3, 2: [0.0] * 3},
               "minutes": {1: [0.0] * 3, 2: [0.0] * 3}}
     matrix[ro.MANAGER_MATRIX_IDENTITY_KEY] = "stamped-identity"
-    identity = ro._worlds_identity({4: matrix}, bundles=None, config=config, union=[1, 2])
+    identity = ro._worlds_identity({4: matrix}, generation=None, config=config, union=[1, 2])
     assert identity == {4: "stamped-identity"}
 
 
 def test_world_identity_falls_back_to_the_certified_cache_key():
     from test_route_optimizer import _config
-    bundle = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3, xpts_run_id=4)
+
+    import generation_fixtures as gf
+    from fpl_brain import generation_store as gs
+
+    conn, runs = gf.world_with_run_ids(
+        {4: {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
+         "monte_carlo_v1": 5}},
+    )
+    generation = gf.certify_world(
+        conn, runs, events=(4,), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+    )
     config = _config()
     matrix = {"worlds": 3, "player_ids": [1, 2], "core": {1: [0.0] * 3, 2: [0.0] * 3},
               "minutes": {1: [0.0] * 3, 2: [0.0] * 3}}
-    identity = ro._worlds_identity({4: matrix}, bundles={4: bundle}, config=config, union=[1, 2])
-    assert identity == {4: ro.world_cache_key(event=4, bundle=bundle, config=config,
-                                             union_ids=[1, 2])}
+    identity = ro._worlds_identity({4: matrix}, generation=generation, config=config, union=[1, 2])
+    assert identity == {
+        4: ro.world_cache_key(
+            event=4, generation_id=generation.generation_id, runs=generation.runs_for(4),
+            config=config, union_ids=[1, 2],
+        )
+    }
     # An unidentifiable matrix yields None rather than a guess.
-    assert ro._worlds_identity({4: {"worlds": 1, "player_ids": []}}, bundles=None,
+    assert ro._worlds_identity({4: {"worlds": 1, "player_ids": []}}, generation=None,
                                config=config, union=[]) is None
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -109,73 +110,31 @@ def _optimize(universe, state, meta, **over):
                        config=_config(**over), non_production_worlds=_np(_provider()))
 
 
-def _certified_bundle(event=4, **over):
-    """A bundle that declares the certified provenance the loader requires.
+def _certified_generation(events=(4,), *, tmp_path=None):
+    """A REAL certified generation over a synthetic coherent world.
 
-    ``build_event_worlds`` refuses a bundle that cannot prove which certified run
-    ids it came from, so the cache-path tests construct one the way a producer does:
-    through ``route_comparator.certified_event_bundle``, carrying the AUTHORITATIVE
-    model version of every family it names -- a version nobody pins is refused.
+    Built through ``generation_store.certify_generation``, so the run ids, versions,
+    bundle identities and pinned snapshot a load consumes are the ones the
+    production certification lifecycle actually persists.  A fixture that fabricated
+    a generation object would be exercising a code path production does not have.
     """
 
-    runs = {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
-            "monte_carlo_v1": 5}
-    pinned = cb.declared_required_versions()
-    return rc.certified_event_bundle(
-        event=int(event), runs=runs, cutoff="2026-09-11T10:16:51Z",
-        model_versions={family: pinned[family] for family in runs}, **over,
+    from fpl_brain import generation_store as gs
+
+    import generation_fixtures as gf
+
+    conn, runs = gf.synthetic_world(events=events)
+    generation = gf.certify_world(
+        conn, runs, events=events,
+        # A single-event fixture is a MANAGER_WORLD generation: the four-Gameweek
+        # normal-transfer horizon gate is a property of THAT kind, and inventing a
+        # four-event world to satisfy it would test something else.
+        horizon_kind=(
+            gs.HORIZON_KIND_FOUR_GW if len(tuple(events)) >= 4 else gs.HORIZON_KIND_MANAGER_WORLD
+        ),
+        snapshot_path=(tmp_path / "snapshot.db") if tmp_path is not None else None,
     )
-
-
-def _certified_artifact(*bundles):
-    """The AUTHORISED certification artifact that RECORDED these bundles.
-
-    A bundle that merely hashes its own run ids consistently is not an
-    authorisation: the loader compares it against the bundle the ARTIFACT recorded,
-    so a caller driving the certified path must present one.  This mints that
-    artifact in the shape the certifier writes -- through the ONE shared identity
-    algorithm -- for the bundle(s) a test already holds.
-
-    It carries the authorization fields the canonical loader's contract requires,
-    because a mapping without them is not an authorisation either: a predictive load
-    re-runs that contract over whatever it is handed and refuses an artifact-shaped
-    mapping that cannot satisfy it.
-    """
-
-    from fpl_brain import four_gw_decision as fg
-
-    payloads = {str(int(bundle.event)): bundle.as_identity_payload() for bundle in bundles}
-    first = bundles[0]
-    artifact = {
-        "schema": fg.CERTIFICATION_ARTIFACT_SCHEMA,
-        "events": sorted(int(bundle.event) for bundle in bundles),
-        "planning_cutoff": first.planning_cutoff,
-        # The artifact records the data identity the bundles were built under; the
-        # fixture bundles declare none, and a bundle that declares none is bounded by
-        # the certification's own snapshot rather than by an invented one.
-        "data_snapshot_sha256": first.source_snapshot_sha256 or _FIXTURE_DATA_SNAPSHOT,
-        "code_snapshot_sha256": first.code_snapshot_sha256,
-        "required_model_versions": cb.declared_required_versions(),
-        "certified_bundles": payloads,
-        "certified_bundle_identity": {
-            event: cb.canonical_bundle_identity(payload) for event, payload in payloads.items()
-        },
-        "certification_wiring": fg.certification_wiring_identity(),
-        "temporal_status": "CAUSAL",
-        "dependency_validation": "COHERENT",
-        "history_completeness": {"schema": "fixture", "complete": True, "reasons": []},
-        "route_search_executed": False,
-        "transfer_execution_performed": False,
-        "decision_search_permitted": True,
-        "decision_search_permitted_reasons": [],
-    }
-    artifact["four_gw_certification_identity"] = fg.certification_identity_of(artifact)
-    return artifact
-
-
-#: The data snapshot identity a fixture artifact records when the fixture bundles
-#: declare none themselves (the contract requires the artifact to carry one).
-_FIXTURE_DATA_SNAPSHOT = "sha256:" + "d" * 64
+    return conn, generation
 
 
 # ---------------------------------------------------------------------------
@@ -674,28 +633,75 @@ def test_state_identity_still_separates_ft_bank_and_basis():
         assert ro.state_key(base) != ro.state_key(variant)
 
 
+def _cache_payload(union, *, bonus=True, digest=True, core=None, minutes=None):
+    """A serialized world-cache entry, optionally carrying its own content digest.
+
+    ``digest=False`` models a pre-PE-9 file or a hand-edited one: amendment 2 section
+    12 makes such an entry a MISS rather than a trusted matrix.
+    """
+
+    def block(values):
+        return {str(p): values for p in union}
+
+    payload = {
+        "worlds": 2, "player_ids": [int(p) for p in union],
+        "core": block(core if core is not None else [1.0, 2.0]),
+        "minutes": block(minutes if minutes is not None else [90.0, 90.0]),
+    }
+    if bonus:
+        payload["expected_bonus"] = block(0.0)
+        payload["role_actionability"] = block(False)
+    if digest:
+        payload[ro.CACHE_CONTENT_DIGEST_KEY] = ro.world_matrix_content_identity({
+            "worlds": payload["worlds"],
+            "player_ids": payload["player_ids"],
+            "core": {int(k): v for k, v in payload["core"].items()},
+            "minutes": {int(k): v for k, v in payload["minutes"].items()},
+            "expected_bonus": {int(k): v for k, v in (payload.get("expected_bonus") or {}).items()},
+            "role_actionability": {
+                int(k): bool(v) for k, v in (payload.get("role_actionability") or {}).items()
+            },
+        })
+    return payload
+
+
 def test_world_cache_hit_and_key_sensitivity(tmp_path):
     universe, state, meta = _universe()
     union = list(SQUAD_IDS)
-    bundle = _certified_bundle(4)
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
+    runs = generation.runs_for(4)
     config = _config()
-    key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union)
-    payload = {"worlds": 2, "player_ids": [int(p) for p in union],
-               "core": {str(p): [1.0, 2.0] for p in union},
-               "minutes": {str(p): [90.0, 90.0] for p in union},
-               "expected_bonus": {str(p): 0.0 for p in union},
-               "role_actionability": {str(p): False for p in union}}
-    (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
+    key = ro.world_cache_key(
+        event=4, generation_id=generation.generation_id, runs=runs, config=config, union_ids=union,
+    )
+    (tmp_path / f"{key}.json").write_text(json.dumps(_cache_payload(union)), encoding="utf-8")
     matrix, info = ro.build_event_worlds(
-        None, {4: bundle}, 4, union, config, cache_dir=tmp_path,
-        certification=_certified_artifact(bundle),
+        conn, generation, 4, union, config, cache_dir=tmp_path,
     )
     assert info["source"] == "cache" and info["key"] == key
+    assert info["cache"]["status"] == ro.CACHE_HIT
     assert matrix["core"][int(union[0])] == [1.0, 2.0]
-    other_key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union + [999])
+    # An entry whose content does not reproduce a recorded digest is a MISS: the cache
+    # is optimization, so the worlds are rebuilt rather than trusted.
+    (tmp_path / f"{key}.json").write_text(
+        json.dumps(_cache_payload(union, core=[9.0, 9.0], digest=False)), encoding="utf-8"
+    )
+    _, missed = ro.build_event_worlds(conn, generation, 4, union, config, cache_dir=tmp_path)
+    assert missed["source"] == "generated"
+    assert missed["cache"]["status"] == ro.CACHE_MISS_NO_DIGEST
+    other_key = ro.world_cache_key(
+        event=4, generation_id=generation.generation_id, runs=runs, config=config,
+        union_ids=union + [999],
+    )
     assert other_key != key  # union-player hash changes cache identity
-    other_key2 = ro.world_cache_key(event=5, bundle=bundle, config=config, union_ids=union)
-    assert other_key2 != key
+    other_key2 = ro.world_cache_key(
+        event=5, generation_id=generation.generation_id, runs=runs, config=config, union_ids=union,
+    )
+    assert other_key2 != key  # the event is part of the identity
+    other_generation_key = ro.world_cache_key(
+        event=4, generation_id="sha256:" + "0" * 64, runs=runs, config=config, union_ids=union,
+    )
+    assert other_generation_key != key  # a different certified generation IS a different world
 
 
 def test_no_new_predictive_runs_no_db_write_no_threshold_change():
@@ -771,23 +777,50 @@ def test_a_cache_entry_without_the_bonus_block_fails_closed(tmp_path):
 
     The cache key carries the schema version, so an entry keyed v2 while missing
     the block is internally inconsistent.  Silently using it would rank the armband
-    on CORE while the caller believed bonus was included.
+    on CORE while the caller believed bonus was included.  PE-9 amendment 2 section 12
+    makes that mechanical: the entry cannot present a content digest that reproduces
+    from its own bytes, so it is a MISS (recorded in the load's evidence) and the
+    worlds are rebuilt.
     """
 
     universe, state, meta = _universe()
     union = list(SQUAD_IDS)
-    bundle = _certified_bundle(4)
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
     config = _config()
-    key = ro.world_cache_key(event=4, bundle=bundle, config=config, union_ids=union)
-    payload = {"worlds": 2, "player_ids": [int(p) for p in union],
-               "core": {str(p): [1.0, 2.0] for p in union},
-               "minutes": {str(p): [90.0, 90.0] for p in union}}
-    (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(KeyError):
-        ro.build_event_worlds(
-            None, {4: bundle}, 4, union, config, cache_dir=tmp_path,
-            certification=_certified_artifact(bundle),
-        )
+    key = ro.world_cache_key(
+        event=4, generation_id=generation.generation_id, runs=generation.runs_for(4),
+        config=config, union_ids=union,
+    )
+    # Blocks missing entirely: the entry does not carry a world matrix, and it is a
+    # recorded MISS rather than a KeyError or a silently under-fed matrix.
+    incomplete = _cache_payload(union, bonus=True)
+    incomplete.pop("expected_bonus")
+    incomplete.pop("role_actionability")
+    (tmp_path / f"{key}.json").write_text(json.dumps(incomplete), encoding="utf-8")
+    matrix, info = ro.build_event_worlds(
+        conn, generation, 4, union, config, cache_dir=tmp_path,
+    )
+    assert info["source"] == "generated"
+    assert info["cache"]["status"] == ro.CACHE_MISS_UNREADABLE
+    assert "expected_bonus" in matrix and "role_actionability" in matrix
+
+    # Blocks present but content edited under a digest that no longer reproduces: a
+    # recorded MISS too, and the rebuilt matrix is the full certified one.
+    stale = _cache_payload(union, bonus=True)
+    stale["core"] = {str(p): [v + 5.0 for v in stale["core"][str(p)]] for p in union}
+    (tmp_path / f"{key}.json").write_text(json.dumps(stale), encoding="utf-8")
+    _, edited = ro.build_event_worlds(conn, generation, 4, union, config, cache_dir=tmp_path)
+    assert edited["source"] == "generated"
+    assert edited["cache"]["status"] == ro.CACHE_MISS_CONTENT_MISMATCH
+    assert edited["cache"]["cache_key"] == key
+
+    # An entry that never carried a digest at all is a MISS too, never silently used.
+    (tmp_path / f"{key}.json").write_text(
+        json.dumps(_cache_payload(union, bonus=False, digest=False)), encoding="utf-8"
+    )
+    _, undigested = ro.build_event_worlds(conn, generation, 4, union, config, cache_dir=tmp_path)
+    assert undigested["source"] == "generated"
+    assert undigested["cache"]["status"] == ro.CACHE_MISS_NO_DIGEST
 
 
 def test_the_bonus_is_part_of_the_world_cache_identity():

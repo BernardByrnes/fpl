@@ -820,33 +820,33 @@ def refine_finalists(
     player_meta: Mapping[int, Any],
     base_config: ro.OptimizerConfig,
     stage1_result: Mapping[str, Any],
-    bundles: Mapping[int, Any] | None = None,
+    generation: Any = None,
     conn=None,
     stage2_draws: int = STAGE2_DRAWS,
     finalist_selection: Mapping[str, Any] | None = None,
     non_production_worlds: Any | None = None,
-    certification: Mapping[str, Any] | None = None,
-    prebuilt_worlds: Mapping[int, Any] | None = None,
     cache_dir=None,
     verify_prefix: bool = True,
     optimizer: Callable[..., Mapping[str, Any]] | None = None,
     exact_cache: dict | None = None,
     cancel_probe: Callable[[], None] | None = None,
     parallel_workers: int | None = None,
+    **descriptors: Any,
 ) -> dict[str, Any]:
     """Re-evaluate ONLY the finalists at ``stage2_draws`` and rank them.
 
-    Same seed, same certified bundles, same route legality, same discovery
+    Same seed, same certified generation, same route legality, same discovery
     universe; the only changed input is the number of shared football worlds.
 
     Predictive data enters through exactly two declared doors, and the refinement
-    crosses the same boundary as the optimizer it calls: a ``certification``
-    artifact authorises the ``bundles``' exact certified run ids -- the loader
-    compares each event's bundle identity, event and cutoff against the bundle the
-    artifact recorded -- while worlds that were never loaded from a prediction run
-    must be declared through ``route_optimizer.NonProductionWorlds``, which names
-    who is exercising that interface.  A ``prebuilt_worlds`` mapping is the
-    certified loader's own output and is checked against the artifact.
+    crosses the same boundary as the optimizer it calls: a certified ``generation``
+    names the exact certified run ids -- its manifest was digest-verified,
+    snapshot-pinned and re-proven against the run rows before it was loaded -- while
+    worlds that were never loaded from a prediction run must be declared through
+    ``route_optimizer.NonProductionWorlds``, which names who is exercising that
+    interface.  Cross-stage reuse of the SAME worlds is the content-addressed
+    cache's job (``cache_dir``, keyed on ``generation_id``): it is optimization, not
+    authority, so a deleted cache costs time and changes no result.
 
     ``exact_cache`` lets a caller share ONE exact-evaluation cache between this
     refinement and a later evaluation over the same certified worlds (the stability
@@ -861,6 +861,7 @@ def refine_finalists(
     runner can see the choice; nothing here defaults it to a pool.
     """
 
+    ro.refuse_predictive_descriptors(descriptors, caller="finalist_refinement.refine_finalists")
     selection = dict(finalist_selection or select_finalists(stage1_result))
     finalists = selection.get("finalists") or []
     if not finalists:
@@ -869,42 +870,19 @@ def refine_finalists(
         )
     partials = finalist_partials(stage1_result, selection)
 
-    if prebuilt_worlds is None:
-        pool = ro.build_search_pool(universe, [int(p.player_id) for p in initial_state.players], base_config)
-        forced: set[int] = set()
-        for partial in partials:
-            forced |= ro.route_player_ids(partial)
-        union = ro.union_player_ids(initial_state, sorted(set(pool["pool_ids"]) | forced))
-        world_config = ro.OptimizerConfig(
-            events=base_config.events, search_draws=int(stage2_draws), seed=base_config.seed,
-            beam_width=base_config.beam_width,
-            exact_evaluation_budget=base_config.exact_evaluation_budget,
-            policy_selection_worlds=base_config.policy_selection_worlds,
+    if non_production_worlds is None and generation is None:
+        raise FinalistRefinementError(
+            "refine_finalists needs a certified generation or a declared non-production world "
+            "source"
         )
-        if non_production_worlds is None and certification is None:
-            raise FinalistRefinementError(
-                "refine_finalists needs a certification artifact, a declared non-production world "
-                "source, or prebuilt_worlds"
-            )
-        prebuilt_worlds = {}
-        for event in base_config.events:
-            if cancel_probe is not None:
-                # Safe boundary: the previous build_event_worlds call has fully returned
-                # (its cache file is written and no SQLite transaction is open).
-                cancel_probe()
-            matrix, _info = ro.build_event_worlds(
-                conn, bundles, int(event), union, world_config, cache_dir=cache_dir,
-                non_production_worlds=non_production_worlds, certification=certification,
-            )
-            prebuilt_worlds[int(event)] = matrix
 
     prefix_report: dict[str, Any] | None = None
     if verify_prefix:
         prefix_report = _measure_prefix_invariance(
-            universe=universe, initial_state=initial_state, bundles=bundles, conn=conn,
+            universe=universe, initial_state=initial_state, generation=generation, conn=conn,
             base_config=base_config, stage2_draws=int(stage2_draws), partials=partials,
-            prebuilt_worlds=prebuilt_worlds, non_production_worlds=non_production_worlds,
-            certification=certification, cache_dir=cache_dir, cancel_probe=cancel_probe,
+            non_production_worlds=non_production_worlds,
+            cache_dir=cache_dir, cancel_probe=cancel_probe,
         )
 
     refined_config = ro.OptimizerConfig(
@@ -926,9 +904,9 @@ def refine_finalists(
         cancel_probe()
     refined = run(
         universe=universe, initial_state=initial_state, scenario=scenario, player_meta=player_meta,
-        bundles=bundles, conn=conn, config=refined_config, cache_dir=None,
-        non_production_worlds=non_production_worlds, certification=certification,
-        prebuilt_worlds=prebuilt_worlds,
+        generation=generation, conn=conn, config=refined_config,
+        cache_dir=cache_dir if non_production_worlds is None else None,
+        non_production_worlds=non_production_worlds,
         required_routes=partials, nested_prior=None, exact_cache=exact_cache,
         cancel_probe=cancel_probe, parallel_workers=parallel_workers,
     )
@@ -986,17 +964,13 @@ def refine_finalists(
         "canonical_paired_near_tie": canonical,
         "simulation_fidelity": fidelity,
         "prefix_invariance": prefix_report,
-        # In-process only: the exact shared worlds Stage 2 used, so the ONE
-        # stability escalation can run in the SAME worlds (common random numbers).
-        # Never serialized into an artifact.
-        "prebuilt_worlds": prebuilt_worlds,
         "global_optimality_claimed": False,
     }
 
 
-def _measure_prefix_invariance(*, universe, initial_state, bundles, conn, base_config,
-                               stage2_draws, partials, prebuilt_worlds,
-                               non_production_worlds, certification, cache_dir=None,
+def _measure_prefix_invariance(*, universe, initial_state, generation, conn, base_config,
+                               stage2_draws, partials,
+                               non_production_worlds, cache_dir=None,
                                cancel_probe: Callable[[], None] | None = None) -> dict[str, Any]:
     """Re-run the prefix experiment against the live 10k matrices.
 
@@ -1016,20 +990,31 @@ def _measure_prefix_invariance(*, universe, initial_state, bundles, conn, base_c
         beam_width=base_config.beam_width, exact_evaluation_budget=0,
         policy_selection_worlds=base_config.policy_selection_worlds,
     )
+    high_config = ro.OptimizerConfig(
+        events=base_config.events, search_draws=int(stage2_draws), seed=base_config.seed,
+        beam_width=base_config.beam_width, exact_evaluation_budget=0,
+        policy_selection_worlds=base_config.policy_selection_worlds,
+    )
     reports: dict[str, Any] = {}
     overall = PREFIX_STATUS_PASS
     for event in base_config.events:
         event = int(event)
         if cancel_probe is not None:
             cancel_probe()  # safe boundary: each iteration is one cache read + a pure compare
-        # ``cache_dir`` is the Stage-1 world cache: the 2,000-draw matrix for the
-        # SAME union and seed is already there, so the prefix check compares
-        # Stage 2's worlds against the worlds Stage 1 actually scored.
+        # ``cache_dir`` is the shared content-addressed world cache: the 2,000-draw
+        # matrix for the SAME union and seed is already there, so the prefix check
+        # compares Stage 2's worlds against the worlds Stage 1 actually scored.  The
+        # higher-draw matrix is obtained through the SAME cache, keyed on the
+        # generation, so the comparison is over the same certified worlds whether the
+        # entry was warm or cold.
         low, _info = ro.build_event_worlds(
-            conn, bundles, event, union, low_config, cache_dir=cache_dir,
-            non_production_worlds=non_production_worlds, certification=certification,
+            conn, generation, event, union, low_config, cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds,
         )
-        high = prebuilt_worlds[event]
+        high, _high_info = ro.build_event_worlds(
+            conn, generation, event, union, high_config, cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds,
+        )
         if int(low["worlds"]) >= int(stage2_draws):
             # A low-draw matrix must be the strictly smaller prefix.
             reports[str(event)] = {"status": PREFIX_STATUS_FAIL, "reason": "LOW_NOT_SMALLER"}

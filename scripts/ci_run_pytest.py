@@ -1,7 +1,16 @@
 """Run the authoritative test suite with the repository's accepted baseline policy.
 
-The four accepted failures are configuration-environment contracts documented in
-the orchestration-readiness bootstrap.  Every other failure remains a CI failure.
+The accepted failures are configuration-environment contracts documented in the
+orchestration-readiness bootstrap: they exercise ``scripts/confirm_manager_state.py``
+in a subprocess that resolves the DEFAULT ``config.json``, which a checkout without
+local machine configuration does not have.  Every other failure remains a CI failure.
+
+PE-9 removed the two ``test_r4b1_decision_correctness`` entries that stood here: the
+``--certification`` artifact file those tests needed is gone with the caller-carried
+certification authority (amendment 2 section 5), and the tests that replaced them --
+``test_T_conflicting_event_against_the_certified_generation_fails`` and
+``test_T_no_event_and_no_generation_is_refused`` -- run against the generation store
+and do not need local configuration.
 """
 
 from __future__ import annotations
@@ -18,8 +27,6 @@ ACCEPTED_FAILURES = frozenset(
     {
         "test_causal_bundle_integrity::test_13_manager_state_prose_derives_from_actual_state",
         "test_causal_bundle_integrity::test_13b_zero_ft_prose_is_also_derived",
-        "test_r4b1_decision_correctness::test_T_conflicting_event_against_certification_fails",
-        "test_r4b1_decision_correctness::test_T_no_event_and_no_certification_is_refused",
     }
 )
 

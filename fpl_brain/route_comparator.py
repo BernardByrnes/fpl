@@ -111,13 +111,14 @@ class EventBundle:
     #: The CODE identity the certified runs came from.
     code_snapshot_sha256: str | None = None
     planning_context_hash: str | None = None
-    #: The model version each family's run carries, as DECLARED by the producer.
-    #: ``certified_bundle.assert_event_bundle_certified`` checks every one of them
-    #: against the version recorded on the run's own row.
+    #: The model version each family's run carries, as DECLARED by the generator of
+    #: this carrier.  Nothing is gated on the declaration: the authority is the
+    #: certified generation's digest-verified manifest, and ``EventBundle`` is plain
+    #: data ergonomics on top of it.
     model_versions: Mapping[str, str] = field(default_factory=dict)
-    #: The canonical identity of the CERTIFIED bundle these exact run ids came from.
-    #: A bundle without it cannot be loaded: see
-    #: ``certified_bundle.assert_event_bundle_certified``.
+    #: The canonical identity of the CERTIFIED bundle these exact run ids came from,
+    #: as recorded in the generation's manifest.  A LABEL for a reader, not a
+    #: capability: ``generation.manifest['per_event'][event]['bundle_identity']``.
     certified_bundle_identity: str | None = None
 
     def certified_runs(self) -> dict[str, int]:
@@ -199,6 +200,53 @@ def certified_event_bundle(
             data_snapshot_sha256=data_snapshot_sha256,
             planning_context_hash=planning_context_hash,
         ),
+    )
+
+
+def event_bundle_from_generation(
+    generation: Any,
+    event: int,
+    *,
+    simulations: int = 2000,
+    seed: int = 20260911,
+) -> EventBundle:
+    """The bundle one event's certified GENERATION names, as plain data.
+
+    An ``EventBundle`` is an ergonomic carrier here, not an authorisation: the run
+    ids and versions come from the generation's digest-verified manifest, and the
+    identity is recomputed by the one shared algorithm so a consumer can see which
+    certified bundle the values belong to.  Nothing is gated on the object.
+    """
+
+    from . import certified_bundle as cb
+
+    record = (generation.manifest.get("per_event") or {}).get(str(int(event))) or {}
+    runs = {str(family): int(run_id) for family, run_id in (record.get("runs") or {}).items()}
+    missing = [family for family in cb.LOAD_REQUIRED_FAMILIES if family not in runs]
+    if missing:
+        raise certified_bundle.CertificationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [
+                f"event {int(event)}: generation {generation.generation_id} names no run for "
+                f"{sorted(missing)}"
+            ],
+        )
+    versions = {str(family): str(version) for family, version in (record.get("model_versions") or {}).items()}
+    return EventBundle(
+        event=int(event),
+        minutes_run_id=runs["minutes_v1"],
+        team_run_id=runs["team_strength_v1"],
+        rate_run_id=runs["player_rates_v1"],
+        xpts_run_id=runs["xpts_v1"],
+        mc_run_id=runs.get("monte_carlo_v1"),
+        simulations=int(simulations),
+        seed=int(seed),
+        planning_cutoff=str(generation.cutoff),
+        source_snapshot_sha256=(generation.manifest.get("data_snapshot") or {}).get("sha256"),
+        code_snapshot_sha256=generation.manifest.get("code_snapshot_sha256"),
+        planning_context_hash=record.get("planning_context_hash"),
+        model_versions=versions,
+        certified_bundle_identity=str(record.get("bundle_identity") or "") or None,
     )
 
 
@@ -365,49 +413,67 @@ def _best_policy(squad_ids, positions, world_matrix, *, top_k: int = 1):
 
 def compare_routes(
     *,
-    bundles: Mapping[int, EventBundle],
+    generation: Any | None = None,
     routes: Sequence[TransferRoute],
     initial_state: ts.RouteState,
     scenario: PriceScenario,
     player_meta: Mapping[int, ts.PlayerMeta],
     conn=None,
     non_production_worlds: Any | None = None,
-    certification: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
     simulations: int = 2000,
     seed: int = 20260911,
     planning_cutoff: str | None = None,
+    events: Sequence[int] | None = None,
+    **descriptors: Any,
 ) -> dict[str, Any]:
     """Evaluate every explicit route in shared per-event football worlds.
 
     Predictive data enters through exactly two declared doors, and the comparator
     keeps the SAME boundary as the optimizer's loader:
 
-    * the CERTIFIED door, which requires a validation artifact.  Each event's
-      bundle must be the one the artifact recorded -- ``certified_bundle.
-      assert_event_bundle_certified`` compares the bundle's identity, event and
-      cutoff against the artifact and re-proves the recorded family / event /
-      status / cutoff / dependency closure against the run rows -- so a
-      hand-assembled "newest run per family" bundle, or one that merely hashes its
-      own run ids consistently, is REFUSED rather than simulated;
+    * the CERTIFIED door, which requires a loaded certified GENERATION.  Worlds are
+      re-simulated from that generation's exact certified run ids, and the
+      generation's manifest was digest-verified, snapshot-pinned and re-validated
+      against the run rows before it was loaded -- so a hand-assembled "newest run
+      per family" bundle, or a caller's own run-id mapping, has no route in at all;
     * the declared NON-PRODUCTION door
       (``route_optimizer.NonProductionWorlds``), for worlds that are not read from
       a prediction run at all.  It names who is exercising it, and it is refused
-      outright when a certification artifact is presented.
+      outright when a certified generation is presented.
     """
 
     from . import route_optimizer as ro
 
-    if non_production_worlds is not None and certification is not None:
+    ro.refuse_predictive_descriptors(descriptors, caller="route_comparator.compare_routes")
+    if non_production_worlds is not None and generation is not None:
         raise certified_bundle.CertificationRefused(
             ro.DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN,
             [
-                "a certification artifact authorises the certified run ids, and a non-production "
+                "a certified generation names the certified run ids, and a non-production "
                 "world source was supplied beside it; a certified comparison never consumes "
                 "injected worlds"
             ],
         )
+    if generation is None and non_production_worlds is None:
+        raise certified_bundle.CertificationRefused(
+            ro.DIAG_CERTIFIED_GENERATION_REQUIRED,
+            [
+                "compare_routes requires a certified GENERATION or a declared non-production world "
+                "source; a caller cannot supply bundles or run-id mappings in their place"
+            ],
+        )
 
-    events = sorted(int(event) for event in bundles)
+    bundles = (
+        {
+            int(event): event_bundle_from_generation(
+                generation, int(event), simulations=int(simulations), seed=int(seed)
+            )
+            for event in (events if events is not None else generation.events)
+        }
+        if generation is not None
+        else {}
+    )
+    events = sorted(int(event) for event in (events if events is not None else bundles))
     route_problems = validate_routes(routes, events)
 
     union_ids = {int(p.player_id) for p in initial_state.players}
@@ -444,13 +510,9 @@ def compare_routes(
                 )
             bundle = bundles[event]
             # The comparator's own DB branch is a predictive-data loader too, so it
-            # crosses the SAME certification boundary: it requires the artifact, and
-            # a bundle that is not the one the artifact recorded -- or whose recorded
-            # family / event / status / cutoff / dependency closure disagrees with the
-            # run rows -- is refused rather than simulated.
-            certified_bundle.assert_event_bundle_certified(
-                conn, bundle, event=int(event), certification=certification
-            )
+            # crosses the SAME generation boundary: the run ids are the certified
+            # generation's, and its manifest was already digest-verified, snapshot-
+            # pinned and re-proven against the run rows before it was loaded.
             fixtures = monte_carlo.load_fixture_inputs(
                 conn, event=event, xpts_run_id=int(bundle.xpts_run_id),
                 minutes_run_id=int(bundle.minutes_run_id), team_run_id=int(bundle.team_run_id),

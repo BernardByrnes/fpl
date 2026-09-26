@@ -10,7 +10,7 @@ from typing import Callable
 
 from .utils import utc_now
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # Model families the analytics spine may record.  ``baseline`` / ``minutes_v1``
 # predate this list; the team and player-rate families were added in m007 and
@@ -1372,6 +1372,101 @@ def m017_certified_freeze_is_closed(conn: sqlite3.Connection) -> None:
     )
 
 
+def m018_certified_generation_store(conn: sqlite3.Connection) -> None:
+    """PE-9: the content-addressed certified generation store (schema 17 -> 18).
+
+    Three tables, and no more than the architecture needs:
+
+    * ``generation`` -- append-only certified generation.  ``generation_id`` IS the
+      sha256 of the canonical semantic manifest stored in ``manifest_json``, so the
+      row is self-verifying: recomputing the digest from the persisted bytes must
+      reproduce the primary key.  A row may exist ONLY when certification passed;
+      there is deliberately no mutable ``CERTIFIED`` flag to toggle, so a crash
+      before commit leaves no generation and the old pointer.
+    * ``current_generation`` -- the small MUTABLE convenience selector
+      ``(planning_event, horizon_kind) -> generation_id``.  It is a selector, not
+      evidence: a decision pinned to an explicit ``generation_id`` does not read it.
+    * ``engine_decision_records`` -- append-only production decision attribution.
+
+    The two append-only tables refuse UPDATE and DELETE mechanically (triggers).
+    This is protection against ACCIDENTAL mutation, not a hostile-database security
+    claim -- PE-9's own threat model excludes an attacker who can already write to
+    the authoritative store.  Corrections create new evidence; they never rewrite
+    history.
+
+    Strictly additive: no existing table, column, constraint or row is touched.
+    """
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS generation (
+            generation_id TEXT PRIMARY KEY,
+            manifest_json TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            planning_event INTEGER NOT NULL,
+            horizon_kind TEXT NOT NULL,
+            cutoff TEXT NOT NULL,
+            snapshot_path TEXT,
+            snapshot_sha256 TEXT,
+            snapshot_source_db_identity TEXT,
+            execution_run_uuid TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS current_generation (
+            planning_event INTEGER NOT NULL,
+            horizon_kind TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (planning_event, horizon_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS engine_decision_records (
+            decision_id TEXT PRIMARY KEY,
+            generation_id TEXT NOT NULL,
+            planning_event INTEGER NOT NULL,
+            horizon_kind TEXT NOT NULL,
+            manager_packet_sha256 TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            result_sha256 TEXT NOT NULL,
+            runner_identity TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            decision_artifact_ref TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_generation_event_horizon
+            ON generation(planning_event, horizon_kind);
+        CREATE INDEX IF NOT EXISTS idx_engine_decision_generation
+            ON engine_decision_records(generation_id);
+
+        CREATE TRIGGER IF NOT EXISTS generation_no_update
+          BEFORE UPDATE ON generation
+          BEGIN
+            SELECT RAISE(ABORT, 'PE9_APPEND_ONLY: a certified generation is immutable');
+          END;
+
+        CREATE TRIGGER IF NOT EXISTS generation_no_delete
+          BEFORE DELETE ON generation
+          BEGIN
+            SELECT RAISE(ABORT, 'PE9_APPEND_ONLY: a certified generation is immutable');
+          END;
+
+        CREATE TRIGGER IF NOT EXISTS engine_decision_records_no_update
+          BEFORE UPDATE ON engine_decision_records
+          BEGIN
+            SELECT RAISE(ABORT, 'PE9_APPEND_ONLY: a production decision record is immutable');
+          END;
+
+        CREATE TRIGGER IF NOT EXISTS engine_decision_records_no_delete
+          BEFORE DELETE ON engine_decision_records
+          BEGIN
+            SELECT RAISE(ABORT, 'PE9_APPEND_ONLY: a production decision record is immutable');
+          END;
+        """
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_initial,
     m002_manual_manager_state,
@@ -1390,6 +1485,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m015_bootstrap_generation_identity,
     m016_outcome_ledger,
     m017_certified_freeze_is_closed,
+    m018_certified_generation_store,
 ]
 
 

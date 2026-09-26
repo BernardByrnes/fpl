@@ -50,6 +50,7 @@ from typing import Any, Mapping, Sequence
 from . import certified_bundle as cb
 from . import chip_decision as cd
 from . import chip_free_hit as fh
+from . import generation_store as gs
 from .free_hit_route import FreeHitRouteError
 from . import manager_lineup as ml
 from . import planning as planning_module
@@ -340,6 +341,10 @@ def build_free_hit_request(
     chip_available: bool = True,
     calibration_status: str = cd.CALIBRATION_UNCALIBRATED,
     input_uncertainty_flags: Sequence[str] = (),
+    #: The certified GENERATION SELECTOR, resolved from the authoritative store when
+    #: omitted.  It selects WHICH certified world this decision consumes; the evidence
+    #: that authorises the load is the persisted generation itself.
+    generation: Any = None,
 ) -> fh.FreeHitRequest:
     """Assemble an authoritative ``FreeHitRequest``, or refuse.
 
@@ -444,12 +449,14 @@ def build_free_hit_request(
             reasons=(fh.FH_HORIZON_NOT_CANONICAL,),
         )
 
-    # ── bind each arm's route worlds to the certified bundle, PER EVENT ───────
+    # ── bind each arm's route worlds to the certified GENERATION, PER EVENT ───
     # Validation and matrix extraction happen together, so the matrices handed to
-    # exact_evaluate are the ones carried by the artifacts that were just proved
-    # to be the certified event bundles.
+    # exact_evaluate are the ones the CERTIFIED GENERATION names.  The generation is
+    # resolved from the authoritative store: it is a SELECTOR bound to this decision's
+    # planning event, never a caller-supplied object, and the caller cannot pass one.
     horizon = tuple(int(e) for e in binding.horizon_events)
-    bundles = certified_event_bundles(authority)
+    if generation is None:
+        generation = gs.resolve_generation(conn, planning_event=int(manager.planning_event))
     if world_cache_dir is None:
         raise FreeHitAdapterError(
             f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: no world-cache directory is configured, so the "
@@ -457,14 +464,14 @@ def build_free_hit_request(
             reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
         )
     save_worlds = load_certified_route_worlds(
-        conn, bundles, arm="SAVE", expected_events=horizon,
+        conn, generation, arm="SAVE", expected_events=horizon,
         union_ids=manager.eligible_ids, config=certified.save.route_config,
-        cache_dir=world_cache_dir, certification=authority.artifact,
+        cache_dir=world_cache_dir,
     )
     play_worlds = load_certified_route_worlds(
-        conn, bundles, arm="PLAY", expected_events=horizon[1:],
+        conn, generation, arm="PLAY", expected_events=horizon[1:],
         union_ids=manager.eligible_ids, config=certified.play.route_config,
-        cache_dir=world_cache_dir, certification=authority.artifact,
+        cache_dir=world_cache_dir,
     )
 
     # ── A2: derive the expected start states, then CONVERT both arms HERE ─────
@@ -646,61 +653,68 @@ def certified_event_bundles(authority: Any) -> dict[int, _CertifiedRunIds]:
 
 def load_certified_route_worlds(
     conn: sqlite3.Connection,
-    bundles: Mapping[int, _CertifiedRunIds],
+    generation: Any,
     *,
     arm: str,
     expected_events: Sequence[int],
     union_ids: Sequence[int],
     config: Any,
     cache_dir: Any | None = None,
-    certification: Mapping[str, Any] | None = None,
 ) -> dict[int, dict[str, Any]]:
-    """Load ONE arm's route worlds from the CANONICAL matrix authority.
+    """Load ONE arm's route worlds from the CANONICAL world loader.
 
     ``route_optimizer.build_event_worlds`` is the accepted loader: it derives the
-    world-cache key from the CERTIFIED run ids, the Monte Carlo model identity, the
-    simulation count, the seed and the capture union, reads the matrix from the
-    content-addressed cache under that key (or regenerates it from those certified
-    runs), and STAMPS the result with that key.  The matrices returned here are the
-    loader's own output -- there is no caller matrix anywhere on the path.
+    world-cache key from the CERTIFIED generation, the exact certified run ids, the
+    Monte Carlo model identity, the simulation count, the seed and the capture union;
+    reads the matrix from the content-addressed cache under that key (or regenerates
+    it from those certified runs); and STAMPS the result with that key.  The matrices
+    returned here are the loader's own output -- there is no caller matrix anywhere on
+    the path.
 
-    ``certification`` is the LOADED artifact the run ids were derived from, and it
-    is what authorises the load: the loader compares each event's bundle -- its
-    identity, its event and its cutoff -- against the bundle the artifact RECORDED,
-    so run ids that merely agree with each other cannot stand in for the
-    authorisation.  An absent artifact refuses; it is never defaulted.
+    ``generation`` is the loaded certified generation; it is what authorises the
+    load, because its manifest was digest-verified, snapshot-pinned and re-proven
+    against the run rows before it was loaded.  An absent generation refuses; it is
+    never defaulted.
     """
 
     from . import route_optimizer as ro
 
+    if generation is None or not getattr(generation, "generation_id", None):
+        raise FreeHitAdapterError(
+            f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the certified route worlds are loaded from a "
+            "certified GENERATION and none was supplied",
+            reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
+        )
     loaded: dict[int, dict[str, Any]] = {}
     union = tuple(int(p) for p in union_ids)
     for event in expected_events:
         event = int(event)
-        bundle = bundles.get(event)
-        if bundle is None:
+        runs = generation.runs_for(event)
+        if not runs:
             raise FreeHitAdapterError(
-                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the certification certifies no bundle for "
+                f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the certified generation names no run for "
                 f"{arm} route event {event}",
                 reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
             )
         try:
             matrix, _info = ro.build_event_worlds(
-                conn, bundles, event, union, config, cache_dir=cache_dir,
-                certification=certification,
+                conn, generation, event, union, config, cache_dir=cache_dir,
             )
         except Exception as exc:  # the canonical loader's own refusals are authoritative
             raise FreeHitAdapterError(
                 f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the canonical worlds for {arm} route event "
-                f"{event} could not be loaded from the certified bundle: {exc}",
+                f"{event} could not be loaded from the certified generation: {exc}",
                 reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
             ) from exc
-        expected_key = ro.world_cache_key(event=event, bundle=bundle, config=config, union_ids=union)
+        expected_key = ro.world_cache_key(
+            event=event, generation_id=generation.generation_id, runs=runs, config=config,
+            union_ids=union,
+        )
         stamp = str(matrix.get(ro.MANAGER_MATRIX_IDENTITY_KEY) or "")
         if stamp != expected_key:
             raise FreeHitAdapterError(
                 f"{fh.FH_DECISION_AUTHORITY_REQUIRED}: the {arm} world matrix for event {event} does "
-                "not carry the canonical identity of its certified bundle",
+                "not carry the canonical identity of its certified generation",
                 reasons=(fh.FH_DECISION_AUTHORITY_REQUIRED,),
             )
         if {int(p) for p in matrix["player_ids"]} != set(union):

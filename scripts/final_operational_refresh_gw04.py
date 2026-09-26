@@ -3,7 +3,10 @@
 
 SCOPE: HISTORICAL GW4 / H1 DESCRIPTIVE DIAGNOSTIC — NOT the 4GW production runner.
 
-* ``EVENTS = (4,)`` — a single GW4 world bundle only.
+* ``EVENTS = (4,)`` — a single GW4 world bundle only.  PE-9: the run ids, cutoff and
+  model versions all come from the resolved CERTIFIED GENERATION's manifest, and a
+  supplied ``--minutes-run``/``--xpts-run``/... that is not the certified run is
+  refused; there is no hand-assembled run-id set and no uncertified readiness view.
 * The route table is the historical Rodon-era four-route comparison; Rodon is
   now sold, Davis is already owned, and those routes are no longer actionable.
 * It passes ``routes=None`` into the four-GW decision output, so it can never
@@ -28,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import analytics, candidate_universe as cu, four_gw_decision as fg, manager_worlds
+from fpl_brain import generation_store as gs
 from fpl_brain import packet as packet_mod
 from fpl_brain import repositories as repo
 from fpl_brain import route_comparator as rc
@@ -53,13 +57,10 @@ EVENTS = (4,)
 DECISION_EVENTS = fg.decision_events(EVENT)
 SEED = 20260911
 SIMULATIONS = 10_000
-RUNS = {
-    "minutes": 114,
-    "team": 115,
-    "rates": 117,
-    "xpts": 120,
-    "monte_carlo": 121,
-}
+#: PE-9: populated by ``main`` from the resolved CERTIFIED GENERATION's manifest, under
+#: this script's short family names.  There are deliberately no hardcoded run ids here:
+#: a run set that is not the certified one must never be assembled.
+RUNS: dict[str, int] = {}
 
 ROUTE_A = "A_RODON_JUSTIN_MUHAREMOVIC_DAVIS"
 ROUTE_B = "B_RAYA_MARTINEZ_RODON_DAVIS"
@@ -101,7 +102,7 @@ def _policy_names(conn, policy: dict | None) -> dict | None:
     }
 
 
-def _fresh_candidate_universe(conn, context, squad, snapshot) -> dict:
+def _fresh_candidate_universe(conn, context, squad, snapshot, generation) -> dict:
     from fpl_brain import analytics as analytics_module
 
     pool = cu.load_pool(conn)
@@ -109,6 +110,14 @@ def _fresh_candidate_universe(conn, context, squad, snapshot) -> dict:
     xpts_rows = {EVENT: cu.load_projection_rows(conn, RUNS["xpts"])}
     minutes_rows = {
         EVENT: cu.load_projection_rows(conn, RUNS["minutes"], analytics_module.MINUTES_V1_KIND)
+    }
+    # The published versions are the CERTIFIED generation's own records, not literals:
+    # a stale literal here would name a model the world was not certified under.
+    certified_versions = {
+        str(family): str(version)
+        for family, version in sorted(
+            (generation.model_versions_by_event.get(int(EVENT)) or {}).items()
+        )
     }
     universe = cu.build_universe(
         pool=pool,
@@ -124,7 +133,8 @@ def _fresh_candidate_universe(conn, context, squad, snapshot) -> dict:
             "xpts": {str(EVENT): RUNS["xpts"]},
             "minutes": {str(EVENT): RUNS["minutes"]},
             "events": list(EVENTS),
-            "versions": {"minutes": "minutes_v1.5.2", "xpts": "xpts_v1.4.1", "mc": "mc_v1.2.1"},
+            "generation_id": generation.generation_id,
+            "versions": certified_versions,
         },
     )
     universe["scope"] = "FRESH_GW4_ONLY"
@@ -423,23 +433,26 @@ def main(argv=None) -> int:
     parser.add_argument("--out-dir", default="data/exports/operational_refresh/gw04")
     parser.add_argument("--cache-dir", default="data/cache/manager_worlds")
     parser.add_argument("--cutoff", default=FRESH_CUTOFF)
-    parser.add_argument("--minutes-run", type=int, default=RUNS["minutes"])
-    parser.add_argument("--team-run", type=int, default=RUNS["team"])
-    parser.add_argument("--rates-run", type=int, default=RUNS["rates"])
-    parser.add_argument("--xpts-run", type=int, default=RUNS["xpts"])
-    parser.add_argument("--monte-carlo-run", type=int, default=RUNS["monte_carlo"])
+    parser.add_argument(
+        "--generation", default=None,
+        help="explicit certified generation id SELECTOR.  Omit to resolve the current_generation "
+             "pointer for this manager-world horizon",
+    )
+    parser.add_argument("--minutes-run", type=int, default=None,
+                        help="must equal the certified minutes run, when supplied")
+    parser.add_argument("--team-run", type=int, default=None,
+                        help="must equal the certified team-strength run, when supplied")
+    parser.add_argument("--rates-run", type=int, default=None,
+                        help="must equal the certified player-rates run, when supplied")
+    parser.add_argument("--xpts-run", type=int, default=None,
+                        help="must equal the certified xPts run, when supplied")
+    parser.add_argument("--monte-carlo-run", type=int, default=None,
+                        help="must equal the certified Monte Carlo run, when supplied")
     parser.add_argument("--simulations", type=int, default=SIMULATIONS)
     parser.add_argument("--manager-packet", help="exact manager-policy packet to reference")
     args = parser.parse_args(argv)
 
     FRESH_CUTOFF = str(args.cutoff)
-    RUNS = {
-        "minutes": int(args.minutes_run),
-        "team": int(args.team_run),
-        "rates": int(args.rates_run),
-        "xpts": int(args.xpts_run),
-        "monte_carlo": int(args.monte_carlo_run),
-    }
     SIMULATIONS = int(args.simulations)
 
     config = load_config(args.config)
@@ -482,12 +495,64 @@ def main(argv=None) -> int:
             print("  establish a planning cutoff at or after the manager-state override and re-run", file=sys.stderr)
             return _refuse_execution(guard, 5, "cutoff precedes manager-state override")
 
+        # --- PE-9: the CERTIFIED GENERATION is the only predictive authority -----
+        # An explicit certified generation, or the certified pointer.  The run ids this
+        # report names, the cutoff it plans at and the model versions it publishes are
+        # all read from its digest-verified manifest: the script never rediscovers
+        # "the newest run per family", and a supplied run id that is not the certified
+        # one is refused rather than used.
+        try:
+            generation = gs.resolve_generation(
+                conn, planning_event=int(EVENT), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+                generation_id=args.generation,
+            )
+        except gs.GenerationRefused as refusal:
+            print(f"operational refresh refused: {refusal}", file=sys.stderr)
+            return _refuse_execution(guard, 6, "no certified generation for the refresh world")
+        gs.require_snapshot_retained(generation)
+        gs.assert_generation_bundles_valid(conn, generation)
+        if [int(event) for event in generation.events] != [int(event) for event in EVENTS]:
+            print(f"operational refresh refused: the certified generation covers "
+                  f"{list(generation.events)}, not the refresh scope {list(EVENTS)}", file=sys.stderr)
+            return _refuse_execution(guard, 6, "certified generation does not cover the refresh scope")
+        if str(generation.cutoff) != str(FRESH_CUTOFF):
+            print(f"operational refresh refused: the certified generation is at cutoff "
+                  f"{generation.cutoff}, not {FRESH_CUTOFF}", file=sys.stderr)
+            return _refuse_execution(guard, 6, "certified generation cutoff mismatch")
+        certified_runs = generation.runs_for(int(EVENT))
+        _RUN_FAMILIES = {
+            "minutes": "minutes_v1", "team": "team_strength_v1", "rates": "player_rates_v1",
+            "xpts": "xpts_v1", "monte_carlo": "monte_carlo_v1",
+        }
+        missing_families = sorted(
+            family for family in _RUN_FAMILIES.values() if family not in certified_runs
+        )
+        if missing_families:
+            print(f"operational refresh refused: the certified generation names no run for "
+                  f"{missing_families}", file=sys.stderr)
+            return _refuse_execution(guard, 6, "certified generation names no run for a required family")
+        supplied = {
+            "minutes": args.minutes_run, "team": args.team_run, "rates": args.rates_run,
+            "xpts": args.xpts_run, "monte_carlo": args.monte_carlo_run,
+        }
+        mismatched = {
+            key: int(value) for key, value in supplied.items()
+            if value is not None and certified_runs[_RUN_FAMILIES[key]] != int(value)
+        }
+        if mismatched:
+            print(f"operational refresh refused: supplied run id(s) {mismatched} are not the runs the "
+                  f"certified generation {generation.generation_id} records", file=sys.stderr)
+            return _refuse_execution(guard, 6, "supplied run id is not the certified one")
+        RUNS = {key: int(certified_runs[family]) for key, family in _RUN_FAMILIES.items()}
+        print(f"certified generation accepted: id={generation.generation_id[:24]}… "
+              f"cutoff={generation.cutoff} runs={RUNS}")
+
         snapshot = cu.price_snapshot_as_of(
             conn, EVENT, FRESH_CUTOFF,
             required_player_ids=[int(pid) for pid in squad["squad_ids"]],
         )
         initial_state = rc.build_route_state(conn, context, squad, snapshot)
-        universe = _fresh_candidate_universe(conn, context, squad, snapshot)
+        universe = _fresh_candidate_universe(conn, context, squad, snapshot, generation)
         universe_ids = {int(row["player_id"]) for row in universe["universe"]}
         missing_owned = sorted(int(pid) for pid in squad["squad_ids"] if int(pid) not in universe_ids)
         if missing_owned:
@@ -507,7 +572,12 @@ def main(argv=None) -> int:
 
         # --- canonical four-GW decision horizon + hard readiness gate -----------
         season_last_event = fg.season_last_event_from_db(conn)
-        horizon_support = fg.event_support_from_db(conn, DECISION_EVENTS, FRESH_CUTOFF)
+        # PE-9 gap 3: readiness resolves the CERTIFIED generation, not a
+        # latest-per-family rediscovery.  The generation covers exactly the fresh
+        # events, so the four-Gameweek horizon reports the events it does not cover as
+        # unsupported -- the same fact the report states, now read from certified
+        # evidence instead of from rows a later rerun could silently replace.
+        horizon_support = gs.support_by_event(generation)
         horizon = fg.evaluate_horizon(
             planning_event=EVENT, support_by_event=horizon_support, cutoff=FRESH_CUTOFF,
             last_event=season_last_event,
@@ -572,27 +642,19 @@ def main(argv=None) -> int:
             return _refuse_execution(guard, 2, "missing player metadata")
 
         scenario = rc.flat_current_price_scenario(snapshot, EVENTS)
-        bundle = rc.EventBundle(
-            event=EVENT, minutes_run_id=RUNS["minutes"], team_run_id=RUNS["team"], rate_run_id=RUNS["rates"],
-            xpts_run_id=RUNS["xpts"], mc_run_id=RUNS["monte_carlo"], simulations=SIMULATIONS,
-            seed=SEED, planning_cutoff=FRESH_CUTOFF,
-        )
         world_config = ro.OptimizerConfig(events=EVENTS, search_draws=SIMULATIONS, seed=SEED, policy_selection_worlds=0)
         cache_dir = Path(args.cache_dir)
+        # PE-9: the certified GENERATION is the door, on both the world load and the
+        # comparison.  There is no caller bundle mapping and no hand-built matrix: the
+        # exact certified run ids are read from the generation's digest-verified
+        # manifest, so the two published views of this report cannot describe a world
+        # the certification did not commit to.
         matrix, world_info = ro.build_event_worlds(
-            conn, {EVENT: bundle}, EVENT, sorted(union_ids), world_config, cache_dir=cache_dir,
+            conn, generation, EVENT, sorted(union_ids), world_config, cache_dir=cache_dir,
         )
         comparison = rc.compare_routes(
-            conn=conn, bundles={EVENT: bundle}, routes=routes, initial_state=initial_state,
+            conn=conn, generation=generation, routes=routes, initial_state=initial_state,
             scenario=scenario, player_meta=player_meta,
-            # The matrix was fetched by the certified loader above, so it is
-            # presented under an explicit NON-PRODUCTION declaration: this is a
-            # historical replay, and no certification artifact exists for it.
-            non_production_worlds=ro.NonProductionWorlds(
-                declaration="scripts/final_operational_refresh_gw04.py: historical GW4 replay, "
-                            "world loaded from a hand-assembled bundle",
-                matrices={EVENT: matrix},
-            ),
             simulations=SIMULATIONS, seed=SEED, planning_cutoff=FRESH_CUTOFF,
         )
         comparison["fresh_world_info"] = {**world_info, "worlds": int(matrix["worlds"]), "union_players": len(union_ids)}

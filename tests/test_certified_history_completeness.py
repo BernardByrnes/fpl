@@ -916,18 +916,28 @@ def test_F2_new_schema_requires_the_certifier_in_the_declared_wiring(tmp_path):
 
 
 def test_G_runner_gate_refuses_a_new_artifact_missing_the_audit(tmp_path):
-    """The runner has ONE certification entry, and it is the validating loader."""
+    """The runner has ONE predictive-world entry, and it is the validating one.
+
+    PE-9 amendment 2 moved the production decision boundary off caller-carried
+    certification objects and onto the content-addressed generation store, so the
+    runner no longer loads a certification artifact at all.  The INVARIANT this test
+    guards is unchanged: exactly one entry to the predictive world, and it is the
+    validating one.
+    """
 
     source = Path("scripts/run_four_gw_decision.py").read_text(encoding="utf-8")
-    # Exactly one assignment to the certification object, and it comes from the loader.
-    assert source.count("certification = fg.load_certification_artifact(") == 1
-    assert source.count("fg.load_certification_artifact(") == 1
-    # The only consumer of a certification object is fed that loaded variable.
-    assert source.count("fg.event_support_from_certification(") == 1
-    assert "fg.event_support_from_certification(\n                conn, certification," in source
+    # The ONE predictive-world entry resolves and re-proves the certified generation.
+    assert source.count("def resolve_decision_generation(") == 1
+    # The READINESS view, the production gate, and the definition itself.
+    assert source.count("resolve_decision_generation(") == 3
+    assert "gs.assert_generation_bundles_valid(conn, generation)" in source
+    # No caller-carried certification object reaches a predictive load any more.
+    assert "fg.load_certification_artifact(" not in source
+    assert "fg.event_support_from_certification(" not in source
 
-    # Behaviourally: the object that gate produces is refused when a NEW artifact
-    # omits the audit (this is the exact call the runner makes).
+    # Behaviourally: a NEW certification artifact that omits the history audit is
+    # still refused by the loader that owns that contract, so the historical path
+    # this test guards has not been weakened by the move.
     path = _write(tmp_path, _artifact(fg.CERTIFICATION_ARTIFACT_SCHEMA))
     with pytest.raises(fg.DecisionCertificationRequired) as failure:
         fg.load_certification_artifact(path)
@@ -1334,13 +1344,21 @@ def _seed_event5_certified_world(conn):
         conn.execute("INSERT INTO fixtures(id, event, team_h, team_a, kickoff_time, finished, started,"
                      " raw_json, updated_at)"
                      " VALUES (48,5,1,2,'2026-09-19T14:00:00Z',0,0,'{}','2026-09-01T00:00:00Z')")
-        for run_id, family, version in (
-            (1, "minutes_v1", "minutes_v1.6.0"),
-            (2, "team_strength_v1", "team_strength_v1.0.0"),
-            (3, "player_rates_v1", "player_rates_v1.0.0"),
-            (4, "xpts_v1", "xpts_v1.4.1"),
-            (5, "monte_carlo_v1", "mc_v1.3.0"),
+        # The AUTHORITATIVE declared versions, read from the one in-library source:
+        # PE-9 gap 1 made the required versions come from that source and never from
+        # the artifact, so a fixture world recorded under stale literals would be a
+        # run nobody pins -- exactly what UNSUPPORTED_MODEL_VERSION exists to refuse.
+        from fpl_brain import certified_bundle as _cb
+
+        declared = _cb.declared_required_versions()
+        for run_id, family in (
+            (1, "minutes_v1"),
+            (2, "team_strength_v1"),
+            (3, "player_rates_v1"),
+            (4, "xpts_v1"),
+            (5, "monte_carlo_v1"),
         ):
+            version = declared[family]
             conn.execute(
                 "INSERT INTO projection_runs(id, model_family, model_version, generated_at, planning_event,"
                 " data_cutoff, status, source_snapshot_sha256, planning_context_hash)"
@@ -1351,13 +1369,15 @@ def _seed_event5_certified_world(conn):
             "INSERT INTO player_fixture_xpts_projections(projection_run_id, player_id, fixture_id, event,"
             " team_id, opponent_id, position, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, scoring_rules_version, generated_at)"
-            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}','xpts_v1.4.1','v1','2026-09-12T19:01:00Z')"
+            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}',?,'v1','2026-09-12T19:01:00Z')",
+            (declared["xpts_v1"],),
         )
         conn.execute(
             "INSERT INTO monte_carlo_distributions(projection_run_id, player_id, fixture_id, event, team_id,"
             " opponent_id, position, xpts_run_id, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, generated_at)"
-            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}','mc_v1.3.0','2026-09-12T19:01:00Z')"
+            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}',?,'2026-09-12T19:01:00Z')",
+            (declared["monte_carlo_v1"],),
         )
 
 
@@ -1436,12 +1456,13 @@ def test_P2_2D_duplicates_and_reorderings_are_deterministic(tmp_path):
 
 
 def test_P2_2E_the_production_runner_seam_refuses_a_mismatched_horizon(tmp_path):
-    """The runner's exact gate: load the artifact, then request its own horizon."""
+    """The runner's exact gate: resolve the generation, then require ITS horizon."""
 
     source = Path("scripts/run_four_gw_decision.py").read_text(encoding="utf-8")
     assert "decision_events = fg.decision_events(" in source
-    assert "fg.event_support_from_certification(" in source
-    assert "conn, certification, events=decision_events, cutoff=cutoff" in source
+    assert "resolve_decision_generation(" in source
+    # The generation's OWN horizon is what the decision must equal.
+    assert "if list(generation.events) != [int(event) for event in decision_events]:" in source
 
     events = (5, 6, 7, 8, 9)
     bundles, identities = _bound_bundles(events)
