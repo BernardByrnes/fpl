@@ -15,6 +15,7 @@ import inspect
 import json
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,8 @@ def _world(path: Path) -> gs.CertifiedGeneration:
     gf.add_event(conn, 5)
     with conn:
         gf.add_fixture(conn, 1000, 5, 1, 2)
+    gf.prepare_fixture_snapshot(conn, (5,), cutoff=gf.CUTOFF)
+    with conn:
         for family, run_id in RUN_IDS.items():
             gf.add_run(conn, run_id, family, 5)
         for pid in SQUAD:
@@ -81,8 +84,8 @@ def _world(path: Path) -> gs.CertifiedGeneration:
         conn, {5: dict(RUN_IDS)}, events=(5,),
         horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
         # The decision READS the pinned snapshot, so the fixture pins a real copy of
-        # the store rather than a placeholder file.
-        snapshot_path=path.parent / "snapshot.db", snapshot_database=path,
+        # the exact source state used to produce these runs.
+        snapshot_path=path.parent / "snapshot.db",
     )
     conn.close()
     return generation
@@ -158,7 +161,7 @@ def test_make_decision_resolves_the_current_generation_and_records_the_decision(
 
 def test_make_decision_is_idempotent_and_never_rewrites_history(tmp_path):
     path = tmp_path / "fpl.db"
-    _world(path)
+    historical = _world(path)
     conn = connect_database(path)
     try:
         first = _decision(conn)
@@ -177,29 +180,27 @@ def test_make_decision_pins_an_explicit_historical_generation(tmp_path):
     historical = _world(path)
     conn = connect_database(path)
     try:
-        # A second generation over the SAME runs but a DIFFERENT pinned snapshot is a
-        # different predictive world, so the pointer moves; a later ingest cannot
-        # replace the certified ids, only add another generation.
-        newer = gf.certify_world(
-            conn, {5: dict(RUN_IDS)}, events=(5,),
-            horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
-            snapshot_path=tmp_path / "second.db", snapshot_database=path,
-        )
-        assert newer.generation_id != historical.generation_id
-        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) == newer.generation_id
+        # Reusing these rows against a newly copied, different database must fail:
+        # their immutable provenance names the original production snapshot.
+        with pytest.raises(gs.GenerationRefused) as mismatched_snapshot:
+            gf.certify_world(
+                conn, {5: dict(RUN_IDS)}, events=(5,),
+                horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+                snapshot_path=tmp_path / "second.db", snapshot_database=path,
+            )
+        assert mismatched_snapshot.value.token == cb.STATE_EVIDENCE_MISSING
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) == historical.generation_id
 
         pinned = _decision(conn, historical.generation_id)
         assert pinned["generation_id"] == historical.generation_id
         assert pinned["provenance"]["snapshot"]["sha256"] == historical.snapshot["sha256"]
-        assert pinned["provenance"]["snapshot"]["sha256"] != newer.snapshot["sha256"]
         assert gs.verify_decision(conn, pinned["decision_record_id"])["generation_verified"] is True
 
-        # And the CURRENT generation is a different decision record over a different
-        # world, not a rewrite of the historical one.
+        # The current selector still names the original, verified generation.
         current = _decision(conn)
-        assert current["generation_id"] == newer.generation_id
-        assert current["decision_record_id"] != pinned["decision_record_id"]
-        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 2
+        assert current["generation_id"] == historical.generation_id
+        assert current["decision_record_id"] == pinned["decision_record_id"]
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 1
     finally:
         conn.close()
 
@@ -337,12 +338,14 @@ def _certify(conn, *, snapshot=None, runs=None, **over):
         "snapshot": snapshot,
     }
     arguments.update(over)
-    return gs.certify_generation(conn, **arguments)
+    if "controller" in arguments:
+        return gs.certify_generation(conn, **arguments)
+    return gf.certify_under_writer_lease(conn, **arguments)
 
 
 def test_certification_requires_a_pinned_snapshot(tmp_path):
     path = tmp_path / "fpl.db"
-    _world(path)
+    historical = _world(path)
     conn = connect_database(path)
     try:
         before = conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0]
@@ -370,7 +373,7 @@ def test_certification_requires_a_pinned_snapshot(tmp_path):
         # Nothing was written by any of those refusals.
         assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before
         # And the same world certifies once a real identity is pinned.
-        assert _certify(conn, snapshot=real).generation_id.startswith("sha256:")
+        assert _certify(conn, snapshot=historical.snapshot).generation_id.startswith("sha256:")
     finally:
         conn.close()
 
@@ -414,11 +417,12 @@ def test_certification_requires_a_planning_context(tmp_path):
     try:
         gf.base_world(conn)
         gf.add_event(conn, 5)
+        gf.prepare_fixture_snapshot(conn, (5,), cutoff=gf.CUTOFF)
         with conn:
             for family, run_id in RUN_IDS.items():
                 gf.add_run(conn, run_id, family, 5, context_hash=None)
         with pytest.raises(gs.GenerationRefused) as caught:
-            _certify(conn, snapshot=gf.write_snapshot(tmp_path / "s.db", database=conn))
+            _certify(conn, snapshot=gf.fixture_snapshot(conn))
         assert caught.value.token == gs.DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED
         assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
     finally:
@@ -445,7 +449,8 @@ def test_certification_runs_under_the_leased_controller(tmp_path):
             families=["certification"],
         )
         controller.start()
-        snapshot = gf.write_snapshot(tmp_path / "leased.db", database=path)
+        current_id = gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD)
+        snapshot = gs.load_generation(conn, current_id).snapshot
         with pytest.raises(execution.LeaseError) as unleased:
             _certify(conn, snapshot=snapshot, controller=controller)
         assert "CERTIFICATION_WITHOUT_WRITER_LEASE" in str(unleased.value)
@@ -466,24 +471,106 @@ def test_certification_runs_under_the_leased_controller(tmp_path):
         conn.close()
 
 
+def test_generation_publication_requires_a_live_lease_for_the_same_database():
+    conn, runs = gf.synthetic_world()
+    other = connect_database(":memory:")
+    controllers = []
+    try:
+        snapshot = gf.fixture_snapshot(conn)
+        kwargs = {
+            "planning_event": 5, "cutoff": gf.CUTOFF, "runs_by_event": runs,
+            "events": gf.HORIZON, "snapshot": snapshot,
+        }
+        with pytest.raises(execution.LeaseError, match="CERTIFICATION_WITHOUT_WRITER_LEASE"):
+            gs.certify_generation(conn, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5) is None
+
+        foreign = execution.ExecutionController(other)
+        foreign.create_run(
+            planning_event=5, planning_cutoff=gf.CUTOFF,
+            hard_stop_at=execution.add_seconds(foreign.now_dt(), 3600), label="foreign-store",
+        )
+        foreign.start()
+        foreign.acquire_writer_lease()
+        controllers.append(foreign)
+        with pytest.raises(execution.LeaseError, match="same SQLite database"):
+            gs.certify_generation(conn, controller=foreign, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+
+        owner = execution.ExecutionController(conn)
+        owner.create_run(
+            planning_event=5, planning_cutoff=gf.CUTOFF,
+            hard_stop_at=execution.add_seconds(owner.now_dt(), 3600), label="lease-owner",
+        )
+        owner.start()
+        owner.acquire_writer_lease()
+        controllers.append(owner)
+        wrong_run = execution.ExecutionController(conn)
+        wrong_run.create_run(
+            planning_event=5, planning_cutoff=gf.CUTOFF,
+            hard_stop_at=execution.add_seconds(wrong_run.now_dt(), 3600), label="wrong-run",
+        )
+        wrong_run.start()
+        controllers.append(wrong_run)
+        with pytest.raises(execution.LeaseError, match="belongs to another run"):
+            gs.certify_generation(conn, controller=wrong_run, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        owner.finish(execution.RUN_COMPLETE)
+        wrong_run.finish(execution.RUN_COMPLETE)
+        controllers.remove(owner)
+        controllers.remove(wrong_run)
+
+        now = [datetime.now(timezone.utc)]
+        expired = execution.ExecutionController(conn, wall_clock=lambda: now[0])
+        expired.create_run(
+            planning_event=5, planning_cutoff=gf.CUTOFF,
+            hard_stop_at=now[0] + timedelta(hours=1), label="expired-lease",
+        )
+        expired.start()
+        expired.acquire_writer_lease(ttl_seconds=1)
+        now[0] += timedelta(seconds=2)
+        controllers.append(expired)
+        with pytest.raises(execution.LeaseError, match="expired"):
+            gs.certify_generation(conn, controller=expired, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5) is None
+    finally:
+        for controller in reversed(controllers):
+            controller.finish(execution.RUN_COMPLETE)
+        other.close()
+        conn.close()
+
+
 def test_concurrent_certification_serialises_on_one_generation(tmp_path):
     """Two certifiers of the SAME semantic world resolve to ONE generation row."""
 
     path = tmp_path / "fpl.db"
-    _world(path)
-    snapshot = gf.write_snapshot(tmp_path / "race.db", database=path)
+    generation = _world(path)
+    snapshot = generation.snapshot
     baseline = connect_database(path)
     before = baseline.execute("SELECT COUNT(*) FROM generation").fetchone()[0]
     baseline.close()
     barrier = threading.Barrier(2)
     results: list[str] = []
     failures: list[BaseException] = []
+    owner_conn = connect_database(path)
+    owner = execution.ExecutionController(owner_conn)
+    owner.create_run(
+        planning_event=5, planning_cutoff=gf.CUTOFF,
+        hard_stop_at=execution.add_seconds(owner.now_dt(), 3600), label="pe9-race",
+    )
+    owner.start()
+    owner.acquire_writer_lease()
 
     def certify():
         conn = connect_database(path)
         try:
+            controller = execution.ExecutionController(
+                conn, run_uuid=owner.run_uuid, pid=owner.pid, host=owner.host,
+            )
             barrier.wait(timeout=30)
-            results.append(_certify(conn, snapshot=snapshot).generation_id)
+            results.append(_certify(conn, snapshot=snapshot, controller=controller).generation_id)
         except BaseException as failure:  # noqa: BLE001 - reported below
             failures.append(failure)
         finally:
@@ -499,7 +586,7 @@ def test_concurrent_certification_serialises_on_one_generation(tmp_path):
         assert len(set(results)) == 1
         conn = connect_database(path)
         try:
-            assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before + 1
+            assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == before
             # Both certifiers resolved the SAME semantic generation, and the pointer
             # names it: contention cannot produce two rows for one world.
             assert gs.current_generation_id(
@@ -508,7 +595,8 @@ def test_concurrent_certification_serialises_on_one_generation(tmp_path):
         finally:
             conn.close()
     finally:
-        pass
+        owner.finish(execution.RUN_COMPLETE)
+        owner_conn.close()
 
 
 # ---------------------------------------------------------------------------

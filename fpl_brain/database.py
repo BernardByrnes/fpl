@@ -10,7 +10,7 @@ from typing import Callable
 
 from .utils import utc_now
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # Model families the analytics spine may record.  ``baseline`` / ``minutes_v1``
 # predate this list; the team and player-rate families were added in m007 and
@@ -1467,6 +1467,33 @@ def m018_certified_generation_store(conn: sqlite3.Connection) -> None:
     )
 
 
+def m019_certified_run_snapshot_provenance(conn: sqlite3.Connection) -> None:
+    """Bind newly produced runs to their data snapshot and context inputs.
+
+    Nullable additive fields preserve historical rows as explicitly unprovenanced;
+    there is no backfill.  Once a run receives this provenance, the identity fields
+    cannot be changed while its status and other lifecycle fields remain mutable.
+    """
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(projection_runs)")}
+    for name in ("data_snapshot_sha256", "execution_run_uuid", "planning_context_inputs_json"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE projection_runs ADD COLUMN {name} TEXT")
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS projection_runs_pe9_provenance_immutable
+          BEFORE UPDATE OF data_snapshot_sha256, execution_run_uuid, planning_context_inputs_json
+          ON projection_runs
+          WHEN OLD.data_snapshot_sha256 IS NOT NEW.data_snapshot_sha256
+            OR OLD.execution_run_uuid IS NOT NEW.execution_run_uuid
+            OR OLD.planning_context_inputs_json IS NOT NEW.planning_context_inputs_json
+          BEGIN
+            SELECT RAISE(ABORT, 'PE9_PROVENANCE_IMMUTABLE: certified run provenance cannot be rewritten');
+          END;
+        """
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_initial,
     m002_manual_manager_state,
@@ -1486,6 +1513,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m016_outcome_ledger,
     m017_certified_freeze_is_closed,
     m018_certified_generation_store,
+    m019_certified_run_snapshot_provenance,
 ]
 
 

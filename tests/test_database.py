@@ -45,6 +45,45 @@ def test_additive_migration_bumps_once(tmp_path):
         conn.close()
 
 
+def test_schema_19_adds_immutable_snapshot_provenance_without_backfill(tmp_path):
+    path = tmp_path / "schema18.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO schema_meta(key,value) VALUES ('schema_version','0')")
+    for version, migration in enumerate(database.MIGRATIONS[:-1], start=1):
+        with conn:
+            migration(conn)
+            conn.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_version'", (str(version),)
+            )
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO projection_runs(model_family,model_version,generated_at,planning_event,"
+            "data_cutoff,status) VALUES ('minutes_v1','legacy','2026-09-19T11:00:00Z',5,"
+            "'2026-09-19T11:00:00Z','complete')"
+        )
+        legacy_id = int(cursor.lastrowid)
+
+    database.initialize_database(conn)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(projection_runs)")}
+    assert {
+        "data_snapshot_sha256", "execution_run_uuid", "planning_context_inputs_json",
+    } <= columns
+    assert conn.execute(
+        "SELECT data_snapshot_sha256,execution_run_uuid,planning_context_inputs_json "
+        "FROM projection_runs WHERE id=?", (legacy_id,),
+    ).fetchone() == (None, None, None)
+    assert int(conn.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()[0]) == database.SCHEMA_VERSION
+    with pytest.raises(sqlite3.IntegrityError, match="PE9_PROVENANCE_IMMUTABLE"):
+        conn.execute(
+            "UPDATE projection_runs SET data_snapshot_sha256=? WHERE id=?",
+            ("a" * 64, legacy_id),
+        )
+    conn.close()
+
+
 def test_foreign_keys_are_enforced(tmp_path):
     conn = database.connect_database(tmp_path / "fpl.db")
     with pytest.raises(sqlite3.IntegrityError):

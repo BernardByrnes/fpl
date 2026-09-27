@@ -29,6 +29,7 @@ from fpl_brain import replay_worlds as rw
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
 from fpl_brain.database import connect_database
+import generation_fixtures as gf
 
 CUTOFF = "2026-09-19T11:00:00Z"
 OTHER_CUTOFF = "2026-09-18T11:00:00Z"
@@ -108,10 +109,14 @@ def _run(
     code_snapshot: str | None = CODE_SNAPSHOT,
     context_hash: str | None = CONTEXT_HASH,
 ) -> None:
+    provenance = gf.fixture_run_provenance(conn, event)
+    if context_hash == CONTEXT_HASH and provenance:
+        context_hash = provenance.pop("planning_context_hash")
     conn.execute(
         "INSERT INTO projection_runs(id, model_family, model_version, generated_at, planning_event,"
-        " data_cutoff, status, source_snapshot_sha256, planning_context_hash)"
-        " VALUES (?,?,?,'2026-09-19T11:01:00Z',?,?,?,?,?)",
+        " data_cutoff, status, source_snapshot_sha256, planning_context_hash, data_snapshot_sha256,"
+        " execution_run_uuid, planning_context_inputs_json)"
+        " VALUES (?,?,?,'2026-09-19T11:01:00Z',?,?,?,?,?,?,?,?)",
         (
             run_id,
             family,
@@ -121,6 +126,9 @@ def _run(
             status,
             code_snapshot,
             context_hash,
+            provenance.get("data_snapshot_sha256"),
+            provenance.get("execution_run_uuid"),
+            provenance.get("planning_context_inputs_json"),
         ),
     )
 
@@ -188,6 +196,17 @@ def _world(events=HORIZON, *, fixtures_per_event=1, blanks=(), versions=None):
                     _add_fixture(conn, next_fixture, event, 1, 2)
                     fixture_ids.append(next_fixture)
                     next_fixture += 1
+            # Run and projection rows are added after the source snapshot.
+    fixture_rows: dict[int, list[int]] = {}
+    # Re-read the source fixtures into a simple map before prediction rows exist.
+    for event in events:
+        fixture_rows[int(event)] = [
+            int(row[0]) for row in conn.execute("SELECT id FROM fixtures WHERE event=? ORDER BY id", (int(event),))
+        ]
+    gf.prepare_fixture_snapshot(conn, events, cutoff=CUTOFF)
+    with conn:
+        for event in events:
+            fixture_ids = fixture_rows[int(event)]
             ids = {
                 "minutes_v1": next_run,
                 "team_strength_v1": next_run + 1,
@@ -1598,7 +1617,7 @@ def test_the_loaders_boundary_is_declared_and_does_not_accept_a_bare_id_map():
             model_versions=generation.model_versions_by_event[5],
             code_snapshot_sha256=CODE_SNAPSHOT,
             data_snapshot_sha256=generation.snapshot["sha256"],
-            planning_context_hash=CONTEXT_HASH,
+            planning_context_hash=record["planning_context_hash"],
         )
     finally:
         conn.close()

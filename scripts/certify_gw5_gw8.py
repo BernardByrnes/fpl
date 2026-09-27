@@ -418,10 +418,10 @@ def main(argv: list[str] | None = None) -> int:
         "started_at": utc_now(),
     }
 
-    controller = execution.ExecutionController(conn)
     # --- clean production sequence ------------------------------------------
     # 1. generate the execution UUID WITHOUT beginning predictive execution
     provisional_uuid = str(__import__("uuid").uuid4())
+    controller = execution.ExecutionController(conn, run_uuid=provisional_uuid)
     # 2. capture the immutable DB snapshot
     snapshot_dir = OUT_DIR / "snapshots" / provisional_uuid
     snapshot = execution_snapshot.capture_execution_snapshot(
@@ -499,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
                     code = freeze._freeze(
                         conn, config, _freeze_args(event, effective_cutoff, simulations, artifact_dir),
                         set(SUBSTANTIVE_FAMILIES), source_conn=source_conn, production=True,
+                        pinned_snapshot=snapshot,
                     )
                     if code != 0:
                         raise _EventFreezeFailed(f"GW{event} freeze returned {code}", code)

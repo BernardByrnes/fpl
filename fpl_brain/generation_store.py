@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -714,7 +715,7 @@ def certify_generation(
         if events is not None
         else sorted(int(event) for event in runs_by_event)
     )
-    lease_run_uuid = assert_writer_lease_held(controller)
+    lease_run_uuid = assert_writer_lease_held(conn, controller)
 
     snapshot_conn = sqlite3.connect(
         f"file:{Path(snapshot_block['path'])}?mode=ro", uri=True
@@ -741,7 +742,7 @@ def certify_generation(
     # The validation and the persist are ONE write transaction: nothing can certify
     # between the checks below and the row that records their outcome.
     with write_transaction(conn):
-        current_lease_run_uuid = assert_writer_lease_held(controller)
+        current_lease_run_uuid = assert_writer_lease_held(conn, controller)
         if current_lease_run_uuid != lease_run_uuid:
             raise GenerationRefused(
                 DIAG_GENERATION_NOT_CERTIFIED,
@@ -815,12 +816,17 @@ def certify_generation(
                     event=int(event),
                     runs=certified.runs,
                     code_identity=code_identity,
+                    snapshot=snapshot_block,
                 )
                 if identity_failures:
                     context_failure = any("planning_context_hash" in reason for reason in identity_failures)
+                    snapshot_failure = any(
+                        "data snapshot" in reason or "execution UUID" in reason
+                        for reason in identity_failures
+                    )
                     raise GenerationRefused(
                         DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED
-                        if context_failure
+                        if context_failure and not snapshot_failure
                         else cb.STATE_EVIDENCE_MISSING,
                         identity_failures,
                     )
@@ -963,7 +969,7 @@ def certify_generation(
     return load_generation(conn, generation_id)
 
 
-def assert_writer_lease_held(controller: Any) -> str | None:
+def assert_writer_lease_held(conn: sqlite3.Connection, controller: Any) -> str:
     """Require the ACTIVE writer lease ``controller`` holds, or refuse with ``LeaseError``.
 
     Amendment 2 §8 opens the certification lifecycle with "acquire existing writer
@@ -975,8 +981,19 @@ def assert_writer_lease_held(controller: Any) -> str | None:
     """
 
     if controller is None:
-        return None
+        from . import execution as ex
+
+        raise ex.LeaseError(
+            "CERTIFICATION_WITHOUT_WRITER_LEASE: generation publication requires an active writer "
+            "lease held by a controller on the same database connection"
+        )
     from . import execution as ex
+
+    if not _same_sqlite_database(conn, controller.conn):
+        raise ex.LeaseError(
+            "CERTIFICATION_WITHOUT_WRITER_LEASE: the writer lease controller and generation store "
+            "must use the same SQLite database"
+        )
 
     lease = controller.active_lease(ex.LEASE_KIND_WRITER, "sqlite-writer")
     if lease is None:
@@ -988,7 +1005,32 @@ def assert_writer_lease_held(controller: Any) -> str | None:
         raise ex.LeaseError(
             "CERTIFICATION_WITHOUT_WRITER_LEASE: the ACTIVE writer lease belongs to another run"
         )
+    expires = ex.parse_utc_dt(lease["expires_at"])
+    if expires is None or expires <= controller.now_dt():
+        raise ex.LeaseError(
+            "CERTIFICATION_WITHOUT_WRITER_LEASE: the writer lease is expired and is not ACTIVE"
+        )
+    if int(lease["owner_pid"]) != int(controller.pid) or str(lease["owner_host"]) != str(controller.host):
+        raise ex.LeaseError(
+            "CERTIFICATION_WITHOUT_WRITER_LEASE: the writer lease owner does not match its controller"
+        )
     return str(controller.run_uuid)
+
+
+def _same_sqlite_database(left: sqlite3.Connection, right: sqlite3.Connection) -> bool:
+    """Compare the main database identity without trusting a caller-supplied path."""
+
+    if left is right:
+        return True
+
+    def main_path(conn: sqlite3.Connection) -> str:
+        row = next((item for item in conn.execute("PRAGMA database_list") if str(item[1]) == "main"), None)
+        return str(row[2]) if row is not None else ""
+
+    left_path, right_path = main_path(left), main_path(right)
+    if not left_path or not right_path:
+        return False
+    return os.path.normcase(os.path.realpath(left_path)) == os.path.normcase(os.path.realpath(right_path))
 
 
 def _utc_now() -> str:
@@ -1062,6 +1104,11 @@ def _snapshot_identity_block(snapshot: Mapping[str, Any] | None) -> dict[str, An
                 "to WHICH source database it replaced, not merely to a file digest"
             ]
         )
+    execution_run_uuid = str(snapshot.get("execution_run_uuid") or "").strip()
+    if not execution_run_uuid:
+        raise GenerationSnapshotUnverified(
+            [f"the pinned snapshot {path} records no execution run UUID binding"]
+        )
     identity = dict(identity)
     try:
         actual_identity = es.source_db_identity(snapshot_file)
@@ -1094,7 +1141,7 @@ def _snapshot_identity_block(snapshot: Mapping[str, Any] | None) -> dict[str, An
         "sha256": str(live),
         "size_bytes": int(snapshot_file.stat().st_size),
         "source_db_identity": identity,
-        "execution_run_uuid": snapshot.get("execution_run_uuid"),
+        "execution_run_uuid": execution_run_uuid,
     }
 
 
@@ -1104,30 +1151,106 @@ def _run_identity_failures(
     event: int,
     runs: Mapping[str, int],
     code_identity: str,
+    snapshot: Mapping[str, Any],
 ) -> list[str]:
-    """Require every consumed run to retain the same code and planning context."""
+    """Bind every consumed run to the pinned snapshot and rederive its context."""
 
     failures: list[str] = []
     contexts: dict[str, list[str]] = {}
-    for family in _declared_families(runs, {}):
-        run_id = runs.get(family)
-        row = cb._run(conn, int(run_id)) if run_id is not None else None
-        if row is None:
-            failures.append(f"GW{event}: {family} run {run_id!r} has no persisted identity row")
-            continue
-        recorded_code = str(row["source_snapshot_sha256"] or "").strip()
-        if not recorded_code:
-            failures.append(f"GW{event}: {family} run {run_id} records no authoritative code identity")
-        elif recorded_code != str(code_identity):
-            failures.append(
-                f"GW{event}: {family} run {run_id} code identity {recorded_code!r} "
-                f"!= authoritative identity {code_identity!r}"
+    from . import execution_snapshot as es
+
+    try:
+        snapshot_conn = sqlite3.connect(f"file:{Path(str(snapshot['path']))}?mode=ro", uri=True)
+        snapshot_conn.row_factory = sqlite3.Row
+        snapshot_conn.execute("PRAGMA query_only=ON")
+    except (OSError, sqlite3.Error, KeyError) as failure:
+        raise GenerationSnapshotUnverified(
+            [f"GW{event}: the pinned snapshot cannot be opened to reproduce planning context: {failure}"]
+        ) from failure
+    try:
+        current_digest = es.file_sha256(str(snapshot["path"]))
+        if current_digest != str(snapshot["sha256"]):
+            raise GenerationSnapshotUnverified(
+                [f"the pinned snapshot changed before planning-context rederivation: {snapshot['path']}"]
             )
-        context = str(row["planning_context_hash"] or "").strip()
-        if not context:
-            failures.append(f"GW{event}: {family} run {run_id} records no planning_context_hash")
-        else:
+        for family in _declared_families(runs, {}):
+            run_id = runs.get(family)
+            row = cb._run(conn, int(run_id)) if run_id is not None else None
+            if row is None:
+                failures.append(f"GW{event}: {family} run {run_id!r} has no persisted identity row")
+                continue
+            recorded_code = str(row["source_snapshot_sha256"] or "").strip()
+            if not recorded_code:
+                failures.append(f"GW{event}: {family} run {run_id} records no authoritative code identity")
+            elif recorded_code != str(code_identity):
+                failures.append(
+                    f"GW{event}: {family} run {run_id} code identity {recorded_code!r} "
+                    f"!= authoritative identity {code_identity!r}"
+                )
+
+            run_snapshot = str(row["data_snapshot_sha256"] or "").strip()
+            if not run_snapshot:
+                failures.append(f"GW{event}: {family} run {run_id} records no data snapshot identity")
+            elif run_snapshot != str(snapshot["sha256"]):
+                failures.append(
+                    f"GW{event}: {family} run {run_id} data snapshot {run_snapshot!r} "
+                    f"!= pinned snapshot {snapshot['sha256']!r}"
+                )
+            run_uuid = str(row["execution_run_uuid"] or "").strip()
+            if not run_uuid:
+                failures.append(f"GW{event}: {family} run {run_id} records no execution run UUID")
+            elif run_uuid != str(snapshot["execution_run_uuid"]):
+                failures.append(
+                    f"GW{event}: {family} run {run_id} execution UUID {run_uuid!r} "
+                    f"!= pinned snapshot UUID {snapshot['execution_run_uuid']!r}"
+                )
+
+            context = str(row["planning_context_hash"] or "").strip()
+            if not context:
+                failures.append(f"GW{event}: {family} run {run_id} records no planning_context_hash")
+                continue
             contexts.setdefault(context, []).append(family)
+            raw_inputs = row["planning_context_inputs_json"]
+            try:
+                inputs = json.loads(str(raw_inputs)) if raw_inputs else None
+                if not isinstance(inputs, Mapping):
+                    raise ValueError("planning-context derivation inputs are absent")
+                required = {
+                    "entry_id", "season", "as_of", "scouting_stale_after_days",
+                    "official_price_stale_after_hours",
+                }
+                if set(inputs) != required:
+                    raise ValueError(f"planning-context input keys differ from {sorted(required)}")
+                if str(inputs["as_of"]) != str(row["data_cutoff"]):
+                    raise ValueError("planning-context as_of differs from the run data cutoff")
+                from . import analytics
+                from .planning import get_planning_context
+
+                context_inputs = dict(inputs)
+                entry_id = int(context_inputs.pop("entry_id"))
+                context_as_of = str(context_inputs.pop("as_of"))
+                reproduced = get_planning_context(
+                    snapshot_conn,
+                    entry_id,
+                    int(event),
+                    as_of=context_as_of,
+                    season=context_inputs["season"],
+                    scouting_stale_after_days=context_inputs["scouting_stale_after_days"],
+                    official_price_stale_after_hours=context_inputs["official_price_stale_after_hours"],
+                )
+                reproduced_hash = analytics.planning_context_reference(reproduced)
+                if reproduced_hash != context:
+                    failures.append(
+                        f"GW{event}: {family} run {run_id} planning_context_hash {context!r} "
+                        f"does not reproduce from the pinned snapshot ({reproduced_hash!r})"
+                    )
+            except (TypeError, ValueError, KeyError, sqlite3.Error) as failure:
+                failures.append(
+                    f"GW{event}: {family} run {run_id} planning_context_hash cannot be reproduced "
+                    f"from the pinned snapshot: {failure}"
+                )
+    finally:
+        snapshot_conn.close()
     if len(contexts) > 1:
         failures.append(
             f"GW{event}: planning_context_hash differs across certified families "
@@ -1358,10 +1481,10 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     snapshot = manifest.get("data_snapshot") or {}
     snapshot_status = "MISSING"
     try:
-        _snapshot_identity_block(snapshot)
+        snapshot = _snapshot_identity_block(snapshot)
         snapshot_status = "VERIFIED"
     except GenerationRefused as failure:
-        failures.extend(failure.reasons)
+        raise failure
 
     base_bundles: dict[int, cb.CertifiedBundle] = {}
     dependency_ok = True
@@ -1413,7 +1536,7 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
                 versions_ok = False
 
         identity_failures = _run_identity_failures(
-            conn, event=event, runs=runs, code_identity=code_identity
+            conn, event=event, runs=runs, code_identity=code_identity, snapshot=snapshot
         )
         failures.extend(identity_failures)
         try:
@@ -1475,7 +1598,10 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     if pe8_consulted:
         artifact_ref = pe8.get("artifact_ref")
         if not artifact_ref or not Path(str(artifact_ref)).is_file():
-            failures.append(f"the consulted PE-8 artifact {artifact_ref!r} is not retained")
+            raise GenerationRefused(
+                cb.STATE_EVIDENCE_MISSING,
+                [f"the consulted PE-8 artifact {artifact_ref!r} is not retained"],
+            )
         else:
             try:
                 calibration_payload = json.loads(Path(str(artifact_ref)).read_text(encoding="utf-8"))
@@ -1627,7 +1753,7 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
         "runs_complete": runs_complete,
         "versions_valid": versions_ok,
         "code_identity_reproduced_from_runs": True,
-        "planning_context_reproduced_from_runs": True,
+        "planning_context_reproduced_from_snapshot": True,
         "bundle_identities_reproduced": True,
         "dependency_closure_reproduced": dependency_ok,
         "snapshot_identity": snapshot_status,

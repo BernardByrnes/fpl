@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import json
+import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -40,6 +43,93 @@ VERSIONS = cb.declared_required_versions()
 
 #: The four-event normal-transfer horizon the contract fixes.
 HORIZON = (5, 6, 7, 8)
+_FIXTURE_SNAPSHOTS: dict[int, dict[str, Any]] = {}
+_FIXTURE_SNAPSHOTS_BY_DIGEST: dict[str, dict[str, Any]] = {}
+
+
+def prepare_fixture_snapshot(
+    conn: sqlite3.Connection, events: Sequence[int], *, cutoff: str = CUTOFF
+) -> dict[str, Any]:
+    """Capture the source state before prediction rows are inserted in a fixture."""
+
+    from fpl_brain.planning import get_planning_context
+
+    source_dir = Path(tempfile.mkdtemp(prefix="fpl-pe9-source-"))
+    snapshot = write_snapshot(source_dir / "source.db", database=conn)
+    inputs = {
+        "entry_id": 1,
+        "season": None,
+        "as_of": str(cutoff),
+        "scouting_stale_after_days": None,
+        "official_price_stale_after_hours": None,
+    }
+    snapshot_conn = sqlite3.connect(f"file:{Path(snapshot['path'])}?mode=ro", uri=True)
+    snapshot_conn.row_factory = sqlite3.Row
+    try:
+        context_hashes = {
+            int(event): analytics.planning_context_reference(
+                get_planning_context(
+                    snapshot_conn, 1, int(event), as_of=str(cutoff), season=None,
+                    scouting_stale_after_days=None, official_price_stale_after_hours=None,
+                )
+            )
+            for event in events
+        }
+    finally:
+        snapshot_conn.close()
+    record = {"snapshot": snapshot, "inputs": inputs, "context_hashes": context_hashes}
+    _FIXTURE_SNAPSHOTS[id(conn)] = record
+    _FIXTURE_SNAPSHOTS_BY_DIGEST[str(snapshot["sha256"])] = record
+    return record
+
+
+def register_fixture_snapshot(conn: sqlite3.Connection, record: Mapping[str, Any]) -> None:
+    """Attach an already captured canonical source snapshot to a copied test store."""
+
+    copied = dict(record)
+    _FIXTURE_SNAPSHOTS[id(conn)] = copied
+    _FIXTURE_SNAPSHOTS_BY_DIGEST[str(copied["snapshot"]["sha256"])] = copied
+
+
+def fixture_run_provenance(conn: sqlite3.Connection, event: int) -> dict[str, Any]:
+    record = _FIXTURE_SNAPSHOTS.get(id(conn))
+    if record is None:
+        return {}
+    snapshot = record["snapshot"]
+    return {
+        "data_snapshot_sha256": str(snapshot["sha256"]),
+        "execution_run_uuid": str(snapshot["execution_run_uuid"]),
+        "planning_context_inputs_json": json.dumps(record["inputs"], sort_keys=True),
+        "planning_context_hash": record["context_hashes"].get(int(event)),
+    }
+
+
+def fixture_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    record = _FIXTURE_SNAPSHOTS.get(id(conn))
+    if record is None:
+        raise ValueError("the fixture source snapshot was not prepared before projection rows")
+    return dict(record["snapshot"])
+
+
+def _fixture_record_for_runs(
+    conn: sqlite3.Connection, runs_by_event: Mapping[int, Mapping[str, int]]
+) -> dict[str, Any] | None:
+    run_ids = sorted({int(run_id) for rows in runs_by_event.values() for run_id in rows.values()})
+    if not run_ids:
+        return _FIXTURE_SNAPSHOTS.get(id(conn))
+    placeholders = ",".join("?" for _ in run_ids)
+    rows = conn.execute(
+        f"SELECT DISTINCT data_snapshot_sha256 FROM projection_runs WHERE id IN ({placeholders})",
+        run_ids,
+    ).fetchall()
+    digests = {str(row[0]) for row in rows if row[0]}
+    if len(digests) == 1:
+        digest = next(iter(digests))
+        record = _FIXTURE_SNAPSHOTS.get(id(conn))
+        if record is not None and str(record["snapshot"].get("sha256")) == digest:
+            return record
+        return _FIXTURE_SNAPSHOTS_BY_DIGEST.get(digest)
+    return None
 
 
 def base_world(conn: sqlite3.Connection) -> None:
@@ -97,11 +187,18 @@ def add_run(
     status: str = "complete",
     code_snapshot: str | None = CODE_SNAPSHOT,
     context_hash: str | None = CONTEXT_HASH,
+    provenance_override: Mapping[str, Any] | None = None,
 ) -> None:
+    provenance = fixture_run_provenance(conn, event)
+    if context_hash == CONTEXT_HASH and provenance:
+        context_hash = provenance.pop("planning_context_hash")
+    if provenance_override is not None:
+        provenance.update(provenance_override)
     conn.execute(
         "INSERT INTO projection_runs(id, model_family, model_version, generated_at, planning_event,"
-        " data_cutoff, status, source_snapshot_sha256, planning_context_hash)"
-        " VALUES (?,?,?,'2026-09-19T11:01:00Z',?,?,?,?,?)",
+        " data_cutoff, status, source_snapshot_sha256, planning_context_hash, data_snapshot_sha256,"
+        " execution_run_uuid, planning_context_inputs_json)"
+        " VALUES (?,?,?,'2026-09-19T11:01:00Z',?,?,?,?,?,?,?,?)",
         (
             run_id,
             family,
@@ -111,6 +208,9 @@ def add_run(
             status,
             code_snapshot,
             context_hash,
+            provenance.get("data_snapshot_sha256"),
+            provenance.get("execution_run_uuid"),
+            provenance.get("planning_context_inputs_json"),
         ),
     )
 
@@ -175,6 +275,7 @@ def synthetic_world(
     runs_by_event: dict[int, dict[str, int]] = {}
     next_run = 100
     next_fixture = 1000
+    fixture_rows: dict[int, list[int]] = {}
     with conn:
         for event in events:
             add_event(conn, event)
@@ -184,6 +285,11 @@ def synthetic_world(
                     add_fixture(conn, next_fixture, event, 1, 2)
                     fixture_ids.append(next_fixture)
                     next_fixture += 1
+            fixture_rows[int(event)] = fixture_ids
+    prepare_fixture_snapshot(conn, events, cutoff=cutoff)
+    with conn:
+        for event in events:
+            fixture_ids = fixture_rows[int(event)]
             ids = {
                 "minutes_v1": next_run,
                 "team_strength_v1": next_run + 1,
@@ -236,6 +342,9 @@ def world_with_run_ids(
     with conn:
         for event, runs in runs_by_event.items():
             add_event(conn, int(event))
+    prepare_fixture_snapshot(conn, list(runs_by_event), cutoff=cutoff)
+    with conn:
+        for event, runs in runs_by_event.items():
             for family, run_id in runs.items():
                 add_run(
                     conn, int(run_id), str(family), int(event), cutoff=cutoff,
@@ -418,19 +527,33 @@ def certify_world(
     """
 
     resolved_events = [int(event) for event in (events if events is not None else runs_by_event)]
-    source_database = snapshot_database if snapshot_database is not None else conn
-    snapshot = (
-        write_snapshot(snapshot_path, database=source_database)
-        if snapshot_path is not None
-        else _write_default_snapshot(database=source_database)
-    )
+    fixture_record = _fixture_record_for_runs(conn, runs_by_event)
+    if snapshot_database is not None:
+        source_database = snapshot_database
+        target = snapshot_path or _DEFAULT_SNAPSHOT
+        snapshot = write_snapshot(target, database=source_database)
+    elif fixture_record is not None:
+        snapshot = dict(fixture_record["snapshot"])
+        if snapshot_path is not None:
+            target = Path(snapshot_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if Path(snapshot["path"]).resolve() != target.resolve():
+                shutil.copyfile(snapshot["path"], target)
+            snapshot = {**snapshot, "path": str(target)}
+    else:
+        source_database = conn
+        snapshot = (
+            write_snapshot(snapshot_path, database=source_database)
+            if snapshot_path is not None
+            else _write_default_snapshot(database=source_database)
+        )
     if calibration is not None and calibration_artifact_ref is None:
         calibration_artifact_ref = Path(snapshot["path"]).with_name("pe8_calibration_evidence.json")
         Path(calibration_artifact_ref).write_text(
             json.dumps(calibration, sort_keys=True, separators=(",", ":"), default=str),
             encoding="utf-8",
         )
-    return gs.certify_generation(
+    return certify_under_writer_lease(
         conn,
         planning_event=int(planning_event if planning_event is not None else resolved_events[0]),
         horizon_kind=horizon_kind,
@@ -443,6 +566,29 @@ def certify_world(
         require_calibration=require_calibration,
         clock=lambda: "2026-09-19T11:02:00Z",
     )
+
+
+def certify_under_writer_lease(conn: sqlite3.Connection, **kwargs) -> gs.CertifiedGeneration:
+    """Exercise generation publication under a real active controller lease."""
+
+    from fpl_brain import execution
+
+    controller = execution.ExecutionController(conn)
+    controller.create_run(
+        planning_event=int(kwargs.get("planning_event") or 0),
+        planning_cutoff=str(kwargs.get("cutoff") or CUTOFF),
+        hard_stop_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        label="pe9_test_certification",
+    )
+    controller.start()
+    controller.acquire_writer_lease()
+    try:
+        result = gs.certify_generation(conn, controller=controller, **kwargs)
+    except BaseException:
+        controller.finish(execution.RUN_FAILED, "fixture certification failed")
+        raise
+    controller.finish(execution.RUN_COMPLETE)
+    return result
 
 
 __all__ = [
@@ -460,6 +606,11 @@ __all__ = [
     "add_xpts_row",
     "base_world",
     "certify_world",
+    "certify_under_writer_lease",
+    "fixture_run_provenance",
+    "fixture_snapshot",
+    "register_fixture_snapshot",
+    "prepare_fixture_snapshot",
     "synthetic_world",
     "world_with_run_ids",
     "write_snapshot",

@@ -154,6 +154,7 @@ def _hand_world(
     drop_family=None,
     dgw_fixtures=1,
     mc_rows=True,
+    provenance_overrides=None,
 ):
     """A one-event world built row by row, so a DEFECT can be present at creation.
 
@@ -170,6 +171,8 @@ def _hand_world(
         gf.add_event(conn, event)
         for fixture_id in fixture_ids:
             gf.add_fixture(conn, fixture_id, event, 1, 2)
+    gf.prepare_fixture_snapshot(conn, (event,), cutoff=CUTOFF)
+    with conn:
         for family, run_id in runs.items():
             gf.add_run(
                 conn, run_id, family, event,
@@ -178,6 +181,7 @@ def _hand_world(
                 context_hash=(
                     None if context_hash is None else context_hash.get(family, gf.CONTEXT_HASH)
                 ),
+                provenance_override=(provenance_overrides or {}).get(family),
             )
         if "xpts_v1" in runs:
             upstream = dict(xpts_upstream or {})
@@ -268,6 +272,93 @@ def test_refusal_inconsistent_planning_context_hash():
         conn.close()
 
 
+def test_refusal_planning_context_rows_that_agree_but_do_not_match_the_snapshot():
+    claimed = "sha256:" + "c" * 64
+    conn, runs = _hand_world(context_hash={family: claimed for family in FAMILIES})
+    try:
+        with pytest.raises(gs.GenerationRefused) as caught:
+            _generation(conn, runs, events=(5,), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD)
+        assert caught.value.token == gs.DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED
+        assert "does not reproduce from the pinned snapshot" in str(caught.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) is None
+    finally:
+        conn.close()
+
+
+def test_refusal_missing_run_snapshot_provenance():
+    missing = {
+        family: {
+            "data_snapshot_sha256": None,
+            "execution_run_uuid": None,
+            "planning_context_inputs_json": None,
+        }
+        for family in FAMILIES
+    }
+    conn, runs = _hand_world(provenance_overrides=missing)
+    try:
+        with pytest.raises(gs.GenerationRefused) as caught:
+            _generation(conn, runs, events=(5,), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD)
+        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
+        assert "records no data snapshot identity" in str(caught.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) is None
+    finally:
+        conn.close()
+
+
+def test_refusal_mixed_snapshot_identities_across_predictive_families():
+    conn, runs = _hand_world(
+        provenance_overrides={"player_rates_v1": {"data_snapshot_sha256": "d" * 64}}
+    )
+    try:
+        with pytest.raises(gs.GenerationRefused) as caught:
+            _generation(conn, runs, events=(5,), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD)
+        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
+        assert "data snapshot" in str(caught.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) is None
+    finally:
+        conn.close()
+
+
+def test_refusal_mixed_execution_identities_across_predictive_families():
+    conn, runs = _hand_world(
+        provenance_overrides={"player_rates_v1": {"execution_run_uuid": "another-execution"}}
+    )
+    try:
+        with pytest.raises(gs.GenerationRefused) as caught:
+            _generation(conn, runs, events=(5,), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD)
+        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
+        assert "execution UUID" in str(caught.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) is None
+    finally:
+        conn.close()
+
+
+def test_refusal_caller_snapshot_does_not_match_persisted_run_provenance(tmp_path):
+    conn, runs = _hand_world()
+    try:
+        alternate = gf.write_snapshot(tmp_path / "caller-snapshot.db", database=conn)
+        with pytest.raises(gs.GenerationRefused) as caught:
+            gf.certify_under_writer_lease(
+                conn,
+                planning_event=5,
+                cutoff=CUTOFF,
+                runs_by_event=runs,
+                events=(5,),
+                horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+                snapshot=alternate,
+            )
+        assert caught.value.token == cb.STATE_EVIDENCE_MISSING
+        assert "data snapshot" in str(caught.value)
+        assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 0
+        assert gs.current_generation_id(conn, 5, gs.HORIZON_KIND_MANAGER_WORLD) is None
+    finally:
+        conn.close()
+
+
 def test_refusal_mutated_snapshot(tmp_path):
     conn, runs = _world()
     try:
@@ -290,6 +381,9 @@ def test_refusal_missing_snapshot_must_be_retained(tmp_path):
         with pytest.raises(gs.GenerationSnapshotUnverified) as caught:
             gs.require_snapshot_retained(generation)
         assert "must be retained" in str(caught.value)
+        with pytest.raises(gs.GenerationSnapshotUnverified) as verify_failure:
+            gs.verify_generation(conn, generation.generation_id)
+        assert verify_failure.value.token == gs.DIAG_GENERATION_SNAPSHOT_UNVERIFIED
     finally:
         conn.close()
 
@@ -601,11 +695,11 @@ def test_success_decision_resolves_current_and_explicit_historical_generations(t
         assert historical.generation_id == generation.generation_id
         # A later generation for the same event moves the POINTER; the explicit
         # selector still resolves the historical one, so a decision stays pinned.
-        # A second generation over the SAME run rows but a DIFFERENT pinned snapshot
-        # is a different predictive world identity, so the pointer moves.
+        # A second filename does not change the pinned bytes. Re-certification is
+        # therefore idempotent and the pointer remains on the same generation.
         newer = _generation(conn, runs, snapshot_path=tmp_path / "second.db")
-        assert newer.generation_id != generation.generation_id
-        assert gs.resolve_generation(conn, planning_event=5).generation_id == newer.generation_id
+        assert newer.generation_id == generation.generation_id
+        assert gs.resolve_generation(conn, planning_event=5).generation_id == generation.generation_id
         assert gs.resolve_generation(
             conn, planning_event=5, generation_id=generation.generation_id
         ).generation_id == generation.generation_id
@@ -706,7 +800,7 @@ def test_success_generation_verify_and_decision_verify_pass(tmp_path):
 def test_success_pe8_evidence_participates_without_promotion(tmp_path):
     conn, runs = _world()
     try:
-        snapshot = gf.write_snapshot(tmp_path / "pe8-snapshot.db", database=conn)
+        snapshot = gf.fixture_snapshot(conn)
         bundle_identities = {
             str(event): cb.certified_bundle_from_explicit_ids(
                 conn,
@@ -731,7 +825,7 @@ def test_success_pe8_evidence_participates_without_promotion(tmp_path):
         )
         calibration_ref = Path(snapshot["path"]).with_name("pe8-calibration.json")
         calibration_ref.write_text(json.dumps(calibration), encoding="utf-8")
-        generation = gs.certify_generation(
+        generation = gf.certify_under_writer_lease(
             conn,
             planning_event=5,
             cutoff=CUTOFF,
@@ -756,12 +850,13 @@ def test_success_pe8_evidence_participates_without_promotion(tmp_path):
         verified = gs.verify_generation(conn, generation.generation_id)
         assert verified["pe8_evidence_artifact_digest_verified"] is True
         assert verified["pe8_evidence_refs_reproduce"] is True
+        assert verified["planning_context_reproduced_from_snapshot"] is True
         wrong_world = {**calibration, "identity": {**calibration["identity"]}}
         wrong_world["identity"]["certification_identity"] = "sha256:" + "f" * 64
         wrong_ref = tmp_path / "pe8-calibration-wrong-world.json"
         wrong_ref.write_text(json.dumps(wrong_world), encoding="utf-8")
         with pytest.raises(cb.CertificationRefused) as mismatch:
-            gs.certify_generation(
+            gf.certify_under_writer_lease(
                 conn,
                 planning_event=5,
                 cutoff=CUTOFF,
@@ -774,6 +869,10 @@ def test_success_pe8_evidence_participates_without_promotion(tmp_path):
             )
         assert mismatch.value.token == cb.DIAG_CALIBRATION_WORLD_MISMATCH
         assert conn.execute("SELECT COUNT(*) FROM generation").fetchone()[0] == 1
+        Path(calibration_ref).unlink()
+        with pytest.raises(gs.GenerationRefused) as missing_retained_evidence:
+            gs.verify_generation(conn, generation.generation_id)
+        assert missing_retained_evidence.value.token == cb.STATE_EVIDENCE_MISSING
     finally:
         conn.close()
 

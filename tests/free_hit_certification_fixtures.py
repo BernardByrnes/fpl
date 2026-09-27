@@ -12,6 +12,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -82,18 +83,65 @@ def seed_certified_runs(
     cutoff and code identity the artifact declares.
     """
 
+    import generation_fixtures as gf
+    from fpl_brain.database import connect_database
+    from fpl_brain import execution_snapshot as es
+
     stamped = str(generated_at or CUTOFF)
+    events = tuple(int(event) for event in events)
+    # This fixture models a stable predictive source independent of manager state.
+    # Capture its canonical facts before inserting prediction runs or caller-specific
+    # manager rows, then attach the retained snapshot to the live test store.
+    source_conn = connect_database(":memory:")
+    base_world(source_conn)
+    source_conn.execute(
+        "UPDATE schema_meta SET value=? WHERE key='created_at'", ("2026-09-16T11:00:00Z",)
+    )
+    with source_conn:
+        for event in events:
+            source_conn.execute(
+                "INSERT OR IGNORE INTO fixtures(id, event, team_h, team_a, kickoff_time, finished,"
+                " started, raw_json, updated_at) VALUES (?,?,?,?,?,0,0,'{}',?)",
+                (5000 + event, event, 100, 101, f"2026-09-{event + 11:02d}T14:00:00Z", CUTOFF),
+            )
+    source_record = gf.prepare_fixture_snapshot(source_conn, events, cutoff=CUTOFF)
+    stable_snapshot_path = _SNAPSHOT_PATH
+    stable_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    if Path(source_record["snapshot"]["path"]).resolve() != stable_snapshot_path.resolve():
+        shutil.copyfile(source_record["snapshot"]["path"], stable_snapshot_path)
+    source_record = {
+        **source_record,
+        "snapshot": {
+            **source_record["snapshot"],
+            "path": str(stable_snapshot_path),
+            "source_db_identity": es.source_db_identity(stable_snapshot_path),
+        },
+    }
+    gf.register_fixture_snapshot(conn, source_record)
+    source_conn.close()
+    with conn:
+        for event in events:
+            conn.execute(
+                "INSERT OR IGNORE INTO fixtures(id, event, team_h, team_a, kickoff_time, finished,"
+                " started, raw_json, updated_at) VALUES (?,?,?,?,?,0,0,'{}',?)",
+                (5000 + event, event, 100, 101, f"2026-09-{event + 11:02d}T14:00:00Z", CUTOFF),
+            )
     runs_by_event: dict[int, dict[str, int]] = {}
     for event in events:
         runs = runs_for(int(event))
+        provenance = gf.fixture_run_provenance(conn, int(event))
+        context_hash = provenance.pop("planning_context_hash")
         for family, run_id in runs.items():
             conn.execute(
                 "INSERT INTO projection_runs(id, model_family, model_version, generated_at,"
-                " planning_event, planning_context_hash, data_cutoff, status, source_snapshot_sha256)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                " planning_event, planning_context_hash, data_cutoff, status, source_snapshot_sha256,"
+                " data_snapshot_sha256, execution_run_uuid, planning_context_inputs_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     int(run_id), str(family), str(MODEL_VERSIONS[family]), stamped, int(event),
-                    CONTEXT_HASH, CUTOFF, "complete", CODE_SNAPSHOT,
+                    context_hash, CUTOFF, "complete", CODE_SNAPSHOT,
+                    provenance["data_snapshot_sha256"], provenance["execution_run_uuid"],
+                    provenance["planning_context_inputs_json"],
                 ),
             )
         runs_by_event[int(event)] = {family: int(run_id) for family, run_id in runs.items()}
@@ -149,14 +197,15 @@ def seed_certified_world(
     if not certify:
         return None, runs_by_event
 
-    generation = gs.certify_generation(
+    import generation_fixtures as gf
+
+    generation = gf.certify_world(
         conn,
+        runs_by_event,
         planning_event=events[0],
         cutoff=str(cutoff),
-        runs_by_event=runs_by_event,
         events=events,
         horizon_kind=gs.HORIZON_KIND_FOUR_GW,
-        snapshot=pinned_snapshot(conn),
     )
     return generation, runs_by_event
 
