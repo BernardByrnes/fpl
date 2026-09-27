@@ -155,7 +155,10 @@ class MissingSourceSnapshot(RuntimeError):
     """Production freeze mode was entered without an immutable source connection."""
 
 
-def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, production: bool = False) -> int:
+def _freeze(
+    conn, config: dict, args, selected: set[str], source_conn=None, production: bool = False,
+    pinned_snapshot=None,
+) -> int:
     """Build and persist projections.
 
     ``conn`` is the WRITE database (new projection runs are inserted there).
@@ -177,7 +180,7 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
     if source_conn is None:
         source_conn = conn
     event = int(args.gw)
-    deadline_row = conn.execute("SELECT deadline_time FROM events WHERE id=?", (event,)).fetchone()
+    deadline_row = source_conn.execute("SELECT deadline_time FROM events WHERE id=?", (event,)).fetchone()
     if deadline_row is None or deadline_row["deadline_time"] is None:
         print(f"freeze failed: no official deadline for GW{event}", file=sys.stderr)
         return 2
@@ -202,6 +205,31 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
         return 2
 
     context_ref = analytics.planning_context_reference(context)
+    run_provenance: dict[str, object] = {}
+    if production:
+        if pinned_snapshot is None:
+            raise MissingSourceSnapshot(
+                "CERTIFICATION_SOURCE_SNAPSHOT_REQUIRED: production freeze requires the pinned snapshot identity"
+            )
+        from fpl_brain import execution_snapshot as es
+
+        try:
+            es.assert_connection_matches_snapshot(source_conn, pinned_snapshot)
+        except es.SnapshotError as failure:
+            raise MissingSourceSnapshot(str(failure)) from failure
+        run_provenance = {
+            "data_snapshot_sha256": str(pinned_snapshot.data_snapshot_sha256),
+            "execution_run_uuid": str(pinned_snapshot.execution_run_uuid or ""),
+            "planning_context_inputs": {
+                "entry_id": int(entry_id),
+                "season": config.get("season"),
+                "as_of": str(context.as_of),
+                "scouting_stale_after_days": None,
+                "official_price_stale_after_hours": config["report"].get(
+                    "official_price_stale_after_hours"
+                ),
+            },
+        }
     rules, rules_verification = _scoring_verification(config)
     if not rules_verification["verified"]:
         print("freeze failed: scoring-rules drift against the official payload", file=sys.stderr)
@@ -415,7 +443,8 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
     try:
         with conn:
             run_ids, counts = _freeze_components(
-                conn, context, context_ref, prepared, selected, cutoff, deadline_status, event, source_hash
+                conn, context, context_ref, prepared, selected, cutoff, deadline_status, event, source_hash,
+                run_provenance, source_conn,
             )
             if "xpts" in selected:
                 if explicit_xpts:
@@ -444,7 +473,7 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
                 )
                 built = _build_xpts(conn, event, cutoff, xpts_inputs, rules,
                                     deadline_status=deadline_status, deadline=deadline,
-                                    strict_coherence=strict_coherence)
+                                    strict_coherence=strict_coherence, source_conn=source_conn)
                 xpts_readiness = built["readiness"]
                 if xpts_readiness["status"] == "FAIL":
                     raise _ReadinessFailure("xpts", xpts_readiness["fail_reasons"])
@@ -453,6 +482,7 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
                     planning_event=event, planning_context_hash=context_ref, data_cutoff=cutoff,
                     scouting_cutoff=context.scouting_cutoff, official_run_ids=context.official_runs,
                     config_hash=built["config_hash"], deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+                    **run_provenance,
                 )
                 for row in built["rows"]:
                     analytics.freeze_xpts_projection(
@@ -519,6 +549,7 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
                     planning_context_hash=context_ref, data_cutoff=cutoff, scouting_cutoff=context.scouting_cutoff,
                     official_run_ids=context.official_runs, config_hash=mc_config.config_hash(),
                     random_seed=mc_config.seed, deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+                    **run_provenance,
                 )
                 player_meta = {int(r["player_id"]): r for r in analytics.xpts_projections(conn, run_ids["xpts"])}
                 for summary in mc_result["summaries"]:
@@ -619,14 +650,18 @@ def _freeze(conn, config: dict, args, selected: set[str], source_conn=None, prod
     return 0
 
 
-def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, deadline_status, event, source_hash):
+def _freeze_components(
+    conn, context, context_ref, prepared, selected, cutoff, deadline_status, event, source_hash,
+    run_provenance, source_conn,
+):
     """Create and freeze the component runs; returns (run_ids, counts)."""
 
     run_ids: dict[str, int] = {}
     counts: dict[str, object] = {}
     if "baseline" in selected:
         baseline_run_id, baseline_counts = analytics.freeze_baselines_for_event(
-            conn, context, cutoff, event=event, deadline_status=deadline_status
+            conn, context, cutoff, event=event, deadline_status=deadline_status,
+            run_provenance=run_provenance, source_conn=source_conn,
         )
         run_ids["baseline"] = baseline_run_id
         counts["baseline_rows"] = baseline_counts
@@ -637,6 +672,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
             planning_event=event, planning_context_hash=context_ref, data_cutoff=cutoff,
             scouting_cutoff=context.scouting_cutoff, official_run_ids=context.official_runs,
             config_hash=minutes_config.config_hash(), deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in minutes_rows:
             analytics.freeze_prediction(
@@ -658,6 +694,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
                 {"minutes": minutes_config.config_hash(), "coherence": coherence_config.config_hash()}
             ),
             deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in coherent_rows:
             analytics.freeze_prediction(
@@ -684,6 +721,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
                  "positional": True}
             ),
             deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in positional_rows:
             analytics.freeze_prediction(
@@ -708,6 +746,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
                 {"minutes": sub_minutes_config.config_hash(), "substitution": sub_config.config_hash()}
             ),
             deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in substitution_rows:
             analytics.freeze_prediction(
@@ -730,6 +769,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
             planning_event=event, planning_context_hash=context_ref, data_cutoff=cutoff,
             scouting_cutoff=context.scouting_cutoff, official_run_ids=context.official_runs,
             config_hash=joint_config.config_hash(), deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in joint_rows:
             analytics.freeze_prediction(
@@ -751,6 +791,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
             planning_event=event, planning_context_hash=context_ref, data_cutoff=cutoff,
             scouting_cutoff=context.scouting_cutoff, official_run_ids=context.official_runs,
             config_hash=team_config.config_hash(), deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in team_rows:
             analytics.freeze_team_fixture_projection(
@@ -768,6 +809,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
             planning_event=event, planning_context_hash=context_ref, data_cutoff=cutoff,
             scouting_cutoff=context.scouting_cutoff, official_run_ids=context.official_runs,
             config_hash=team_config.config_hash(), deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in naive_team_rows:
             analytics.freeze_team_fixture_projection(
@@ -786,6 +828,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
             planning_event=event, planning_context_hash=context_ref, data_cutoff=cutoff,
             scouting_cutoff=context.scouting_cutoff, official_run_ids=context.official_runs,
             config_hash=rate_config.config_hash(), deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+            **run_provenance,
         )
         for row in rate_rows:
             analytics.freeze_player_rate_projection(
@@ -804,6 +847,7 @@ def _freeze_components(conn, context, context_ref, prepared, selected, cutoff, d
                 planning_context_hash=context_ref, data_cutoff=cutoff, scouting_cutoff=context.scouting_cutoff,
                 official_run_ids=context.official_runs, config_hash=rate_config.config_hash(),
                 deadline_status=deadline_status, source_snapshot_sha256=source_hash,
+                **run_provenance,
             )
             baseline_rows = rate_baselines[kind]
             for row in baseline_rows:
@@ -834,7 +878,7 @@ def _run_is_coherent(conn, run_id) -> bool:
 
 def _build_xpts(conn, event: int, cutoff: str, inputs: dict, rules, *,
                 deadline_status: str = "PRE_DEADLINE", deadline: str | None = None,
-                strict_coherence: bool = False) -> dict:
+                strict_coherence: bool = False, source_conn=None) -> dict:
     """Build xPts rows from explicit input runs and compute readiness."""
 
     config = xpts.XPtsConfig()
@@ -843,6 +887,7 @@ def _build_xpts(conn, event: int, cutoff: str, inputs: dict, rules, *,
         minutes_run_id=int(inputs["minutes"]), team_run_id=int(inputs["team"]),
         team_baseline_run_id=int(inputs["team_baseline"]) if inputs.get("team_baseline") else None,
         rate_run_id=int(inputs["rate"]), config=config, rules=rules,
+        source_conn=source_conn,
     )
     strict = strict_coherence or bool(built["meta"].get("input_team_coherence"))
     readiness = xpts.readiness_summary(

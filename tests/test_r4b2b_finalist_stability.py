@@ -290,7 +290,10 @@ def test_stage2_uses_the_declared_higher_draw_budget_and_the_same_inputs():
     report = fr.refine_finalists(
         universe=sentinel_universe, initial_state=_partial("X").state,
         scenario="SCENARIO", player_meta={41: "META"}, base_config=base_config,
-        stage1_result=stage1, prebuilt_worlds={5: {"worlds": 10_000, "player_ids": []}},
+        stage1_result=stage1,
+        # The declared NON-PRODUCTION door: this fixture supplies worlds that were never
+        # loaded from a certified generation, and it says so out loud.
+        non_production_worlds=_np({5: {"worlds": 10_000, "player_ids": []}}),
         verify_prefix=False, optimizer=optimizer,
     )
     assert len(optimizer.calls) == 1
@@ -323,7 +326,7 @@ def test_stage2_refinement_creates_no_predictive_run():
         universe={"universe": [], "replacement_edges": []}, initial_state=_partial("X").state,
         scenario=None, player_meta={}, base_config=ro.OptimizerConfig(events=EVENTS, seed=1),
         stage1_result=stage1, conn=_WriteForbidden(),
-        prebuilt_worlds={5: {"worlds": 10_000, "player_ids": []}},
+        non_production_worlds=_np({5: {"worlds": 10_000, "player_ids": []}}),
         verify_prefix=False, optimizer=optimizer,
     )
     source = (REPO_ROOT / "fpl_brain" / "finalist_refinement.py").read_text(encoding="utf-8")
@@ -576,8 +579,8 @@ def test_missing_canonical_record_suppresses_the_recommendation():
     assert suppressed["ranking"], "the route table stays available"
     source = (REPO_ROOT / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
     assert "if canonical is None:" in source
-    assert source.rindex('reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED') < source.index(
-        '(out_dir / "four_gw_decision.json").write_text(')
+    assert source.rindex('reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED') < source.rindex(
+        '"suppression_reasons": suppression_reasons,')
 
 
 def test_a_failed_escalation_fails_closed():
@@ -623,11 +626,14 @@ def test_no_best_h1_fallback_and_confidence_never_changes_the_preferred_route():
     source = (REPO_ROOT / "scripts" / "run_four_gw_decision.py").read_text(encoding="utf-8")
     assert "DECISION_SEARCH_NOT_STABLE" in source
     assert "best_h1" not in source and "BEST_H1" not in source
-    # the suppression CALLS are applied before the artifact is written (rindex:
-    # the helper's own definition must not satisfy this)
-    write_index = source.index('(out_dir / "four_gw_decision.json").write_text(')
-    assert source.rindex("_suppress_transfer_recommendation(") < write_index
-    assert source.rindex("assess_search_stability(") < write_index
+    # suppression CALLS are applied before the artifact that carries them is
+    # assembled, and the canonical entrypoint persists that artifact only after the
+    # pipeline has returned (rindex: the helper's own definition must not satisfy this)
+    artifact_index = source.rindex('"suppression_reasons": suppression_reasons,')
+    assert source.rindex("_suppress_transfer_recommendation(") < artifact_index
+    assert source.rindex("assess_search_stability(") < artifact_index
+    store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
+    assert "artifact_ref = _write_decision_artifact(artifact_path, artifact)" in store
     # confidence is computed after the ranked decision, and the preferred route
     # comes from the decision (confidence never supplies or changes a route)
     assert source.rindex("fg.evaluate_four_gw_decision(") < source.index("classify_decision_confidence(")
@@ -762,9 +768,9 @@ def test_escalation_runner_uses_the_next_beam_width_at_the_stage2_draws(monkeypa
     stage1["level_survivors"] = ["sentinel-levels"]
     run = runner._escalation_runner(
         universe={"universe": []}, initial_state=_partial("X").state, scenario=None,
-        player_meta={}, bundles={5: object()}, conn=None, base_config=base_config,
+        player_meta={}, generation=None, conn=None, base_config=base_config,
         stage1_result=stage1, stage2_draws=fr.STAGE2_DRAWS,
-        prebuilt_worlds={5: {"worlds": 10_000, "player_ids": []}}, finalist_partials=[a, b],
+        finalist_partials=[a, b],
     )
     run(12)
     config = captured["config"]
@@ -774,9 +780,20 @@ def test_escalation_runner_uses_the_next_beam_width_at_the_stage2_draws(monkeypa
     assert config.events == EVENTS
     assert captured["required_routes"] == [a, b]
     assert captured["nested_prior"]["level_survivors"] == ["sentinel-levels"]
-    assert captured["prebuilt_worlds"][5]["worlds"] == 10_000
     # and the ladder is bounded: there is no way to ask for a second escalation
     assert rs.next_ladder_budget(12) == 24
+
+
+def _np(matrices):
+    """The DECLARED non-production door: these worlds were never loaded from a
+    certified generation, and the declaration says who is exercising the interface."""
+
+    from fpl_brain import route_optimizer as ro
+
+    return ro.NonProductionWorlds(
+        declaration="test_r4b2b_finalist_stability: synthetic worlds, no certified generation",
+        matrices=matrices,
+    )
 
 
 SEED_SENTINEL = 424242
@@ -792,11 +809,14 @@ def test_runner_artifact_asserts_the_refinement_and_never_advertises_a_ladder():
     assert "refinement[\"simulation_fidelity\"]" in source
     # the canonical record is published on the result the confidence code reads
     assert 'result["canonical_paired_near_tie"] = canonical' in source
-    # suppression CALLS happen before the artifact hits disk (rindex so the
-    # helper's definition cannot satisfy the check)
-    write_index = source.index('(out_dir / "four_gw_decision.json").write_text(')
-    assert source.rindex("_suppress_transfer_recommendation(") < write_index
-    assert source.rindex("assess_search_stability(") < write_index
+    # suppression CALLS are applied before the artifact that carries them is
+    # assembled, and the canonical entrypoint persists that artifact only after the
+    # pipeline has returned (rindex: the helper's own definition must not satisfy this)
+    artifact_index = source.rindex('"suppression_reasons": suppression_reasons,')
+    assert source.rindex("_suppress_transfer_recommendation(") < artifact_index
+    assert source.rindex("assess_search_stability(") < artifact_index
+    store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
+    assert "artifact_ref = _write_decision_artifact(artifact_path, artifact)" in store
     # no open-ended ladder: exactly one escalation call site
     assert source.count("escalation=_escalation_runner(") == 1
     assert source.count("rs.budget_config(") == 1

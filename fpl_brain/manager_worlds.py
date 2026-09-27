@@ -129,18 +129,41 @@ def with_expected_bonus(world_matrix: dict[str, Any], bonus: Mapping[int, float]
 def build_manager_worlds(
     conn,
     *,
+    generation: Any,
     planning_event: int,
-    minutes_run_id: int,
-    xpts_run_id: int,
-    team_run_id: int,
     squad_ids: Sequence[int],
     simulations: int = 10_000,
     seed: int = 20260911,
     occupancy_audit: bool = True,
     expected_bonus: bool = True,
 ) -> dict[str, Any]:
-    """Simulate the full frozen universe and extract the squad GW matrix."""
+    """Simulate the full frozen universe and extract the squad GW matrix.
 
+    This is a PREDICTIVE-LOAD boundary: it reads the Minutes / team-strength / xPts
+    runs and simulates the shared football worlds every manager policy is scored in,
+    so the run ids must be exactly the ones a certified GENERATION records for this
+    event.  A hand-assembled run-id set has no route in: there is no run-id
+    parameter at all, and the generation's manifest was digest-verified,
+    snapshot-pinned and re-proven against the run rows before it was loaded.
+    """
+
+    from . import certified_bundle as cb
+    from . import generation_store as gs
+
+    if generation is None:
+        raise cb.CertificationRefused(
+            "CERTIFIED_GENERATION_REQUIRED",
+            [
+                f"GW{int(planning_event)}: the manager worlds require a certified GENERATION; a "
+                "caller cannot supply run ids in its place"
+            ],
+        )
+    gs.assert_cutoff_matches(conn, generation, cutoff=generation.cutoff)
+    gs.assert_generation_bundles_valid(conn, generation)
+    runs = generation.runs_for(int(planning_event))
+    minutes_run_id = runs["minutes_v1"]
+    team_run_id = runs["team_strength_v1"]
+    xpts_run_id = runs["xpts_v1"]
     fixtures = monte_carlo.load_fixture_inputs(
         conn, event=int(planning_event), xpts_run_id=int(xpts_run_id),
         minutes_run_id=int(minutes_run_id), team_run_id=int(team_run_id),
@@ -160,8 +183,13 @@ def build_manager_worlds(
             conn, minutes_run_id=int(minutes_run_id), event=int(planning_event)
         ),
     )
+    matrix[MATRIX_IDENTITY_KEY] = (
+        f"generation:{generation.generation_id}|{int(planning_event)}:{int(config.simulations)}:"
+        f"{int(config.seed)}"
+    )
     return {
         "world_matrix": matrix,
+        "generation_id": generation.generation_id,
         "simulation": {
             "worlds": int(config.simulations),
             "seed": int(config.seed),
@@ -175,6 +203,11 @@ def build_manager_worlds(
         "input_run_ids": {
             "minutes": int(minutes_run_id), "xpts": int(xpts_run_id), "team": int(team_run_id),
         },
+        "model_versions": {
+            str(family): str(version)
+            for family, version in (generation.model_versions_by_event.get(int(planning_event)) or {}).items()
+        },
+        "snapshot": dict(generation.snapshot),
         "fixtures": sorted(int(fixture_id) for fixture_id in fixtures),
     }
 
@@ -240,8 +273,14 @@ MATRIX_IDENTITY_KEY = "_p2_matrix_identity"
 #: memo key (a path is mutable, a content identity is not).
 MATRIX_PATH_KEY = "_p2_matrix_path"
 
+#: The CERTIFIED GENERATION identity the matrix was loaded from, stamped by
+#: ``route_optimizer.build_event_worlds``.  It is a decodable PROVENANCE label -- the
+#: link between a matrix in memory and the generation it came from -- and it
+#: authorises nothing: a matrix arriving from anywhere else enters only through the
+#: declared non-production interface, never on the strength of a stamp.
+
 #: Run-scoped, matrix-keyed memos.  Never persisted, never keyed on a
-#: certification identity from a different run (the key IS the certified cache
+#: generation identity from a different run (the key IS the content-addressed cache
 #: identity of the matrix that is already in memory).
 _MATRIX_MEMO: dict[tuple, Any] = {}
 _MATRIX_MEMO_STATS: dict[str, int] = {

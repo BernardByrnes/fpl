@@ -30,11 +30,31 @@ from fpl_brain import manager_worlds as mw
 from fpl_brain import parallel_exact as px
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _config, _scenario, _universe
+from test_route_optimizer import (
+    _config,
+    _scenario,
+    _universe,
+)
 from test_transfer_state import POSITION, SQUAD_IDS
 
-BUNDLE = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3,
-                        xpts_run_id=4, mc_run_id=5)
+import generation_fixtures as gf
+from fpl_brain import generation_store as gs
+
+#: The exact certified run ids this fixture's worlds belong to.  ``build_event_worlds``
+#: refuses anything that is not a LOADED certified generation, so the fixture certifies
+#: this world through the REAL generation-store lifecycle rather than fabricating one.
+BUNDLE_RUNS = {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
+               "monte_carlo_v1": 5}
+#: The decision window this module's optimizer runs are configured for.
+_CONFIG_EVENTS = tuple(_config().events)
+_BUNDLE_CONN, _BUNDLE_RUNS_BY_EVENT = gf.world_with_run_ids(
+    {event: {family: int(run_id) + 5 * index for family, run_id in BUNDLE_RUNS.items()}
+     for index, event in enumerate(_CONFIG_EVENTS)}
+)
+GENERATION = gf.certify_world(
+    _BUNDLE_CONN, _BUNDLE_RUNS_BY_EVENT, events=_CONFIG_EVENTS,
+    horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+)
 WORLDS = 6
 
 #: Every unlisted player scores the fixture's flat default.
@@ -99,9 +119,19 @@ def _union_for(universe, state, config):
 
 
 def _write_cache_file(tmp_path, union, config, *, drop=(), event=4):
-    key = ro.world_cache_key(event=event, bundle=BUNDLE, config=config, union_ids=union)
+    """Write ONE world-cache entry, carrying the content digest PE-9 requires.
+
+    Amendment 2 section 12 makes a cache HIT provable: a reader recomputes the entry's
+    content identity and requires it to reproduce the recorded digest, so a hand-written
+    entry must carry one or the loader (correctly) treats it as a MISS.
+    """
+
+    key = ro.world_cache_key(event=event, generation_id=GENERATION.generation_id,
+                             runs=GENERATION.runs_for(event), config=config, union_ids=union)
+    matrix = _semantic_matrix(union, drop=drop)
     payload = {name: ({str(k): v for k, v in value.items()} if isinstance(value, dict) else value)
-               for name, value in _semantic_matrix(union, drop=drop).items()}
+               for name, value in matrix.items()}
+    payload[ro.CACHE_CONTENT_DIGEST_KEY] = ro.world_matrix_content_identity(matrix)
     (tmp_path / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
     return key
 
@@ -111,7 +141,9 @@ def _parent_matrix(tmp_path, universe, state, config, *, drop=()):
 
     union = _union_for(universe, state, config)
     _write_cache_file(tmp_path, union, config, drop=drop)
-    matrix, info = ro.build_event_worlds(None, {4: BUNDLE}, 4, union, config, cache_dir=tmp_path)
+    matrix, info = ro.build_event_worlds(
+        _BUNDLE_CONN, GENERATION, 4, union, config, cache_dir=tmp_path,
+    )
     assert info["source"] == "cache", info
     return matrix, union
 
@@ -380,15 +412,13 @@ def test_optimize_parallel_equals_sequential_over_real_file_transport(tmp_path):
     for event in config.events:
         _write_cache_file(tmp_path, union, config, event=int(event))
 
-    bundles = {int(event): rc.EventBundle(event=int(event), minutes_run_id=1, team_run_id=2,
-                                          rate_run_id=3, xpts_run_id=4, mc_run_id=5)
-               for event in config.events}
     scenario = _scenario()
 
     def _run(workers):
         return ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                           player_meta=meta, bundles=bundles, conn=None, config=config,
-                           cache_dir=tmp_path, exact_cache={}, parallel_workers=workers)
+                           player_meta=meta, generation=GENERATION, conn=_BUNDLE_CONN,
+                           config=config, cache_dir=tmp_path, exact_cache={},
+                           parallel_workers=workers)
 
     sequential = _run(None)
     parallel = _run(2)

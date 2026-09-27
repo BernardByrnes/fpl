@@ -22,6 +22,8 @@ import random
 
 import pytest
 
+from test_route_optimizer import _np  # noqa: E402
+
 from fpl_brain import manager_lineup as ml
 from fpl_brain import manager_worlds as mw
 from fpl_brain import route_comparator as rc
@@ -316,7 +318,7 @@ def test_window_proxy_is_unchanged_and_order_preserving():
 # ---------------------------------------------------------------------------
 
 def _search_fixture():
-    from test_route_optimizer import _config, _provider, _scenario, _universe
+    from test_route_optimizer import _config, _np, _provider, _scenario, _universe
     universe, state, meta = _universe()
     return universe, state, meta, _scenario(), _config(), _provider()
 
@@ -343,18 +345,18 @@ def test_shared_exact_cache_reuses_identical_evaluations_and_keeps_routes_identi
     universe, state, meta, scenario, config, provider = _search_fixture()
     # Fresh caches: the second call recomputes everything.
     fresh_first = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                              player_meta=meta, config=config, world_provider=provider,
+                              player_meta=meta, config=config, non_production_worlds=_np(provider),
                               exact_cache={})
     fresh_second = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                               player_meta=meta, config=config, world_provider=provider,
+                               player_meta=meta, config=config, non_production_worlds=_np(provider),
                                exact_cache={})
     # One shared cache: the second call must hit.
     shared: dict = {}
     shared_first = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                               player_meta=meta, config=config, world_provider=provider,
+                               player_meta=meta, config=config, non_production_worlds=_np(provider),
                                exact_cache=shared)
     shared_second = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                                player_meta=meta, config=config, world_provider=provider,
+                                player_meta=meta, config=config, non_production_worlds=_np(provider),
                                 exact_cache=shared)
 
     assert fresh_first["routes"] == shared_first["routes"]
@@ -382,26 +384,40 @@ def test_shared_exact_cache_reuses_identical_evaluations_and_keeps_routes_identi
 
 
 def test_world_identity_prefers_the_stamped_matrix_identity():
-    from test_route_optimizer import _config, _provider
+    from test_route_optimizer import _config
     universe, state, meta, scenario, config, provider = _search_fixture()
     matrix = {"worlds": 3, "player_ids": [1, 2], "core": {1: [0.0] * 3, 2: [0.0] * 3},
               "minutes": {1: [0.0] * 3, 2: [0.0] * 3}}
     matrix[ro.MANAGER_MATRIX_IDENTITY_KEY] = "stamped-identity"
-    identity = ro._worlds_identity({4: matrix}, bundles=None, config=config, union=[1, 2])
+    identity = ro._worlds_identity({4: matrix}, generation=None, config=config, union=[1, 2])
     assert identity == {4: "stamped-identity"}
 
 
 def test_world_identity_falls_back_to_the_certified_cache_key():
     from test_route_optimizer import _config
-    bundle = rc.EventBundle(event=4, minutes_run_id=1, team_run_id=2, rate_run_id=3, xpts_run_id=4)
+
+    import generation_fixtures as gf
+    from fpl_brain import generation_store as gs
+
+    conn, runs = gf.world_with_run_ids(
+        {4: {"minutes_v1": 1, "team_strength_v1": 2, "player_rates_v1": 3, "xpts_v1": 4,
+         "monte_carlo_v1": 5}},
+    )
+    generation = gf.certify_world(
+        conn, runs, events=(4,), horizon_kind=gs.HORIZON_KIND_MANAGER_WORLD,
+    )
     config = _config()
     matrix = {"worlds": 3, "player_ids": [1, 2], "core": {1: [0.0] * 3, 2: [0.0] * 3},
               "minutes": {1: [0.0] * 3, 2: [0.0] * 3}}
-    identity = ro._worlds_identity({4: matrix}, bundles={4: bundle}, config=config, union=[1, 2])
-    assert identity == {4: ro.world_cache_key(event=4, bundle=bundle, config=config,
-                                             union_ids=[1, 2])}
+    identity = ro._worlds_identity({4: matrix}, generation=generation, config=config, union=[1, 2])
+    assert identity == {
+        4: ro.world_cache_key(
+            event=4, generation_id=generation.generation_id, runs=generation.runs_for(4),
+            config=config, union_ids=[1, 2],
+        )
+    }
     # An unidentifiable matrix yields None rather than a guess.
-    assert ro._worlds_identity({4: {"worlds": 1, "player_ids": []}}, bundles=None,
+    assert ro._worlds_identity({4: {"worlds": 1, "player_ids": []}}, generation=None,
                                config=config, union=[]) is None
 
 

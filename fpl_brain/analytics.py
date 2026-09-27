@@ -183,6 +183,9 @@ def create_projection_run(
     random_seed: int | None = None,
     deadline_status: str | None = None,
     source_snapshot_sha256: str | None = None,
+    data_snapshot_sha256: str | None = None,
+    execution_run_uuid: str | None = None,
+    planning_context_inputs: Mapping[str, Any] | None = None,
     allow_future_cutoff: bool = False,
 ) -> int:
     # Defense in depth: a run may not claim a data cutoff in the future relative
@@ -192,13 +195,26 @@ def create_projection_run(
         from . import causality
 
         causality.assert_data_cutoff_not_after_generated(data_cutoff, utc_now())
+    provenance_values = (data_snapshot_sha256, execution_run_uuid, planning_context_inputs)
+    if any(value is not None for value in provenance_values) and not all(
+        value is not None for value in provenance_values
+    ):
+        raise ValueError("snapshot provenance requires digest, execution UUID, and planning-context inputs")
+    if data_snapshot_sha256 is not None:
+        digest = str(data_snapshot_sha256).lower()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("data_snapshot_sha256 must be a lowercase SHA-256 digest")
+        if not str(execution_run_uuid).strip():
+            raise ValueError("execution_run_uuid must be nonempty when snapshot provenance is recorded")
+        data_snapshot_sha256 = digest
     cursor = conn.execute(
         """INSERT INTO projection_runs(
              model_family, model_version, generated_at, planning_event,
              planning_context_hash, data_cutoff, scouting_cutoff, official_run_ids,
              code_revision, config_hash, random_seed, deadline_status, status,
-             source_snapshot_sha256
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'running',?)""",
+             source_snapshot_sha256, data_snapshot_sha256, execution_run_uuid,
+             planning_context_inputs_json
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'running',?,?,?,?)""",
         (
             model_family,
             model_version,
@@ -213,6 +229,9 @@ def create_projection_run(
             random_seed,
             deadline_status,
             source_snapshot_sha256,
+            data_snapshot_sha256,
+            execution_run_uuid,
+            _json_text_or_none(planning_context_inputs),
         ),
     )
     return int(cursor.lastrowid)
@@ -970,12 +989,15 @@ def freeze_baselines_for_event(
     *,
     event: int | None = None,
     deadline_status: str | None = None,
+    run_provenance: Mapping[str, Any] | None = None,
+    source_conn: sqlite3.Connection | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Freeze the four transparent baselines for every projectable player.
 
     Baselines are exact at freeze time and never recomputed later.
     """
 
+    source_conn = source_conn or conn
     planning_event = int(event if event is not None else context.planning_event)
     run_id = create_projection_run(
         conn,
@@ -995,15 +1017,16 @@ def freeze_baselines_for_event(
         # here is not "no claim": it silently escapes certified_bundle's
         # cross-family code-snapshot check, leaving the arm unbound.
         source_snapshot_sha256=source_snapshot_sha256(),
+        **dict(run_provenance or {}),
     )
-    fixtures_by_team = event_fixture_map(conn, planning_event)
-    pooled_minutes = positional_pooled_minutes(conn, planning_event, cutoff)
+    fixtures_by_team = event_fixture_map(source_conn, planning_event)
+    pooled_minutes = positional_pooled_minutes(source_conn, planning_event, cutoff)
     count_rows = {"ep": 0, "recent": 0, "minutes": 0, "p90": 0}
-    for player in projectable_players(conn):
+    for player in projectable_players(source_conn):
         player_id = int(player["player_id"])
         if not fixtures_by_team.get(int(player["team_id"])):
             continue
-        official = snapshot_status_evidence(conn, player_id, cutoff)
+        official = snapshot_status_evidence(source_conn, player_id, cutoff)
         freeze_prediction(
             conn,
             run_id,
@@ -1011,7 +1034,7 @@ def freeze_baselines_for_event(
             player_id=player_id,
             event=planning_event,
             payload={
-                "value": ep_next_as_of(conn, player_id, cutoff),
+                "value": ep_next_as_of(source_conn, player_id, cutoff),
                 "provenance": official,
                 "formula": "official FPL ep_next captured at freeze time, never recomputed",
             },
@@ -1024,12 +1047,12 @@ def freeze_baselines_for_event(
             kind=RECENT_POINTS_KIND,
             player_id=player_id,
             event=planning_event,
-            payload=recent_points_baseline(conn, player_id, planning_event, cutoff),
+            payload=recent_points_baseline(source_conn, player_id, planning_event, cutoff),
             model_version=BASELINE_MODEL_VERSION,
         )
         count_rows["recent"] += 1
         naive_minutes = naive_minutes_baseline(
-            conn,
+            source_conn,
             player_id,
             planning_event,
             cutoff,
@@ -1051,7 +1074,7 @@ def freeze_baselines_for_event(
             kind=NAIVE_P90_KIND,
             player_id=player_id,
             event=planning_event,
-            payload=naive_p90_baseline(conn, player_id, planning_event, cutoff, naive_minutes.get("value")),
+            payload=naive_p90_baseline(source_conn, player_id, planning_event, cutoff, naive_minutes.get("value")),
             model_version=BASELINE_MODEL_VERSION,
         )
         count_rows["p90"] += 1

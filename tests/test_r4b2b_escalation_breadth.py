@@ -307,7 +307,12 @@ def test_repin_the_real_escalation_shape_restarts_from_the_initial_state_and_reu
     # Stage-1 nested view, and the finalists forced in — nothing else changes
     assert "rs.budget_config(int(beam), base_config)" in runner
     assert "search_draws=int(stage2_draws)" in runner
-    assert "prebuilt_worlds=prebuilt_worlds" in runner
+    assert "generation=generation" in runner
+    # NO cross-stage prebuilt-matrix reuse: the escalation reaches the SAME certified
+    # generation through the content-addressed cache, which is optimization rather than
+    # authority, so a cold cache rebuilds the same worlds instead of changing the answer.
+    assert "prebuilt_worlds" not in runner
+    assert "certified_bundle" not in runner
     assert "nested_prior=ro.nested_budget_view(stage1_result)" in runner
     assert "required_routes=list(finalist_partials)" in runner
     assert "initial_state=initial_state" in runner

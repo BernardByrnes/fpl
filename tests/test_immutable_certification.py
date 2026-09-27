@@ -330,30 +330,39 @@ def _base_world_for_bundles(conn):
                 (run_id, family, version),
             )
 
-        run(1, "minutes_v1", "minutes_v1.6.0")
-        run(2, "team_strength_v1", "team_strength_v1.0.0")
-        run(3, "player_rates_v1", "player_rates_v1.0.0")
-        run(4, "xpts_v1", "xpts_v1.4.1")
-        run(5, "monte_carlo_v1", "mc_v1.3.0")
-        run(6, "minutes_v1", "minutes_v1.6.0")
-        run(7, "xpts_v1", "xpts_v1.4.1")
+        # The AUTHORITATIVE declared versions, read from the one in-library source.
+        # PE-9 gap 1 made the required versions come from that source and never from
+        # the artifact, so a world recorded under stale literals is a run nobody pins.
+        from fpl_brain import certified_bundle as _cb
+
+        declared = _cb.declared_required_versions()
+        run(1, "minutes_v1", declared["minutes_v1"])
+        run(2, "team_strength_v1", declared["team_strength_v1"])
+        run(3, "player_rates_v1", declared["player_rates_v1"])
+        run(4, "xpts_v1", declared["xpts_v1"])
+        run(5, "monte_carlo_v1", declared["monte_carlo_v1"])
+        run(6, "minutes_v1", declared["minutes_v1"])
+        run(7, "xpts_v1", declared["xpts_v1"])
         conn.execute(
             "INSERT INTO player_fixture_xpts_projections(projection_run_id, player_id, fixture_id, event,"
             " team_id, opponent_id, position, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, scoring_rules_version, generated_at)"
-            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}','xpts_v1.4.1','v1','2026-09-12T19:01:00Z')"
+            " VALUES (4,1,48,5,1,2,'MID',1,2,3,'{}',?,'v1','2026-09-12T19:01:00Z')",
+            (declared["xpts_v1"],),
         )
         conn.execute(
             "INSERT INTO player_fixture_xpts_projections(projection_run_id, player_id, fixture_id, event,"
             " team_id, opponent_id, position, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, scoring_rules_version, generated_at)"
-            " VALUES (7,1,48,5,1,2,'MID',6,2,3,'{}','xpts_v1.4.1','v1','2026-09-12T19:01:00Z')"
+            " VALUES (7,1,48,5,1,2,'MID',6,2,3,'{}',?,'v1','2026-09-12T19:01:00Z')",
+            (declared["xpts_v1"],),
         )
         conn.execute(
             "INSERT INTO monte_carlo_distributions(projection_run_id, player_id, fixture_id, event, team_id,"
             " opponent_id, position, xpts_run_id, minutes_run_id, team_run_id, rate_run_id, payload_json,"
             " model_version, generated_at)"
-            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}','mc_v1.3.0','2026-09-12T19:01:00Z')"
+            " VALUES (5,1,48,5,1,2,'MID',4,1,2,3,'{}',?,'2026-09-12T19:01:00Z')",
+            (declared["monte_carlo_v1"],),
         )
 
 
@@ -482,19 +491,29 @@ def test_i_artifact_missing_an_event_is_refused(tmp_path):
 
 
 def test_j_production_decision_path_does_not_use_legacy_discovery():
+    """The search branch consumes the CERTIFIED GENERATION; rediscovery is a diagnostic."""
+
     source = Path("scripts/run_four_gw_decision.py").read_text(encoding="utf-8")
-    # The search branch must use the certified support.
+    # The search branch consumes the certified generation's own support.
+    assert "certified_support = gs.support_by_event(generation)" in source
     assert "certified_support[int(event)]" in source
-    # The legacy call survives only for the readiness display, and is labelled.
-    assert "NON-PRODUCTION" in source
+    # PE-9 gap 3: readiness resolves the SAME generation, so it is no longer the
+    # legacy rediscovery that feeds it.
+    assert "support = gs.support_by_event(readiness_generation)" in source
+    # The legacy rediscovery survives ONLY as an explicitly labelled diagnostic.
+    assert "readiness_diagnostic_source" in source
+    assert "NON_PRODUCTION_LATEST_PER_FAMILY" in source
     legacy_line = [
         line for line in source.splitlines() if "event_support_from_db(" in line and "fg." in line
     ]
-    assert legacy_line, "the legacy readiness call should still exist for diagnostics"
-    # It must appear BEFORE the search branch, i.e. only in the readiness stage.
-    legacy_index = source.index(legacy_line[0])
-    search_index = source.index("certified_support[int(event)]")
-    assert legacy_index < search_index, "legacy discovery must not feed the search stage"
+    assert legacy_line, "the legacy diagnostic call should still exist"
+    # The rediscovery's result feeds EXACTLY ONE thing: the divergence record that is
+    # published beside the decision.  It never reaches the search branch's support.
+    assert 'diagnostic_support[int(e)].get("matched_runs")' in source
+    assert source.count("diagnostic_support") == 2  # its assignment and that one read
+    # The production support is the GENERATION's, and nothing else.
+    assert "certified_support = gs.support_by_event(generation)" in source
+    assert "support = gs.support_by_event(readiness_generation)" in source
     # And the legacy function itself is documented as non-production.
     fg_source = Path("fpl_brain/four_gw_decision.py").read_text(encoding="utf-8")
     assert "NON-PRODUCTION (diagnostics and tests only)" in fg_source

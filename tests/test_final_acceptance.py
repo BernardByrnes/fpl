@@ -202,20 +202,31 @@ def test_one_gw4_world_set_shared_and_squads_cached():
     assert confirmations["sig_a"]["world_scores"] == confirmations["sig_b"]["world_scores"]
 
 
+RUNS = {"minutes_v1": 64, "team_strength_v1": 65, "player_rates_v1": 67, "xpts_v1": 70,
+        "monte_carlo_v1": 71}
+GENERATION_ID = "sha256:" + "a" * 64
+
+
 def test_2k_cache_cannot_masquerade_as_10k():
-    bundle = rc.EventBundle(event=4, minutes_run_id=64, team_run_id=65, rate_run_id=67, xpts_run_id=70, mc_run_id=71)
     cfg2k = ro.OptimizerConfig(events=EVENTS, search_draws=2000)
     cfg10k = ro.OptimizerConfig(events=EVENTS, search_draws=10000)
-    key2k = ro.world_cache_key(event=4, bundle=bundle, config=cfg2k, union_ids=SQUAD_IDS)
-    key10k = ro.world_cache_key(event=4, bundle=bundle, config=cfg10k, union_ids=SQUAD_IDS)
+    key2k = ro.world_cache_key(event=4, generation_id=GENERATION_ID, runs=RUNS, config=cfg2k,
+                               union_ids=SQUAD_IDS)
+    key10k = ro.world_cache_key(event=4, generation_id=GENERATION_ID, runs=RUNS, config=cfg10k,
+                                union_ids=SQUAD_IDS)
     assert key2k != key10k
-    assert ro.world_cache_key(event=4, bundle=bundle, config=cfg10k, union_ids=SQUAD_IDS) == key10k
+    assert ro.world_cache_key(event=4, generation_id=GENERATION_ID, runs=RUNS, config=cfg10k,
+                              union_ids=SQUAD_IDS) == key10k
+    # A DIFFERENT certified generation is a different world, however identical the draws.
+    other = ro.world_cache_key(event=4, generation_id="sha256:" + "b" * 64, runs=RUNS,
+                               config=cfg10k, union_ids=SQUAD_IDS)
+    assert other != key10k
 
 
 def test_route_id_absent_from_world_identity():
-    bundle = rc.EventBundle(event=4, minutes_run_id=64, team_run_id=65, rate_run_id=67, xpts_run_id=70, mc_run_id=71)
     cfg = ro.OptimizerConfig(events=EVENTS, search_draws=10000)
-    key = ro.world_cache_key(event=4, bundle=bundle, config=cfg, union_ids=SQUAD_IDS)
+    key = ro.world_cache_key(event=4, generation_id=GENERATION_ID, runs=RUNS, config=cfg,
+                             union_ids=SQUAD_IDS)
     assert "route" not in key.lower()
 
 

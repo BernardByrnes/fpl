@@ -19,7 +19,7 @@ import pytest
 
 from fpl_brain import parallel_exact as px
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _config, _provider, _scenario, _universe
+from test_route_optimizer import _config, _np, _provider, _scenario, _universe
 
 
 @pytest.fixture(autouse=True)
@@ -121,10 +121,10 @@ def test_keys_already_in_the_parent_cache_are_never_dispatched():
 def test_parallel_pool_output_is_bit_identical_to_sequential(workers):
     universe, state, meta, scenario, config, provider = _fixture()
     sequential = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                             player_meta=meta, config=config, world_provider=provider,
+                             player_meta=meta, config=config, non_production_worlds=_np(provider),
                              exact_cache={})
     parallel = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                           player_meta=meta, config=config, world_provider=provider,
+                           player_meta=meta, config=config, non_production_worlds=_np(provider),
                            exact_cache={}, parallel_workers=workers)
     assert parallel["routes"] == sequential["routes"]
     assert parallel["exact_evaluations"] == sequential["exact_evaluations"]
@@ -152,16 +152,16 @@ def test_merge_is_independent_of_completion_order():
 
     universe, state, meta, scenario, config, provider = _fixture()
     sequential = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                             player_meta=meta, config=config, world_provider=provider,
+                             player_meta=meta, config=config, non_production_worlds=_np(provider),
                              exact_cache={})
     base = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                       player_meta=meta, config=config, world_provider=provider,
+                       player_meta=meta, config=config, non_production_worlds=_np(provider),
                        exact_cache={}, parallel_workers=2)
     # Re-run several times: the pool's arrival order varies run to run, so identical
     # output across repeats is the observable form of order-independence.
     for _ in range(2):
         repeat = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                             player_meta=meta, config=config, world_provider=provider,
+                             player_meta=meta, config=config, non_production_worlds=_np(provider),
                              exact_cache={}, parallel_workers=2)
         assert repeat["routes"] == base["routes"] == sequential["routes"]
         assert repeat["paired_supported_3gw"] == sequential["paired_supported_3gw"]

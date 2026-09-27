@@ -97,6 +97,30 @@ def _parse_minutes_version(version: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 
+class InputRunAbsent(RuntimeError):
+    """A run the simulation was asked to load does not exist.
+
+    Reading a missing run as "no metadata" is not a neutral default: the Minutes
+    metadata decides whether a run is a PROSPECTIVE (>= v1.5.1) run whose joint
+    primitives must all be present, or a LEGACY run that may be reconstructed.  An
+    absent row would otherwise parse as version ``(0, 0, 0)``, silently selecting
+    the legacy path and reconstructing primitives the run never declared.  A
+    missing row refuses instead.
+    """
+
+
+def require_input_run(conn: sqlite3.Connection, run_id: int, *, family: str, event: int) -> dict[str, Any]:
+    """The run row for an input, or a refusal naming the family and run id."""
+
+    row = analytics.get_projection_run(conn, int(run_id))
+    if row is None:
+        raise InputRunAbsent(
+            f"INPUT_RUN_ABSENT: no projection run {int(run_id)} for the {family} input of event "
+            f"{int(event)}; a missing run is never defaulted to an empty legacy run"
+        )
+    return dict(row)
+
+
 def validate_input_run_coherence(
     conn: sqlite3.Connection,
     *,
@@ -484,8 +508,9 @@ def load_fixture_inputs(
 
     # Primitive validation is driven by the ACTUAL Minutes run metadata, never by
     # the presence of the payload field being validated (which was vacuously
-    # true when a legacy run carried no primitive fields at all).
-    minutes_run = analytics.get_projection_run(conn, int(minutes_run_id)) or {}
+    # true when a legacy run carried no primitive fields at all).  The metadata is
+    # READ, never defaulted: an absent run is a refusal, not an empty legacy run.
+    minutes_run = require_input_run(conn, int(minutes_run_id), family="minutes_v1", event=int(event))
     minutes_run_version = str(minutes_run.get("model_version") or "")
     prospective_primitives = _parse_minutes_version(minutes_run_version) >= (1, 5, 1)
 

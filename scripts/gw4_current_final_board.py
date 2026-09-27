@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """FINAL pre-deadline GW4 current-GW (H1) manager board.
 
-Uses the certified fresh GW4 bundle at cutoff 2026-09-12T10:40:04Z
-(minutes 127 / team 128 / rates 130 / xPts 133 / MC 134) and the accepted
-Phase-6 exact manager-policy enumeration over the GW4 worlds.
+Consumes the certified GW4 generation (the accepted fresh GW4 runs at cutoff
+2026-09-12T10:40:04Z: minutes 127 / team 128 / rates 130 / xPts 133 / MC 134) and
+the accepted Phase-6 exact manager-policy enumeration over the GW4 worlds.
+
+PE-9: the run ids and the cutoff are READ from the generation's digest-verified
+manifest.  ``--generation`` selects a specific certified generation; omitting it
+resolves the ``current_generation`` pointer, so the board can never describe a
+world that was not certified.
 
 CURRENT_GW_H1_ONLY — the four-GW transfer horizon is INCOMPLETE, so there is no
 normal transfer recommendation, no chip recommendation and no route search.
@@ -21,22 +26,26 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import four_gw_decision as fg, manager_lineup as ml, manager_worlds, route_comparator as rc
+from fpl_brain import generation_store as gs
 from fpl_brain import route_optimizer as ro, transfer_state as ts
 from fpl_brain.config import config_path, load_config
 from fpl_brain.database import connect_database
 from fpl_brain.planning import get_planning_context
 from fpl_brain.utils import utc_now
 
-CUTOFF = "2026-09-12T10:40:04Z"
 SEED = 20260911
 DRAWS = 10_000
-RUNS = {"minutes_v1": 127, "team_strength_v1": 128, "player_rates_v1": 130,
-        "xpts_v1": 133, "monte_carlo_v1": 134}
+PLANNING_EVENT = 4
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Final GW4 current-GW H1 board")
     parser.add_argument("--config")
+    parser.add_argument(
+        "--generation", default=None,
+        help="explicit certified generation id SELECTOR.  Omit to resolve the current_generation "
+             "pointer for GW4",
+    )
     parser.add_argument("--cache-dir", default="data/cache/manager_worlds")
     parser.add_argument("--out", default="data/exports/four_gw/gw04/current_gw_h1_decision.json")
     args = parser.parse_args(argv)
@@ -45,8 +54,19 @@ def main(argv=None) -> int:
     config = load_config(args.config)
     conn = connect_database(config_path(config, "database"))
     try:
+        generation = gs.resolve_generation(
+            conn, planning_event=PLANNING_EVENT, generation_id=args.generation
+        )
+        gs.require_snapshot_retained(generation)
+        gs.assert_generation_bundles_valid(conn, generation)
+        certified_runs = generation.runs_for(PLANNING_EVENT)
+        missing = [family for family in ("minutes_v1", "xpts_v1") if family not in certified_runs]
+        if missing:
+            print(f"board failed: the certified generation names no run for {missing}", file=sys.stderr)
+            return 3
+        CUTOFF = str(generation.cutoff)
         entry_id = int(config["fpl_entry_id"])
-        context = get_planning_context(conn, entry_id, 4, as_of=CUTOFF, season=config.get("season"))
+        context = get_planning_context(conn, entry_id, PLANNING_EVENT, as_of=CUTOFF, season=config.get("season"))
         squad = manager_worlds.resolve_squad(context, conn)
         squad_ids = [int(pid) for pid in squad["squad_ids"]]
         positions = {int(pid): str(pos) for pid, pos in squad["positions"].items()}
@@ -62,15 +82,17 @@ def main(argv=None) -> int:
         clubs = {int(r["id"]): r["short_name"] for r in conn.execute("SELECT id, short_name FROM teams")}
 
         # --- GW4 worlds: reuse the accepted cache when present ----------------
-        bundle = rc.EventBundle(event=4, minutes_run_id=RUNS["minutes_v1"], team_run_id=RUNS["team_strength_v1"],
-                                rate_run_id=RUNS["player_rates_v1"], xpts_run_id=RUNS["xpts_v1"],
-                                mc_run_id=RUNS["monte_carlo_v1"], simulations=DRAWS, seed=SEED,
-                                planning_cutoff=CUTOFF)
-        wconfig = ro.OptimizerConfig(events=(4,), search_draws=DRAWS, seed=SEED, policy_selection_worlds=0)
-        key = ro.world_cache_key(event=4, bundle=bundle, config=wconfig, union_ids=squad_ids)
+        wconfig = ro.OptimizerConfig(events=(PLANNING_EVENT,), search_draws=DRAWS, seed=SEED,
+                                     policy_selection_worlds=0)
+        key = ro.world_cache_key(
+            event=PLANNING_EVENT, generation_id=generation.generation_id, runs=certified_runs,
+            config=wconfig, union_ids=squad_ids,
+        )
         cache_path = Path(args.cache_dir) / f"{key}.json"
         t0 = time.time()
-        worlds, info = ro.build_event_worlds(conn, {4: bundle}, 4, squad_ids, wconfig, cache_dir=Path(args.cache_dir))
+        worlds, info = ro.build_event_worlds(
+            conn, generation, PLANNING_EVENT, squad_ids, wconfig, cache_dir=Path(args.cache_dir)
+        )
         world_seconds = time.time() - t0
 
         # --- exact Phase-6 policy selection over ALL draws --------------------
@@ -99,7 +121,8 @@ def main(argv=None) -> int:
         for pid in squad_ids:
             mrow = conn.execute(
                 "SELECT payload_json FROM frozen_predictions WHERE projection_run_id=? AND kind=? AND player_id=?",
-                (RUNS["minutes_v1"], __import__("fpl_brain.analytics", fromlist=["x"]).MINUTES_V1_KIND, pid),
+                (certified_runs["minutes_v1"],
+                 __import__("fpl_brain.analytics", fromlist=["x"]).MINUTES_V1_KIND, pid),
             ).fetchall()
             rows = [json.loads(r["payload_json"]) for r in mrow]
             avail = min((float(r.get("joint_availability") or 0.0) for r in rows), default=None)
@@ -120,7 +143,7 @@ def main(argv=None) -> int:
         board = {
             "label": ["CURRENT_GW_H1_ONLY", "TRANSFER_DECISION_HORIZON_INCOMPLETE",
                       "NO_ADDITIONAL_TRANSFER", "NO_CHIP_RECOMMENDATION"],
-            "planning_event": 4, "planning_cutoff": CUTOFF,
+            "planning_event": PLANNING_EVENT, "planning_cutoff": CUTOFF,
             "generated_at_utc": utc_now(),
             "horizon": {"decision_events": [4, 5, 6, 7], "status": fg.DECISION_HORIZON_INCOMPLETE,
                         "blocked_events": [5, 6, 7]},
@@ -159,8 +182,13 @@ def main(argv=None) -> int:
                                    "evaluated_policies": ranked["evaluated_policies"], "skeletons": ranked["skeletons"]},
             "world_provenance": {"source": info.get("source"), "cache_key": key, "exists_before": cache_path.exists(),
                                  "worlds": int(worlds["worlds"]), "union_players": len(squad_ids),
-                                 "run_ids": RUNS, "seed": SEED, "seconds": round(world_seconds, 1),
-                                 "generation": info.get("source")},
+                                 "seed": SEED, "seconds": round(world_seconds, 1),
+                                 "generation_id": generation.generation_id,
+                                 "certified_runs": certified_runs,
+                                 "certified_cutoff": CUTOFF,
+                                 "snapshot_sha256": generation.snapshot.get("sha256"),
+                                 "snapshot_source_db_identity": generation.snapshot.get("source_db_identity"),
+                                 "execution_run_uuid": generation.snapshot.get("execution_run_uuid")},
             "player_availability": {str(pid): per_player[pid] for pid in squad_ids},
             "warnings": warnings,
             "timing_seconds": {"worlds": round(world_seconds, 1), "policy": round(policy_seconds, 1),

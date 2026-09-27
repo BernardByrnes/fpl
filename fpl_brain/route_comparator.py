@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
-from . import manager_lineup, monte_carlo, transfer_state as ts
+from . import certified_bundle, manager_lineup, monte_carlo, transfer_state as ts
 from .season_rules import CHIP_NAME_KEYWORDS
 
 PHASE7B_VERSION = "route_comparator_v7b_1.0.0"
@@ -105,8 +105,149 @@ class EventBundle:
     simulations: int = 2000
     seed: int = 20260911
     planning_cutoff: str | None = None
+    #: The DATA snapshot identity this bundle was built from (the immutable
+    #: execution snapshot captured at ``planning_cutoff``), never a code fingerprint.
     source_snapshot_sha256: str | None = None
+    #: The CODE identity the certified runs came from.
+    code_snapshot_sha256: str | None = None
+    planning_context_hash: str | None = None
+    #: The model version each family's run carries, as DECLARED by the generator of
+    #: this carrier.  Nothing is gated on the declaration: the authority is the
+    #: certified generation's digest-verified manifest, and ``EventBundle`` is plain
+    #: data ergonomics on top of it.
     model_versions: Mapping[str, str] = field(default_factory=dict)
+    #: The canonical identity of the CERTIFIED bundle these exact run ids came from,
+    #: as recorded in the generation's manifest.  A LABEL for a reader, not a
+    #: capability: ``generation.manifest['per_event'][event]['bundle_identity']``.
+    certified_bundle_identity: str | None = None
+
+    def certified_runs(self) -> dict[str, int]:
+        """The bundle's exact run ids under their model-family names."""
+
+        return {
+            "minutes_v1": int(self.minutes_run_id),
+            "team_strength_v1": int(self.team_run_id),
+            "player_rates_v1": int(self.rate_run_id),
+            "xpts_v1": int(self.xpts_run_id),
+            **(
+                {}
+                if self.mc_run_id is None
+                else {"monte_carlo_v1": int(self.mc_run_id)}
+            ),
+        }
+
+    def as_identity_payload(self) -> dict:
+        """The canonical identity payload of this bundle, in its persisted shape."""
+
+        from . import certified_bundle as cb
+
+        return cb.bundle_identity_payload(
+            event=int(self.event),
+            cutoff=self.planning_cutoff,
+            runs=self.certified_runs(),
+            model_versions=self.model_versions,
+            code_snapshot_sha256=self.code_snapshot_sha256,
+            data_snapshot_sha256=self.source_snapshot_sha256,
+            planning_context_hash=self.planning_context_hash,
+        )
+
+
+def certified_event_bundle(
+    *,
+    event: int,
+    runs: Mapping[str, int],
+    cutoff: str,
+    model_versions: Mapping[str, str],
+    simulations: int = 2000,
+    seed: int = 20260911,
+    code_snapshot_sha256: str | None = None,
+    data_snapshot_sha256: str | None = None,
+    planning_context_hash: str | None = None,
+) -> EventBundle:
+    """Build an ``EventBundle`` that DECLARES its certified provenance.
+
+    The ONE constructor a producer may use to hand exact certified run ids to a
+    predictive loader: the identity is computed by the single shared algorithm, and
+    the declared model versions are the ones the certification recorded.  There is
+    deliberately no convenience default that would let a bundle reach the loader
+    without them.
+    """
+
+    from . import certified_bundle as cb
+
+    resolved_versions = {str(family): str(version) for family, version in model_versions.items()}
+    runs = {str(family): int(run_id) for family, run_id in runs.items()}
+    return EventBundle(
+        event=int(event),
+        minutes_run_id=runs["minutes_v1"],
+        team_run_id=runs["team_strength_v1"],
+        rate_run_id=runs["player_rates_v1"],
+        xpts_run_id=runs["xpts_v1"],
+        mc_run_id=runs.get("monte_carlo_v1"),
+        simulations=int(simulations),
+        seed=int(seed),
+        planning_cutoff=str(cutoff),
+        source_snapshot_sha256=data_snapshot_sha256,
+        code_snapshot_sha256=code_snapshot_sha256,
+        planning_context_hash=planning_context_hash,
+        model_versions=resolved_versions,
+        certified_bundle_identity=cb.certified_bundle_identity_for(
+            event=int(event),
+            cutoff=str(cutoff),
+            runs=runs,
+            model_versions=resolved_versions,
+            code_snapshot_sha256=code_snapshot_sha256,
+            data_snapshot_sha256=data_snapshot_sha256,
+            planning_context_hash=planning_context_hash,
+        ),
+    )
+
+
+def event_bundle_from_generation(
+    generation: Any,
+    event: int,
+    *,
+    simulations: int = 2000,
+    seed: int = 20260911,
+) -> EventBundle:
+    """The bundle one event's certified GENERATION names, as plain data.
+
+    An ``EventBundle`` is an ergonomic carrier here, not an authorisation: the run
+    ids and versions come from the generation's digest-verified manifest, and the
+    identity is recomputed by the one shared algorithm so a consumer can see which
+    certified bundle the values belong to.  Nothing is gated on the object.
+    """
+
+    from . import certified_bundle as cb
+
+    record = (generation.manifest.get("per_event") or {}).get(str(int(event))) or {}
+    runs = {str(family): int(run_id) for family, run_id in (record.get("runs") or {}).items()}
+    missing = [family for family in cb.LOAD_REQUIRED_FAMILIES if family not in runs]
+    if missing:
+        raise certified_bundle.CertificationRefused(
+            cb.STATE_EVIDENCE_MISSING,
+            [
+                f"event {int(event)}: generation {generation.generation_id} names no run for "
+                f"{sorted(missing)}"
+            ],
+        )
+    versions = {str(family): str(version) for family, version in (record.get("model_versions") or {}).items()}
+    return EventBundle(
+        event=int(event),
+        minutes_run_id=runs["minutes_v1"],
+        team_run_id=runs["team_strength_v1"],
+        rate_run_id=runs["player_rates_v1"],
+        xpts_run_id=runs["xpts_v1"],
+        mc_run_id=runs.get("monte_carlo_v1"),
+        simulations=int(simulations),
+        seed=int(seed),
+        planning_cutoff=str(generation.cutoff),
+        source_snapshot_sha256=(generation.manifest.get("data_snapshot") or {}).get("sha256"),
+        code_snapshot_sha256=generation.manifest.get("code_snapshot_sha256"),
+        planning_context_hash=record.get("planning_context_hash"),
+        model_versions=versions,
+        certified_bundle_identity=str(record.get("bundle_identity") or "") or None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,20 +413,67 @@ def _best_policy(squad_ids, positions, world_matrix, *, top_k: int = 1):
 
 def compare_routes(
     *,
-    bundles: Mapping[int, EventBundle],
+    generation: Any | None = None,
     routes: Sequence[TransferRoute],
     initial_state: ts.RouteState,
     scenario: PriceScenario,
     player_meta: Mapping[int, ts.PlayerMeta],
     conn=None,
-    world_provider: Callable[[int], Mapping[str, Any]] | None = None,
+    non_production_worlds: Any | None = None,
     simulations: int = 2000,
     seed: int = 20260911,
     planning_cutoff: str | None = None,
+    events: Sequence[int] | None = None,
+    **descriptors: Any,
 ) -> dict[str, Any]:
-    """Evaluate every explicit route in shared per-event football worlds."""
+    """Evaluate every explicit route in shared per-event football worlds.
 
-    events = sorted(int(event) for event in bundles)
+    Predictive data enters through exactly two declared doors, and the comparator
+    keeps the SAME boundary as the optimizer's loader:
+
+    * the CERTIFIED door, which requires a loaded certified GENERATION.  Worlds are
+      re-simulated from that generation's exact certified run ids, and the
+      generation's manifest was digest-verified, snapshot-pinned and re-validated
+      against the run rows before it was loaded -- so a hand-assembled "newest run
+      per family" bundle, or a caller's own run-id mapping, has no route in at all;
+    * the declared NON-PRODUCTION door
+      (``route_optimizer.NonProductionWorlds``), for worlds that are not read from
+      a prediction run at all.  It names who is exercising it, and it is refused
+      outright when a certified generation is presented.
+    """
+
+    from . import route_optimizer as ro
+
+    ro.refuse_predictive_descriptors(descriptors, caller="route_comparator.compare_routes")
+    if non_production_worlds is not None and generation is not None:
+        raise certified_bundle.CertificationRefused(
+            ro.DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN,
+            [
+                "a certified generation names the certified run ids, and a non-production "
+                "world source was supplied beside it; a certified comparison never consumes "
+                "injected worlds"
+            ],
+        )
+    if generation is None and non_production_worlds is None:
+        raise certified_bundle.CertificationRefused(
+            ro.DIAG_CERTIFIED_GENERATION_REQUIRED,
+            [
+                "compare_routes requires a certified GENERATION or a declared non-production world "
+                "source; a caller cannot supply bundles or run-id mappings in their place"
+            ],
+        )
+
+    bundles = (
+        {
+            int(event): event_bundle_from_generation(
+                generation, int(event), simulations=int(simulations), seed=int(seed)
+            )
+            for event in (events if events is not None else generation.events)
+        }
+        if generation is not None
+        else {}
+    )
+    events = sorted(int(event) for event in (events if events is not None else bundles))
     route_problems = validate_routes(routes, events)
 
     union_ids = {int(p.player_id) for p in initial_state.players}
@@ -295,15 +483,36 @@ def compare_routes(
             union_ids.update(int(a.in_player_id) for a in step.transfer_batch.actions)
 
     # ONE football world set per event, shared by every route.
+    non_production_matrices = (
+        non_production_worlds.matrices_or_none() if non_production_worlds is not None else None
+    )
     worlds_by_event: dict[int, Mapping[str, Any]] = {}
     worlds_generation: list[dict[str, Any]] = []
     for event in events:
-        if world_provider is not None:
-            matrix = world_provider(event)
+        if non_production_matrices is not None and int(event) in non_production_matrices:
+            matrix = non_production_matrices[int(event)]
+            ro._stamp_matrix_identity(
+                matrix,
+                f"{non_production_worlds.stamp()}|injected:{int(event)}:{int(simulations)}:"
+                f"{int(seed)}:{len(union_ids)}",
+            )
+        elif non_production_worlds is not None and non_production_worlds.provider is not None:
+            matrix = non_production_worlds.provider(event, sorted(union_ids))
+            ro._stamp_matrix_identity(
+                matrix,
+                f"{non_production_worlds.stamp()}|injected:{int(event)}:{int(simulations)}:"
+                f"{int(seed)}:{len(union_ids)}",
+            )
         else:
             if conn is None:
-                raise RouteSpecError("compare_routes needs a connection or a world_provider")
+                raise RouteSpecError(
+                    "compare_routes needs a connection or a declared non-production world source"
+                )
             bundle = bundles[event]
+            # The comparator's own DB branch is a predictive-data loader too, so it
+            # crosses the SAME generation boundary: the run ids are the certified
+            # generation's, and its manifest was already digest-verified, snapshot-
+            # pinned and re-proven against the run rows before it was loaded.
             fixtures = monte_carlo.load_fixture_inputs(
                 conn, event=event, xpts_run_id=int(bundle.xpts_run_id),
                 minutes_run_id=int(bundle.minutes_run_id), team_run_id=int(bundle.team_run_id),

@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """Production rolling four-Gameweek (GW4-GW7) decision runner.
 
-Feeds GW4, GW5, GW6, GW7 into the accepted multi-event optimizer path and then
-into ``fpl_brain.four_gw_decision.evaluate_four_gw_decision``.
+The four-Gameweek horizon is fed into the accepted multi-event optimizer path and
+then into ``fpl_brain.four_gw_decision.evaluate_four_gw_decision``.  This module is
+the DECLARED production decision pipeline:
+
+.. code-block:: text
+
+    fpl_brain.generation_store.make_decision(...)
+        -> scripts/run_four_gw_decision.py:run_certified_four_gw_decision(...)
 
 Stages
 ------
 ``bundle``  verify coherent accepted predictive support for every decision event
             at ONE cutoff, and write the four-event bundle artifact.
-``search``  run the accepted bounded multi-event route search (ROLL + non-chip
-            routes), adapt the results, and emit the four-GW decision board.
+``search``  take the production DECISION through the canonical entrypoint
+            (``generation_store.make_decision``), which resolves and re-proves the
+            certified generation, opens its pinned snapshot READ-ONLY, runs this
+            module's pipeline, and persists the decision artifact with an
+            ``engine_decision_records`` row.
 ``all``     bundle then search (search refuses if the horizon is incomplete).
+
+The decision is descriptor-only: the manager packet identifies the manager and may
+carry assertions to validate, while the canonical economic state is derived inside
+the trusted boundary from the pinned snapshot.  NOTHING predictive -- no bundle
+mapping, no run-id mapping, no matrix, no cache handle, no executor -- can reach a
+predictive load from the caller.  The exact run ids come from the generation's
+digest-verified manifest and the causal source rows from the pinned snapshot.
 
 Read/write only: no transfer or chip is executed, no readiness gate is weakened,
 and no search-stability ladder is re-run.
@@ -30,6 +46,7 @@ from fpl_brain import analytics, candidate_universe as cu, decision_confidence a
 from fpl_brain import finalist_refinement as fr
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import certified_bundle
+from fpl_brain import generation_store as gs
 from fpl_brain import manager_worlds, route_optimizer as ro, transfer_state as ts
 from fpl_brain import execution
 from fpl_brain import ingest_provenance as provenance
@@ -164,6 +181,12 @@ def _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy) -> list
     return sorted(ids)
 
 
+#: The content-addressed world cache the certified loaders use.  The cache is
+#: OPTIMIZATION, not authority (amendment 2 section 12), and it is deliberately NOT a
+#: caller input: a production decision owns its cache location, so a caller cannot
+#: point a predictive load at a cache it chose.
+WORLD_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache" / "manager_worlds"
+
 SEED = 20260911
 #: Stage-1 (screening) draw count.  This is the count ACTUALLY used to build the
 #: shared per-event world matrices for every event, and it is what the artifact
@@ -225,17 +248,19 @@ def _money(tenths) -> str:
     return "n/a" if tenths is None else f"£{int(tenths) / 10:.1f}m"
 
 
-def bundle_for(event: int, runs: dict, cutoff: str, draws: int):
+def bundle_for(event: int, generation, draws: int, seed: int = SEED):
+    """The CERTIFIED bundle for one event, derived from the certified GENERATION.
+
+    The run ids, the model versions and the identity all come from the generation's
+    digest-verified manifest, through the ONE shared constructor -- so this is a plain
+    data carrier for the frozen search, not an authorisation, and there is no path by
+    which a caller's own run ids could be substituted.
+    """
+
     from fpl_brain import route_comparator as rc
 
-    return rc.EventBundle(
-        event=int(event),
-        minutes_run_id=int(runs["minutes_v1"]),
-        team_run_id=int(runs["team_strength_v1"]),
-        rate_run_id=int(runs["player_rates_v1"]),
-        xpts_run_id=int(runs["xpts_v1"]),
-        mc_run_id=int(runs["monte_carlo_v1"]),
-        simulations=int(draws), seed=SEED, planning_cutoff=cutoff,
+    return rc.event_bundle_from_generation(
+        generation, int(event), simulations=int(draws), seed=int(seed)
     )
 
 
@@ -247,32 +272,28 @@ def draws_for(event: int, decision_events) -> int:
     return STAGE1_DRAWS
 
 
-def _certification_events(path) -> list[int] | None:
-    """Read the certified decision events from an artifact WITHOUT validating it.
+def resolve_decision_generation(conn, *, planning_event: int, generation_id: str | None):
+    """Resolve and re-prove the certified GENERATION this decision consumes.
 
-    Used only to resolve the authoritative planning event before the execution
-    guard exists.  Full validation still happens through
-    ``four_gw_decision.load_certification_artifact`` on the decision path.
+    Resolution, digest verification, event/horizon/cutoff checks, snapshot retention
+    and the full per-event bundle re-validation all happen inside the generation store,
+    so the runner cannot obtain a world by a route the boundary has not authorised.
     """
 
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    events = payload.get("events") or []
-    try:
-        resolved = [int(event) for event in events]
-    except (TypeError, ValueError):
-        return None
-    return resolved or None
+    generation = gs.resolve_generation(
+        conn, planning_event=int(planning_event), generation_id=generation_id,
+    )
+    gs.verify_generation(conn, generation.generation_id)
+    gs.require_snapshot_retained(generation)
+    return generation
 
 
-def _certified_role_evidence(conn, certified_runs, player_ids, decision_events, certification):
+def _certified_role_evidence(conn, certified_runs, player_ids, decision_events, generation):
     """Role evidence from the CERTIFIED minutes runs ONLY (R4B.2c).
 
     Reads the frozen MINUTES_V1 payloads of the exact minutes run ids named by the
-    certification bundles.  It never reads the latest minutes run, live scouting, or
-    any post-certification role evidence.
+    certified generation's manifest.  It never reads the latest minutes run, live
+    scouting, or any post-certification role evidence.
     """
 
     minutes_run_ids = sorted(
@@ -292,7 +313,7 @@ def _certified_role_evidence(conn, certified_runs, player_ids, decision_events, 
             if isinstance(block, dict):
                 evidence[pid] = block
     source = {
-        "certification_identity": certification.get("four_gw_certification_identity"),
+        "generation_id": generation.generation_id,
         "minutes_run_ids": minutes_run_ids,
         "player_ids": sorted(int(p) for p in player_ids),
         "provenance": "certified_minutes_run_only",
@@ -307,12 +328,16 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--event",
         type=int,
+        required=True,
+        help="planning Gameweek.  Required: there is no default Gameweek.",
+    )
+    parser.add_argument(
+        "--generation",
         default=None,
-        help="planning Gameweek. Omit to derive it from the certification artifact (authoritative); "
-             "if supplied it must match the certification's first event",
+        help="explicit certified generation id SELECTOR.  Omit to resolve the "
+             "current_generation pointer for this event",
     )
     parser.add_argument("--cutoff", required=True)
-    parser.add_argument("--cache-dir", default="data/cache/manager_worlds")
     parser.add_argument("--out-dir", default="data/exports/four_gw")
     parser.add_argument("--beam", type=int, default=8)
     parser.add_argument("--exact-budget", type=int, default=20)
@@ -332,40 +357,16 @@ def main(argv=None) -> int:
              "Must be strictly greater than the Stage-1 draw count; the artifact "
              "reports the count that actually ran.",
     )
-    parser.add_argument(
-        "--certification",
-        help="path to the authoritative certification artifact (REQUIRED for --stage search|all)",
-    )
     args = parser.parse_args(argv)
 
     started = time.time()
     config = load_config(args.config)
 
     # --- Event safety -------------------------------------------------------
-    # The certification artifact is AUTHORITATIVE for the planning event.  There
-    # is deliberately no GW4 default: omitting --event without a certification is
-    # an error, and a supplied --event that contradicts the certification is a
-    # hard stop (DECISION_EVENT_MISMATCH).
-    cert_events = _certification_events(args.certification) if args.certification else None
-    if args.event is None:
-        if not cert_events:
-            print(
-                "decision refused: --event is required when no readable --certification artifact is "
-                "supplied (there is no default Gameweek)",
-                file=sys.stderr,
-            )
-            return 2
-        planning_event = int(cert_events[0])
-    else:
-        planning_event = int(args.event)
-        if cert_events and int(cert_events[0]) != planning_event:
-            print(
-                f"decision refused: {DIAG_DECISION_EVENT_MISMATCH}: --event {planning_event} does not "
-                f"match the certification's first event {int(cert_events[0])}; the certification is "
-                "authoritative",
-                file=sys.stderr,
-            )
-            return 2
+    # There is deliberately no GW4 default: the planning event is supplied by the
+    # operator and the certified GENERATION must agree with it, or the decision is
+    # refused (DECISION_EVENT_MISMATCH).
+    planning_event = int(args.event)
 
     conn = connect_database(config_path(config, "database"))
     entered_guard = None
@@ -396,12 +397,21 @@ def main(argv=None) -> int:
         squad = manager_worlds.resolve_squad(context, conn)
         initial_state = __import__("fpl_brain.route_comparator", fromlist=["x"]).build_route_state(conn, context, squad)
 
-        # --- Stage A: coherence of the four-event predictive bundle -----------
-        # NON-PRODUCTION readiness display only.  This legacy path picks the newest
-        # same-cutoff run per family and validates no dependency edges, so it is
-        # used for the readiness PRINT and never for the production decision below.
-        support = fg.event_support_from_db(conn, decision_events, cutoff)
-        print("readiness support source: NON-PRODUCTION latest-per-family rediscovery")
+        # --- Stage A: readiness, resolved from the CERTIFIED GENERATION ----------
+        # PE-9 gap 3: readiness resolves the certified generation/pointer.  The
+        # latest-per-family rediscovery is NOT the readiness source any more; it is
+        # kept only as an explicitly labelled NON-PRODUCTION diagnostic below.
+        try:
+            readiness_generation = resolve_decision_generation(
+                conn, planning_event=planning_event, generation_id=args.generation,
+            )
+        except (gs.GenerationRefused, certified_bundle.CertificationRefused) as failure:
+            print(f"decision refused: {failure}", file=sys.stderr)
+            return _refuse_execution(guard, 6, str(failure))
+        support = gs.support_by_event(readiness_generation)
+        print(
+            f"readiness support source: certified generation {readiness_generation.generation_id[:24]}…"
+        )
         horizon = fg.evaluate_horizon(planning_event=planning_event, support_by_event=support,
                                       cutoff=cutoff, last_event=last_event)
         bundle_artifact = {
@@ -444,570 +454,67 @@ def main(argv=None) -> int:
             print(f"  readiness complete; artifact={out_dir / 'four_gw_bundle.json'}")
             return 0
 
-        # --- Production decision gate: a certified bundle is MANDATORY ----------
-        # No fallback to latest-per-family discovery.  Without an authoritative
-        # certification artifact this refuses with DECISION_CERTIFICATION_REQUIRED.
-        if not args.certification:
-            print(
-                "decision refused: DECISION_CERTIFICATION_REQUIRED: --certification <artifact> is "
-                "required for --stage search|all; a production decision must consume certified run ids",
-                file=sys.stderr,
-            )
-            return _refuse_execution(guard, 6, "DECISION_CERTIFICATION_REQUIRED: no artifact supplied")
-        try:
-            certification = fg.load_certification_artifact(args.certification)
-            certified_support = fg.event_support_from_certification(
-                conn, certification, events=decision_events, cutoff=cutoff
-            )
-        except fg.DecisionCertificationRequired as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            return _refuse_execution(guard, 6, str(failure))
-        except certified_bundle.BundleIncoherent as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            return _refuse_execution(guard, 6, str(failure))
-        print(
-            f"certified bundles accepted: snapshot={str(certification.get('data_snapshot_sha256'))[:16]}… "
-            f"identity={str(certification.get('four_gw_certification_identity'))[:16]}…"
-        )
-        for event in decision_events:
-            record = certified_support[int(event)]
-            print(f"  GW{event}: certified runs={record['matched_runs']} "
-                  f"bundle={record['bundle_identity'][:16]}…")
-
-        # --- ONE certified generation, everywhere ------------------------------
-        # Discovery/screening, exact evaluation and the decision board must all
-        # describe the SAME certified generation.  The readiness-only `support`
-        # above is a NON-PRODUCTION rediscovery and is never used for the
-        # decision.  The equivalence of the two generations actually consumed is
-        # asserted below, once the bundles exist.
-        certified_runs = {
-            int(event): certified_support[int(event)]["matched_runs"] for event in decision_events
-        }
-        certified_horizon = fg.evaluate_horizon(
-            planning_event=planning_event, support_by_event=certified_support,
-            cutoff=cutoff, last_event=last_event,
-        )
-        if not certified_horizon["complete"]:
-            print(
-                f"decision refused: {certified_horizon['status']}: the CERTIFIED horizon is incomplete "
-                f"blocked_events={certified_horizon['blocked_events']}",
-                file=sys.stderr,
-            )
-            return _refuse_execution(guard, 6, "certified decision horizon incomplete")
-        search_provenance = {
-            "planning_cutoff": cutoff,
-            "planning_context_hash": analytics.canonical_hash({
-                "entry_id": entry_id,
-                "planning_event": planning_event,
-                "cutoff": cutoff,
-                "manager_state": (context.manager_state or {}),
-            }),
-            "four_gw_certification_identity": certification.get("four_gw_certification_identity"),
-            "data_snapshot_sha256": certification.get("data_snapshot_sha256"),
-            "decision_events": list(decision_events),
-            "certified_runs_by_event": {str(e): dict(certified_runs[int(e)]) for e in decision_events},
-        }
-        # The discovery/exact generation identities are added below, once the
-        # bundles exist and both generations can be compared.
-
-        # --- Stage B: bounded non-chip route search ---------------------------
-        import fpl_brain.route_comparator as rc
-
-        # SOURCE vs PREDICTION split.  All causal source state comes from the
-        # certification's immutable snapshot; predictive rows come from the live
-        # prediction DB using ONLY the certified exact run ids.
-        source_conn = fg.open_certification_source(certification)
-        try:
-            source_context = get_planning_context(
-                source_conn, entry_id, planning_event, as_of=cutoff, season=config.get("season")
-            )
-            source_squad = manager_worlds.resolve_squad(source_context, source_conn)
-            source_state = rc.build_route_state(source_conn, source_context, source_squad)
-        except Exception:
-            source_conn.close()
-            raise
-        if [int(pid) for pid in source_squad["squad_ids"]] != [int(pid) for pid in squad["squad_ids"]]:
-            print(
-                "decision refused: the certification snapshot's squad differs from the live squad; "
-                "the snapshot is the causal source for this decision",
-                file=sys.stderr,
-            )
-            source_conn.close()
-            return _refuse_execution(guard, 6, "snapshot squad differs from live squad")
-
-        bundles = {
-            int(event): bundle_for(
-                event, certified_runs[int(event)], cutoff, draws_for(event, decision_events)
-            )
-            for event in decision_events
-        }
-        snapshot = cu.price_snapshot_as_of(
-            source_conn, planning_event, cutoff,
-            required_player_ids=[int(pid) for pid in source_squad["squad_ids"]],
-        )
-        scenario = rc.flat_current_price_scenario(snapshot, decision_events)
-        pool = cu.load_pool(source_conn)
-        # --- Certified official-pool identity (R4B.1.1) ------------------------
-        # The snapshot's active pool must BE the latest accepted official
-        # bootstrap generation, by exact ID identity.  This reads ONLY the
-        # immutable snapshot (never live JSON, never the live DB) and refuses
-        # before candidate promotion, route generation or optimisation.
-        try:
-            pool_identity = provenance.assert_official_pool_identity(
-                accepted_generation=repo.latest_accepted_bootstrap_generation(source_conn),
-                snapshot_player_ids=repo.active_player_ids(source_conn),
-                enforce=True,
-            )
-        except provenance.OfficialPoolIncomplete as failure:
-            print(f"decision refused: {failure}", file=sys.stderr)
-            source_conn.close()
-            return _refuse_execution(guard, 6, str(failure))
-        print(
-            f"official pool identity: generation={pool_identity['official_generation_id']} "
-            f"count={pool_identity['snapshot_pool_count']} "
-            f"sha={str(pool_identity['snapshot_pool_ids_sha256'])[:16]}… "
-            f"match={pool_identity['official_pool_identity_match']}"
-        )
-        fixtures = cu.load_fixtures_by_team(source_conn, decision_events)
-        xpts_rows = {int(e): cu.load_projection_rows(conn, int(certified_runs[int(e)]["xpts_v1"]))
-                     for e in decision_events}
-        minutes_rows = {int(e): cu.load_projection_rows(
-            conn, int(certified_runs[int(e)]["minutes_v1"]), FAMILY_KINDS["minutes_v1"])
-            for e in decision_events}
-        # The generation actually consumed by DISCOVERY/SCREENING.
-        discovery_runs = {int(e): dict(certified_runs[int(e)]) for e in decision_events}
-        # The generation actually consumed by EXACT EVALUATION (the bundles).
-        exact_runs = {
-            int(e): {
-                "minutes_v1": int(bundles[int(e)].minutes_run_id),
-                "team_strength_v1": int(bundles[int(e)].team_run_id),
-                "player_rates_v1": int(bundles[int(e)].rate_run_id),
-                "xpts_v1": int(bundles[int(e)].xpts_run_id),
-                "monte_carlo_v1": int(bundles[int(e)].mc_run_id),
-            }
-            for e in decision_events
-        }
-        discovery_identity = analytics.canonical_hash(
-            {"cutoff": cutoff, "runs": {str(e): discovery_runs[int(e)] for e in decision_events}}
-        )
-        exact_identity = analytics.canonical_hash(
-            {"cutoff": cutoff, "runs": {str(e): exact_runs[int(e)] for e in decision_events}}
-        )
-        if discovery_identity != exact_identity:
-            print(
-                f"decision refused: {DIAG_PREDICTIVE_GENERATION_MISMATCH}: discovery generation "
-                f"{discovery_identity} != exact-evaluation generation {exact_identity}",
-                file=sys.stderr,
-            )
-            source_conn.close()
-            return _refuse_execution(guard, 6, DIAG_PREDICTIVE_GENERATION_MISMATCH)
-        universe = cu.build_universe(
-            pool=pool, events_fixtures=fixtures, xpts_rows_by_event=xpts_rows,
-            minutes_rows_by_event=minutes_rows, events=list(decision_events),
-            owned_ids=source_squad["squad_ids"], price_snapshot=snapshot,
-            config=cu.CandidateConfig(top_n_per_criterion=20), planning_cutoff=cutoff,
-            run_refs={"events": list(decision_events),
-                      "runs": {str(e): certified_runs[int(e)] for e in decision_events}},
-        )
-        meta_ids = {int(row["player_id"]) for row in universe["universe"]}
-        player_meta = rc.load_player_meta(source_conn, meta_ids)
-        universe["replacement_edges"] = cu.build_replacement_edges(
-            universe_rows=universe["universe"], owned_ids=source_squad["squad_ids"], state=source_state,
-            price_snapshot=snapshot, player_meta=player_meta,
-        )
-        screen = fg.screen_legal_actions(
-            universe_rows=universe["universe"], replacement_edges=universe["replacement_edges"],
-            owned_ids=source_squad["squad_ids"], decision_events_window=decision_events,
-        )
-        optimizer_config = ro.OptimizerConfig(
-            events=tuple(decision_events), search_draws=STAGE1_DRAWS, seed=SEED,
-            beam_width=int(args.beam), exact_evaluation_budget=int(args.exact_budget),
-            search_n_per_criterion=int(args.search_n), singles_per_out=int(args.singles_per_out),
-            max_transfers_per_event=int(args.max_transfers_per_event),
-            policy_selection_worlds=0,
-        )
-        # A "refinement" that is not higher fidelity would still be reported as one,
-        # so it is refused before any work is done.
-        if int(args.stage2_draws) <= int(STAGE1_DRAWS):
-            print(
-                f"decision refused: --stage2-draws {int(args.stage2_draws)} must exceed the Stage-1 "
-                f"draw count {STAGE1_DRAWS}",
-                file=sys.stderr,
-            )
-            source_conn.close()
-            return _refuse_execution(guard, 6, "stage2 draws not higher than stage1")
-        # All-player discovery accounting, asserted BEFORE any route search.
-        discovery = cu.discovery_completeness(
-            pool=pool,
-            universe_rows=universe["universe"],
-            excluded=universe.get("excluded") or [],
-            replacement_edges=universe["replacement_edges"],
-            screen=screen,
-            enforce=True,
-        )
-        t0 = time.time()
-        stage1_result = ro.optimize(
-            universe=universe, initial_state=source_state, scenario=scenario, player_meta=player_meta,
-            bundles=bundles, conn=conn, config=optimizer_config, cache_dir=Path(args.cache_dir),
-            provenance={**search_provenance,
-                        "discovery_certification_identity": discovery_identity,
-                        "exact_evaluation_certification_identity": exact_identity},
-            parallel_workers=parallel_workers,
-        )
-        search_seconds = time.time() - t0
-
-        # --- R4B.2b Stage 2: FINALIST-ONLY precision refinement ----------------
-        # Same seed, same certified bundles, same route legality, same discovery
-        # universe; the ONLY changed input is the shared-world draw count.  The
-        # refinement also publishes the one canonical paired record below.
-        t_refine = time.time()
-        # ONE run-scoped exact-evaluation cache, shared by the Stage-2 refinement and the
-        # single stability escalation.  Reuse is keyed on the COMPLETE evaluation
-        # identity (event, canonical squad, draws, seed, world provenance), and both
-        # calls run at the same draw count, seed and certified worlds, so a shared entry
-        # is literally the same evaluation.  The cache never leaves the run.
-        cancel_probe = _cancel_probe(guard)
-        run_exact_cache: dict = {}
-        refinement = fr.refine_finalists(
-            universe=universe, initial_state=source_state, scenario=scenario,
-            player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
-            stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
-            cache_dir=Path(args.cache_dir),
-            exact_cache=run_exact_cache, cancel_probe=cancel_probe,
-            parallel_workers=parallel_workers,
-        )
-        t_refine_finished = time.time()
-        stage2_result = refinement["refined"]
-        stage2_parallel = (stage2_result.get("parallel_exact") or {}).get("worker_count")
-        print(f"exact cache: {len(run_exact_cache)} entries after the Stage-2 refinement; "
-              f"stage2 parallel workers={stage2_parallel}")
-
-        # --- R4B.2b REPAIR: stability FIRST, so the final ranking is known ------
-        # The gate may run the ONE bounded escalation (the next supported search
-        # breadth, at the Stage-2 draw budget, in the SAME worlds).  Its widened
-        # result is captured through a sink because the stability REPORT is
-        # serialized into the artifact and a world matrix must never be.  The
-        # leader-change comparison is always Stage-2 versus Stage-1: the gate asks
-        # whether widening the search changes the answer the narrow budget gave.
-        leader_change = fr.analyze_leader_change(stage1_result, stage2_result)
-        escalated_sink: dict = {}
-        t_stability = time.time()
-        stability = fr.assess_search_stability(
-            refined_result=stage2_result,
-            leader_change=leader_change,
-            canonical_paired=refinement["canonical_paired_near_tie"],
-            escalation=_escalation_runner(
-                universe=universe, initial_state=source_state, scenario=scenario,
-                player_meta=player_meta, bundles=bundles, conn=conn, base_config=optimizer_config,
-                stage1_result=stage1_result, stage2_draws=int(args.stage2_draws),
-                prebuilt_worlds=refinement.get("prebuilt_worlds"),
-                finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
-                exact_cache=run_exact_cache,
-                cancel_probe=cancel_probe,
-                parallel_workers=parallel_workers,
-            ),
-            config=fr.StabilityGateConfig(current_beam=int(args.beam)),
-            escalated_result_sink=escalated_sink,
-            cancel_probe=cancel_probe,
-        )
-        stability_seconds = time.time() - t_stability
-        escalated_result = escalated_sink.get("result")
-
-        # §4: after an escalation the FINAL ranking is the widened-search ranking,
-        # evaluated on the same Stage-2 worlds.  Without an escalation it is the
-        # Stage-2 finalist ranking.
-        final = fr.final_ranking_after_escalation(
-            stage2_result=stage2_result, escalated_result=escalated_result,
-        )
-        # From here on the DECISION is taken at the final supported evaluation
-        # budget: `result` is that final result (widened when the escalation ran),
-        # and both Stage 1 and the Stage-2-only ranking are reported separately.
-        # This also keeps the documented
-        # `result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)` consumption path exactly
-        # as the confidence contract requires.
-        result = final["result"]
-
-        transfers_by_route = {}
-        for route_id, record in (result.get("routes") or {}).items():
-            transfers_by_route[route_id] = {
-                int(action["event"]): [{"out": int(m["out"]), "in": int(m["in"])} for m in action.get("transfers") or []]
-                for action in (record.get("actions") or [])
-            }
-        # R5-P0-01: `result` is a route_optimizer result, so it must cross the OPTIMIZER
-        # boundary.  `routes_for_decision` is the comparator boundary and would adapt every
-        # optimizer route to an empty per_event with null terminal accounting, which the
-        # eligibility gate then (correctly) reported as an incomplete route - excluding every
-        # route and emitting no recommendation at all.
-        routes = fg.optimizer_routes_for_decision(
-            result.get("routes") or {}, transfers_by_route=transfers_by_route)
-        baseline = next((row["route_id"] for row in routes if not any(r["transfers"] for r in row["per_event"])), None)
-        # First pass: the transfer decision.  The H1 lineup is then taken from the
-        # PREFERRED route (or, when suppressed, from the baseline) so the
-        # operator-visible lineup always belongs to the route being recommended.
-        decision = fg.evaluate_four_gw_decision(
-            planning_event=planning_event, support_by_event=certified_support, cutoff=cutoff,
-            last_event=last_event, screened_actions=screen, routes=routes,
-            baseline_route_id=baseline, lineup=None,
-        )
-        preferred_route_id = (decision.get("transfer_recommendation") or {}).get("preferred_route_id")
-        lineup_route_id = preferred_route_id or baseline
-        lineup_policy = fg.lineup_policy_for_route(
-            routes=routes, route_id=lineup_route_id, decision_events_window=decision_events,
-        )
-        if lineup_policy is not None:
-            decision = fg.evaluate_four_gw_decision(
-                planning_event=planning_event, support_by_event=certified_support, cutoff=cutoff,
-                last_event=last_event, screened_actions=screen, routes=routes,
-                baseline_route_id=baseline,
-                lineup={"status": fg.LINEUP_ONLY, "policy": lineup_policy,
-                        "lineup_route_id": lineup_route_id, "lineup_basis": "CURRENT_GW_H1"},
-            )
-        else:
-            lineup_route_id = None
-        # --- R4B.2c: four-GW fixture horizon (from the CERTIFICATION snapshot) --
-        fixture_horizon = fg.classify_fixture_horizon(
-            source_conn, decision_events,
-            last_event=fg.season_last_event_from_db(source_conn),
-        )
-        source_conn.close()
-
-        # --- R4B.2b REPAIR §5: canonical paired record from the FINAL ranking ---
-        # route_a is the FINAL preferred route and route_b is the ACTUAL next-ranked
-        # route in the FINAL (post-escalation) ranking — not the old Stage-2
-        # finalist runner-up.  The decision layer is authoritative for which route
-        # is preferred (it may in principle exclude a route the optimizer ranked
-        # first), so it is passed in explicitly and the comparator follows from the
-        # FINAL ranking.
-        decision_preferred = (decision.get("transfer_recommendation") or {}).get("preferred_route_id")
-        final = fr.final_ranking_after_escalation(
-            stage2_result=stage2_result,
-            escalated_result=escalated_result,
-            preferred_route_id=decision_preferred or final["final_ranking"]["preferred_route_id"],
-        )
-        final_leader = final["final_ranking"]["preferred_route_id"]
-        comparator = final["final_ranking"]["runner_up_route_id"]
-        canonical = final["canonical_paired_near_tie"]
-        refinement["stage2_finalist_ranking"] = {
-            "preferred_route_id": final["stage2_leader_route_id"],
-            "runner_up_route_id": None,
-        }
-        refinement["optimizer_ranked_leader_route_id"] = final["stage2_leader_route_id"]
-        refinement["final_rank_1_route_id"] = final["final_rank_1_route_id"]
-        refinement["ranking_source"] = final["ranking_source"]
-        refinement["comparator_source"] = final["comparator_source"]
-        refinement["canonical_alignment"] = final["canonical_alignment"]
-        refinement["canonical_paired_near_tie"] = canonical
-        refinement["final_ranking"] = dict(final["final_ranking"])
-        refinement["simulation_fidelity"]["final_ranking"] = dict(final["final_ranking"])
-        refinement["simulation_fidelity"]["canonical_paired_near_tie"] = canonical
-        refinement["leader_change"] = leader_change
-        refinement["stability"] = stability
-        refinement["simulation_fidelity"]["leader_change"] = leader_change
-        refinement["simulation_fidelity"]["stability"] = stability
-        refinement["timing_s"] = _stage_timings(
-            search_seconds=search_seconds, refine_started=t_refine,
-            refine_finished=t_refine_finished, stability_seconds=stability_seconds)
-        result["canonical_paired_near_tie"] = canonical
-        print(
-            f"refinement: finalists={len(refinement['finalist_selection']['finalist_route_ids'])} "
-            f"stage2_draws={int(args.stage2_draws)} prefix="
-            f"{(refinement.get('prefix_invariance') or {}).get('status')} "
-            f"leader_change={leader_change['changed']}/{leader_change['accepted']} "
-            f"stability={stability['state']} escalation={stability['escalation_used']} "
-            f"ranking_source={final['ranking_source']} "
-            f"({stability_seconds:.1f}s)"
-        )
-        if escalated_result is not None:
-            print(
-                f"  escalation to beam {stability['escalation_beam']} re-ranked "
-                f"{len(result.get('routes') or {})} routes on the Stage-2 worlds; "
-                f"final leader {final_leader} (Stage-2 leader was {final['stage2_leader_route_id']})"
-            )
-        if canonical is None:
-            print(
-                f"confidence: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED}: no canonical paired record for "
-                f"leader={final_leader} comparator={comparator}; confidence cannot be decisive and "
-                "search stability cannot be claimed",
-                file=sys.stderr,
-            )
-
-        # --- R4B.2c: decision confidence (computed AFTER ranking; never ranks) --
-        # Paired CRN near-tie is CONSUMED from the route comparison when the result
-        # exposes it; otherwise it is reported unavailable and the state cannot claim
-        # a near tie.
-        # --- ROLE-RELEVANT PLAYER SET (R4B.2c integration correction 1, REPAIR §6) --
-        # NOT the certified squad.  The players whose role drives the
-        # recommendation's thesis are: everyone transferred IN, everyone transferred
-        # OUT, and the armband, **of the FINAL preferred route** — so a widened
-        # search that changes the preferred route also moves the role-relevant set.
-        # A transfer-IN player is usually NOT in the pre-transfer certified squad and
-        # must nevertheless be evaluated.
-        preferred_key = final_leader or preferred_route_id or lineup_route_id
-        role_relevant_players = _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy)
-
-        # --- CANONICAL PAIRED CRN DIAGNOSTIC (integration correction 2) --------
-        # Exactly one canonical record: the FINAL preferred leader versus its
-        # relevant runner-up/comparator.  Legacy keys are accepted only as a
-        # fallback; when no canonical record exists, confidence must NOT infer
-        # "not near tied".
-        paired_record = result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)
-        if not isinstance(paired_record, dict):
-            paired_record = None
-            for key in ("leader_paired", "paired_leader_vs_runner_up"):
-                candidate = result.get(key)
-                if isinstance(candidate, dict) and (
-                    "mean_difference" in candidate or "near_tied" in candidate
-                ):
-                    paired_record = candidate
-                    break
-        if not isinstance(paired_record, dict) or not paired_record:
-            print(
-                f"confidence: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED}: route comparison published no "
-                f"canonical paired diagnostic ({dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY}); confidence "
-                "cannot be decisive",
-                file=sys.stderr,
-            )
-
-        role_evidence, role_source = _certified_role_evidence(
-            conn, certified_runs, role_relevant_players, decision_events, certification
-        )
-        confidence = dc.classify_decision_confidence(
-            paired=paired_record,
-            role_evidence=role_evidence,
-            focus_player_ids=role_relevant_players,
-            role_evidence_source=role_source,
-        )
-        dc.assert_confidence_invariants(confidence)
-
-        # --- Suppression is applied BEFORE the artifact is written --------------
-        # Every gate that removes decisiveness must be visible in the artifact that
-        # is actually on disk.  Deferred suppression would leave the file asserting
-        # a recommendation the runner no longer stands behind.
-        suppression_reasons: list[str] = []
-        if not fixture_horizon["complete"]:
-            # R4B.2c decision gate: an unresolved fixture that could alter any team's
-            # fixture set inside the four-GW window blocks the normal transfer
-            # recommendation.  It is SUPPRESSED, never replaced by a "best H1 transfer".
-            _suppress_transfer_recommendation(
-                decision, reason=fg.DECISION_HORIZON_INCOMPLETE,
-                extra={"fixture_horizon_blocking_reasons": fixture_horizon["blocking_reasons"]},
-            )
-            suppression_reasons.append(fg.DECISION_HORIZON_INCOMPLETE)
-            print(
-                "transfer recommendation SUPPRESSED: fixture horizon incomplete "
-                f"({len(fixture_horizon['blocking_reasons'])} blocking reason(s))"
-            )
-        if stability["state"] != fr.SEARCH_STABLE:
-            # R4B.2b search-stability gate: the bounded search cannot separate the
-            # preferred route from its alternatives at the widest supported budget.
-            # The route table stays available; decisiveness is removed, and there is
-            # deliberately no best-current-GW-transfer fallback.
-            _suppress_transfer_recommendation(
-                decision, reason=fg.DECISION_SEARCH_NOT_STABLE,
-                extra={
-                    "search_stability_state": stability["state"],
-                    "search_stability_basis": stability.get("stability_basis"),
-                    "search_budget_sequence": stability["search_budget_sequence"],
-                    "escalation_used": stability["escalation_used"],
-                },
-            )
-            suppression_reasons.append(fg.DECISION_SEARCH_NOT_STABLE)
-            print(
-                f"transfer recommendation SUPPRESSED: {stability['state']} "
-                f"(basis={stability.get('stability_basis')})"
-            )
-        if canonical is None:
-            # §5: a decisive recommendation requires the canonical paired record.  It
-            # could not be produced, so decisiveness is removed rather than inferred.
-            _suppress_transfer_recommendation(
-                decision, reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED,
-                extra={"paired_diagnostic_required": True,
-                       "search_stability_state": stability["state"]},
-            )
-            suppression_reasons.append(dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED)
-            print(
-                f"transfer recommendation SUPPRESSED: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED} "
-                f"(leader={final_leader} comparator={comparator})"
-            )
-
-        artifact = {
-            "schema": "fpl_brain.four_gw_decision.v1",
+        # --- Stage B: the DECISION, through the canonical entrypoint ------------
+        # The runner no longer assembles a decision of its own: it identifies the
+        # manager it is deciding FOR and calls ``generation_store.make_decision``, which
+        # resolves and re-proves the certified generation, opens its PINNED snapshot
+        # read-only, selects the DECLARED production pipeline by name, runs it, and
+        # persists the decision artifact together with the engine_decision_record.
+        # There is no certification object, no bundle mapping and no cache handle on
+        # this path: the predictive world IS the certified generation.
+        packet = {
+            "entry_id": entry_id,
             "planning_event": planning_event,
-            "planning_cutoff": cutoff,
-            "decision_events": list(decision_events),
-            "cutoff_guard": override,
-            "search": {
-                "engine": "route_optimizer.optimize (accepted bounded multi-event search)",
-                "config": optimizer_config.as_dict(),
-                "seconds": round(search_seconds, 1),
-                "world_info": stage1_result.get("world_info"),
-                "search_stats": stage1_result.get("search_stats"),
-                "exact_evaluations": stage1_result.get("exact_evaluations"),
-                "promoted_route_count": stage1_result.get("promoted_route_count"),
-                "flags": stage1_result.get("flags"),
-                "no_stability_ladder_rerun": True,
-                # Truthful draw provenance: Stage 1 screens EVERY route at this
-                # count for EVERY event.  The higher Stage-2 count is a FINALIST-ONLY
-                # refinement and is reported separately, never as route coverage.
-                "stage1_search_draws": STAGE1_DRAWS,
-                "draw_fidelity": {str(event): STAGE1_DRAWS for event in decision_events},
-            },
-            "finalist_refinement": {
-                "stage2_draws": int(args.stage2_draws),
-                "finalists": refinement["finalist_selection"],
-                "final_ranking": refinement["final_ranking"],
-                "optimizer_ranked_leader_route_id": refinement["optimizer_ranked_leader_route_id"],
-                "canonical_alignment": refinement["canonical_alignment"],
-                "leader_change": leader_change,
-                "stability": stability,
-                "route_table": {
-                    "routes": result.get("routes"),
-                    "flags": result.get("flags"),
-                    "exact_evaluations": result.get("exact_evaluations"),
-                },
-                "timing_s": refinement["timing_s"],
-                "no_recommendation": True,
-            },
-            "simulation_fidelity": refinement["simulation_fidelity"],
-            "parallel_exact_scheduling": {
-                "requested": parallel_workers,
-                "stage2_workers": stage2_parallel,
-                "escalation_workers": _scheduled_workers(escalated_result),
-                "stage1_workers": None,
-                "stage1_note": "Stage 1 stays sequential by design (see "
-                               "PRODUCTION_PARALLEL_EXACT_WORKERS)",
-                "semantics": "SCHEDULING_ONLY_BIT_IDENTICAL",
-            },
-            "canonical_paired_near_tie": canonical,
-            "fixture_horizon": fixture_horizon,
-            "decision_confidence": confidence,
-            "suppression_reasons": suppression_reasons,
-            "provenance": {
-                **search_provenance,
-                "search_artifact_cutoff": stage1_result.get("planning_cutoff"),
-                "search_artifact_context_hash": stage1_result.get("planning_context_hash"),
-                "search_supported_events": stage1_result.get("supported_events"),
-                "refinement_cutoff": result.get("planning_cutoff"),
-                "lineup_route_id": lineup_route_id,
-                "lineup_basis": "CURRENT_GW_H1",
-            },
-            "discovery_completeness": discovery,
-            "official_pool_identity": pool_identity,
-            "screened_actions": {k: v for k, v in screen.items() if k != "promotion_pool"},
-            "decision": decision,
-            "no_execution": True,
+            "cutoff": cutoff,
+            "season": config.get("season"),
         }
+        profile = gs.DecisionProfile(
+            kind=gs.HORIZON_KIND_FOUR_GW,
+            parameters={
+                "beam": int(args.beam),
+                "exact_evaluation_budget": int(args.exact_budget),
+                "search_n_per_criterion": int(args.search_n),
+                "singles_per_out": int(args.singles_per_out),
+                "max_transfers_per_event": int(args.max_transfers_per_event),
+                "stage2_draws": int(args.stage2_draws),
+                "parallel_workers": parallel_workers,
+            },
+        )
+        try:
+            outcome = gs.make_decision(
+                conn, packet, planning_event,
+                # Pin the exact generation Stage A inspected.  If current_generation
+                # moves between readiness and the decision boundary, both artifacts
+                # must still describe one predictive world.
+                generation_id=readiness_generation.generation_id,
+                profile=profile,
+                request={"tracing_id": f"run_four_gw_decision:GW{planning_event}:{cutoff}"},
+                controller=guard,
+            )
+        except (
+            gs.GenerationRefused,
+            certified_bundle.CertificationRefused,
+            provenance.OfficialPoolIncomplete,
+        ) as failure:
+            print(f"decision refused: {failure}", file=sys.stderr)
+            return _refuse_execution(guard, 6, str(failure))
+        artifact = outcome["artifact"]
         (out_dir / "four_gw_decision.json").write_text(
-            json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True, default=cu.jsonable) + "\n",
+            json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True, default=cu.jsonable)
+            + "\n",
             encoding="utf-8",
         )
-        block = decision["transfer_recommendation"]
-        print(f"STAGE B decision: {block['status']} preferred={block.get('preferred_route_id')} "
-              f"eligible={block.get('eligible_route_count')} excluded={len(block.get('excluded_routes') or [])}")
+        block = (artifact.get("decision") or {}).get("transfer_recommendation") or {}
+        print(f"STAGE B decision: {block.get('status')} preferred={block.get('preferred_route_id')} "
+              f"eligible={block.get('eligible_route_count')} "
+              f"excluded={len(block.get('excluded_routes') or [])}")
         for row in block.get("ranking", [])[:6]:
             print(f"  #{row['rank']} {row['route_id']} 4GW net={row['four_gw_net_core']:.3f} "
-                  f"hits={row['total_hit_points']} terminal FT={row['terminal_ft']} bank={_money(row['terminal_bank_tenths'])}")
-        print(f"  search {search_seconds:.1f}s  decisions in {time.time() - started:.1f}s  "
+                  f"hits={row['total_hit_points']} terminal FT={row['terminal_ft']} "
+                  f"bank={_money(row['terminal_bank_tenths'])}")
+        print(f"  generation={outcome['generation_id'][:24]}\u2026 "
+              f"decision_record={outcome['decision_record_id']}")
+        print(f"  decisions in {time.time() - started:.1f}s  "
               f"artifact={out_dir / 'four_gw_decision.json'}")
         return 0
     finally:
@@ -1016,10 +523,711 @@ def main(argv=None) -> int:
         conn.close()
 
 
-def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundles, conn,
-                       base_config, stage1_result, stage2_draws, prebuilt_worlds,
-                       finalist_partials, exact_cache=None, cancel_probe=None,
-                       parallel_workers=None):
+
+
+def run_certified_four_gw_decision(
+    *,
+    conn,
+    generation,
+    manager_packet,
+    parameters,
+    source_conn,
+    canonical_manager_state,
+    controller=None,
+):
+    """The DECLARED production four-Gameweek decision pipeline.
+
+        scripts/run_four_gw_decision.py:run_certified_four_gw_decision
+
+    ``generation_store.make_decision`` locates this module BY NAME (the declared
+    production entry point, never a caller-supplied callable) and calls this function
+    with the certified generation, the PINNED snapshot it opened read-only, and the
+    ordinary decision parameters of the profile.  Nothing predictive reaches it from
+    a caller: the exact run ids come from the generation's digest-verified manifest,
+    the causal source rows come from the pinned snapshot, and the only caller-supplied
+    inputs are manager identity, optional state assertions, and search breadth.
+
+    It returns the decision payload that ``make_decision`` turns into the persisted
+    decision artifact.  Every failure is a refusal that RAISES, so a decision that
+    could not be taken is never recorded.
+    """
+
+    # --- Stage B: bounded non-chip route search ---------------------------
+    import fpl_brain.route_comparator as rc
+    from fpl_brain import generation_store as _gs
+
+    # The decision's OWN identity comes from the CERTIFIED GENERATION and the manager
+    # packet, never from a caller-supplied world.  ``source_conn`` is the pinned
+    # snapshot ``make_decision`` opened READ-ONLY and handed to this pipeline: the
+    # pipeline cannot substitute a source, and it never closes one it does not own.
+    planning_event = int(generation.planning_event)
+    cutoff = str(generation.cutoff)
+    entry_id = int(manager_packet.get("entry_id") or 0)
+    season = manager_packet.get("season")
+    # Ordinary decision parameters: search breadth and scheduling only.  The world
+    # cache location is NOT among them -- a production decision owns where its
+    # optimization cache lives, so no caller can point a load at another one.
+    stage2_draws = int(parameters.get("stage2_draws", fr.STAGE2_DRAWS))
+    parallel_workers = parameters.get("parallel_workers")
+    parallel_workers = None if parallel_workers is None else int(parallel_workers)
+    if not entry_id:
+        raise gs.DecisionRecordInvalid(
+            [
+                "the manager packet names no entry id, so the manager state this decision is taken "
+                "for cannot be resolved from the pinned snapshot"
+            ]
+        )
+    last_event = fg.season_last_event_from_db(conn)
+    decision_events = fg.decision_events(planning_event, last_event=last_event)
+    if list(generation.events) != [int(event) for event in decision_events]:
+        raise gs.GenerationRefused(
+            DIAG_DECISION_EVENT_MISMATCH,
+            [
+                f"the certified generation covers {list(generation.events)}, not the decision "
+                f"horizon {list(decision_events)}"
+            ],
+        )
+    certified_support = gs.support_by_event(generation)
+    print(
+        f"certified generation accepted: id={generation.generation_id[:24]}… "
+        f"cutoff={generation.cutoff} snapshot={str(generation.snapshot.get('sha256'))[:16]}…"
+    )
+    for event in decision_events:
+        record = certified_support[int(event)]
+        print(f"  GW{event}: certified runs={record['matched_runs']} "
+              f"bundle={record['bundle_identity'][:16]}…")
+    # --- ONE certified generation, everywhere ------------------------------
+    # Discovery/screening, exact evaluation and the decision board all describe the
+    # SAME certified generation, so the two published artifacts cannot describe
+    # different predictive worlds.
+    certified_runs = {
+        int(event): certified_support[int(event)]["matched_runs"] for event in decision_events
+    }
+    certified_horizon = fg.evaluate_horizon(
+        planning_event=planning_event, support_by_event=certified_support,
+        cutoff=cutoff, last_event=last_event,
+    )
+    if not certified_horizon["complete"]:
+        raise gs.GenerationRefused(
+            str(certified_horizon["status"]),
+            [
+                "the CERTIFIED horizon is incomplete: "
+                f"blocked_events={certified_horizon['blocked_events']}"
+            ],
+        )
+    # --- PE-9 reconciliation of the two views ------------------------------
+    # Stage A's horizon is a NON-PRODUCTION latest-per-family rediscovery.  The
+    # decision never consumes it, but it IS published as this run's readiness
+    # artifact, so PE-9 reconciles the certification against it rather than leaving
+    # the two published views free to describe different predictive worlds.  A
+    # divergence is RECORDED, not fatal: the certified run ids are authoritative, and
+    # a newer same-cutoff rerun must never replace them (nor block the decision by
+    # merely existing).
+    readiness_generation = generation
+    diagnostic_support = fg.event_support_from_db(conn, decision_events, cutoff)
+    readiness_runs = {
+        int(e): {
+            str(f): int(r)
+            for f, r in (diagnostic_support[int(e)].get("matched_runs") or {}).items()
+        }
+        for e in decision_events
+    }
+    readiness_divergence = {
+        str(e): {
+            "readiness_runs": readiness_runs[int(e)],
+            "certified_runs": {str(f): int(r) for f, r in certified_runs[int(e)].items()},
+        }
+        for e in decision_events
+        if readiness_runs[int(e)]
+        != {str(f): int(r) for f, r in certified_runs[int(e)].items()}
+    }
+    if readiness_divergence:
+        print(
+            "readiness diagnostic: the NON-PRODUCTION latest-per-family rediscovery names a "
+            "different generation for "
+            + ", ".join(f"GW{event}" for event in sorted(readiness_divergence))
+            + "; the certified run ids are authoritative and are what this decision consumes"
+        )
+        for event in sorted(readiness_divergence):
+            record = readiness_divergence[event]
+            print(
+                f"  GW{event}: readiness={record['readiness_runs']} "
+                f"certified={record['certified_runs']}"
+            )
+    else:
+        print("readiness diagnostic: the latest-per-family rediscovery agrees with the certified generation")
+    source_context = get_planning_context(
+        source_conn, int(entry_id), int(planning_event), as_of=cutoff, season=season
+    )
+    source_squad = manager_worlds.resolve_squad(source_context, source_conn)
+    source_state = rc.build_route_state(source_conn, source_context, source_squad)
+    snapshot_manager_state = _gs.canonical_four_gw_manager_state(
+        entry_id=entry_id,
+        planning_event=planning_event,
+        cutoff=cutoff,
+        season=season,
+        context=source_context,
+        squad=source_squad,
+        route_state=source_state,
+    )
+    if analytics.canonical_hash(snapshot_manager_state) != analytics.canonical_hash(
+        canonical_manager_state
+    ):
+        raise gs.GenerationRefused(
+            gs.DIAG_MANAGER_STATE_MISMATCH,
+            [
+                "the four-GW pipeline route state differs from the canonical manager state "
+                "derived at the production decision boundary"
+            ],
+        )
+    _gs.assert_manager_packet_matches_canonical_state(manager_packet, snapshot_manager_state)
+    manager_context_sha256 = _gs.four_gw_manager_context_identity(snapshot_manager_state)
+    search_provenance = {
+        "planning_cutoff": cutoff,
+        "planning_context_hash": manager_context_sha256,
+        "generation_id": generation.generation_id,
+        "generation_horizon_kind": generation.horizon_kind,
+        "data_snapshot_sha256": generation.snapshot.get("sha256"),
+        "decision_events": list(decision_events),
+        "certified_runs_by_event": {str(e): dict(certified_runs[int(e)]) for e in decision_events},
+        # The reconciliation itself is persisted, so the readiness artifact and
+        # the decision artifact cannot silently disagree about which generation
+        # each of them described.
+        "readiness_source": "CERTIFIED_GENERATION",
+        "readiness_generation_id": readiness_generation.generation_id,
+        # The latest-per-family rediscovery is retained ONLY as a labelled
+        # diagnostic; it is never a readiness source and never a decision input.
+        "readiness_diagnostic_source": "NON_PRODUCTION_LATEST_PER_FAMILY",
+        "readiness_reconciled_against_generation": True,
+        "readiness_generation_divergence": readiness_divergence,
+    }
+
+    bundles = {
+        int(event): bundle_for(
+            event, generation, draws_for(event, decision_events),
+        )
+        for event in decision_events
+    }
+    snapshot = cu.price_snapshot_as_of(
+        source_conn, planning_event, cutoff,
+        required_player_ids=[int(pid) for pid in source_squad["squad_ids"]],
+    )
+    scenario = rc.flat_current_price_scenario(snapshot, decision_events)
+    pool = cu.load_pool(source_conn)
+    # --- Certified official-pool identity (R4B.1.1) ------------------------
+    # The snapshot's active pool must BE the latest accepted official
+    # bootstrap generation, by exact ID identity.  This reads ONLY the
+    # immutable snapshot (never live JSON, never the live DB) and refuses
+    # before candidate promotion, route generation or optimisation.
+    try:
+        pool_identity = provenance.assert_official_pool_identity(
+            accepted_generation=repo.latest_accepted_bootstrap_generation(source_conn),
+            snapshot_player_ids=repo.active_player_ids(source_conn),
+            enforce=True,
+        )
+    except provenance.OfficialPoolIncomplete as failure:
+        raise gs.GenerationRefused(
+            "CERTIFIED_OFFICIAL_POOL_INCOMPLETE", [str(failure)]
+        ) from failure
+    print(
+        f"official pool identity: generation={pool_identity['official_generation_id']} "
+        f"count={pool_identity['snapshot_pool_count']} "
+        f"sha={str(pool_identity['snapshot_pool_ids_sha256'])[:16]}… "
+        f"match={pool_identity['official_pool_identity_match']}"
+    )
+    fixtures = cu.load_fixtures_by_team(source_conn, decision_events)
+    xpts_rows = {int(e): cu.load_projection_rows(conn, int(certified_runs[int(e)]["xpts_v1"]))
+                 for e in decision_events}
+    minutes_rows = {int(e): cu.load_projection_rows(
+        conn, int(certified_runs[int(e)]["minutes_v1"]), FAMILY_KINDS["minutes_v1"])
+        for e in decision_events}
+    # The generation actually consumed by DISCOVERY/SCREENING.
+    discovery_runs = {int(e): dict(certified_runs[int(e)]) for e in decision_events}
+    # The generation actually consumed by EXACT EVALUATION (the bundles).
+    exact_runs = {
+        int(e): {
+            "minutes_v1": int(bundles[int(e)].minutes_run_id),
+            "team_strength_v1": int(bundles[int(e)].team_run_id),
+            "player_rates_v1": int(bundles[int(e)].rate_run_id),
+            "xpts_v1": int(bundles[int(e)].xpts_run_id),
+            "monte_carlo_v1": int(bundles[int(e)].mc_run_id),
+        }
+        for e in decision_events
+    }
+    discovery_identity = analytics.canonical_hash(
+        {"cutoff": cutoff, "runs": {str(e): discovery_runs[int(e)] for e in decision_events}}
+    )
+    exact_identity = analytics.canonical_hash(
+        {"cutoff": cutoff, "runs": {str(e): exact_runs[int(e)] for e in decision_events}}
+    )
+    if discovery_identity != exact_identity:
+        raise gs.GenerationRefused(
+            DIAG_PREDICTIVE_GENERATION_MISMATCH,
+            [
+                f"discovery generation {discovery_identity} != exact-evaluation generation "
+                f"{exact_identity}"
+            ],
+        )
+
+    # --- PE-9: the generation IS the certificate ---------------------------
+    # The horizon gate was applied when the generation was certified, and the
+    # generation row exists only because certification PASSED: there is no mutable
+    # CERTIFIED flag to re-check here and none to be toggled.  What a later reader
+    # can verify is the persisted generation, re-derived from authoritative
+    # evidence, not a narrative about it.
+    horizon_state = str(generation.manifest.get("horizon_state"))
+    if horizon_state != fg.DECISION_HORIZON_COMPLETE:
+        raise gs.GenerationRefused(
+            fg.DECISION_HORIZON_INCOMPLETE,
+            [f"the certified generation records horizon state {horizon_state}"],
+        )
+    print(
+        f"PE-9 certified generation: horizon={horizon_state} "
+        f"states="
+        f"{ {event: (generation.manifest.get('per_event') or {}).get(str(event), {}).get('state') for event in decision_events} } "
+        f"id={generation.generation_id[:24]}…"
+    )
+    universe = cu.build_universe(
+        pool=pool, events_fixtures=fixtures, xpts_rows_by_event=xpts_rows,
+        minutes_rows_by_event=minutes_rows, events=list(decision_events),
+        owned_ids=source_squad["squad_ids"], price_snapshot=snapshot,
+        config=cu.CandidateConfig(top_n_per_criterion=20), planning_cutoff=cutoff,
+        run_refs={"events": list(decision_events),
+                  "runs": {str(e): certified_runs[int(e)] for e in decision_events}},
+    )
+    meta_ids = {int(row["player_id"]) for row in universe["universe"]}
+    player_meta = rc.load_player_meta(source_conn, meta_ids)
+    universe["replacement_edges"] = cu.build_replacement_edges(
+        universe_rows=universe["universe"], owned_ids=source_squad["squad_ids"], state=source_state,
+        price_snapshot=snapshot, player_meta=player_meta,
+    )
+    screen = fg.screen_legal_actions(
+        universe_rows=universe["universe"], replacement_edges=universe["replacement_edges"],
+        owned_ids=source_squad["squad_ids"], decision_events_window=decision_events,
+    )
+    optimizer_config = ro.OptimizerConfig(
+        events=tuple(decision_events), search_draws=STAGE1_DRAWS, seed=SEED,
+        beam_width=int(parameters.get("beam", 8)),
+        exact_evaluation_budget=int(parameters.get("exact_evaluation_budget", 20)),
+        search_n_per_criterion=int(parameters.get("search_n_per_criterion", 12)),
+        singles_per_out=int(parameters.get("singles_per_out", 4)),
+        max_transfers_per_event=int(parameters.get("max_transfers_per_event", 2)),
+        policy_selection_worlds=0,
+    )
+    # A "refinement" that is not higher fidelity would still be reported as one,
+    # so it is refused before any work is done.
+    if int(stage2_draws) <= int(STAGE1_DRAWS):
+        raise gs.ProductionDescriptorOnly(
+            [
+                f"the profile's stage2_draws {int(stage2_draws)} must exceed the Stage-1 draw count "
+                f"{STAGE1_DRAWS}; a 'refinement' at no higher fidelity would still be reported as one"
+            ]
+        )
+    # All-player discovery accounting, asserted BEFORE any route search.
+    discovery = cu.discovery_completeness(
+        pool=pool,
+        universe_rows=universe["universe"],
+        excluded=universe.get("excluded") or [],
+        replacement_edges=universe["replacement_edges"],
+        screen=screen,
+        enforce=True,
+    )
+    t0 = time.time()
+    stage1_result = ro.optimize(
+        universe=universe, initial_state=source_state, scenario=scenario, player_meta=player_meta,
+        generation=generation, conn=conn, config=optimizer_config, cache_dir=WORLD_CACHE_DIR,
+        provenance={**search_provenance,
+                    "discovery_generation_identity": discovery_identity,
+                    "exact_evaluation_generation_identity": exact_identity},
+        parallel_workers=parallel_workers,
+    )
+    search_seconds = time.time() - t0
+
+    # --- R4B.2b Stage 2: FINALIST-ONLY precision refinement ----------------
+    # Same seed, same certified generation, same route legality, same discovery
+    # universe; the ONLY changed input is the shared-world draw count.  The
+    # refinement also publishes the one canonical paired record below.
+    t_refine = time.time()
+    # ONE run-scoped exact-evaluation cache, shared by the Stage-2 refinement and the
+    # single stability escalation.  Reuse is keyed on the COMPLETE evaluation
+    # identity (event, canonical squad, draws, seed, world provenance), and both
+    # calls run at the same draw count, seed and certified worlds, so a shared entry
+    # is literally the same evaluation.  The cache never leaves the run.
+    cancel_probe = _cancel_probe(controller) if controller is not None else (lambda: None)
+    run_exact_cache: dict = {}
+    refinement = fr.refine_finalists(
+        universe=universe, initial_state=source_state, scenario=scenario,
+        player_meta=player_meta, generation=generation, conn=conn, base_config=optimizer_config,
+        stage1_result=stage1_result, stage2_draws=int(stage2_draws),
+        cache_dir=WORLD_CACHE_DIR,
+        exact_cache=run_exact_cache, cancel_probe=cancel_probe,
+        parallel_workers=parallel_workers,
+    )
+    t_refine_finished = time.time()
+    stage2_result = refinement["refined"]
+    stage2_parallel = (stage2_result.get("parallel_exact") or {}).get("worker_count")
+    print(f"exact cache: {len(run_exact_cache)} entries after the Stage-2 refinement; "
+          f"stage2 parallel workers={stage2_parallel}")
+
+    # --- R4B.2b REPAIR: stability FIRST, so the final ranking is known ------
+    # The gate may run the ONE bounded escalation (the next supported search
+    # breadth, at the Stage-2 draw budget, in the SAME worlds).  Its widened
+    # result is captured through a sink because the stability REPORT is
+    # serialized into the artifact and a world matrix must never be.  The
+    # leader-change comparison is always Stage-2 versus Stage-1: the gate asks
+    # whether widening the search changes the answer the narrow budget gave.
+    leader_change = fr.analyze_leader_change(stage1_result, stage2_result)
+    escalated_sink: dict = {}
+    t_stability = time.time()
+    stability = fr.assess_search_stability(
+        refined_result=stage2_result,
+        leader_change=leader_change,
+        canonical_paired=refinement["canonical_paired_near_tie"],
+        escalation=_escalation_runner(
+            universe=universe, initial_state=source_state, scenario=scenario,
+            player_meta=player_meta, generation=generation, conn=conn, base_config=optimizer_config,
+            stage1_result=stage1_result, stage2_draws=int(stage2_draws),
+            finalist_partials=fr.finalist_partials(stage1_result, refinement["finalist_selection"]),
+            exact_cache=run_exact_cache,
+            cancel_probe=cancel_probe,
+            parallel_workers=parallel_workers,
+            cache_dir=WORLD_CACHE_DIR,
+        ),
+        config=fr.StabilityGateConfig(current_beam=int(parameters.get("beam", 8))),
+        escalated_result_sink=escalated_sink,
+        cancel_probe=cancel_probe,
+    )
+    stability_seconds = time.time() - t_stability
+    escalated_result = escalated_sink.get("result")
+
+    # §4: after an escalation the FINAL ranking is the widened-search ranking,
+    # evaluated on the same Stage-2 worlds.  Without an escalation it is the
+    # Stage-2 finalist ranking.
+    final = fr.final_ranking_after_escalation(
+        stage2_result=stage2_result, escalated_result=escalated_result,
+    )
+    # From here on the DECISION is taken at the final supported evaluation
+    # budget: `result` is that final result (widened when the escalation ran),
+    # and both Stage 1 and the Stage-2-only ranking are reported separately.
+    # This also keeps the documented
+    # `result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)` consumption path exactly
+    # as the confidence contract requires.
+    result = final["result"]
+
+    transfers_by_route = {}
+    for route_id, record in (result.get("routes") or {}).items():
+        transfers_by_route[route_id] = {
+            int(action["event"]): [{"out": int(m["out"]), "in": int(m["in"])} for m in action.get("transfers") or []]
+            for action in (record.get("actions") or [])
+        }
+    # R5-P0-01: `result` is a route_optimizer result, so it must cross the OPTIMIZER
+    # boundary.  `routes_for_decision` is the comparator boundary and would adapt every
+    # optimizer route to an empty per_event with null terminal accounting, which the
+    # eligibility gate then (correctly) reported as an incomplete route - excluding every
+    # route and emitting no recommendation at all.
+    routes = fg.optimizer_routes_for_decision(
+        result.get("routes") or {}, transfers_by_route=transfers_by_route)
+    baseline = next((row["route_id"] for row in routes if not any(r["transfers"] for r in row["per_event"])), None)
+    # First pass: the transfer decision.  The H1 lineup is then taken from the
+    # PREFERRED route (or, when suppressed, from the baseline) so the
+    # operator-visible lineup always belongs to the route being recommended.
+    decision = fg.evaluate_four_gw_decision(
+        planning_event=planning_event, support_by_event=certified_support, cutoff=cutoff,
+        last_event=last_event, screened_actions=screen, routes=routes,
+        baseline_route_id=baseline, lineup=None,
+    )
+    preferred_route_id = (decision.get("transfer_recommendation") or {}).get("preferred_route_id")
+    lineup_route_id = preferred_route_id or baseline
+    lineup_policy = fg.lineup_policy_for_route(
+        routes=routes, route_id=lineup_route_id, decision_events_window=decision_events,
+    )
+    if lineup_policy is not None:
+        decision = fg.evaluate_four_gw_decision(
+            planning_event=planning_event, support_by_event=certified_support, cutoff=cutoff,
+            last_event=last_event, screened_actions=screen, routes=routes,
+            baseline_route_id=baseline,
+            lineup={"status": fg.LINEUP_ONLY, "policy": lineup_policy,
+                    "lineup_route_id": lineup_route_id, "lineup_basis": "CURRENT_GW_H1"},
+        )
+    else:
+        lineup_route_id = None
+    # --- R4B.2c: four-GW fixture horizon (from the CERTIFICATION snapshot) --
+    fixture_horizon = fg.classify_fixture_horizon(
+        source_conn, decision_events,
+        last_event=fg.season_last_event_from_db(source_conn),
+    )
+    # --- R4B.2b REPAIR §5: canonical paired record from the FINAL ranking ---
+    # route_a is the FINAL preferred route and route_b is the ACTUAL next-ranked
+    # route in the FINAL (post-escalation) ranking — not the old Stage-2
+    # finalist runner-up.  The decision layer is authoritative for which route
+    # is preferred (it may in principle exclude a route the optimizer ranked
+    # first), so it is passed in explicitly and the comparator follows from the
+    # FINAL ranking.
+    decision_preferred = (decision.get("transfer_recommendation") or {}).get("preferred_route_id")
+    final = fr.final_ranking_after_escalation(
+        stage2_result=stage2_result,
+        escalated_result=escalated_result,
+        preferred_route_id=decision_preferred or final["final_ranking"]["preferred_route_id"],
+    )
+    final_leader = final["final_ranking"]["preferred_route_id"]
+    comparator = final["final_ranking"]["runner_up_route_id"]
+    canonical = final["canonical_paired_near_tie"]
+    refinement["stage2_finalist_ranking"] = {
+        "preferred_route_id": final["stage2_leader_route_id"],
+        "runner_up_route_id": None,
+    }
+    refinement["optimizer_ranked_leader_route_id"] = final["stage2_leader_route_id"]
+    refinement["final_rank_1_route_id"] = final["final_rank_1_route_id"]
+    refinement["ranking_source"] = final["ranking_source"]
+    refinement["comparator_source"] = final["comparator_source"]
+    refinement["canonical_alignment"] = final["canonical_alignment"]
+    refinement["canonical_paired_near_tie"] = canonical
+    refinement["final_ranking"] = dict(final["final_ranking"])
+    refinement["simulation_fidelity"]["final_ranking"] = dict(final["final_ranking"])
+    refinement["simulation_fidelity"]["canonical_paired_near_tie"] = canonical
+    refinement["leader_change"] = leader_change
+    refinement["stability"] = stability
+    refinement["simulation_fidelity"]["leader_change"] = leader_change
+    refinement["simulation_fidelity"]["stability"] = stability
+    refinement["timing_s"] = _stage_timings(
+        search_seconds=search_seconds, refine_started=t_refine,
+        refine_finished=t_refine_finished, stability_seconds=stability_seconds)
+    result["canonical_paired_near_tie"] = canonical
+    print(
+        f"refinement: finalists={len(refinement['finalist_selection']['finalist_route_ids'])} "
+        f"stage2_draws={int(stage2_draws)} prefix="
+        f"{(refinement.get('prefix_invariance') or {}).get('status')} "
+        f"leader_change={leader_change['changed']}/{leader_change['accepted']} "
+        f"stability={stability['state']} escalation={stability['escalation_used']} "
+        f"ranking_source={final['ranking_source']} "
+        f"({stability_seconds:.1f}s)"
+    )
+    if escalated_result is not None:
+        print(
+            f"  escalation to beam {stability['escalation_beam']} re-ranked "
+            f"{len(result.get('routes') or {})} routes on the Stage-2 worlds; "
+            f"final leader {final_leader} (Stage-2 leader was {final['stage2_leader_route_id']})"
+        )
+    if canonical is None:
+        print(
+            f"confidence: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED}: no canonical paired record for "
+            f"leader={final_leader} comparator={comparator}; confidence cannot be decisive and "
+            "search stability cannot be claimed",
+            file=sys.stderr,
+        )
+
+    # --- R4B.2c: decision confidence (computed AFTER ranking; never ranks) --
+    # Paired CRN near-tie is CONSUMED from the route comparison when the result
+    # exposes it; otherwise it is reported unavailable and the state cannot claim
+    # a near tie.
+    # --- ROLE-RELEVANT PLAYER SET (R4B.2c integration correction 1, REPAIR §6) --
+    # NOT the certified squad.  The players whose role drives the
+    # recommendation's thesis are: everyone transferred IN, everyone transferred
+    # OUT, and the armband, **of the FINAL preferred route** — so a widened
+    # search that changes the preferred route also moves the role-relevant set.
+    # A transfer-IN player is usually NOT in the pre-transfer certified squad and
+    # must nevertheless be evaluated.
+    preferred_key = final_leader or preferred_route_id or lineup_route_id
+    role_relevant_players = _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy)
+
+    # --- CANONICAL PAIRED CRN DIAGNOSTIC (integration correction 2) --------
+    # Exactly one canonical record: the FINAL preferred leader versus its
+    # relevant runner-up/comparator.  Legacy keys are accepted only as a
+    # fallback; when no canonical record exists, confidence must NOT infer
+    # "not near tied".
+    paired_record = result.get(dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY)
+    if not isinstance(paired_record, dict):
+        paired_record = None
+        for key in ("leader_paired", "paired_leader_vs_runner_up"):
+            candidate = result.get(key)
+            if isinstance(candidate, dict) and (
+                "mean_difference" in candidate or "near_tied" in candidate
+            ):
+                paired_record = candidate
+                break
+    if not isinstance(paired_record, dict) or not paired_record:
+        print(
+            f"confidence: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED}: route comparison published no "
+            f"canonical paired diagnostic ({dc.CANONICAL_PAIRED_DIAGNOSTIC_KEY}); confidence "
+            "cannot be decisive",
+            file=sys.stderr,
+        )
+
+    role_evidence, role_source = _certified_role_evidence(
+        conn, certified_runs, role_relevant_players, decision_events, generation
+    )
+    confidence = dc.classify_decision_confidence(
+        paired=paired_record,
+        role_evidence=role_evidence,
+        focus_player_ids=role_relevant_players,
+        role_evidence_source=role_source,
+    )
+    dc.assert_confidence_invariants(confidence)
+
+    # --- Suppression is applied BEFORE the artifact is written --------------
+    # Every gate that removes decisiveness must be visible in the artifact that
+    # is actually on disk.  Deferred suppression would leave the file asserting
+    # a recommendation the runner no longer stands behind.
+    suppression_reasons: list[str] = []
+    if not fixture_horizon["complete"]:
+        # R4B.2c decision gate: an unresolved fixture that could alter any team's
+        # fixture set inside the four-GW window blocks the normal transfer
+        # recommendation.  It is SUPPRESSED, never replaced by a "best H1 transfer".
+        _suppress_transfer_recommendation(
+            decision, reason=fg.DECISION_HORIZON_INCOMPLETE,
+            extra={"fixture_horizon_blocking_reasons": fixture_horizon["blocking_reasons"]},
+        )
+        suppression_reasons.append(fg.DECISION_HORIZON_INCOMPLETE)
+        print(
+            "transfer recommendation SUPPRESSED: fixture horizon incomplete "
+            f"({len(fixture_horizon['blocking_reasons'])} blocking reason(s))"
+        )
+    if stability["state"] != fr.SEARCH_STABLE:
+        # R4B.2b search-stability gate: the bounded search cannot separate the
+        # preferred route from its alternatives at the widest supported budget.
+        # The route table stays available; decisiveness is removed, and there is
+        # deliberately no best-current-GW-transfer fallback.
+        _suppress_transfer_recommendation(
+            decision, reason=fg.DECISION_SEARCH_NOT_STABLE,
+            extra={
+                "search_stability_state": stability["state"],
+                "search_stability_basis": stability.get("stability_basis"),
+                "search_budget_sequence": stability["search_budget_sequence"],
+                "escalation_used": stability["escalation_used"],
+            },
+        )
+        suppression_reasons.append(fg.DECISION_SEARCH_NOT_STABLE)
+        print(
+            f"transfer recommendation SUPPRESSED: {stability['state']} "
+            f"(basis={stability.get('stability_basis')})"
+        )
+    if canonical is None:
+        # §5: a decisive recommendation requires the canonical paired record.  It
+        # could not be produced, so decisiveness is removed rather than inferred.
+        _suppress_transfer_recommendation(
+            decision, reason=dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED,
+            extra={"paired_diagnostic_required": True,
+                   "search_stability_state": stability["state"]},
+        )
+        suppression_reasons.append(dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED)
+        print(
+            f"transfer recommendation SUPPRESSED: {dc.DIAG_PAIRED_DIAGNOSTIC_REQUIRED} "
+            f"(leader={final_leader} comparator={comparator})"
+        )
+
+    artifact = {
+        "schema": "fpl_brain.four_gw_decision.v1",
+        "planning_event": planning_event,
+        "planning_cutoff": cutoff,
+        "decision_events": list(decision_events),
+        "cutoff_guard": override,
+        "search": {
+            "engine": "route_optimizer.optimize (accepted bounded multi-event search)",
+            "config": optimizer_config.as_dict(),
+            "seconds": round(search_seconds, 1),
+            "world_info": stage1_result.get("world_info"),
+            "search_stats": stage1_result.get("search_stats"),
+            "exact_evaluations": stage1_result.get("exact_evaluations"),
+            "promoted_route_count": stage1_result.get("promoted_route_count"),
+            "flags": stage1_result.get("flags"),
+            "no_stability_ladder_rerun": True,
+            # Truthful draw provenance: Stage 1 screens EVERY route at this
+            # count for EVERY event.  The higher Stage-2 count is a FINALIST-ONLY
+            # refinement and is reported separately, never as route coverage.
+            "stage1_search_draws": STAGE1_DRAWS,
+            "draw_fidelity": {str(event): STAGE1_DRAWS for event in decision_events},
+        },
+        "finalist_refinement": {
+            "stage2_draws": int(stage2_draws),
+            "finalists": refinement["finalist_selection"],
+            "final_ranking": refinement["final_ranking"],
+            "optimizer_ranked_leader_route_id": refinement["optimizer_ranked_leader_route_id"],
+            "canonical_alignment": refinement["canonical_alignment"],
+            "leader_change": leader_change,
+            "stability": stability,
+            "route_table": {
+                "routes": result.get("routes"),
+                "flags": result.get("flags"),
+                "exact_evaluations": result.get("exact_evaluations"),
+            },
+            "timing_s": refinement["timing_s"],
+            "no_recommendation": True,
+        },
+        "simulation_fidelity": refinement["simulation_fidelity"],
+        "parallel_exact_scheduling": {
+            "requested": parallel_workers,
+            "stage2_workers": stage2_parallel,
+            "escalation_workers": _scheduled_workers(escalated_result),
+            "stage1_workers": None,
+            "stage1_note": "see PRODUCTION_PARALLEL_EXACT_WORKERS: Stage 1 and Stage 2 both "
+                           "dispatch through the SAME scheduler",
+            "semantics": "SCHEDULING_ONLY_BIT_IDENTICAL",
+        },
+        "canonical_paired_near_tie": canonical,
+        "fixture_horizon": fixture_horizon,
+        "decision_confidence": confidence,
+        "suppression_reasons": suppression_reasons,
+        "discovery_completeness": discovery,
+        "official_pool_identity": pool_identity,
+        "screened_actions": {k: v for k, v in screen.items() if k != "promotion_pool"},
+        "decision": decision,
+        "world_info": stage1_result.get("world_info"),
+        "provenance": {
+            **search_provenance,
+            "search_artifact_cutoff": stage1_result.get("planning_cutoff"),
+            "search_artifact_context_hash": stage1_result.get("planning_context_hash"),
+            "search_supported_events": stage1_result.get("supported_events"),
+            "refinement_cutoff": result.get("planning_cutoff"),
+            "lineup_route_id": lineup_route_id,
+            "lineup_basis": "CURRENT_GW_H1",
+            # PE-9: the certified GENERATION travels WITH the decision, so the evidence
+            # this decision consumed is verifiable from the artifact itself: the
+            # generation id, each event's canonical bundle identity, the per-family run
+            # ids and model versions, the cutoff, the code and data snapshot identities,
+            # the pinned snapshot, the PE-8 evidence references and the disclosure block.
+            "generation_id": generation.generation_id,
+            "generation_manifest": dict(generation.manifest),
+            "snapshot": {
+                "path": generation.snapshot.get("path"),
+                "sha256": generation.snapshot.get("sha256"),
+                "source_db_identity": generation.snapshot.get("source_db_identity"),
+                "execution_run_uuid": generation.snapshot.get("execution_run_uuid"),
+            },
+            "pe8_evidence": generation.manifest.get("pe8_evidence"),
+            "disclosure": generation.manifest.get("disclosure"),
+            "identified_bypasses": certified_bundle.disclosed_bypasses(),
+        },
+        "no_execution": True,
+    }
+    print(f"  search {search_seconds:.1f}s  decision artifact assembled for "
+          f"GW{planning_event} ({len(artifact)} blocks)")
+    return {
+        "decision": decision,
+        "screened_actions": artifact["screened_actions"],
+        "finalist_refinement": artifact["finalist_refinement"],
+        "decision_confidence": confidence,
+        "fixture_horizon": fixture_horizon,
+        "suppression_reasons": suppression_reasons,
+        "world_info": artifact["world_info"],
+        "provenance": artifact["provenance"],
+        "consumed_manager_state": snapshot_manager_state,
+        # The pipeline's own artwork: every block the operator-facing decision
+        # artifact carries.  ``make_decision`` publishes them beside the canonical
+        # identity fields rather than replacing them.
+        "artifact_blocks": {
+            key: value
+            for key, value in artifact.items()
+            if key not in {"provenance", "decision", "no_execution"}
+        },
+        "runner_identity": f"scripts/run_four_gw_decision.py:{ro.PHASE8B_VERSION}",
+    }
+
+
+def _escalation_runner(*, universe, initial_state, scenario, player_meta, generation, conn,
+                       base_config, stage1_result, stage2_draws,
+                       finalist_partials, non_production_worlds=None,
+                       exact_cache=None, cancel_probe=None, parallel_workers=None,
+                       cache_dir=None):
     """The ONE bounded search-breadth escalation, as a closure over one beam width.
 
     Runs the next SUPPORTED search budget (the next beam width in
@@ -1027,6 +1235,11 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
     draw budget, in the SAME shared worlds, inheriting the Stage-1 nested
     survivors and forcing the refined finalists in so the two leaders are always
     comparable.  It never changes the objective, the pool, or the universe.
+
+    The escalation re-scores in the SAME worlds Stage 2 used, which are the certified
+    loader's own output for the SAME certified generation, reached through the same
+    content-addressed cache.  A caller that supplies worlds from somewhere else must
+    declare them through ``non_production_worlds``.
     """
 
     import dataclasses
@@ -1037,8 +1250,10 @@ def _escalation_runner(*, universe, initial_state, scenario, player_meta, bundle
         )
         return ro.optimize(
             universe=universe, initial_state=initial_state, scenario=scenario,
-            player_meta=player_meta, bundles=bundles, conn=conn, config=config, cache_dir=None,
-            prebuilt_worlds=prebuilt_worlds, required_routes=list(finalist_partials),
+            player_meta=player_meta, generation=generation, conn=conn, config=config,
+            cache_dir=cache_dir,
+            non_production_worlds=non_production_worlds,
+            required_routes=list(finalist_partials),
             nested_prior=ro.nested_budget_view(stage1_result),
             exact_cache=exact_cache, cancel_probe=cancel_probe,
             parallel_workers=parallel_workers,

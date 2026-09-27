@@ -102,6 +102,12 @@ class FreeHitDecisionAuthority:
     #: The certified bundles themselves, keyed by event.  Predictive authority is
     #: read from THESE, because they are what the certifier actually commits to.
     bundle_map: Mapping[int, Mapping[str, Any]] = field(default_factory=dict, compare=False)
+    #: The LOADED artifact the authority was derived from.  It travels with the
+    #: authority because a downstream predictive load must present the
+    #: AUTHORISATION, not merely run ids that happen to agree with it: the world
+    #: loader compares the bundle it is handed against the artifact's own recorded
+    #: bundle.  Never compared, never serialized, never part of the identity.
+    artifact: Mapping[str, Any] = field(default_factory=dict, compare=False)
 
     def problems(self) -> list[str]:
         found: list[str] = []
@@ -238,6 +244,7 @@ class FreeHitDecisionAuthority:
             planning_context_hash=str(first.get("planning_context_hash") or ""),
             loaded_from=str(loaded_from or "in-memory artifact"),
             bundle_map=bundle_map,
+            artifact=artifact,
         )
         problems = authority.problems()
         if problems:

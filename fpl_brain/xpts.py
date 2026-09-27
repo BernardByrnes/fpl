@@ -561,9 +561,11 @@ def build_xpts_projections(
     rate_run_id: int,
     config: XPtsConfig | None = None,
     rules: ScoringRules | None = None,
+    source_conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     """Build every player-fixture xPts projection from explicit frozen runs."""
 
+    source_conn = source_conn or conn
     config = config or XPtsConfig()
     rules = rules or DEFAULT_SCORING_RULES
     generated_at = utc_now()
@@ -588,13 +590,13 @@ def build_xpts_projections(
 
     positions: dict[int, str] = {}
     player_team: dict[int, int] = {}
-    for row in conn.execute("SELECT id, team_id, element_type FROM players WHERE is_active=1 AND team_id IS NOT NULL"):
+    for row in source_conn.execute("SELECT id, team_id, element_type FROM players WHERE is_active=1 AND team_id IS NOT NULL"):
         positions[int(row["id"])] = POSITION_IDS.get(int(row["element_type"])) if row["element_type"] is not None else None
         player_team[int(row["id"])] = int(row["team_id"])
 
     fixtures: dict[int, dict[str, Any]] = {
         int(row["id"]): dict(row)
-        for row in conn.execute("SELECT id, event, team_h, team_a FROM fixtures WHERE event=?", (int(event),))
+        for row in source_conn.execute("SELECT id, event, team_h, team_a FROM fixtures WHERE event=?", (int(event),))
     }
 
     # Reference attacking environment (league baseline lambda) for save pressure.
@@ -609,8 +611,8 @@ def build_xpts_projections(
             float((r.get("payload") or {}).get("expected_goals_for") or 0.0) for r in team_records
         ) / max(1, len(team_records)) or 1.0
 
-    aggregates = current_player_aggregates(conn, int(event), cutoff)
-    pooled_rates = position_pooled_current_rates(conn, int(event), cutoff)
+    aggregates = current_player_aggregates(source_conn, int(event), cutoff)
+    pooled_rates = position_pooled_current_rates(source_conn, int(event), cutoff)
 
     # --- first pass: raw expected xG/xA per player-fixture ------------------
     candidates: list[dict[str, Any]] = []

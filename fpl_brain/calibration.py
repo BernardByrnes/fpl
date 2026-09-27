@@ -634,7 +634,18 @@ def evaluate_monte_carlo_run(conn: sqlite3.Connection, run_id: int, event: int) 
     a DATA_GAP, never silently predicted as zero.
     """
 
-    run_row = analytics.get_projection_run(conn, int(run_id)) or {}
+    # PE-9 gap 5: an ABSENT run is a refusal, never an empty legacy run.  Reading it
+    # as ``{{}}`` parsed the model version as the empty string, which is not a legacy
+    # version anyone declared, and silently selected the legacy adapter for a run
+    # whose metadata was never read.
+    from .monte_carlo import InputRunAbsent
+
+    run_row = analytics.get_projection_run(conn, int(run_id))
+    if run_row is None:
+        raise InputRunAbsent(
+            f"INPUT_RUN_ABSENT: no projection run {int(run_id)} for the Monte Carlo calibration of "
+            f"event {int(event)}; a missing run is never defaulted to an empty legacy run"
+        )
     model_version = str(run_row.get("model_version") or "")
     legacy_adapter = model_version in LEGACY_MC_VERSIONS or model_version.startswith(
         tuple(f"{prefix}" for prefix in LEGACY_MC_VERSIONS)

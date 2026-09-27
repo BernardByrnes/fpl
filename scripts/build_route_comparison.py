@@ -4,6 +4,13 @@
 Descriptive only: no candidate generation, no optimization, no recommendation.
 Routes are supplied by the caller (``--routes FILE``); the default is ROUTE_ROLL
 (ROLL every event), which is the only real-squad engineering validation.
+
+PE-9: the worlds are simulated from a CERTIFIED GENERATION.  The exact certified
+run ids are read from the generation's digest-verified manifest, so this script
+never rediscovers "the newest run per family" and cannot silently construct an
+alternate predictive world.  ``--generation`` selects a specific certified
+generation; omitting it resolves the ``current_generation`` pointer, and an unset
+pointer refuses rather than falling back to a rediscovery.
 """
 
 from __future__ import annotations
@@ -16,40 +23,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fpl_brain import generation_store as gs
 from fpl_brain import manager_worlds, packet as packet_mod, route_comparator as rc, transfer_state as ts
 from fpl_brain.config import config_path, load_config
 from fpl_brain.database import connect_database
 from fpl_brain.planning import get_planning_context
 
 PHASE7B_VERSION = "phase7b_route_comparator_v1.0.0"
-HORIZON_EVENTS = 6  # H6 = G .. G+5
-
-FAMILY_VERSION_PREFIX = {
-    "minutes_v1": "minutes_v1.5",
-    "team_strength_v1": None,
-    "player_rates_v1": None,
-    "xpts_v1": None,
-    "monte_carlo_v1": None,
-}
-
-
-def _latest_runs(conn, events) -> dict[int, dict[str, int]]:
-    out: dict[int, dict[str, int]] = {}
-    for event in events:
-        row: dict[str, int] = {}
-        for family, prefix in FAMILY_VERSION_PREFIX.items():
-            sql = ("SELECT id, model_version FROM projection_runs WHERE model_family=? AND planning_event=? "
-                   "AND status='complete'")
-            params = [family, int(event)]
-            if prefix:
-                sql += " AND model_version LIKE ?"
-                params.append(prefix + "%")
-            sql += " ORDER BY id DESC LIMIT 1"
-            found = conn.execute(sql, params).fetchone()
-            if found:
-                row[family] = int(found["id"])
-        out[int(event)] = row
-    return out
 
 
 def _current_prices(conn, player_ids) -> dict[int, int]:
@@ -70,6 +50,11 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gw", type=int, default=4)
     parser.add_argument("--config")
+    parser.add_argument(
+        "--generation", default=None,
+        help="explicit certified generation id SELECTOR.  Omit to resolve the current_generation "
+             "pointer for this event; an unset pointer refuses rather than rediscovering runs",
+    )
     parser.add_argument("--simulations", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--routes", help="JSON file with an explicit route list (list of route specs)")
@@ -83,24 +68,18 @@ def main(argv=None) -> int:
         context = get_planning_context(conn, int(config.get("fpl_entry_id")), int(args.gw),
                                        season=config.get("season"))
         squad = manager_worlds.resolve_squad(context, conn)
-        # Longest CONTIGUOUS prefix of events that has a complete predictive bundle.
-        all_events = list(range(int(args.gw), int(args.gw) + HORIZON_EVENTS))
-        runs = _latest_runs(conn, all_events)
-        families = ("minutes_v1", "team_strength_v1", "player_rates_v1", "xpts_v1", "monte_carlo_v1")
-        events, blocked = [], []
-        for event in all_events:
-            if all(k in runs[event] for k in families):
-                if not blocked:
-                    events.append(event)
-            else:
-                blocked.append(event)
-        if not events:
-            print(f"phase 7b failed: no complete predictive bundle at GW{args.gw}", file=sys.stderr)
+        # PE-9: the certified generation is the ONLY source of predictive run ids.
+        try:
+            generation = gs.resolve_generation(
+                conn, planning_event=int(args.gw), generation_id=args.generation
+            )
+        except gs.GenerationRefused as refusal:
+            print(f"phase 7b failed: {refusal}", file=sys.stderr)
             return 3
-        if blocked:
-            print(f"phase 7b note: events {blocked} have no certified predictive bundle; "
-                  f"route comparison limited to contiguous {events}")
-        runs = {event: runs[event] for event in events}
+        gs.require_snapshot_retained(generation)
+        gs.assert_generation_bundles_valid(conn, generation)
+        events = [int(event) for event in generation.events]
+        cutoff = str(generation.cutoff)
 
         initial_state = rc.build_route_state(conn, context, squad)
 
@@ -132,29 +111,29 @@ def main(argv=None) -> int:
         base_snapshot = ts.PriceSnapshot(event=int(args.gw), prices=prices)
         scenario = rc.flat_current_price_scenario(base_snapshot, events)
 
-        bundles = {
-            event: rc.EventBundle(
-                event=event, minutes_run_id=runs[event]["minutes_v1"], team_run_id=runs[event]["team_strength_v1"],
-                rate_run_id=runs[event]["player_rates_v1"], xpts_run_id=runs[event]["xpts_v1"],
-                mc_run_id=runs[event].get("monte_carlo_v1"), simulations=int(args.simulations),
-                seed=int(args.seed), planning_cutoff=context.as_of,
-            )
-            for event in events
-        }
-
         result = rc.compare_routes(
-            conn=conn, bundles=bundles, routes=routes, initial_state=initial_state,
+            conn=conn, generation=generation, routes=routes, initial_state=initial_state,
             scenario=scenario, player_meta=player_meta, simulations=int(args.simulations),
-            seed=int(args.seed), planning_cutoff=context.as_of,
+            seed=int(args.seed), planning_cutoff=cutoff,
         )
         result["phase"] = PHASE7B_VERSION
         result["simulations"] = int(args.simulations)
-        result["predictive_bundles"] = {
-            str(event): {**runs[event], "cutoff": context.as_of, "versions": {
-                "minutes": "minutes_v1.5.2", "xpts": "xpts_v1.4.1", "mc": "mc_v1.2.1"}}
-            for event in events
+        result["certified_generation"] = {
+            "generation_id": generation.generation_id,
+            "planning_event": int(generation.planning_event),
+            "horizon_kind": generation.horizon_kind,
+            "cutoff": cutoff,
+            "events": events,
+            "certified_runs_by_event": {str(event): generation.runs_for(event) for event in events},
+            "model_versions_by_event": {
+                str(event): generation.model_versions_by_event.get(int(event), {}) for event in events
+            },
+            "snapshot_path": generation.snapshot.get("path"),
+            "snapshot_sha256": generation.snapshot.get("sha256"),
+            "snapshot_source_db_identity": generation.snapshot.get("source_db_identity"),
+            "execution_run_uuid": generation.snapshot.get("execution_run_uuid"),
         }
-        result["blocked_events"] = blocked
+        result["blocked_events"] = []
         result["route_table"] = _route_table(result)
 
         out_dir = Path(args.out) if args.out else config_path(config, "exports_dir") / "routes"

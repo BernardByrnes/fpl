@@ -412,7 +412,7 @@ def test_role_relevant_set_is_transfers_and_armband_not_the_squad():
     assert 'focus_players = sorted(' not in source
     # the transfer-in player must be queried from certified minutes ids
     assert "role_relevant_players" in source
-    assert "_certified_role_evidence(\n            conn, certified_runs, role_relevant_players" in source
+    assert "conn, certified_runs, role_relevant_players" in source
 
 
 def test_role_evidence_includes_an_unowned_transfer_in_player():
@@ -485,9 +485,14 @@ def _helper_probe():
             },
             model_version="minutes_v1.6.0",
         )
+    class _ProbeGeneration:
+        """The role-evidence helper reads ONE field off the generation: its id."""
+
+        generation_id = "sha256:" + "a" * 64
+
     certified = {5: {"minutes_v1": run_id}}
     evidence, block = runner._certified_role_evidence(
-        conn, certified, [9001], [5], {"four_gw_certification_identity": "sha256:probe"}
+        conn, certified, [9001], [5], _ProbeGeneration()
     )
     conn.close()
     return evidence, block
@@ -648,9 +653,14 @@ def _helper_probe():
             },
             model_version="minutes_v1.6.0",
         )
+    class _ProbeGeneration:
+        """The role-evidence helper reads ONE field off the generation: its id."""
+
+        generation_id = "sha256:" + "a" * 64
+
     certified = {5: {"minutes_v1": run_id}}
     evidence, block = runner._certified_role_evidence(
-        conn, certified, [9001], [5], {"four_gw_certification_identity": "sha256:probe"}
+        conn, certified, [9001], [5], _ProbeGeneration()
     )
     conn.close()
     return evidence, block

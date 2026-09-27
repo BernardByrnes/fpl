@@ -28,7 +28,7 @@ import pytest
 
 from fpl_brain import four_gw_decision as fg
 from fpl_brain import route_optimizer as ro
-from test_route_optimizer import _config, _provider, _scenario, _universe
+from test_route_optimizer import _config, _np, _provider, _scenario, _universe
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
@@ -329,7 +329,7 @@ def test_production_chain_keeps_optimizer_routes_complete():
     universe, state, meta = _universe()
     scenario, config, provider = _scenario(), _config(), _provider()
     result = ro.optimize(universe=universe, initial_state=state, scenario=scenario,
-                         player_meta=meta, config=config, world_provider=provider)
+                         player_meta=meta, config=config, non_production_worlds=_np(provider))
     assert result["routes"], "the search produced no routes"
     transfers_by_route = {
         str(route_id): {

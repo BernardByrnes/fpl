@@ -24,6 +24,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from . import certified_bundle as cb
 from .season_rules import SeasonRules, free_transfers_after_chip, wildcard_gameweek_hit
 from .utils import parse_utc
 
@@ -443,6 +444,10 @@ DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING = "CERTIFICATION_WIRING_IDENTITY_MISS
 DIAG_LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED = "LEGACY_CERTIFICATION_IDENTITY_UNRECOGNISED"
 DIAG_CERTIFICATION_BUNDLE_IDENTITY_MISMATCH = "CERTIFICATION_BUNDLE_IDENTITY_MISMATCH"
 DIAG_CERTIFICATION_EVENT_SET_MISMATCH = "CERTIFICATION_EVENT_SET_MISMATCH"
+# PE-9: an ABSENT artifact and a CONTRADICTORY one are different facts, and the
+# tokens that say so are declared once, in the certification module.
+DIAG_CERTIFICATION_ARTIFACT_ABSENT = cb.DIAG_CERTIFICATION_ARTIFACT_ABSENT
+DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY = cb.DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY
 
 
 def certification_artifact_requires_history_completeness(schema: Any) -> bool:
@@ -529,27 +534,43 @@ def certification_identity_of(payload: Mapping[str, Any]) -> str:
     verify it without any code-drift assumption.  That is what makes the legacy
     allowlist an identity test rather than a forgeable label: copying a recognised
     identity onto a different artifact fails this check.
+
+    The fields are read through ``certified_bundle.plain_certification_value`` so the
+    SAME bytes are hashed whether the caller holds the parsed JSON or the read-only
+    snapshot a validated artifact exposes: the fingerprint is a function of the
+    artifact's content, never of the container it arrived in.
     """
 
     import hashlib
     import json as _json
 
-    fingerprint = {
-        "cutoff": payload.get("planning_cutoff"),
-        "bundles": payload.get("certified_bundle_identity") or {},
-        "data_snapshot_sha256": payload.get("data_snapshot_sha256"),
-    }
+    from . import certified_bundle as cb
+
+    fingerprint = cb.plain_certification_value(
+        {
+            "cutoff": payload.get("planning_cutoff"),
+            "bundles": payload.get("certified_bundle_identity") or {},
+            "data_snapshot_sha256": payload.get("data_snapshot_sha256"),
+        }
+    )
     return "sha256:" + hashlib.sha256(
         _json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
-def load_certification_artifact(path: str | Path) -> dict[str, Any]:
-    """Load and validate a certification artifact produced by the certifier.
+def validate_certification_artifact(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The COMPLETE authorization contract, applied to an artifact mapping.
 
-    Fails closed with ``DECISION_CERTIFICATION_REQUIRED`` when the artifact is
-    absent, malformed, or does not carry the fields a decision needs.  There is no
-    fallback to latest-per-family discovery anywhere in this path.
+    Fails closed with ``DECISION_CERTIFICATION_REQUIRED`` when the mapping is
+    malformed or does not carry the fields a decision needs.  There is no fallback
+    to latest-per-family discovery anywhere in this path.
+
+    This is the contract a LOAD consumes, so it is applied to the mapping form here
+    as well as to the file form by :func:`load_certification_artifact`: a caller that
+    presents an artifact-shaped mapping instead of a loaded artifact has exactly the
+    same contract re-run over it, and one that cannot pass it is never an
+    authorisation -- however self-consistent its own run ids and bundle identities
+    are.
 
     The certification contract is versioned.  ``v2`` requires the
     history-completeness audit and the certification-wiring identity, so a
@@ -559,16 +580,10 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     inferring PASS.
     """
 
-    import json
-    from pathlib import Path as _Path
-
-    artifact_path = _Path(path)
-    if not artifact_path.exists():
-        raise DecisionCertificationRequired(f"no certification artifact at {artifact_path}")
-    try:
-        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # malformed artifact must not be silently ignored
-        raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise DecisionCertificationRequired(
+            f"the certification artifact is {type(payload).__name__}, not an object"
+        )
     if payload.get("schema") not in SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS:
         raise DecisionCertificationRequired(
             f"artifact schema {payload.get('schema')!r} is not one of "
@@ -675,6 +690,32 @@ def load_certification_artifact(path: str | Path) -> dict[str, Any]:
     return payload
 
 
+def load_certification_artifact(path: str | Path) -> Any:
+    """Load and validate a HISTORICAL certification artifact produced by the certifier.
+
+    It reads the artifact's bytes and applies the complete artifact contract
+    (:func:`validate_certification_artifact`).  The value returned is a PLAIN
+    mapping: under PE-9 amendment 2 the authority for a predictive load is a
+    persisted, content-addressed GENERATION (:mod:`fpl_brain.generation_store`), not
+    a caller-carried object, so nothing here is a capability and no production
+    predictive boundary is gated on the result.
+    """
+
+    import json
+    from pathlib import Path as _Path
+
+    artifact_path = _Path(path)
+    if not artifact_path.exists():
+        raise DecisionCertificationRequired(
+            f"{DIAG_CERTIFICATION_ARTIFACT_ABSENT}: no certification artifact at {artifact_path}"
+        )
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # malformed artifact must not be silently ignored
+        raise DecisionCertificationRequired(f"certification artifact unreadable: {exc}") from exc
+    return validate_certification_artifact(payload)
+
+
 def canonical_event_horizon(values: Iterable[Any] | None) -> tuple[int, ...]:
     """Canonical (sorted, int) horizon for an exact-identity comparison.
 
@@ -684,6 +725,55 @@ def canonical_event_horizon(values: Iterable[Any] | None) -> tuple[int, ...]:
     """
 
     return tuple(sorted(int(event) for event in (values or ())))
+
+
+def assert_certification_artifact_describes_decision(
+    certification: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
+    *,
+    events: Iterable[int] | None = None,
+    cutoff: str | None = None,
+) -> Mapping[str, Any]:
+    """Exactly one certification artifact per decision, and it must describe it.
+
+    ``CERTIFICATION_ARTIFACT_ABSENT`` and ``CERTIFICATION_ARTIFACT_CONTRADICTORY``
+    are deliberately different tokens: a missing authorisation and an artifact
+    that contradicts the decision are different operational facts.  A horizon
+    assembled from two artifacts is a contradiction and is refused.
+    """
+
+    try:
+        resolved = cb.require_certification_artifact(certification)
+    except cb.CertificationArtifactAbsent as failure:
+        raise DecisionCertificationRequired(str(failure)) from failure
+    except cb.CertificationArtifactContradictory as failure:
+        raise DecisionCertificationRequired(str(failure)) from failure
+    contradictions: list[str] = []
+    if events is not None:
+        requested = canonical_event_horizon(events)
+        certified = canonical_event_horizon(resolved.get("events"))
+        if requested != certified:
+            contradictions.append(
+                f"{DIAG_CERTIFICATION_EVENT_SET_MISMATCH}: the decision horizon {list(requested)} is "
+                f"not the certified horizon {list(certified)}"
+            )
+    if cutoff is not None:
+        declared = resolved.get("planning_cutoff")
+        # The bundle-level cutoff is enforced exactly, by the dependency validator,
+        # against this same decision cutoff.  Here only a DECLARED artifact cutoff
+        # that contradicts the decision is refused: an artifact that declares none
+        # is bounded by its bundles, which is the identity that protects freshness.
+        if declared is not None and str(declared) != str(cutoff):
+            contradictions.append(
+                f"the certification artifact's planning cutoff {declared} is not the decision "
+                f"cutoff {cutoff}"
+            )
+    if not resolved.get("data_snapshot_sha256"):
+        contradictions.append("the certification artifact carries no data snapshot identity")
+    if contradictions:
+        raise DecisionCertificationRequired(
+            f"{DIAG_CERTIFICATION_ARTIFACT_CONTRADICTORY}: " + "; ".join(contradictions)
+        )
+    return resolved
 
 
 def event_support_from_certification(
@@ -702,15 +792,9 @@ def event_support_from_certification(
     reorderings are all refused before any support is returned.
     """
 
-    requested = canonical_event_horizon(events)
-    certified = canonical_event_horizon(certification.get("events"))
-    if requested != certified:
-        raise DecisionCertificationRequired(
-            f"{DIAG_CERTIFICATION_EVENT_SET_MISMATCH}: the decision horizon {list(requested)} must equal "
-            f"the certified horizon {list(certified)}; a certification authorises exactly its own events "
-            "(no subset, superset, duplicate or reordering)"
-        )
-
+    certification = assert_certification_artifact_describes_decision(
+        certification, events=events, cutoff=cutoff
+    )
     bundles = certification.get("certified_bundles") or {}
     selected = {
         int(event): {
@@ -725,8 +809,19 @@ def event_support_from_certification(
     }
     missing = [int(event) for event in events if int(event) not in selected]
     if missing:
-        raise DecisionCertificationRequired(f"certification covers no bundle for events {missing}")
-    return event_support_from_certified_bundles(conn, selected, cutoff=cutoff)
+        raise DecisionCertificationRequired(f"certification covers no bundle for event {missing}")
+    return event_support_from_certified_bundles(
+        conn,
+        selected,
+        cutoff=cutoff,
+        # PE-9 gap 1: the required model versions come from the ONE declared
+        # IN-LIBRARY source and NEVER from the artifact.  Reading the artifact's own
+        # record made the caller authoritative: an artifact that declared a relaxed or
+        # absent pin would have silently un-pinned the certification.  The artifact's
+        # record is no longer consulted here at all.
+        required_versions=cb.declared_required_versions(),
+        data_snapshot_sha256=certification.get("data_snapshot_sha256"),
+    )
 
 
 def event_support_from_certified_bundles(
@@ -734,6 +829,8 @@ def event_support_from_certified_bundles(
     bundles_by_event: Mapping[int, Mapping[str, Any]],
     *,
     cutoff: str,
+    required_versions: Mapping[str, str] | None = None,
+    data_snapshot_sha256: str | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Per-event support derived from CERTIFIED bundles' EXACT run ids.
 
@@ -741,24 +838,38 @@ def event_support_from_certified_bundles(
     matching run" per family: the bundle names the run ids, they are validated as
     one coherent DAG via ``certified_bundle``, and only then do they count as
     support.  An incoherent bundle raises instead of silently degrading.
+
+    ``data_snapshot_sha256`` is the certification artifact's own snapshot identity.
+    A bundle that declares a DIFFERENT one describes a different predictive world
+    and is refused, so the snapshot identity is validated rather than recorded.
     """
 
     from . import certified_bundle as cb
 
     support: dict[int, dict[str, Any]] = {}
+    failures: dict[int, list[str]] = {}
     for event, bundle in bundles_by_event.items():
         runs = {
             str(family): int(run_id)
             for family, run_id in (bundle.get("runs") or {}).items()
         }
-        certified = cb.certified_bundle_from_explicit_ids(
-            conn,
-            event=int(event),
-            cutoff=cutoff,
-            runs=runs,
-            data_snapshot_sha256=bundle.get("data_snapshot_sha256"),
-            code_snapshot_sha256=bundle.get("code_snapshot_sha256"),
-        )
+        try:
+            certified = cb.certified_bundle_from_explicit_ids(
+                conn,
+                event=int(event),
+                cutoff=cutoff,
+                runs=runs,
+                required_versions=required_versions,
+                data_snapshot_sha256=bundle.get("data_snapshot_sha256"),
+                code_snapshot_sha256=bundle.get("code_snapshot_sha256"),
+                expected_data_snapshot_sha256=data_snapshot_sha256,
+            )
+        except cb.BundleIncoherent as failure:
+            # Which EVENT failed is part of the refusal: one bad event makes the
+            # horizon incomplete, and an operator must be able to see which one
+            # without re-deriving it from the run ids.
+            failures[int(event)] = list(failure.reasons)
+            continue
         support[int(event)] = {
             "supported": True,
             "matched_runs": dict(certified.runs),
@@ -771,9 +882,19 @@ def event_support_from_certified_bundles(
             "data_cutoff": str(cutoff),
             "run_cutoffs": [str(cutoff)],
             "bundle_identity": certified.bundle_identity(),
+            "state": cb.STATE_CERTIFIED_COHERENT,
             "source": "certified_bundle",
         }
+    if failures:
+        raise cb.BundleIncoherent(
+            [
+                f"GW{event}: {reason}"
+                for event, reasons in sorted(failures.items())
+                for reason in reasons
+            ]
+        )
     return support
+
 
 
 def event_support_from_db(
@@ -788,8 +909,10 @@ def event_support_from_db(
     Per-event predictive support derived from accepted projection runs, choosing
     the NEWEST same-cutoff run per family.  That silently lets a later rerun of
     one family replace the certified one, and it validates no dependency edges,
-    so it must NOT be used for a production decision.  Production must consume a
-    certification artifact via :func:`event_support_from_certification`.
+    so it must NOT be used for a production decision.  Production readiness
+    resolves the certified GENERATION instead
+    (:func:`generation_store.resolve_generation` / :func:`generation_store.support_by_event`)
+    and refuses when no generation is selected.
     """
 
     support: dict[int, dict[str, Any]] = {}

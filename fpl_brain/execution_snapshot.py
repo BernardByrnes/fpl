@@ -325,6 +325,24 @@ def assert_snapshot_unchanged(snapshot: ExecutionSnapshot) -> None:
         )
 
 
+def assert_connection_matches_snapshot(conn: sqlite3.Connection, snapshot: ExecutionSnapshot) -> None:
+    """Require a SQLite connection to read the exact file whose bytes were pinned."""
+
+    assert_snapshot_unchanged(snapshot)
+    main = next((row for row in conn.execute("PRAGMA database_list") if str(row[1]) == "main"), None)
+    opened_path = str(main[2]) if main is not None else ""
+    try:
+        opened = os.path.normcase(os.path.realpath(opened_path))
+        pinned = os.path.normcase(os.path.realpath(snapshot.path))
+    except (OSError, TypeError, ValueError) as exc:
+        raise SnapshotError(f"{DIAG_SNAPSHOT_MISSING}: cannot resolve the opened snapshot path: {exc}") from exc
+    if not opened_path or opened != pinned:
+        raise SnapshotError(
+            f"{DIAG_SNAPSHOT_MUTATED}: source connection opens {opened_path!r}, "
+            f"not the pinned snapshot {snapshot.path!r}"
+        )
+
+
 def live_source_drift(
     snapshot: ExecutionSnapshot, *, live_db: str | Path | None = None
 ) -> dict[str, Any]:
@@ -432,6 +450,7 @@ __all__ = [
     "SNAPSHOT_MANIFEST",
     "SnapshotError",
     "assert_snapshot_unchanged",
+    "assert_connection_matches_snapshot",
     "capture_execution_snapshot",
     "file_sha256",
     "live_source_drift",

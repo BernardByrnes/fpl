@@ -12,6 +12,7 @@ import json
 import pytest
 
 from fpl_brain import route_comparator as rc
+from fpl_brain import route_optimizer as ro
 from fpl_brain import transfer_state as ts
 from test_transfer_state import CLUB, POOL_CLUB, POOL_POSITION, POSITION, SQUAD_IDS
 
@@ -48,7 +49,7 @@ def _matrix(event, cores=None, worlds=6, noise=None):
 def _provider(matrices):
     calls = {"count": 0, "events": []}
 
-    def provider(event):
+    def provider(event, union_ids=None):
         calls["count"] += 1
         calls["events"].append(event)
         return matrices[event]
@@ -56,9 +57,17 @@ def _provider(matrices):
     return provider, calls
 
 
-def _bundles(events=EVENTS, simulations=6):
-    return {event: rc.EventBundle(event=event, minutes_run_id=1, team_run_id=1, rate_run_id=1,
-                                  xpts_run_id=1, mc_run_id=1, simulations=simulations) for event in events}
+def _non_production(provider):
+    """The DECLARED interface every injected matrix must enter through.
+
+    A synthetic world was never loaded from a prediction run, so the comparator may
+    only consume it under a declaration naming who is exercising that interface.
+    """
+
+    return ro.NonProductionWorlds(
+        declaration="test_route_comparator: synthetic deterministic matrices, no prediction run",
+        provider=provider,
+    )
 
 
 def _state(*, event=4, bank=0, ft=1):
@@ -92,9 +101,13 @@ def _compare(routes, *, matrices=None, events=EVENTS, state=None, scenario=None,
     matrices = matrices or {event: _matrix(event) for event in events}
     provider, calls = _provider(matrices)
     result = rc.compare_routes(
-        bundles=_bundles(events), routes=routes, initial_state=state or _state(ft=ft),
+        events=events, routes=routes, initial_state=state or _state(ft=ft),
         scenario=scenario or _scenario(events), player_meta=META,
-        world_provider=provider, simulations=6, planning_cutoff="2026-09-11T13:00:00Z",
+        non_production_worlds=ro.NonProductionWorlds(
+            declaration="test_route_comparator: synthetic deterministic matrices, no prediction run",
+            provider=provider,
+        ),
+        simulations=6, planning_cutoff="2026-09-11T13:00:00Z",
     )
     return result, calls
 
@@ -169,7 +182,7 @@ def test_same_route_differs_in_legality_across_price_scenarios():
     assert "INSUFFICIENT_BANK" in (bad["routes"]["r"]["failure"] or "")
 
 
-def test_no_live_price_query_needed_with_world_provider():
+def test_no_live_price_query_needed_with_a_declared_non_production_world_source():
     # No connection is supplied at all; comparison must still work.
     result, _ = _compare([_route("roll", _roll_steps())], events=[4, 5])
     assert result["routes"]["roll"]["valid"]
@@ -254,10 +267,10 @@ def test_same_squad_event_is_cached():
 def test_policy_choice_does_not_alter_football_worlds():
     matrices = {event: _matrix(event) for event in [4, 5]}
     provider, calls = _provider(matrices)
-    rc.compare_routes(bundles=_bundles([4, 5]),
+    rc.compare_routes(events=[4, 5],
                       routes=[_route("a", _roll_steps([4, 5])), _route("b", [(4, [(11, 41)]), (5, [])])],
                       initial_state=_state(), scenario=_scenario([4, 5]), player_meta=META,
-                      world_provider=provider, simulations=6)
+                      non_production_worlds=_non_production(provider), simulations=6)
     assert calls["events"] == [4, 5]  # once per event, never per route
 
 
@@ -270,9 +283,9 @@ def test_routes_consume_same_event_world_matrix():
     matrices = {event: _matrix(event) for event in [4, 5]}
     provider, calls = _provider(matrices)
     routes = [_route("a", _roll_steps([4, 5])), _route("b", _roll_steps([4, 5])), _route("c", _roll_steps([4, 5]))]
-    result = rc.compare_routes(bundles=_bundles([4, 5]), routes=routes, initial_state=_state(),
+    result = rc.compare_routes(events=[4, 5], routes=routes, initial_state=_state(),
                                scenario=_scenario([4, 5]), player_meta=META,
-                               world_provider=provider, simulations=6)
+                               non_production_worlds=_non_production(provider), simulations=6)
     assert calls["count"] == 2  # one per event, shared by 3 routes
     assert result["routes"]["a"]["horizons"]["H1"] == result["routes"]["b"]["horizons"]["H1"]
 
@@ -281,13 +294,13 @@ def test_changing_transfer_sequence_does_not_alter_football_universe():
     matrices = {event: _matrix(event) for event in [4, 5, 6]}
     provider_a, calls_a = _provider(matrices)
     provider_b, calls_b = _provider(matrices)
-    rc.compare_routes(bundles=_bundles([4, 5, 6]), routes=[_route("a", _roll_steps([4, 5, 6]))],
+    rc.compare_routes(events=[4, 5, 6], routes=[_route("a", _roll_steps([4, 5, 6]))],
                       initial_state=_state(), scenario=_scenario([4, 5, 6]), player_meta=META,
-                      world_provider=provider_a, simulations=6)
-    rc.compare_routes(bundles=_bundles([4, 5, 6]),
+                      non_production_worlds=_non_production(provider_a), simulations=6)
+    rc.compare_routes(events=[4, 5, 6],
                       routes=[_route("a", [(4, [(11, 41)]), (5, []), (6, [])])],
                       initial_state=_state(), scenario=_scenario([4, 5, 6]), player_meta=META,
-                      world_provider=provider_b, simulations=6)
+                      non_production_worlds=_non_production(provider_b), simulations=6)
     assert calls_a["events"] == calls_b["events"] == [4, 5, 6]
 
 
@@ -478,7 +491,7 @@ def test_chip_route_not_modelled():
 
 
 def test_planning_context_and_artifacts_untouched(tmp_path):
-    # The comparator is pure with a world_provider: no DB, no writes.
+    # The comparator is pure with a declared non-production world source: no DB, no writes.
     result, _ = _compare([_route("roll", _roll_steps([4, 5]))], events=[4, 5])
     assert result["no_recommendation"] is True
 
