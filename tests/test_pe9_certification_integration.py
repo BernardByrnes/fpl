@@ -274,7 +274,7 @@ def _artifact(conn, runs_by_event, *, cutoff=CUTOFF, events=HORIZON, code_snapsh
     """A certification artifact of the shape the certifier mints.
 
     The code snapshot is recorded on the artifact AND on every bundle payload, as
-    ``scripts/certify_gw5_gw8.py`` does, so the identity the ``certify_*`` entry
+    ``scripts/certify_four_gw.py`` does, so the identity the ``certify_*`` entry
     points recompute from a payload is the identity the artifact recorded.
 
     The AUTHORIZATION fields are the ones the canonical loader's contract requires --

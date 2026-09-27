@@ -113,7 +113,7 @@ SOURCE_SNAPSHOT_FILES = (
     # The certification ENTRY POINT is in the identity on purpose: the
     # history-completeness gate lives in its wiring, so a change to that wiring
     # must change the certified code identity rather than pass unnoticed.
-    "scripts/certify_gw5_gw8.py",
+    "scripts/certify_four_gw.py",
     "scripts/freeze_predictions.py",
 )
 

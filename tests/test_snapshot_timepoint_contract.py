@@ -405,7 +405,7 @@ def test_j_valid_certification_flags_are_factual_and_authorising(tmp_path):
 def test_j_certifier_computes_the_authorisation_flag():
     """The flag is computed from the four conditions, never asserted."""
 
-    source = Path("scripts/certify_gw5_gw8.py").read_text(encoding="utf-8")
+    source = Path(fg.CERTIFIER_ENTRY_POINT).read_text(encoding="utf-8")
     assert "decision_search_permitted" in source
     assert "permit_reasons" in source
     for condition in ("temporal_status", "dependency_validation", "horizon_status",

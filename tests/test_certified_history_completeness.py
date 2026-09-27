@@ -849,7 +849,7 @@ def test_E_missing_audit_never_grants_legacy_status_by_absence(tmp_path):
 
 
 def test_F_certifier_entry_point_is_covered_by_the_code_identity():
-    assert fg.CERTIFIER_ENTRY_POINT == "scripts/certify_gw5_gw8.py"
+    assert fg.CERTIFIER_ENTRY_POINT == "scripts/certify_four_gw.py"
     assert fg.CERTIFIER_ENTRY_POINT in analytics.SOURCE_SNAPSHOT_FILES
 
     # Changing the certifier wiring must change the certified code identity.
@@ -906,13 +906,49 @@ def test_F2_new_schema_requires_the_certifier_in_the_declared_wiring(tmp_path):
 
     # And the certifier must actually EMIT that wiring, through the one helper that
     # names the gated entry point and hashes its live bytes.
-    source = Path("scripts/certify_gw5_gw8.py").read_text(encoding="utf-8")
+    source = Path(fg.CERTIFIER_ENTRY_POINT).read_text(encoding="utf-8")
     assert '"schema": fg.CERTIFICATION_ARTIFACT_SCHEMA' in source
     assert '"certification_wiring": fg.certification_wiring_identity()' in source
     emitted = fg.certification_wiring_identity()
-    assert emitted["entry_point"] == fg.CERTIFIER_ENTRY_POINT == "scripts/certify_gw5_gw8.py"
+    assert emitted["entry_point"] == fg.CERTIFIER_ENTRY_POINT == "scripts/certify_four_gw.py"
     assert emitted["entry_point_sha256"] == hashlib.sha256(Path(fg.CERTIFIER_ENTRY_POINT).read_bytes()).hexdigest()
     assert emitted["covered_source_files"] == list(analytics.SOURCE_SNAPSHOT_FILES)
+
+
+def test_F3_new_v2_artifact_must_name_the_generic_entry_point(tmp_path):
+    wiring = _wiring(covered=list(analytics.SOURCE_SNAPSHOT_FILES))
+    wiring["entry_point"] = "scripts/certify_gw5_gw8.py"
+    payload = _artifact(
+        fg.CERTIFICATION_ARTIFACT_SCHEMA,
+        history_completeness=_complete_audit(),
+        certification_wiring=wiring,
+    )
+    path = _write(tmp_path, payload, name="old_runner_claimed_as_current.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING in str(failure.value)
+
+
+def test_F4_historical_wiring_allowlist_still_requires_its_self_consistent_identity(tmp_path):
+    identity, descriptor = next(iter(fg.HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY.items()))
+    historical_covered = list(analytics.SOURCE_SNAPSHOT_FILES)
+    historical_covered[historical_covered.index(fg.CERTIFIER_ENTRY_POINT)] = descriptor["entry_point"]
+    payload = _artifact(
+        fg.CERTIFICATION_ARTIFACT_SCHEMA,
+        history_completeness=_complete_audit(),
+        planning_cutoff=CUTOFF,
+        four_gw_certification_identity=identity,
+        code_snapshot_sha256=descriptor["code_snapshot_sha256"],
+        certification_wiring={
+            "entry_point": descriptor["entry_point"],
+            "entry_point_sha256": descriptor["entry_point_sha256"],
+            "covered_source_files": historical_covered,
+        },
+    )
+    path = _write(tmp_path, payload, name="forged_historical_identity.json")
+    with pytest.raises(fg.DecisionCertificationRequired) as failure:
+        fg.load_certification_artifact(path)
+    assert fg.DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING in str(failure.value)
 
 
 def test_G_runner_gate_refuses_a_new_artifact_missing_the_audit(tmp_path):
@@ -948,7 +984,7 @@ def test_G_runner_gate_refuses_a_new_artifact_missing_the_audit(tmp_path):
 
 
 def test_H_certifier_writes_the_current_schema_not_a_hardcoded_version():
-    source = Path("scripts/certify_gw5_gw8.py").read_text(encoding="utf-8")
+    source = Path(fg.CERTIFIER_ENTRY_POINT).read_text(encoding="utf-8")
     assert '"fpl_brain.certification_artifact.v1"' not in source
     assert fg.CERTIFICATION_ARTIFACT_SCHEMA == fg.CERTIFICATION_ARTIFACT_SCHEMA_V2
     assert fg.CERTIFICATION_ARTIFACT_SCHEMA_V1 in fg.SUPPORTED_CERTIFICATION_ARTIFACT_SCHEMAS

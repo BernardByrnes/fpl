@@ -53,6 +53,7 @@ python scripts/import_scouting.py scouting/example_report.json --force
 
 python scripts/build_report.py                      # Markdown + JSON
 python scripts/build_report.py --gw 1 --format md --out data/exports/custom.md
+python scripts/certify_four_gw.py --config config.json
 
 python scripts/notes.py watchlist add --player-id 1 --status WATCH --reason "Monitor"
 python scripts/notes.py watchlist list
@@ -61,7 +62,9 @@ python scripts/notes.py strategy set --risk-posture balanced
 python scripts/db_shell.py
 ```
 
-Every CLI supports `--config`, `--verbose`, and `--quiet`. Exit code `0` includes benign pre-season no-data states; `1` is a recoverable network/partial failure; `2` is configuration or usage failure.
+The data and report CLIs support `--config`, `--verbose`, and `--quiet`. Exit code `0` includes benign pre-season no-data states; `1` is a recoverable network/partial failure; `2` is configuration or usage failure.
+
+The certified prediction runner resolves the planning event from the official schedule's unique `is_next` event and certifies the existing rolling four-event transfer horizon. `--planning-event` can make that event explicit, and `--events` can assert the horizon; either is refused if it disagrees with the canonical schedule and horizon rules.
 
 ## Post-GW Market Report V1
 
