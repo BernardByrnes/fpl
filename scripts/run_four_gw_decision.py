@@ -21,8 +21,9 @@ Stages
             ``engine_decision_records`` row.
 ``all``     bundle then search (search refuses if the horizon is incomplete).
 
-The decision is descriptor-only: the manager packet carries manager state, the
-profile carries ordinary decision parameters, and NOTHING predictive -- no bundle
+The decision is descriptor-only: the manager packet identifies the manager and may
+carry assertions to validate, while the canonical economic state is derived inside
+the trusted boundary from the pinned snapshot.  NOTHING predictive -- no bundle
 mapping, no run-id mapping, no matrix, no cache handle, no executor -- can reach a
 predictive load from the caller.  The exact run ids come from the generation's
 digest-verified manifest and the causal source rows from the pinned snapshot.
@@ -454,8 +455,8 @@ def main(argv=None) -> int:
             return 0
 
         # --- Stage B: the DECISION, through the canonical entrypoint ------------
-        # The runner no longer assembles a decision of its own: it states the manager
-        # state it is deciding FOR and calls ``generation_store.make_decision``, which
+        # The runner no longer assembles a decision of its own: it identifies the
+        # manager it is deciding FOR and calls ``generation_store.make_decision``, which
         # resolves and re-proves the certified generation, opens its PINNED snapshot
         # read-only, selects the DECLARED production pipeline by name, runs it, and
         # persists the decision artifact together with the engine_decision_record.
@@ -466,15 +467,6 @@ def main(argv=None) -> int:
             "planning_event": planning_event,
             "cutoff": cutoff,
             "season": config.get("season"),
-            "manager_state": {
-                "squad_ids": [int(pid) for pid in squad["squad_ids"]],
-                "bank_tenths": (context.manager_state or {}).get("bank"),
-                "free_transfers": (context.manager_state or {}).get("free_transfers"),
-                "event_start_free_transfers": (context.manager_state or {}).get(
-                    "event_start_free_transfers"
-                ),
-                "authoritative_source": (context.manager_state or {}).get("authoritative_source"),
-            },
         }
         profile = gs.DecisionProfile(
             kind=gs.HORIZON_KIND_FOUR_GW,
@@ -540,6 +532,7 @@ def run_certified_four_gw_decision(
     manager_packet,
     parameters,
     source_conn,
+    canonical_manager_state,
     controller=None,
 ):
     """The DECLARED production four-Gameweek decision pipeline.
@@ -552,7 +545,7 @@ def run_certified_four_gw_decision(
     ordinary decision parameters of the profile.  Nothing predictive reaches it from
     a caller: the exact run ids come from the generation's digest-verified manifest,
     the causal source rows come from the pinned snapshot, and the only caller-supplied
-    input is manager state plus search breadth.
+    inputs are manager identity, optional state assertions, and search breadth.
 
     It returns the decision payload that ``make_decision`` turns into the persisted
     decision artifact.  Every failure is a refusal that RAISES, so a decision that
@@ -667,29 +660,31 @@ def run_certified_four_gw_decision(
         source_conn, int(entry_id), int(planning_event), as_of=cutoff, season=season
     )
     source_squad = manager_worlds.resolve_squad(source_context, source_conn)
-    # Manager state IS a permitted caller input, so the packet's squad is accepted --
-    # but only if it IS the squad the PINNED snapshot resolves, which is the causal
-    # source this decision is taken against.
-    packet_squad_ids = [
-        int(pid) for pid in (_gs.manager_state_from_packet(manager_packet).get("squad_ids") or [])
-    ]
-    if packet_squad_ids and [int(pid) for pid in source_squad["squad_ids"]] != packet_squad_ids:
+    source_state = rc.build_route_state(source_conn, source_context, source_squad)
+    snapshot_manager_state = _gs.canonical_four_gw_manager_state(
+        entry_id=entry_id,
+        planning_event=planning_event,
+        cutoff=cutoff,
+        season=season,
+        context=source_context,
+        squad=source_squad,
+        route_state=source_state,
+    )
+    if analytics.canonical_hash(snapshot_manager_state) != analytics.canonical_hash(
+        canonical_manager_state
+    ):
         raise gs.GenerationRefused(
-            "MANAGER_PACKET_SQUAD_MISMATCH",
+            gs.DIAG_MANAGER_STATE_MISMATCH,
             [
-                "the manager packet's squad differs from the squad the generation's PINNED snapshot "
-                "resolves; the snapshot is the causal source for this decision"
+                "the four-GW pipeline route state differs from the canonical manager state "
+                "derived at the production decision boundary"
             ],
         )
-    source_state = rc.build_route_state(source_conn, source_context, source_squad)
+    _gs.assert_manager_packet_matches_canonical_state(manager_packet, snapshot_manager_state)
+    manager_context_sha256 = _gs.four_gw_manager_context_identity(snapshot_manager_state)
     search_provenance = {
         "planning_cutoff": cutoff,
-        "planning_context_hash": analytics.canonical_hash({
-            "entry_id": entry_id,
-            "planning_event": planning_event,
-            "cutoff": cutoff,
-            "manager_state": (source_context.manager_state or {}),
-        }),
+        "planning_context_hash": manager_context_sha256,
         "generation_id": generation.generation_id,
         "generation_horizon_kind": generation.horizon_kind,
         "data_snapshot_sha256": generation.snapshot.get("sha256"),
@@ -1215,6 +1210,7 @@ def run_certified_four_gw_decision(
         "suppression_reasons": suppression_reasons,
         "world_info": artifact["world_info"],
         "provenance": artifact["provenance"],
+        "consumed_manager_state": snapshot_manager_state,
         # The pipeline's own artwork: every block the operator-facing decision
         # artifact carries.  ``make_decision`` publishes them beside the canonical
         # identity fields rather than replacing them.

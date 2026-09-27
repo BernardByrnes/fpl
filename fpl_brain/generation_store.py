@@ -62,6 +62,8 @@ DIAG_GENERATION_HORIZON_KIND_UNKNOWN = "GENERATION_HORIZON_KIND_UNKNOWN"
 DIAG_DECISION_RECORD_UNKNOWN = "UNKNOWN_DECISION_ID"
 DIAG_DECISION_RECORD_INVALID = "DECISION_RECORD_INVALID"
 DIAG_DECISION_ARTIFACT_NOT_RETAINED = "DECISION_ARTIFACT_NOT_RETAINED"
+DIAG_MANAGER_STATE_MISMATCH = "MANAGER_STATE_MISMATCH"
+DIAG_MANAGER_STATE_EVIDENCE_MISSING = "MANAGER_STATE_EVIDENCE_MISSING"
 DIAG_PRODUCTION_DESCRIPTOR_ONLY = "PRODUCTION_DESCRIPTOR_ONLY"
 DIAG_PRODUCTION_PROFILE_UNKNOWN = "PRODUCTION_DECISION_PROFILE_UNKNOWN"
 DIAG_DECISION_REPLAY_ONLY = "DECISION_REPLAY_ONLY"
@@ -2116,22 +2118,59 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
     if isinstance(attribution, Mapping) and isinstance(attribution.get("manager_packet"), Mapping):
         manager_packet = attribution["manager_packet"]
         recorded_context = str(payload.get("manager_context_sha256") or "")
+        reproduced_context = ""
+        manager_state_rederived = False
         try:
             if payload.get("schema") == "fpl_brain.four_gw_decision.v1":
-                reproduced_context = _reproduce_four_gw_manager_context(generation, manager_packet)
+                reproduced_state = _rederive_four_gw_consumed_manager_state(
+                    generation, manager_packet
+                )
+                if "consumed_manager_state" in attribution:
+                    retained_state = attribution.get("consumed_manager_state")
+                    if not isinstance(retained_state, Mapping):
+                        failures.append(
+                            "the retained attribution has no canonical consumed manager state"
+                        )
+                    elif _json_round_trip_form(dict(retained_state)) != reproduced_state:
+                        failures.append(
+                            "the manager state retained as consumed differs from the state "
+                            "re-derived from the pinned snapshot"
+                        )
+                    else:
+                        reproduced_context = four_gw_manager_context_identity(reproduced_state)
+                        manager_state_rederived = True
+                else:
+                    # Backward compatibility for v1 artifacts written before the
+                    # canonical consumed state was retained separately.  The helper
+                    # still cross-checks every supplied assertion before reproducing
+                    # the original digest meaning.
+                    from . import analytics
+
+                    reproduced_context = analytics.canonical_hash(
+                        {
+                            "entry_id": int(reproduced_state["entry_id"]),
+                            "planning_event": int(reproduced_state["planning_event"]),
+                            "cutoff": str(reproduced_state["cutoff"]),
+                            "manager_state": reproduced_state["source_manager_context"],
+                        }
+                    )
+                    manager_state_rederived = True
             else:
                 reproduced_context = _fallback_manager_context_identity(
                     manager_packet,
                     planning_event=int(record["planning_event"]),
                     cutoff=generation.cutoff,
                 )
-            if not recorded_context or reproduced_context != recorded_context:
+                manager_state_rederived = True
+            if manager_state_rederived and (
+                not recorded_context or reproduced_context != recorded_context
+            ):
                 failures.append(
-                    "the manager context digest does not reproduce from the retained packet and "
-                    "pinned source snapshot "
+                    "the manager context digest does not reproduce from the canonical consumed "
+                    "manager state and pinned source snapshot "
                     f"({reproduced_context} vs {recorded_context or '<missing>'})"
                 )
-            else:
+            elif manager_state_rederived:
                 manager_context_verified = True
         except Exception as failure:  # evidence refusal, never an unverified success
             failures.append(f"the manager context cannot be re-derived: {type(failure).__name__}: {failure}")
@@ -2320,42 +2359,23 @@ def _fallback_manager_context_identity(
 def _reproduce_four_gw_manager_context(
     generation: CertifiedGeneration, manager_packet: Mapping[str, Any]
 ) -> str:
-    """Recompute the four-GW manager-context hash from its pinned source snapshot."""
+    """Reproduce the legacy four-GW source-context hash from its pinned snapshot.
+
+    New decision artifacts bind the full consumed state separately.  This remains
+    for already-retained v1 decision artifacts, and now checks every manager-state
+    assertion they retained before reporting the legacy context digest reproduced.
+    """
 
     from . import analytics
-    from . import manager_worlds
-    from .planning import get_planning_context
-
-    entry_id = int(manager_packet.get("entry_id") or 0)
-    if not entry_id:
-        raise ValueError("the retained manager packet has no entry_id")
-    source_conn = _open_generation_snapshot(generation)
-    try:
-        context = get_planning_context(
-            source_conn,
-            entry_id,
-            int(generation.planning_event),
-            as_of=str(generation.cutoff),
-            season=manager_packet.get("season"),
-        )
-        source_squad = manager_worlds.resolve_squad(context, source_conn)
-        packet_squad_ids = [
-            int(pid) for pid in (manager_state_from_packet(manager_packet).get("squad_ids") or [])
-        ]
-        if packet_squad_ids and [int(pid) for pid in source_squad["squad_ids"]] != packet_squad_ids:
-            raise ValueError(
-                "the retained manager packet squad does not match the squad resolved from the pinned snapshot"
-            )
-        return analytics.canonical_hash(
-            {
-                "entry_id": entry_id,
-                "planning_event": int(generation.planning_event),
-                "cutoff": str(generation.cutoff),
-                "manager_state": context.manager_state or {},
-            }
-        )
-    finally:
-        source_conn.close()
+    state = _rederive_four_gw_consumed_manager_state(generation, manager_packet)
+    return analytics.canonical_hash(
+        {
+            "entry_id": int(state["entry_id"]),
+            "planning_event": int(state["planning_event"]),
+            "cutoff": str(state["cutoff"]),
+            "manager_state": state["source_manager_context"],
+        }
+    )
 
 
 def _forbidden_descriptors_in(value: Any, *, path: str) -> list[str]:
@@ -2534,6 +2554,249 @@ def manager_state_from_packet(manager_packet: Mapping[str, Any]) -> dict[str, An
     if manager_packet.get("squad_ids") is not None:
         state.setdefault("squad_ids", manager_packet.get("squad_ids"))
     return state
+
+
+FOUR_GW_CONSUMED_MANAGER_STATE_SCHEMA = "fpl_brain.four_gw_consumed_manager_state.v1"
+
+
+def canonical_four_gw_manager_state(
+    *,
+    entry_id: int,
+    planning_event: int,
+    cutoff: str,
+    season: str | None,
+    context: Any,
+    squad: Mapping[str, Any],
+    route_state: Any,
+) -> dict[str, Any]:
+    """Serialize the exact snapshot-derived manager state consumed by four-GW search.
+
+    ``RouteState`` is the decision engine's actual initial state: it contains the
+    squad and acquisition basis, bank in integer tenths, current free transfers,
+    chip state, and the explicitly recorded event-start free-transfer value.  The
+    source manager context is retained alongside it so the authority/provenance for
+    those values can be independently re-derived later.
+    """
+
+    manager_context = dict(context.manager_state or {})
+    bank = _required_manager_integer(manager_context.get("bank"), "bank")
+    free_transfers = _required_manager_integer(
+        manager_context.get("free_transfers"), "free_transfers"
+    )
+    event_start_free_transfers = _required_manager_integer(
+        manager_context.get("event_start_free_transfers"),
+        "event_start_free_transfers",
+        allow_none=True,
+    )
+    if int(route_state.bank_tenths) != bank:
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_MISMATCH,
+            ["the route state's bank_tenths differs from the pinned manager context bank"],
+        )
+    if int(route_state.free_transfers) != free_transfers:
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_MISMATCH,
+            ["the route state's free_transfers differs from the pinned manager context"],
+        )
+    actual_event_start = route_state.event_start_free_transfers
+    if actual_event_start is not None:
+        actual_event_start = _required_manager_integer(
+            actual_event_start, "route_state.event_start_free_transfers"
+        )
+    if actual_event_start != event_start_free_transfers:
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_MISMATCH,
+            ["the route state's event-start free transfers differ from the pinned manager context"],
+        )
+
+    players = [player.as_dict() for player in route_state.players]
+    player_ids = [int(player["player_id"]) for player in players]
+    snapshot_squad_ids = sorted(int(pid) for pid in (squad.get("squad_ids") or []))
+    if player_ids != snapshot_squad_ids:
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_MISMATCH,
+            ["the route state's players differ from the squad resolved from the pinned snapshot"],
+        )
+    return {
+        "schema": FOUR_GW_CONSUMED_MANAGER_STATE_SCHEMA,
+        "entry_id": int(entry_id),
+        "planning_event": int(planning_event),
+        "cutoff": str(cutoff),
+        "season": season,
+        "source_manager_context": _json_round_trip_form(manager_context),
+        "route_state": {
+            "event": int(route_state.event),
+            "players": players,
+            "bank_tenths": bank,
+            "free_transfers": free_transfers,
+            "chip_state": _json_round_trip_form(list(route_state.chip_state or ())),
+            "event_start_free_transfers": event_start_free_transfers,
+        },
+    }
+
+
+def four_gw_manager_context_identity(consumed_manager_state: Mapping[str, Any]) -> str:
+    """Digest the canonical state the four-GW production decision actually consumes."""
+
+    from . import analytics
+
+    state = _json_round_trip_form(dict(consumed_manager_state))
+    return analytics.canonical_hash(
+        {
+            "schema": FOUR_GW_CONSUMED_MANAGER_STATE_SCHEMA,
+            "entry_id": int(state["entry_id"]),
+            "planning_event": int(state["planning_event"]),
+            "cutoff": str(state["cutoff"]),
+            "consumed_manager_state": state,
+        }
+    )
+
+
+def assert_manager_packet_matches_canonical_state(
+    manager_packet: Mapping[str, Any], consumed_manager_state: Mapping[str, Any]
+) -> None:
+    """Validate every caller-supplied manager-state assertion against snapshot state.
+
+    Omitted assertions are allowed because the production boundary derives and
+    retains the canonical state itself.  A present field, including a present
+    ``None`` or numeric zero, is an assertion and must match semantically.
+    """
+
+    route_state = consumed_manager_state.get("route_state")
+    if not isinstance(route_state, Mapping):
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_MISMATCH,
+            ["the canonical four-GW manager state has no route_state"],
+        )
+    players = route_state.get("players") or []
+    canonical = {
+        "squad_ids": [int(player["player_id"]) for player in players],
+        "bank_tenths": int(route_state["bank_tenths"]),
+        "free_transfers": int(route_state["free_transfers"]),
+        "event_start_free_transfers": route_state.get("event_start_free_transfers"),
+        "authoritative_source": (
+            consumed_manager_state.get("source_manager_context") or {}
+        ).get("authoritative_source"),
+    }
+    assertions: list[tuple[str, Any, str]] = []
+    nested = manager_packet.get("manager_state")
+    if "manager_state" in manager_packet and not isinstance(nested, Mapping):
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_MISMATCH,
+            ["manager_packet.manager_state must be an object of assertions when supplied"],
+        )
+    if isinstance(nested, Mapping):
+        assertions.extend(
+            (str(key), value, f"manager_packet.manager_state.{key}")
+            for key, value in nested.items()
+        )
+    if "squad_ids" in manager_packet:
+        assertions.append(("squad_ids", manager_packet.get("squad_ids"), "manager_packet.squad_ids"))
+
+    failures: list[str] = []
+    for field_name, supplied, label in assertions:
+        if field_name not in canonical:
+            failures.append(f"{label} is not a declared manager-state assertion")
+            continue
+        try:
+            normalized = _normalize_manager_assertion(field_name, supplied)
+        except (TypeError, ValueError) as failure:
+            failures.append(f"{label} is invalid: {failure}")
+            continue
+        expected = canonical[field_name]
+        if normalized != expected:
+            failures.append(
+                f"{label} does not match the pinned snapshot state ({normalized!r} vs {expected!r})"
+            )
+    if failures:
+        raise GenerationRefused(DIAG_MANAGER_STATE_MISMATCH, failures)
+
+
+def _required_manager_integer(value: Any, field_name: str, *, allow_none: bool = False) -> int | None:
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_EVIDENCE_MISSING,
+            [f"the pinned manager context has no valid integer {field_name} value"],
+        )
+    if value < 0:
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_EVIDENCE_MISSING,
+            [f"the pinned manager context {field_name} value is negative"],
+        )
+    return int(value)
+
+
+def _normalize_manager_assertion(field_name: str, value: Any) -> Any:
+    if field_name == "squad_ids":
+        if not isinstance(value, (list, tuple)):
+            raise TypeError("must be a list of player ids")
+        if any(isinstance(pid, bool) or not isinstance(pid, int) for pid in value):
+            raise TypeError("player ids must be integers")
+        return sorted(int(pid) for pid in value)
+    if field_name in {"bank_tenths", "free_transfers", "event_start_free_transfers"}:
+        if value is None and field_name == "event_start_free_transfers":
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("must be an integer (zero is a value, not absence)")
+        if value < 0:
+            raise ValueError("must not be negative")
+        return int(value)
+    if field_name == "authoritative_source":
+        if value is not None and not isinstance(value, str):
+            raise TypeError("must be a string or null")
+        return value
+    return value
+
+
+def _derive_four_gw_consumed_manager_state(
+    source_conn: sqlite3.Connection,
+    *,
+    generation: CertifiedGeneration,
+    manager_packet: Mapping[str, Any],
+) -> dict[str, Any]:
+    from . import manager_worlds, route_comparator
+    from .planning import get_planning_context
+
+    entry_id = int(manager_packet.get("entry_id") or 0)
+    if entry_id <= 0:
+        raise GenerationRefused(
+            DIAG_MANAGER_STATE_EVIDENCE_MISSING,
+            ["the manager packet has no usable entry_id for snapshot state resolution"],
+        )
+    context = get_planning_context(
+        source_conn,
+        entry_id,
+        int(generation.planning_event),
+        as_of=str(generation.cutoff),
+        season=manager_packet.get("season"),
+    )
+    squad = manager_worlds.resolve_squad(context, source_conn)
+    route_state = route_comparator.build_route_state(source_conn, context, squad)
+    return canonical_four_gw_manager_state(
+        entry_id=entry_id,
+        planning_event=int(generation.planning_event),
+        cutoff=str(generation.cutoff),
+        season=manager_packet.get("season"),
+        context=context,
+        squad=squad,
+        route_state=route_state,
+    )
+
+
+def _rederive_four_gw_consumed_manager_state(
+    generation: CertifiedGeneration, manager_packet: Mapping[str, Any]
+) -> dict[str, Any]:
+    source_conn = _open_generation_snapshot(generation)
+    try:
+        state = _derive_four_gw_consumed_manager_state(
+            source_conn, generation=generation, manager_packet=manager_packet
+        )
+        assert_manager_packet_matches_canonical_state(manager_packet, state)
+        return state
+    finally:
+        source_conn.close()
 
 
 def _manager_world_decision_executor(
@@ -2720,9 +2983,10 @@ def make_decision(
 
     There is deliberately NO executor parameter: the pipeline is selected by the
     profile's declared KIND, so a caller cannot inject decision logic.  The manager
-    packet carries manager state and the request carries ordinary decision
-    parameters -- predictive evidence, cache handles and certification objects are
-    refused wherever they appear, at any depth.
+    packet carries manager identity and optional state assertions; for four-GW the
+    canonical economic state is derived from the pinned snapshot.  The request
+    carries ordinary decision parameters -- predictive evidence, cache handles and
+    certification objects are refused wherever they appear, at any depth.
 
     The decision stays pinned to the generation selected at the START even if
     ``current_generation`` changes concurrently: the id is resolved once, and every
@@ -2741,6 +3005,10 @@ def make_decision(
             [f"manager_packet has undeclared field(s): {unknown_packet_fields}"]
         )
     manager_state = packet.get("manager_state")
+    if "manager_state" in packet and not isinstance(manager_state, Mapping):
+        raise ProductionDescriptorOnly(
+            ["manager_packet.manager_state must be an object when supplied"]
+        )
     if isinstance(manager_state, Mapping):
         allowed_manager_fields = {
             "squad_ids", "bank_tenths", "free_transfers", "event_start_free_transfers",
@@ -2793,14 +3061,22 @@ def make_decision(
     executor = _decision_executor(resolved_profile)
     source_conn = _open_generation_snapshot(generation)
     try:
-        decision_result = executor(
-            conn=conn,
-            generation=generation,
-            manager_packet=packet,
-            parameters=dict(resolved_profile.parameters),
-            source_conn=source_conn,
-            controller=controller,
-        )
+        executor_arguments = {
+            "conn": conn,
+            "generation": generation,
+            "manager_packet": packet,
+            "parameters": dict(resolved_profile.parameters),
+            "source_conn": source_conn,
+            "controller": controller,
+        }
+        canonical_manager_state = None
+        if resolved_profile.kind == HORIZON_KIND_FOUR_GW:
+            canonical_manager_state = _derive_four_gw_consumed_manager_state(
+                source_conn, generation=generation, manager_packet=packet
+            )
+            assert_manager_packet_matches_canonical_state(packet, canonical_manager_state)
+            executor_arguments["canonical_manager_state"] = canonical_manager_state
+        decision_result = executor(**executor_arguments)
     finally:
         source_conn.close()
     if _decision_runner_code_identity(resolved_profile) != runner_code_identity:
@@ -2825,10 +3101,22 @@ def make_decision(
     runner_identity = str(decision_result.get("runner_identity") or _default_runner_identity())
     result_provenance = dict(decision_result.get("provenance") or {})
     if resolved_profile.kind == HORIZON_KIND_FOUR_GW:
-        manager_context_sha256 = str(result_provenance.get("planning_context_hash") or "")
-        if not manager_context_sha256:
+        returned_state = decision_result.get("consumed_manager_state")
+        if not isinstance(returned_state, Mapping) or _json_round_trip_form(dict(returned_state)) != canonical_manager_state:
             raise DecisionRecordInvalid(
-                ["the four-GW runner returned no resolved manager-context identity"]
+                [
+                    "the four-GW runner did not return the exact manager state the production "
+                    "boundary derived from the pinned snapshot"
+                ]
+            )
+        manager_context_sha256 = four_gw_manager_context_identity(canonical_manager_state)
+        reported_context_sha256 = str(result_provenance.get("planning_context_hash") or "")
+        if reported_context_sha256 != manager_context_sha256:
+            raise DecisionRecordInvalid(
+                [
+                    "the four-GW runner's manager-context digest does not bind the canonical "
+                    "manager state derived from the pinned snapshot"
+                ]
             )
     else:
         manager_context_sha256 = _fallback_manager_context_identity(
@@ -2853,10 +3141,10 @@ def make_decision(
         "planning_event": int(generation.planning_event),
         "planning_cutoff": generation.cutoff,
         "decision_events": list(generation.events),
-        # The attribution block carries the EXACT manager state and request the
-        # decision consumed, so ``verify decision`` RECOMPUTES both digests from the
-        # retained artifact instead of reporting them as verified because a number
-        # was stored.
+        # The attribution block keeps the caller's manager packet and request as
+        # assertions/identity.  The canonical four-GW state actually consumed is
+        # stored separately below and re-derived from the pinned snapshot by
+        # ``verify_decision`` before its digest is reported as verified.
         "attribution": {
             "manager_packet": packet,
             "request": requested,
@@ -2896,6 +3184,8 @@ def make_decision(
         "world_info": decision_result.get("world_info"),
         "no_execution": True,
     })
+    if canonical_manager_state is not None:
+        artifact["attribution"]["consumed_manager_state"] = canonical_manager_state
     result_digest = result_identity_of(artifact)
     artifact_path = _decision_artifact_dir(conn, int(generation.planning_event)) / (
         result_digest.split(":", 1)[1][:32] + ".json"

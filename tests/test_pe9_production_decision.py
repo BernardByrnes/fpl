@@ -24,7 +24,9 @@ import generation_fixtures as gf
 from fpl_brain import certified_bundle as cb
 from fpl_brain import execution
 from fpl_brain import generation_store as gs
+from fpl_brain import manager_worlds, route_comparator, repositories as repo
 from fpl_brain.database import connect_database
+from fpl_brain.planning import get_planning_context
 
 #: A legal 15-player squad (2 GK, 5 DEF, 5 MID, 3 FWD), which is what a manager-world
 #: decision consumes.  Manager state is a PERMITTED caller input; the predictive
@@ -109,6 +111,460 @@ def _decision(conn, generation_id=None, **over):
     packet = over.pop("packet", None) or _packet()
     arguments.update(over)
     return gs.make_decision(conn, packet, 5, generation_id=generation_id, **arguments)
+
+
+def _four_gw_manager_state_snapshot(
+    tmp_path: Path, *, bank: int | None = 7, free_transfers: int | None = 1,
+    event_start_free_transfers: int | None = 2,
+):
+    """Build a real manager snapshot and return its canonical four-GW route state."""
+
+    import test_four_gw_decision as four_gw_fixtures
+
+    path = tmp_path / "manager-source.db"
+    conn = connect_database(path)
+    four_gw_fixtures._seed_regression_manager(conn, entry_id=241392, event=4)
+    repo.upsert_manual_manager_state(
+        conn,
+        241392,
+        4,
+        free_transfers,
+        bank,
+        captured_at=gf.CUTOFF,
+        event_start_free_transfers=event_start_free_transfers,
+    )
+    conn.commit()
+    snapshot = gf.write_snapshot(tmp_path / "manager-snapshot.db", database=conn)
+    source = sqlite3.connect(f"file:{snapshot['path']}?mode=ro", uri=True)
+    source.row_factory = sqlite3.Row
+    try:
+        context = get_planning_context(
+            source, 241392, 4, as_of=gf.CUTOFF, season="2026/27"
+        )
+        squad = manager_worlds.resolve_squad(context, source)
+        route_state = route_comparator.build_route_state(source, context, squad)
+        canonical = gs.canonical_four_gw_manager_state(
+            entry_id=241392,
+            planning_event=4,
+            cutoff=gf.CUTOFF,
+            season="2026/27",
+            context=context,
+            squad=squad,
+            route_state=route_state,
+        )
+    finally:
+        source.close()
+        conn.close()
+    return snapshot, canonical
+
+
+def _four_gw_manager_packet(canonical_state: dict, **state_overrides) -> dict:
+    route = canonical_state["route_state"]
+    state = {
+        "squad_ids": [int(player["player_id"]) for player in route["players"]],
+        "bank_tenths": int(route["bank_tenths"]),
+        "free_transfers": int(route["free_transfers"]),
+        "event_start_free_transfers": route["event_start_free_transfers"],
+        "authoritative_source": canonical_state["source_manager_context"]["authoritative_source"],
+    }
+    state.update(state_overrides)
+    return {
+        "entry_id": int(canonical_state["entry_id"]),
+        "planning_event": int(canonical_state["planning_event"]),
+        "cutoff": str(canonical_state["cutoff"]),
+        "season": canonical_state["season"],
+        "manager_state": state,
+    }
+
+
+def _four_gw_certified_manager_world(
+    path: Path, *, bank: int = 7, free_transfers: int = 0,
+    event_start_free_transfers: int | None = None,
+):
+    """Create a four-event generation whose pinned snapshot has real manager state."""
+
+    import test_four_gw_decision as four_gw_fixtures
+
+    conn = connect_database(path)
+    gf.base_world(conn)
+    four_gw_fixtures._seed_regression_manager(conn, entry_id=241392, event=4)
+    repo.upsert_manual_manager_state(
+        conn,
+        241392,
+        4,
+        free_transfers,
+        bank,
+        captured_at=gf.CUTOFF,
+        event_start_free_transfers=event_start_free_transfers,
+    )
+    events = (4, 5, 6, 7)
+    fixture_ids = {4: [41], 5: [42], 6: [43], 7: [44]}
+    with conn:
+        for event in events[1:]:
+            gf.add_event(conn, event)
+            gf.add_fixture(conn, fixture_ids[event][0], event, 1, 2)
+        gf.prepare_fixture_snapshot(conn, events, cutoff=gf.CUTOFF)
+        runs_by_event = {}
+        next_run = 100
+        for event in events:
+            ids = {
+                "minutes_v1": next_run,
+                "team_strength_v1": next_run + 1,
+                "player_rates_v1": next_run + 2,
+                "xpts_v1": next_run + 3,
+                "monte_carlo_v1": next_run + 4,
+            }
+            next_run += 5
+            for family, run_id in ids.items():
+                gf.add_run(conn, run_id, family, event, cutoff=gf.CUTOFF)
+            for fixture_id in fixture_ids[event]:
+                gf.add_xpts_row(
+                    conn,
+                    ids["xpts_v1"],
+                    fixture_id,
+                    event,
+                    minutes_run_id=ids["minutes_v1"],
+                    team_run_id=ids["team_strength_v1"],
+                    rate_run_id=ids["player_rates_v1"],
+                )
+                gf.add_mc_row(
+                    conn,
+                    ids["monte_carlo_v1"],
+                    fixture_id,
+                    event,
+                    xpts_run_id=ids["xpts_v1"],
+                    minutes_run_id=ids["minutes_v1"],
+                    team_run_id=ids["team_strength_v1"],
+                    rate_run_id=ids["player_rates_v1"],
+                )
+            runs_by_event[event] = ids
+    generation = gf.certify_world(
+        conn,
+        runs_by_event,
+        events=events,
+        planning_event=4,
+        horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+        snapshot_path=path.parent / "four-gw-snapshot.db",
+    )
+    return conn, generation
+
+
+@pytest.mark.parametrize("free_transfers", [0, 1, 2])
+def test_canonical_four_gw_state_binds_zero_and_nonzero_bank_and_ft_values(
+    tmp_path, free_transfers
+):
+    _snapshot, canonical = _four_gw_manager_state_snapshot(
+        tmp_path,
+        bank=0,
+        free_transfers=free_transfers,
+        event_start_free_transfers=free_transfers,
+    )
+    route = canonical["route_state"]
+    assert route["bank_tenths"] == 0
+    assert route["free_transfers"] == free_transfers
+    assert route["event_start_free_transfers"] == free_transfers
+    gs.assert_manager_packet_matches_canonical_state(
+        _four_gw_manager_packet(canonical), canonical
+    )
+    assert gs.four_gw_manager_context_identity(canonical).startswith("sha256:")
+
+
+def test_canonical_four_gw_state_refuses_packet_economic_mismatches_and_allows_omissions(
+    tmp_path,
+):
+    _snapshot, canonical = _four_gw_manager_state_snapshot(
+        tmp_path, bank=7, free_transfers=1, event_start_free_transfers=2
+    )
+    exact = _four_gw_manager_packet(canonical)
+    gs.assert_manager_packet_matches_canonical_state(exact, canonical)
+    # The caller may supply only the manager identity: canonical state is derived
+    # from the pinned snapshot and retained separately by the production boundary.
+    gs.assert_manager_packet_matches_canonical_state(
+        {key: exact[key] for key in ("entry_id", "planning_event", "cutoff", "season")},
+        canonical,
+    )
+
+    for mismatch in (
+        {"bank_tenths": 8},
+        {"free_transfers": 0},
+        {"bank_tenths": 8, "free_transfers": 0},
+        {"event_start_free_transfers": 1},
+        {"squad_ids": [*range(1, 15), 99]},
+    ):
+        packet = _four_gw_manager_packet(canonical, **mismatch)
+        with pytest.raises(gs.GenerationRefused) as refused:
+            gs.assert_manager_packet_matches_canonical_state(packet, canonical)
+        assert refused.value.token == gs.DIAG_MANAGER_STATE_MISMATCH
+
+    # A present None is not treated as an omitted assertion or as numeric zero.
+    packet = _four_gw_manager_packet(canonical, bank_tenths=None)
+    with pytest.raises(gs.GenerationRefused) as missing_value:
+        gs.assert_manager_packet_matches_canonical_state(packet, canonical)
+    assert missing_value.value.token == gs.DIAG_MANAGER_STATE_MISMATCH
+
+    # None is a legitimate event-start FT value when the authoritative snapshot
+    # does not contain it; an omitted assertion remains safe because canonical
+    # attribution is derived and retained independently.
+    no_event_start_dir = tmp_path / "event-start-none"
+    no_event_start_dir.mkdir()
+    _snapshot, no_event_start = _four_gw_manager_state_snapshot(
+        no_event_start_dir, bank=0, free_transfers=0, event_start_free_transfers=None
+    )
+    packet = _four_gw_manager_packet(no_event_start)
+    gs.assert_manager_packet_matches_canonical_state(packet, no_event_start)
+    packet["manager_state"].pop("event_start_free_transfers")
+    gs.assert_manager_packet_matches_canonical_state(packet, no_event_start)
+    packet["manager_state"]["event_start_free_transfers"] = 0
+    with pytest.raises(gs.GenerationRefused) as unexpected_value:
+        gs.assert_manager_packet_matches_canonical_state(packet, no_event_start)
+    assert unexpected_value.value.token == gs.DIAG_MANAGER_STATE_MISMATCH
+
+
+def test_canonical_four_gw_state_refuses_missing_snapshot_bank_or_free_transfers(tmp_path):
+    with pytest.raises(gs.GenerationRefused) as missing:
+        _four_gw_manager_state_snapshot(
+            tmp_path, bank=None, free_transfers=None, event_start_free_transfers=None
+        )
+    assert missing.value.token == gs.DIAG_MANAGER_STATE_EVIDENCE_MISSING
+
+
+def test_make_decision_executes_and_retains_the_snapshot_derived_manager_state(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "four-gw.db"
+    conn, generation = _four_gw_certified_manager_world(
+        path, bank=0, free_transfers=0, event_start_free_transfers=0
+    )
+    captured = {}
+
+    def declared_runner(**kwargs):
+        state = kwargs["canonical_manager_state"]
+        captured["state"] = state
+        return {
+            "decision": {"status": "CANONICAL_MANAGER_STATE_TEST"},
+            "consumed_manager_state": state,
+            "provenance": {
+                "planning_context_hash": gs.four_gw_manager_context_identity(state)
+            },
+            "runner_identity": "test-declared-four-gw-runner",
+            "artifact_blocks": {},
+        }
+
+    monkeypatch.setattr(gs, "_decision_executor", lambda _profile: declared_runner)
+    try:
+        packet = {
+            "entry_id": 241392,
+            "planning_event": 4,
+            "cutoff": gf.CUTOFF,
+            "season": "2026/27",
+        }
+        outcome = gs.make_decision(
+            conn,
+            packet,
+            4,
+            horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+            generation_id=generation.generation_id,
+            profile=gs.DecisionProfile(kind=gs.HORIZON_KIND_FOUR_GW),
+        )
+
+        consumed = captured["state"]
+        assert consumed["route_state"]["bank_tenths"] == 0
+        assert consumed["route_state"]["free_transfers"] == 0
+        assert consumed["route_state"]["event_start_free_transfers"] == 0
+        assert outcome["artifact"]["attribution"]["manager_packet"] == packet
+        assert outcome["artifact"]["attribution"]["consumed_manager_state"] == consumed
+        assert outcome["manager_context_sha256"] == gs.four_gw_manager_context_identity(consumed)
+        assert gs.verify_decision(conn, outcome["decision_record_id"])["verified"] is True
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "field_name", ["bank_tenths", "free_transfers", "event_start_free_transfers"]
+)
+def test_verify_decision_refuses_retained_manager_state_tampering(
+    tmp_path, monkeypatch, field_name
+):
+    path = tmp_path / "four-gw.db"
+    conn, generation = _four_gw_certified_manager_world(
+        path, bank=0, free_transfers=0, event_start_free_transfers=0
+    )
+
+    def declared_runner(**kwargs):
+        state = kwargs["canonical_manager_state"]
+        return {
+            "decision": {"status": "CANONICAL_MANAGER_STATE_TEST"},
+            "consumed_manager_state": state,
+            "provenance": {
+                "planning_context_hash": gs.four_gw_manager_context_identity(state)
+            },
+            "runner_identity": "test-declared-four-gw-runner",
+            "artifact_blocks": {},
+        }
+
+    monkeypatch.setattr(gs, "_decision_executor", lambda _profile: declared_runner)
+    try:
+        packet = {
+            "entry_id": 241392,
+            "planning_event": 4,
+            "cutoff": gf.CUTOFF,
+            "season": "2026/27",
+        }
+        outcome = gs.make_decision(
+            conn,
+            packet,
+            4,
+            horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+            generation_id=generation.generation_id,
+            profile=gs.DecisionProfile(kind=gs.HORIZON_KIND_FOUR_GW),
+        )
+        artifact_path = Path(outcome["decision_artifact_ref"])
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["attribution"]["consumed_manager_state"]["route_state"][field_name] += 1
+        artifact_path.write_text(
+            json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(gs.GenerationRefused) as refused:
+            gs.verify_decision(conn, outcome["decision_record_id"])
+        assert refused.value.token == gs.DIAG_DECISION_RECORD_INVALID
+        assert any(
+            "retained as consumed differs from the state re-derived from the pinned snapshot" in item
+            for item in refused.value.reasons
+        )
+    finally:
+        conn.close()
+
+
+def test_make_decision_refuses_manager_state_assertions_before_execution_or_persistence(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "four-gw.db"
+    conn, generation = _four_gw_certified_manager_world(
+        path, bank=0, free_transfers=0, event_start_free_transfers=0
+    )
+    called = []
+
+    def should_not_run(**_kwargs):
+        called.append(True)
+        raise AssertionError("decision executor ran for mismatched manager state")
+
+    monkeypatch.setattr(gs, "_decision_executor", lambda _profile: should_not_run)
+    try:
+        base_packet = {
+            "entry_id": 241392,
+            "planning_event": 4,
+            "cutoff": gf.CUTOFF,
+            "season": "2026/27",
+        }
+        for assertions in (
+            {"bank_tenths": 1},
+            {"free_transfers": 1},
+            {"bank_tenths": 1, "free_transfers": 1},
+            {"event_start_free_transfers": 1},
+            {"bank_tenths": None},
+        ):
+            packet = {**base_packet, "manager_state": assertions}
+            with pytest.raises(gs.GenerationRefused) as refused:
+                gs.make_decision(
+                    conn,
+                    packet,
+                    4,
+                    horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+                    generation_id=generation.generation_id,
+                    profile=gs.DecisionProfile(kind=gs.HORIZON_KIND_FOUR_GW),
+                )
+            assert refused.value.token == gs.DIAG_MANAGER_STATE_MISMATCH
+        with pytest.raises(gs.ProductionDescriptorOnly):
+            gs.make_decision(
+                conn,
+                {**base_packet, "manager_state": None},
+                4,
+                horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+                generation_id=generation.generation_id,
+                profile=gs.DecisionProfile(kind=gs.HORIZON_KIND_FOUR_GW),
+            )
+        assert called == []
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_four_gw_production_runner_passes_the_pinned_route_state_to_optimizer(
+    tmp_path, monkeypatch
+):
+    import test_four_gw_decision as four_gw_fixtures
+    import fpl_brain.route_comparator as route_comparator
+
+    path = tmp_path / "four-gw.db"
+    conn, generation = _four_gw_certified_manager_world(
+        path, bank=0, free_transfers=0, event_start_free_transfers=0
+    )
+    runner = gs._declared_production_entrypoint(
+        gs.PRODUCTION_DECISION_MODULES[gs.HORIZON_KIND_FOUR_GW]
+    )
+    runner_globals = runner.__globals__
+    captured = {}
+
+    def stop_at_optimizer(**kwargs):
+        captured["initial_state"] = kwargs["initial_state"]
+        raise RuntimeError("test reached the real optimizer boundary")
+
+    monkeypatch.setattr(runner_globals["cu"], "price_snapshot_as_of", lambda *a, **k: object())
+    monkeypatch.setattr(route_comparator, "flat_current_price_scenario", lambda *a, **k: object())
+    monkeypatch.setattr(runner_globals["cu"], "load_pool", lambda *a, **k: {"players": []})
+    monkeypatch.setattr(
+        runner_globals["provenance"],
+        "assert_official_pool_identity",
+        lambda **_k: {
+            "official_generation_id": "test-generation",
+            "snapshot_pool_count": 15,
+            "snapshot_pool_ids_sha256": "sha256:" + "a" * 64,
+            "official_pool_identity_match": True,
+        },
+    )
+    monkeypatch.setattr(runner_globals["cu"], "load_fixtures_by_team", lambda *a, **k: {})
+    monkeypatch.setattr(runner_globals["cu"], "load_projection_rows", lambda *a, **k: [])
+    monkeypatch.setattr(
+        runner_globals["cu"],
+        "build_universe",
+        lambda **_k: {"universe": [{"player_id": 1}], "excluded": []},
+    )
+    monkeypatch.setattr(runner_globals["cu"], "build_replacement_edges", lambda **_k: [])
+    monkeypatch.setattr(runner_globals["fg"], "screen_legal_actions", lambda **_k: {})
+    monkeypatch.setattr(runner_globals["cu"], "discovery_completeness", lambda **_k: {})
+    monkeypatch.setattr(runner_globals["ro"], "optimize", stop_at_optimizer)
+
+    source_conn = gs._open_generation_snapshot(generation)
+    packet = {
+        "entry_id": 241392,
+        "planning_event": 4,
+        "cutoff": gf.CUTOFF,
+        "season": "2026/27",
+    }
+    canonical = gs._derive_four_gw_consumed_manager_state(
+        source_conn, generation=generation, manager_packet=packet
+    )
+    try:
+        with pytest.raises(RuntimeError, match="real optimizer boundary"):
+            runner(
+                conn=conn,
+                generation=generation,
+                manager_packet=packet,
+                parameters={"stage2_draws": runner_globals["STAGE1_DRAWS"] + 1},
+                source_conn=source_conn,
+                canonical_manager_state=canonical,
+            )
+        initial_state = captured["initial_state"]
+        expected = canonical["route_state"]
+        assert initial_state.bank_tenths == expected["bank_tenths"] == 0
+        assert initial_state.free_transfers == expected["free_transfers"] == 0
+        assert initial_state.event_start_free_transfers == expected["event_start_free_transfers"] == 0
+        assert [player.as_dict() for player in initial_state.players] == expected["players"]
+    finally:
+        source_conn.close()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +704,8 @@ def test_a_declared_profile_kind_is_required_and_selects_the_pipeline(tmp_path):
         )
         assert callable(resolved)
         assert set(inspect.signature(resolved).parameters) == {
-            "conn", "generation", "manager_packet", "parameters", "source_conn", "controller",
+            "conn", "generation", "manager_packet", "parameters", "source_conn",
+            "canonical_manager_state", "controller",
         }
     finally:
         conn.close()
