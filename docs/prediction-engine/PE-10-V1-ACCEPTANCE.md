@@ -9,7 +9,8 @@ merge is a separate Product Owner decision.
 | --- | --- |
 | Acceptance code at the predictive run | `78ea86853ba3f13829bb3be0e211352a75ce9119` (branch `feature/pe10-v1-acceptance`) |
 | Predictive code identity (frozen at certification) | `983386e1674cf5d6c74fa08ee2c5fb4488e9c92ce9cca88da8462ebf089b02d5` |
-| Repair candidate (the code this document records) | `ff18c2f491dfc5767d26c76dbf7a21b3a98ba00c` (tree `2e7d7eac09ae8da3504dad1ec1762de97660df57`, parent `78ea86853ba3f13829bb3be0e211352a75ce9119`) |
+| Repair commit (the code this document records) | `ff18c2f491dfc5767d26c76dbf7a21b3a98ba00c` (tree `2e7d7eac09ae8da3504dad1ec1762de97660df57`, parent `78ea86853ba3f13829bb3be0e211352a75ce9119`) |
+| Acceptance-document commit | `deafe84cfed774129f2987424ffa6b5415b48ea5` (tree `969bf0bac87a49175d5a7ba783481f018504d717`) |
 | Repair scope | `scripts/run_four_gw_decision.py` (+cutoff guard, cache location), `tests/test_pe9_production_decision.py` regressions; **0 files under `fpl_brain/`** |
 | Decision runner identity (executed) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
 | Authorization fingerprint (carried forward, identity-only) | `5b253d0f3b6078e6d25228cb89a6b54c5340371cfc51ace16ecb3abeaa9a822e` |
@@ -190,23 +191,28 @@ decision stage alone is ~33 minutes.  No optimisation was attempted during accep
 - Minutes-lineage/authority accounting preserved exactly: 15 tests in the dedicated repair
   file + 1 updated PE-9 authority test = 16; optional-override repair = 5.  These are not
   merged into one number.
-- Full authoritative wrapper (`scripts/ci_run_pytest.py`, local): 2 failed, 2598 passed, 31 skipped in 3985.28s (1:06:25)
+- Full authoritative wrapper (`scripts/ci_run_pytest.py`, local): **2 failed (the two accepted
+  ids below), 2598 passed, 31 skipped** in 3,985.28 s (1:06:25); `unexpected failures: none`.
 - Hosted CI on the acceptance head `78ea8685` (run `36421953185`, job `unit-tests`, SUCCESS):
-  **2578 passed, 49 skipped**, 0 failed, 3,260.77 s.
+  **2 failed (the same two accepted ids), 2578 passed, 49 skipped** in 3,260.77 s.
+- Hosted CI on the repair candidate `deafe84c` (run `36494119652`, job `unit-tests`, SUCCESS):
+  **2 failed (the same two accepted ids), 2580 passed, 49 skipped** in 3,272.11 s.
 
 ## 12. Skips and accepted failures
 
-- **Accepted failures (by exact node id, local only):**
+- **Accepted failures (by exact node id; the authoritative wrapper accepts them BY ID and the
+  job still succeeds, in BOTH environments):**
   1. `tests/test_causal_bundle_integrity.py::test_13_manager_state_prose_derives_from_actual_state`
   2. `tests/test_causal_bundle_integrity.py::test_13b_zero_ft_prose_is_also_derived`
   A different failure is unexpected even if the total is two.
-- **Skip classification:** the hosted/local difference (49 hosted vs local count) is
-  environment-gated, not coverage: the hosted runner executes on a checkout without the
-  local machine configuration (`config.json` at its default path, local data directories), so
-  tests that resolve that configuration skip there, while the two accepted failures above
-  exercise exactly those configuration-dependent subprocess paths locally.  No
-  acceptance-critical test (certification, generation store, decision boundary, optimizer,
-  comparator, Free Hit, manager worlds, four-GW runner) is skipped in either environment.
+- **Skip classification (measured, not inferred):** 49 skips hosted versus 31 local — a
+  difference of **18** — and the pass counts differ by exactly the same **18** (2598 local vs
+  2580 hosted), while both environments fail the same two accepted ids.  The 18 are the tests
+  gated on local machine configuration or host prerequisites that a CI checkout does not have
+  (`config.json` at its default path, local data directories); they execute locally and skip
+  hosted.  No acceptance-critical test (certification, generation store, decision boundary,
+  optimizer, comparator, Free Hit, manager worlds, four-GW runner) is skipped in either
+  environment.
 
 ## 13. Frozen semantics
 
