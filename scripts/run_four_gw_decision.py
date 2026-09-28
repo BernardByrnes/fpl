@@ -204,11 +204,53 @@ def _role_relevant_ids(transfers_by_route, preferred_key, lineup_policy) -> list
     return sorted(ids)
 
 
-#: The content-addressed world cache the certified loaders use.  The cache is
-#: OPTIMIZATION, not authority (amendment 2 section 12), and it is deliberately NOT a
-#: caller input: a production decision owns its cache location, so a caller cannot
-#: point a predictive load at a cache it chose.
-WORLD_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache" / "manager_worlds"
+#: Production world caches are OPTIMIZATION, not authority (amendment 2 section 12), and
+#: the location is deliberately NOT a caller input: a production decision owns where its
+#: cache lives, so a caller cannot point a predictive load at a cache it chose.  It is
+#: derived from the CERTIFIED generation's own pinned snapshot (see
+#: ``_production_world_cache_dir``) so every write lands in the isolated runtime's
+#: evidence tree rather than in whichever source checkout the decision process runs in.
+_WORLD_CACHE_LEAF = ("world_cache", "manager_worlds")
+
+
+def _production_world_cache_dir(conn, generation) -> Path | None:
+    """Where a production decision's world cache lives.
+
+    The path comes from the certified generation's PERSISTED snapshot path -- certified
+    evidence, not a request field and not the source checkout.  A cache is an
+    optimisation, so when the certified snapshot path is unavailable the cache is
+    disabled (a cold run) rather than pointed at some arbitrary writable place.
+    """
+
+    row = conn.execute(
+        "SELECT snapshot_path FROM generation WHERE generation_id=?",
+        (str(generation.generation_id),),
+    ).fetchone()
+    raw = "" if row is None else str(row["snapshot_path"] or "")
+    if not raw:
+        return None
+    snapshot_path = Path(raw)
+    if not snapshot_path.is_absolute():
+        return None
+    return snapshot_path.parent.joinpath(*_WORLD_CACHE_LEAF)
+
+
+def _production_cutoff_guard(source_conn, *, entry_id: int, planning_event: int, cutoff: str, season) -> dict:
+    """The certified decision's cutoff guard, computed BEFORE any expensive work.
+
+    The guard is measured against the manager state the decision actually consumes, so
+    it reads the PINNED SNAPSHOT's manager context -- never the flattened consumed-state
+    record, which does not carry the override provenance, and never the source
+    checkout's own database.
+    """
+
+    context = get_planning_context(
+        source_conn, int(entry_id), int(planning_event), as_of=str(cutoff), season=season,
+    )
+    return fg.verify_cutoff_covers_override(
+        planning_cutoff=str(cutoff),
+        override_captured_at=_override_captured_at(context.manager_state),
+    )
 
 SEED = 20260911
 #: Stage-1 (screening) draw count.  This is the count ACTUALLY used to build the
@@ -252,6 +294,10 @@ PRODUCTION_PARALLEL_EXACT_WORKERS = 4
 
 DIAG_PREDICTIVE_GENERATION_MISMATCH = "PREDICTIVE_GENERATION_MISMATCH"
 DIAG_DECISION_EVENT_MISMATCH = "DECISION_EVENT_MISMATCH"
+#: The certified cutoff precedes the confirmed manager override: the decision would be
+#: measured against a manager state older than the confirmation, so it is refused
+#: before any search rather than after one.
+DIAG_CUTOFF_GUARD_FAILED = "CUTOFF_DOES_NOT_COVER_MANAGER_OVERRIDE"
 FAMILY_KINDS = {
     "minutes_v1": analytics.MINUTES_V1_KIND,
     "xpts_v1": None,
@@ -605,6 +651,25 @@ def run_certified_four_gw_decision(
                 "for cannot be resolved from the pinned snapshot"
             ]
         )
+    # Both of these are established BEFORE any expensive work, and both are derived from
+    # certified evidence: the cache location from this generation's persisted snapshot,
+    # the cutoff guard from the manager context that SAME pinned snapshot resolves.
+    world_cache_dir = _production_world_cache_dir(conn, generation)
+    cutoff_guard = _production_cutoff_guard(
+        source_conn, entry_id=entry_id, planning_event=planning_event, cutoff=cutoff, season=season,
+    )
+    if not cutoff_guard.get("pass"):
+        raise gs.GenerationRefused(
+            DIAG_CUTOFF_GUARD_FAILED,
+            [
+                f"the certified cutoff {cutoff} does not cover the confirmed manager override "
+                f"({cutoff_guard.get('status')}): {cutoff_guard.get('detail')}"
+            ],
+        )
+    print(
+        f"cutoff guard: {cutoff_guard.get('status')} "
+        f"cutoff={cutoff} override={cutoff_guard.get('override_captured_at')}"
+    )
     last_event = fg.season_last_event_from_db(conn)
     decision_events = fg.decision_events(planning_event, last_event=last_event)
     if list(generation.events) != [int(event) for event in decision_events]:
@@ -863,7 +928,7 @@ def run_certified_four_gw_decision(
     t0 = time.time()
     stage1_result = ro.optimize(
         universe=universe, initial_state=source_state, scenario=scenario, player_meta=player_meta,
-        generation=generation, conn=conn, config=optimizer_config, cache_dir=WORLD_CACHE_DIR,
+        generation=generation, conn=conn, config=optimizer_config, cache_dir=world_cache_dir,
         provenance={**search_provenance,
                     "discovery_generation_identity": discovery_identity,
                     "exact_evaluation_generation_identity": exact_identity},
@@ -887,7 +952,7 @@ def run_certified_four_gw_decision(
         universe=universe, initial_state=source_state, scenario=scenario,
         player_meta=player_meta, generation=generation, conn=conn, base_config=optimizer_config,
         stage1_result=stage1_result, stage2_draws=int(stage2_draws),
-        cache_dir=WORLD_CACHE_DIR,
+        cache_dir=world_cache_dir,
         exact_cache=run_exact_cache, cancel_probe=cancel_probe,
         parallel_workers=parallel_workers,
     )
@@ -919,7 +984,7 @@ def run_certified_four_gw_decision(
             exact_cache=run_exact_cache,
             cancel_probe=cancel_probe,
             parallel_workers=parallel_workers,
-            cache_dir=WORLD_CACHE_DIR,
+            cache_dir=world_cache_dir,
         ),
         config=fr.StabilityGateConfig(current_beam=int(parameters.get("beam", 8))),
         escalated_result_sink=escalated_sink,
@@ -1148,7 +1213,7 @@ def run_certified_four_gw_decision(
         "planning_event": planning_event,
         "planning_cutoff": cutoff,
         "decision_events": list(decision_events),
-        "cutoff_guard": override,
+        "cutoff_guard": cutoff_guard,
         "search": {
             "engine": "route_optimizer.optimize (accepted bounded multi-event search)",
             "config": optimizer_config.as_dict(),
