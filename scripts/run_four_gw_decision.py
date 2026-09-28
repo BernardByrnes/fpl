@@ -38,6 +38,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -63,6 +64,28 @@ def _refuse_execution(guard, code: int, reason: str) -> int:
 
     guard.finish(execution.RUN_FAILED, reason)
     return code
+
+
+def _override_captured_at(manager_state) -> str | None:
+    """Read an optional override timestamp without accepting malformed state."""
+
+    if manager_state is None:
+        state = {}
+    elif isinstance(manager_state, Mapping):
+        state = manager_state
+    else:
+        raise gs.DecisionRecordInvalid(
+            ["manager_state must be an object when supplied"]
+        )
+
+    override = state.get("override")
+    if override is None:
+        return None
+    if not isinstance(override, Mapping):
+        raise gs.DecisionRecordInvalid(
+            ["manager_state.override must be an object or null when supplied"]
+        )
+    return override.get("captured_at")
 
 
 def _suppress_transfer_recommendation(decision: dict, *, reason: str, extra: dict | None = None) -> dict:
@@ -390,9 +413,14 @@ def main(argv=None) -> int:
         last_event = fg.season_last_event_from_db(conn)
         decision_events = fg.decision_events(planning_event, last_event=last_event)
         context = get_planning_context(conn, entry_id, planning_event, as_of=cutoff, season=config.get("season"))
+        try:
+            override_captured_at = _override_captured_at(context.manager_state)
+        except gs.GenerationRefused as failure:
+            print(f"decision refused: {failure}", file=sys.stderr)
+            return _refuse_execution(guard, 6, str(failure))
         override = fg.verify_cutoff_covers_override(
             planning_cutoff=cutoff,
-            override_captured_at=(context.manager_state or {}).get("override", {}).get("captured_at"),
+            override_captured_at=override_captured_at,
         )
         squad = manager_worlds.resolve_squad(context, conn)
         initial_state = __import__("fpl_brain.route_comparator", fromlist=["x"]).build_route_state(conn, context, squad)
