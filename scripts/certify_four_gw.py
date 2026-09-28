@@ -147,6 +147,20 @@ def resolve_planning_event(conn, requested: int | None = None) -> int:
     return int(requested)
 
 
+def assert_minutes_authority_consistency() -> str:
+    """Fail before snapshotting or model execution if certification has drifted."""
+
+    required_version = certified_bundle.declared_required_versions().get("minutes_v1")
+    production_version = str(freeze.joint_minutes.JOINT_MINUTES_MODEL_VERSION)
+    if not required_version or str(required_version) != production_version:
+        raise ValueError(
+            "MINUTES_LINEAGE_AUTHORITY_MISMATCH: declared certification minutes version "
+            f"{required_version!r} does not match the frozen production lineage "
+            f"joint_minutes.JOINT_MINUTES_MODEL_VERSION={production_version!r}"
+        )
+    return production_version
+
+
 def _freeze_args(event: int, cutoff: str, simulations: int, out_dir: Path) -> SimpleNamespace:
     return SimpleNamespace(
         gw=int(event),
@@ -210,27 +224,135 @@ def decide_search_permission(
     return (not reasons), reasons
 
 
-def certified_bundle_runs(conn, *, event: int, cutoff: str) -> dict[str, int]:
-    """The run ids this event's certification consumes, proved coherent.
+def certified_bundle_runs(
+    conn,
+    *,
+    event: int,
+    cutoff: str,
+    execution_run_uuid: str | None = None,
+) -> dict[str, int]:
+    """Propose the exact predictive closure consumed by one Monte Carlo run.
 
-    latest-per-family only PROPOSES a bundle; the canonical validators then prove the
-    dependency edges actually agree, which is what "latest" cannot do.  The declared
-    model versions are applied by those validators from the ONE declared source, so a
-    run from an unexpected version is refused with ``UNSUPPORTED_MODEL_VERSION``
-    instead of certifying.
+    The Monte Carlo execution row is scoped to the current PE-10 execution when
+    its UUID is supplied. Its recorded xPts id leads to the exact xPts dependency
+    rows; the canonical bundle validator then rechecks every row and every edge.
+    No run is selected by creation order.
+
+    A zero-fixture event has no downstream rows from which to observe dependency
+    ids. Only in that case, use the unique same-execution family rows, resolving
+    minutes by the separately declared production version. The regular nonblank
+    path always requires a complete observed dependency closure.
     """
 
-    rows = conn.execute(
-        "SELECT model_family, id FROM projection_runs WHERE planning_event=?"
-        " AND data_cutoff=? AND model_family IN"
-        " ('minutes_v1','team_strength_v1','player_rates_v1','xpts_v1','monte_carlo_v1')"
-        " ORDER BY id DESC",
-        (int(event), str(cutoff)),
+    event = int(event)
+    cutoff = str(cutoff)
+    return _certified_bundle_runs_for_execution(
+        conn,
+        event=event,
+        cutoff=cutoff,
+        execution_run_uuid=execution_run_uuid,
+    )
+
+
+def _certified_bundle_runs_for_execution(
+    conn,
+    *,
+    event: int,
+    cutoff: str,
+    execution_run_uuid: str | None,
+) -> dict[str, int]:
+    """Implementation shared by the public selector and PE-10 execution path."""
+
+    clauses = [
+        "model_family='monte_carlo_v1'",
+        "planning_event=?",
+        "data_cutoff=?",
+    ]
+    params: list[object] = [int(event), str(cutoff)]
+    if execution_run_uuid is not None:
+        clauses.append("execution_run_uuid=?")
+        params.append(str(execution_run_uuid))
+    mc_rows = conn.execute(
+        "SELECT id FROM projection_runs WHERE " + " AND ".join(clauses),
+        tuple(params),
     ).fetchall()
-    runs: dict[str, int] = {}
-    for row in rows:
-        runs.setdefault(str(row["model_family"]), int(row["id"]))
-    return runs
+    if len(mc_rows) != 1:
+        qualifier = f" for execution {execution_run_uuid}" if execution_run_uuid else ""
+        detail = "no" if not mc_rows else "multiple"
+        raise certified_bundle.BundleIncoherent(
+            [f"{detail} unique Monte Carlo run for GW{event} at cutoff {cutoff}{qualifier}"]
+        )
+    mc_run = int(mc_rows[0]["id"])
+    blank_event = certified_bundle.event_fixture_count(conn, event) == 0
+    mc_upstream = certified_bundle._upstream_run_ids(conn, "monte_carlo_v1", mc_run)
+
+    def unique_run(family: str, *, model_version: str | None = None) -> int:
+        family_clauses = [
+            "model_family=?",
+            "planning_event=?",
+            "data_cutoff=?",
+        ]
+        family_params: list[object] = [family, event, cutoff]
+        if execution_run_uuid is not None:
+            family_clauses.append("execution_run_uuid=?")
+            family_params.append(str(execution_run_uuid))
+        if model_version is not None:
+            family_clauses.append("model_version=?")
+            family_params.append(str(model_version))
+        rows = conn.execute(
+            "SELECT id FROM projection_runs WHERE " + " AND ".join(family_clauses),
+            tuple(family_params),
+        ).fetchall()
+        if len(rows) != 1:
+            raise certified_bundle.BundleIncoherent(
+                [f"GW{event} has {len(rows)} candidate {family} run(s) in the blank-event execution closure"]
+            )
+        return int(rows[0]["id"])
+
+    if not mc_upstream and blank_event:
+        # Blank-event projection tables correctly contain no rows. Preserve the
+        # explicit MC run, and identify its sibling rows within the same execution.
+        required_minutes = certified_bundle.declared_required_versions()["minutes_v1"]
+        return {
+            "minutes_v1": unique_run("minutes_v1", model_version=required_minutes),
+            "team_strength_v1": unique_run("team_strength_v1"),
+            "player_rates_v1": unique_run("player_rates_v1"),
+            "xpts_v1": unique_run("xpts_v1"),
+            "monte_carlo_v1": mc_run,
+        }
+
+    needed_mc = ("xpts_v1", "minutes_v1", "team_strength_v1", "player_rates_v1")
+    missing_mc = [family for family in needed_mc if mc_upstream.get(family) is None]
+    if missing_mc:
+        raise certified_bundle.BundleIncoherent(
+            [f"Monte Carlo run {mc_run} has an incomplete dependency closure: missing {missing_mc}"]
+        )
+
+    xpts_run = int(mc_upstream["xpts_v1"])
+    xpts_upstream = certified_bundle._upstream_run_ids(conn, "xpts_v1", xpts_run)
+    if not xpts_upstream and blank_event:
+        required_minutes = certified_bundle.declared_required_versions()["minutes_v1"]
+        minutes_run = unique_run("minutes_v1", model_version=required_minutes)
+        team_run = unique_run("team_strength_v1")
+        rate_run = unique_run("player_rates_v1")
+    else:
+        needed_xpts = ("minutes_v1", "team_strength_v1", "player_rates_v1")
+        missing_xpts = [family for family in needed_xpts if xpts_upstream.get(family) is None]
+        if missing_xpts:
+            raise certified_bundle.BundleIncoherent(
+                [f"xPts run {xpts_run} has an incomplete dependency closure: missing {missing_xpts}"]
+            )
+        minutes_run = int(xpts_upstream["minutes_v1"])
+        team_run = int(xpts_upstream["team_strength_v1"])
+        rate_run = int(xpts_upstream["player_rates_v1"])
+
+    return {
+        "minutes_v1": minutes_run,
+        "team_strength_v1": team_run,
+        "player_rates_v1": rate_run,
+        "xpts_v1": xpts_run,
+        "monte_carlo_v1": mc_run,
+    }
 
 
 def certify_generation_under_lease(
@@ -261,7 +383,12 @@ def certify_generation_under_lease(
         record = per_event.get(str(event)) or {}
         if not record.get("certified"):
             continue
-        runs = certified_bundle_runs(conn, event=int(event), cutoff=str(cutoff))
+        runs = certified_bundle_runs(
+            conn,
+            event=int(event),
+            cutoff=str(cutoff),
+            execution_run_uuid=str(controller.run_uuid),
+        )
         bundle = certified_bundle.certified_bundle_from_explicit_ids(
             conn, event=int(event), cutoff=str(cutoff), runs=runs,
             required_versions=required_versions,
@@ -451,6 +578,12 @@ def main(argv: list[str] | None = None) -> int:
         help="refuse certification unless a matching retained PE-8 artifact is supplied",
     )
     args = parser.parse_args(argv)
+
+    try:
+        assert_minutes_authority_consistency()
+    except ValueError as failure:
+        print(f"certification refused: {failure}", file=sys.stderr)
+        return 2
 
     calibration = None
     calibration_artifact_ref = None

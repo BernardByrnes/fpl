@@ -668,15 +668,16 @@ def declared_required_versions() -> dict[str, str]:
 
     Every certification call site reads the expected version of each family from
     here and nowhere else, so a run produced by an unexpected model version fails
-    with ``UNSUPPORTED_MODEL_VERSION`` instead of certifying silently.  The values
-    are the FROZEN accepted constants of the family modules -- this reads them, it
-    never restates them.
+    with ``UNSUPPORTED_MODEL_VERSION`` instead of certifying silently. The values
+    are the FROZEN accepted constants of the production family modules -- this reads
+    them, it never restates them. The minutes family is pinned to the joint kernel
+    because that is the lineage selected by the production freeze.
     """
 
-    from . import minutes_model, monte_carlo, player_rates, team_model, xpts
+    from . import joint_minutes, monte_carlo, player_rates, team_model, xpts
 
     return {
-        "minutes_v1": str(minutes_model.MINUTES_MODEL_VERSION),
+        "minutes_v1": str(joint_minutes.JOINT_MINUTES_MODEL_VERSION),
         "team_strength_v1": str(team_model.TEAM_MODEL_VERSION),
         "player_rates_v1": str(player_rates.PLAYER_RATE_MODEL_VERSION),
         "xpts_v1": str(xpts.XPTS_MODEL_VERSION),

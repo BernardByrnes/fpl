@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fpl_brain import (
     analytics,
     causality,
+    certified_bundle,
     execution,
     joint_minutes,
     minutes_coherence,
@@ -153,6 +154,37 @@ DIAG_CERTIFICATION_SOURCE_SNAPSHOT_REQUIRED = "CERTIFICATION_SOURCE_SNAPSHOT_REQ
 
 class MissingSourceSnapshot(RuntimeError):
     """Production freeze mode was entered without an immutable source connection."""
+
+
+def validate_certified_minutes_run(conn, minutes_run_id: int) -> None:
+    """Require the exact minutes input selected for xPts to match certification."""
+
+    required_version = certified_bundle.declared_required_versions().get("minutes_v1")
+    row = analytics.get_projection_run(conn, int(minutes_run_id))
+    if row is None:
+        raise _ReadinessFailure(
+            "xpts",
+            [f"MINUTES_RUN_ABSENT: selected xPts minutes run {int(minutes_run_id)} does not exist"],
+        )
+    run = dict(row)
+    family = str(run.get("model_family") or "")
+    version = str(run.get("model_version") or "")
+    if family != analytics.MINUTES_MODEL_FAMILY:
+        raise _ReadinessFailure(
+            "xpts",
+            [
+                f"MINUTES_RUN_FAMILY_MISMATCH: selected xPts input run {int(minutes_run_id)} "
+                f"is {family!r}, expected {analytics.MINUTES_MODEL_FAMILY!r}"
+            ],
+        )
+    if not required_version or version != str(required_version):
+        raise _ReadinessFailure(
+            "xpts",
+            [
+                "MINUTES_LINEAGE_VERSION_MISMATCH: selected xPts minutes run "
+                f"{int(minutes_run_id)} has model_version {version!r}, required {required_version!r}"
+            ],
+        )
 
 
 def _freeze(
@@ -466,6 +498,8 @@ def _freeze(
                         raise _ReadinessFailure(
                             "xpts", ["xPts needs minutes/team/rate runs: freeze them together or pass --xpts-*-run"]
                         )
+                if production:
+                    validate_certified_minutes_run(conn, int(xpts_inputs["minutes"]))
                 used_xpts_inputs = dict(xpts_inputs)
                 strict_coherence = bool(run_ids.get("minutes_joint")) or bool(run_ids.get("minutes_substitution")) or bool(run_ids.get("minutes_coherent")) or bool(run_ids.get("minutes_positional")) or bool(
                     getattr(args, "xpts_minutes_run", None)
