@@ -27,7 +27,7 @@ recorded there as superseded.
 | Decision runner identity (intermediate rebuild, superseded — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` |
 | Decision runner identity (the 2026-09-28 historical executions — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
 | Source-guard follow-up | `17682cab2bb3bf1b58f0875c9b7c14599624cdfe` (parent `6261a91d945101486b1e926eb60a0c7b1162886b`) — `tests/test_r4b2b_finalist_stability.py`: the two source-literal guards that the wrapper caught are updated to the renamed helper (§11, §17) |
-| This candidate (publication repair + P2-rebuilt decision) | the **documentation-only child** of `1b79bcdf` that is the tip of `feature/pe10-v1-acceptance`: **this document is that child's only file delta**, so the candidate differs from the P2 repair commit (`fpl_brain/generation_store.py` + `tests/test_pe9_production_decision.py`) by the acceptance record alone |
+| This candidate (publication repair + P2-rebuilt decision) | the **documentation-only descendant** of `1b79bcdf` — through `ec763793…` and `8f892630…`, both named in §16's chain — that is the tip of `feature/pe10-v1-acceptance`: every commit after the P2 repair changes **this document only**, so the candidate differs from the P2 repair commit (`fpl_brain/generation_store.py` + `tests/test_pe9_production_decision.py`) by the acceptance record alone |
 | Repair scope (earlier, `ff18c2f4`) | `scripts/run_four_gw_decision.py` (+cutoff guard, cache location), `tests/test_pe9_production_decision.py` regressions; 0 files under `fpl_brain/` |
 | Repair scope (retention, `6261a91d`) | `fpl_brain/generation_store.py` (artifact retention only: naming + exclusive publish) and `tests/test_pe9_production_decision.py`; the predictive source set is untouched (§13) |
 | Repair scope (publication, `1b79bcdf`) | `fpl_brain/generation_store.py` (staging under cleanup protection; atomic no-replace publication only; refusal where linking is unavailable) and `tests/test_pe9_production_decision.py`; no model, optimizer, scoring or manager-state change (§13) |
@@ -453,9 +453,15 @@ updated to the renamed helper — disclosed in §11 and §17, acknowledged by th
 Sol High reviewed at `FIX_REQUIRED / P2`) →
 `1b79bcdf8688554e3dee9614a9586b92c76fa300` (tree `f9cb3afa…`, the **atomic-publication repair**
 Sol prescribed: staging under cleanup protection, publish only by atomic no-replace hard link,
-refuse where linking is unavailable) → the documentation-only child that completes this document,
-which is the final candidate.  No commit in this chain touches model, optimizer, scoring or
-manager-state code, and none touches evidence.
+refuse where linking is unavailable) → `ec7637935cad352a3848403d5c1fe1ccef46447e` (the
+**P2-evidence document**, the candidate Sol High reviewed at `FIX_REQUIRED / P2` on
+exact-candidate-evidence grounds) → `8f892630b7f19218818c9150260eb24a9ea1921c` (the **three
+post-verdict documentation corrections**; `git diff ec763793 8f892630` = one file,
+`docs/prediction-engine/PE-10-V1-ACCEPTANCE.md`, +8/−4: the §1 candidate-row wording, §17's
+regression count, and the unsubstituted runner identity — applied after that verdict without a
+prior stop, recorded in the evidence pack and acknowledged by the Product Owner) → the
+documentation-only child that completes this document, which is the final candidate.  No commit
+in this chain touches model, optimizer, scoring or manager-state code, and none touches evidence.
 
 ## 17. Decision-artifact retention — `DECISION_ARTIFACT_RETENTION_NOT_IMMUTABLE` (found, repaired, re-evidenced)
 
