@@ -437,7 +437,20 @@ LEGACY_CERTIFICATION_IDENTITIES = (
 # The certification entry point whose wiring contains the history-completeness
 # gate.  It is part of SOURCE_SNAPSHOT_FILES, and every v2 artifact must declare
 # it as covered, so a consumer can prove the gate was in the producing wiring.
-CERTIFIER_ENTRY_POINT = "scripts/certify_gw5_gw8.py"
+CERTIFIER_ENTRY_POINT = "scripts/certify_four_gw.py"
+
+# One retained v2 GW5 artifact was produced before the generic runner was
+# introduced. Its wiring is historical evidence, not the current production
+# entrypoint. Keep this descriptor exact: identity, producer bytes, source
+# snapshot, and the complete covered-file list must all match before that one
+# retained artifact can use the historical path.
+HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY = {
+    "sha256:d39d02d3f244b35ea6e80397e4f1037572f35e733d761cb5cbb10d5358af6aae": {
+        "entry_point": "scripts/certify_gw5_gw8.py",
+        "entry_point_sha256": "7ad4254ec4ba32f67e50dde181a728284335fc2ff37de996c6003a7bd1322c81",
+        "code_snapshot_sha256": "e2c1df67addfe0c54f262916599a8d17aa6d3002782a8ab8a08a2801cf9ceff4",
+    },
+}
 
 DIAG_CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING = "CERTIFIED_HISTORY_COMPLETENESS_EVIDENCE_MISSING"
 DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING = "CERTIFICATION_WIRING_IDENTITY_MISSING"
@@ -558,6 +571,45 @@ def certification_identity_of(payload: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _certification_wiring_is_trusted(payload: Mapping[str, Any], wiring: Any) -> bool:
+    """Accept current wiring or the exact retained historical v2 descriptor.
+
+    New artifacts must identify the generic production runner. The old fixed-name
+    runner is accepted only for its pinned historical certification identity and
+    retained digests; a caller cannot opt into historical status by supplying a
+    runner name.
+    """
+
+    from . import analytics
+
+    if not isinstance(wiring, Mapping):
+        return False
+    covered = list(wiring.get("covered_source_files") or [])
+    declared_identity = str(payload.get("four_gw_certification_identity") or "")
+    historical = HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY.get(declared_identity)
+    if historical is not None:
+        if certification_identity_of(payload) != declared_identity:
+            return False
+        expected_covered = list(analytics.SOURCE_SNAPSHOT_FILES)
+        try:
+            current_entry_index = expected_covered.index(CERTIFIER_ENTRY_POINT)
+        except ValueError:
+            return False
+        expected_covered[current_entry_index] = historical["entry_point"]
+        return (
+            wiring.get("entry_point") == historical["entry_point"]
+            and wiring.get("entry_point_sha256") == historical["entry_point_sha256"]
+            and payload.get("code_snapshot_sha256") == historical["code_snapshot_sha256"]
+            and covered == expected_covered
+        )
+
+    return (
+        wiring.get("entry_point") == CERTIFIER_ENTRY_POINT
+        and CERTIFIER_ENTRY_POINT in covered
+        and bool(wiring.get("entry_point_sha256"))
+    )
+
+
 def validate_certification_artifact(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     """The COMPLETE authorization contract, applied to an artifact mapping.
 
@@ -642,12 +694,12 @@ def validate_certification_artifact(payload: Mapping[str, Any]) -> Mapping[str, 
                 "a missing audit is never inferred as PASS"
             )
         wiring = payload.get("certification_wiring")
-        covered = list(wiring.get("covered_source_files") or []) if isinstance(wiring, Mapping) else []
-        if not isinstance(wiring, Mapping) or CERTIFIER_ENTRY_POINT not in covered:
+        if not _certification_wiring_is_trusted(payload, wiring):
             raise DecisionCertificationRequired(
                 f"{DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING}: certification schema {schema!r} must "
-                f"declare {CERTIFIER_ENTRY_POINT!r} among its covered source files, so the consumer can "
-                "prove the producing wiring carried the history-completeness gate"
+                f"identify the current production entry point {CERTIFIER_ENTRY_POINT!r}, or match a "
+                "recognized immutable historical wiring descriptor, so the consumer can prove the "
+                "producing wiring carried the history-completeness gate"
             )
         if not wiring.get("entry_point_sha256"):
             raise DecisionCertificationRequired(

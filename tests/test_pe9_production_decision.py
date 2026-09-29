@@ -629,6 +629,158 @@ def test_make_decision_is_idempotent_and_never_rewrites_history(tmp_path):
         conn.close()
 
 
+def test_repeat_decisions_retain_each_execution_s_artifact_and_both_still_verify(tmp_path):
+    """A repeated decision keeps BOTH executions' evidence, and both records verify.
+
+    This is the shape production actually has: re-running the same decision over the
+    same certified generation reproduces the same RESULT but not the same artifact
+    bytes, so a result-keyed retention path made the later run overwrite the evidence
+    the earlier record still bound.  Each execution must keep its own immutable
+    artifact, and the earlier record must still verify after the repeat.
+    """
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn, request={"tracing_id": "acceptance-primary"})
+        first_path = Path(first["decision_artifact_ref"])
+        first_bytes = first_path.read_bytes()
+
+        second = _decision(conn, request={"tracing_id": "acceptance-repeat"})
+        second_path = Path(second["decision_artifact_ref"])
+
+        # Same decision, different execution: two records, two retained artifacts.
+        assert second["result_sha256"] == first["result_sha256"]
+        assert second["decision_record_id"] != first["decision_record_id"]
+        assert second_path != first_path
+        assert second_path.exists()
+        assert second_path.read_bytes() != first_bytes
+        assert first_path.read_bytes() == first_bytes, "the earlier artifact was overwritten"
+
+        # The record the repeat used to destroy still verifies, and so does the repeat.
+        assert gs.verify_decision(conn, first["decision_record_id"])["verified"] is True
+        assert gs.verify_decision(conn, second["decision_record_id"])["verified"] is True
+
+        # Neither retention left a publication temporary behind.
+        assert not [item.name for item in first_path.parent.glob("*.tmp-*")]
+    finally:
+        conn.close()
+
+
+def test_tampering_with_one_repeat_artifact_fails_only_that_record(tmp_path):
+    """Tampering is detected per RECORD: its own artifact breaks, the sibling does not."""
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn, request={"tracing_id": "acceptance-primary"})
+        second = _decision(conn, request={"tracing_id": "acceptance-repeat"})
+        second_path = Path(second["decision_artifact_ref"])
+        retained = second_path.read_bytes()
+
+        # Still valid JSON, different bytes: the digest binding is what must catch it.
+        second_path.write_bytes(retained + b"  ")
+        with pytest.raises(gs.GenerationRefused) as tampered:
+            gs.verify_decision(conn, second["decision_record_id"])
+        assert "does not match the decision record" in str(tampered.value)
+
+        # The sibling record is untouched by tampering with the other artifact.
+        assert gs.verify_decision(conn, first["decision_record_id"])["verified"] is True
+
+        # Restoring the retained bytes restores verification: nothing else was relied on.
+        second_path.write_bytes(retained)
+        assert gs.verify_decision(conn, second["decision_record_id"])["verified"] is True
+
+        # The same tampering against the FIRST record fails for that record in turn.
+        first_path = Path(first["decision_artifact_ref"])
+        first_bytes = first_path.read_bytes()
+        first_path.write_bytes(first_bytes + b"  ")
+        with pytest.raises(gs.GenerationRefused) as tampered_first:
+            gs.verify_decision(conn, first["decision_record_id"])
+        assert "does not match the decision record" in str(tampered_first.value)
+        assert gs.verify_decision(conn, second["decision_record_id"])["verified"] is True
+    finally:
+        conn.close()
+
+
+def test_a_retained_decision_artifact_is_never_replaced(tmp_path):
+    """An occupied retention path is refused, not overwritten."""
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn)
+        artifact_path = Path(first["decision_artifact_ref"])
+        foreign = b'{"schema": "not-this-decision"}\n'
+        artifact_path.write_bytes(foreign)
+
+        # The identical decision resolves to the SAME content-addressed path, where those
+        # bytes are occupied by something else: it may not be replaced by a write.
+        with pytest.raises(gs.DecisionRecordInvalid) as occupied:
+            _decision(conn)
+        assert "never replaced" in str(occupied.value)
+        assert artifact_path.read_bytes() == foreign
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 1
+        assert not [item.name for item in artifact_path.parent.glob("*.tmp-*")]
+    finally:
+        conn.close()
+
+
+def test_a_staging_failure_leaves_no_artifact_no_temporary_and_no_record(tmp_path, monkeypatch):
+    """Staging runs under cleanup protection: an fsync failure leaves nothing behind."""
+
+    import errno
+    import os as os_module
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        def no_space(fd):
+            raise OSError(errno.ENOSPC, "simulated: no space left on device")
+
+        monkeypatch.setattr(os_module, "fsync", no_space)
+        with pytest.raises(gs.DecisionRecordInvalid) as staged:
+            _decision(conn)
+        assert "could not stage a decision artifact" in str(staged.value)
+
+        artifact_dir = tmp_path / "pe9_decisions" / "gw05"
+        assert artifact_dir.is_dir()
+        assert list(artifact_dir.iterdir()) == [], "a partial artifact or temporary survived"
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_a_filesystem_without_hard_links_refuses_instead_of_streaming(tmp_path, monkeypatch):
+    """No atomic no-replace publication => refuse; the final path is never written in place."""
+
+    import errno
+    import os as os_module
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        def no_links(source, destination):
+            raise OSError(errno.ENOSYS, "simulated: hard links unavailable")
+
+        monkeypatch.setattr(os_module, "link", no_links)
+        with pytest.raises(gs.DecisionRecordInvalid) as refused:
+            _decision(conn)
+        assert "atomically" in str(refused.value)
+
+        artifact_dir = tmp_path / "pe9_decisions" / "gw05"
+        assert artifact_dir.is_dir()
+        assert list(artifact_dir.iterdir()) == [], "the final path or a temporary was created"
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_make_decision_pins_an_explicit_historical_generation(tmp_path):
     """``generation_id`` is a SELECTOR: a historical decision re-derives from ITS row."""
 
@@ -1180,4 +1332,209 @@ def test_verify_generation_reproduces_the_pe8_reference_or_says_it_did_not_consu
         )[:2]
         assert mismatched is False and failures
     finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# The CERTIFIED production runner must reach decision-artifact assembly
+# ---------------------------------------------------------------------------
+
+
+class _PermissiveStub(dict):
+    """A permissive mapping/callable standing in for the search internals.
+
+    This regression's subject is the artifact ASSEMBLY performed by the certified
+    production runner -- the site that crashed with an undefined name AFTER a completed
+    search.  Every heavy collaborator is replaced by this stub so the real assembly code
+    runs in milliseconds; the value the assertion depends on (the cutoff guard) is still
+    produced by production code, never by the stub.
+    """
+
+    def __missing__(self, key):
+        return _PermissiveStub()
+
+    def __call__(self, *args, **kwargs):
+        return _PermissiveStub()
+
+    def get(self, key, default=None):
+        return _PermissiveStub()
+
+
+def _stub_certified_runner_search(runner_globals, monkeypatch, calls):
+    """Replace the bounded search and its refinement with cheap permissive stubs."""
+
+    def fake_optimize(**kwargs):
+        calls["optimize"] += 1
+        calls["cache_dir"] = kwargs.get("cache_dir")
+        return _PermissiveStub()
+
+    monkeypatch.setattr(runner_globals["ro"], "optimize", fake_optimize)
+    for name in ("refine_finalists", "analyze_leader_change", "assess_search_stability",
+                 "final_ranking_after_escalation", "finalist_partials"):
+        if hasattr(runner_globals["fr"], name):
+            monkeypatch.setattr(runner_globals["fr"], name, lambda *a, **k: _PermissiveStub())
+
+
+def _stub_certified_runner_boundaries(runner_globals, monkeypatch, route_comparator):
+    monkeypatch.setattr(runner_globals["cu"], "price_snapshot_as_of", lambda *a, **k: object())
+    monkeypatch.setattr(route_comparator, "flat_current_price_scenario", lambda *a, **k: object())
+    monkeypatch.setattr(runner_globals["cu"], "load_pool", lambda *a, **k: {"players": []})
+    monkeypatch.setattr(
+        runner_globals["provenance"],
+        "assert_official_pool_identity",
+        lambda **_k: {
+            "official_generation_id": "test-generation",
+            "snapshot_pool_count": 15,
+            "snapshot_pool_ids_sha256": "sha256:" + "a" * 64,
+            "official_pool_identity_match": True,
+        },
+    )
+    monkeypatch.setattr(runner_globals["cu"], "load_fixtures_by_team", lambda *a, **k: {})
+    monkeypatch.setattr(runner_globals["cu"], "load_projection_rows", lambda *a, **k: [])
+    monkeypatch.setattr(
+        runner_globals["cu"],
+        "build_universe",
+        lambda **_k: {"universe": [{"player_id": 1}], "excluded": []},
+    )
+    monkeypatch.setattr(runner_globals["cu"], "build_replacement_edges", lambda **_k: [])
+    monkeypatch.setattr(runner_globals["fg"], "screen_legal_actions", lambda **_k: {})
+    monkeypatch.setattr(runner_globals["cu"], "discovery_completeness", lambda **_k: {})
+    monkeypatch.setattr(
+        runner_globals["fg"], "optimizer_routes_for_decision",
+        lambda *a, **k: [{"route_id": "route-0", "transfers": [], "per_event": []}],
+    )
+    monkeypatch.setattr(
+        runner_globals["fg"], "evaluate_four_gw_decision",
+        lambda *a, **k: {"transfer_recommendation": {"preferred_route_id": "route-0"}},
+    )
+    monkeypatch.setattr(
+        runner_globals["fg"], "lineup_policy_for_route", lambda *a, **k: {"status": "LINEUP_ONLY"}
+    )
+    monkeypatch.setattr(
+        runner_globals["fg"], "classify_fixture_horizon",
+        lambda *a, **k: {"status": "OK", "complete": True, "blocking_reasons": []},
+    )
+
+
+def test_certified_executor_reaches_artifact_assembly_and_reports_the_override_guard(
+    tmp_path, monkeypatch
+):
+    """The certified runner must ASSEMBLE its decision artifact, guard included.
+
+    Regression for the defect that made the real production runner raise
+    ``NameError: name 'override' is not defined`` while building
+    ``artifact["cutoff_guard"]`` after a completed search.  The guard is now computed from
+    the PINNED snapshot's manager context before any search, and the artifact carries that
+    value.  The fixture's snapshot holds real user-confirmed manager state, so the guard
+    must identify the override instant and pass.
+    """
+
+    import fpl_brain.route_comparator as route_comparator
+
+    path = tmp_path / "four-gw.db"
+    conn, generation = _four_gw_certified_manager_world(
+        path, bank=7, free_transfers=3, event_start_free_transfers=None
+    )
+    runner = gs._declared_production_entrypoint(
+        gs.PRODUCTION_DECISION_MODULES[gs.HORIZON_KIND_FOUR_GW]
+    )
+    g = runner.__globals__
+    calls = {"optimize": 0, "cache_dir": "unset"}
+
+    _stub_certified_runner_boundaries(g, monkeypatch, route_comparator)
+    _stub_certified_runner_search(g, monkeypatch, calls)
+
+    source_conn = gs._open_generation_snapshot(generation)
+    packet = {"entry_id": 241392, "planning_event": 4, "cutoff": gf.CUTOFF, "season": "2026/27"}
+    canonical = gs._derive_four_gw_consumed_manager_state(
+        source_conn, generation=generation, manager_packet=packet
+    )
+    try:
+        outcome = runner(
+            conn=conn,
+            generation=generation,
+            manager_packet=packet,
+            parameters={"stage2_draws": g["STAGE1_DRAWS"] + 1},
+            source_conn=source_conn,
+            canonical_manager_state=canonical,
+        )
+    finally:
+        source_conn.close()
+
+    blocks = outcome.get("artifact_blocks") or outcome
+    assert "cutoff_guard" in blocks, "the certified decision artifact must carry the cutoff guard"
+    guard = blocks["cutoff_guard"]
+    # Real override evidence: the snapshot's user-confirmed state was captured at the
+    # instant the certified cutoff covers, so the guard identifies it and passes.
+    assert guard["override_captured_at"] == gf.CUTOFF
+    assert guard["pass"] is True
+    assert guard["status"] == "PASS"
+    assert guard["planning_cutoff"] == generation.cutoff
+
+    # The search ran exactly once, and its cache location was derived from the CERTIFIED
+    # generation's snapshot -- never from the source checkout, never from the packet.
+    assert calls["optimize"] == 1
+    snapshot_row = conn.execute(
+        "SELECT snapshot_path FROM generation WHERE generation_id=?", (generation.generation_id,)
+    ).fetchone()
+    assert snapshot_row is not None, "the certified generation must persist its snapshot path"
+    assert calls["cache_dir"] == Path(snapshot_row["snapshot_path"]).parent / "world_cache" / "manager_worlds"
+    assert "cache_dir" not in packet
+    conn.close()
+
+
+def test_certified_executor_checks_the_override_guard_before_any_search(tmp_path, monkeypatch):
+    """A failing cutoff guard must refuse BEFORE the search.
+
+    The guard is the one check that cannot wait: measured afterwards it would spend the
+    whole search budget on a decision that must not be taken.  The guard's verdict is
+    forced to fail here so the EXECUTOR's ordering is what is under test -- the search
+    must never be reached, and the refusal must carry the specific token.
+    """
+
+    import fpl_brain.route_comparator as route_comparator
+
+    path = tmp_path / "four-gw.db"
+    conn, generation = _four_gw_certified_manager_world(
+        path, bank=7, free_transfers=3, event_start_free_transfers=None
+    )
+    runner = gs._declared_production_entrypoint(
+        gs.PRODUCTION_DECISION_MODULES[gs.HORIZON_KIND_FOUR_GW]
+    )
+    g = runner.__globals__
+    calls = {"optimize": 0, "cache_dir": "unset"}
+
+    _stub_certified_runner_boundaries(g, monkeypatch, route_comparator)
+    _stub_certified_runner_search(g, monkeypatch, calls)
+    monkeypatch.setattr(
+        g["fg"],
+        "verify_cutoff_covers_override",
+        lambda **_k: {
+            "status": g["fg"].CUTOFF_PRECEDES_OVERRIDE,
+            "pass": False,
+            "planning_cutoff": gf.CUTOFF,
+            "override_captured_at": gf.CUTOFF,
+            "detail": "forced for the ordering test",
+        },
+    )
+
+    source_conn = gs._open_generation_snapshot(generation)
+    try:
+        with pytest.raises(gs.GenerationRefused) as refusal:
+            runner(
+                conn=conn,
+                generation=generation,
+                manager_packet={
+                    "entry_id": 241392, "planning_event": 4, "cutoff": gf.CUTOFF,
+                    "season": "2026/27",
+                },
+                parameters={"stage2_draws": g["STAGE1_DRAWS"] + 1},
+                source_conn=source_conn,
+                canonical_manager_state=None,
+            )
+        assert refusal.value.token == g["DIAG_CUTOFF_GUARD_FAILED"]
+        assert "does not cover the confirmed manager override" in str(refusal.value)
+        assert calls["optimize"] == 0, "the guard must refuse before the search"
+    finally:
+        source_conn.close()
         conn.close()

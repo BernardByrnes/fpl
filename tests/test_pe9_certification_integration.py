@@ -274,7 +274,7 @@ def _artifact(conn, runs_by_event, *, cutoff=CUTOFF, events=HORIZON, code_snapsh
     """A certification artifact of the shape the certifier mints.
 
     The code snapshot is recorded on the artifact AND on every bundle payload, as
-    ``scripts/certify_gw5_gw8.py`` does, so the identity the ``certify_*`` entry
+    ``scripts/certify_four_gw.py`` does, so the identity the ``certify_*`` entry
     points recompute from a payload is the identity the artifact recorded.
 
     The AUTHORIZATION fields are the ones the canonical loader's contract requires --
@@ -1364,15 +1364,16 @@ def test_24_chip_transfer_scoring_and_rng_behaviour_is_unchanged():
 
 
 def test_24b_declared_versions_are_read_from_the_frozen_family_modules():
-    from fpl_brain import minutes_model, monte_carlo, player_rates, team_model, xpts
+    from fpl_brain import joint_minutes, minutes_model, monte_carlo, player_rates, team_model, xpts
 
     assert cb.declared_required_versions() == {
-        "minutes_v1": str(minutes_model.MINUTES_MODEL_VERSION),
+        "minutes_v1": str(joint_minutes.JOINT_MINUTES_MODEL_VERSION),
         "team_strength_v1": str(team_model.TEAM_MODEL_VERSION),
         "player_rates_v1": str(player_rates.PLAYER_RATE_MODEL_VERSION),
         "xpts_v1": str(xpts.XPTS_MODEL_VERSION),
         "monte_carlo_v1": str(monte_carlo.MONTE_CARLO_MODEL_VERSION),
     }
+    assert joint_minutes.JOINT_MINUTES_MODEL_VERSION != minutes_model.MINUTES_MODEL_VERSION
 
 
 # ---------------------------------------------------------------------------

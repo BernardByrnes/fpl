@@ -1,7 +1,7 @@
 """A REAL v2 certification artifact fixture, built the way the certifier builds one.
 
 Synthesised in shape only: every field is the one
-``scripts/certify_gw5_gw8.py::build_certification_payload`` produces, and the
+``scripts/certify_four_gw.py::build_certification_artifact`` produces, and the
 fixture must survive the REAL loader (``four_gw_decision.load_certification_artifact``).
 Nothing here invents a Free-Hit-only field.
 """

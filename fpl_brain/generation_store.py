@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -2941,14 +2942,79 @@ def _decision_artifact_dir(conn: sqlite3.Connection, planning_event: int) -> Pat
     return base / f"gw{int(planning_event):02d}"
 
 
-def _write_decision_artifact(path: Path, artifact: Mapping[str, Any]) -> str:
-    """Persist the decision artifact ATOMICALLY, and return its path as text."""
+def _decision_artifact_bytes(artifact: Mapping[str, Any]) -> bytes:
+    """The EXACT bytes a decision artifact is hashed as and retained as."""
+
+    return (json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
+
+
+def _confirm_retained_artifact(path: Path, payload: bytes) -> str:
+    """Confirm the artifact already retained at ``path`` IS these bytes, or refuse."""
+
+    retained = path.read_bytes()
+    if retained != payload:
+        raise DecisionRecordInvalid(
+            [
+                f"a decision artifact is already retained at {str(path)!r} with different bytes; "
+                "a retained decision artifact is never replaced, so this decision cannot be "
+                "recorded over it"
+            ]
+        )
+    return str(path)
+
+
+def _retain_decision_artifact(path: Path, payload: bytes) -> str:
+    """RETAIN a decision artifact: publish it once, atomically, and never replace one.
+
+    The name is content-addressed by ``payload`` itself, so two executions that produce
+    the SAME bytes share one retained file (a repeated identical decision stays
+    idempotent) while two executions that produce DIFFERENT bytes -- the reproducible
+    decision whose volatile telemetry differs while its result digest does not -- each
+    keep their own file instead of overwriting the evidence an earlier record still
+    binds.  Publication is ATOMIC and NO-REPLACE, with no state exposed that is not
+    complete: the payload is staged (written, flushed, fsynced) in a private temporary
+    inside this function's cleanup protection, then hard-linked into place, which
+    either creates the final name or fails without touching it.  A filesystem that
+    cannot hard-link is therefore a REFUSAL, never a streamed write into the final
+    path, and an occupied path is CONFIRMED or refused, never replaced.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n"
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(payload, encoding="utf-8")
-    temporary.replace(path)
+    temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    try:
+        try:
+            with open(temporary, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as failure:
+            # A staging failure must never surface as a bare OSError: the caller refused
+            # this decision, and the finally below discards the staged temporary.
+            raise DecisionRecordInvalid(
+                [
+                    f"the store could not stage a decision artifact before publication "
+                    f"({failure}); the staged temporary is discarded and nothing is retained"
+                ]
+            ) from failure
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            # Some other execution got there first: reuse it only if it IS these bytes.
+            return _confirm_retained_artifact(path, payload)
+        except OSError as failure:
+            # No atomic no-replace publication is available, so there is nothing safe
+            # to do: refuse, leaving the final path untouched, rather than stream into
+            # it and expose an incomplete artifact under its retained name.
+            raise DecisionRecordInvalid(
+                [
+                    "the store cannot publish a decision artifact atomically on this filesystem "
+                    f"(hard links are unavailable: {failure}); the staged artifact is discarded "
+                    "and the final path is left untouched -- a decision artifact is never "
+                    "written in place piece by piece"
+                ]
+            ) from failure
+    finally:
+        temporary.unlink(missing_ok=True)
     return str(path)
 
 
@@ -3187,10 +3253,16 @@ def make_decision(
     if canonical_manager_state is not None:
         artifact["attribution"]["consumed_manager_state"] = canonical_manager_state
     result_digest = result_identity_of(artifact)
+    artifact_bytes = _decision_artifact_bytes(artifact)
+    # The RETAINED NAME carries both identities: the decision this artifact IS, and the
+    # exact bytes retained for it.  The bytes are hashed from the same buffer that is
+    # written, so the name cannot describe content other than what was retained, and a
+    # repeat that reproduces the decision but not its volatile telemetry keeps a SEPARATE
+    # artifact rather than overwriting the one an earlier record binds.
     artifact_path = _decision_artifact_dir(conn, int(generation.planning_event)) / (
-        result_digest.split(":", 1)[1][:32] + ".json"
+        f"{result_digest.split(':', 1)[1][:32]}-{hashlib.sha256(artifact_bytes).hexdigest()}.json"
     )
-    artifact_ref = _write_decision_artifact(artifact_path, artifact)
+    artifact_ref = _retain_decision_artifact(artifact_path, artifact_bytes)
     from . import execution_snapshot as es
 
     artifact_file_sha256 = es.file_sha256(artifact_ref)
