@@ -629,6 +629,106 @@ def test_make_decision_is_idempotent_and_never_rewrites_history(tmp_path):
         conn.close()
 
 
+def test_repeat_decisions_retain_each_execution_s_artifact_and_both_still_verify(tmp_path):
+    """A repeated decision keeps BOTH executions' evidence, and both records verify.
+
+    This is the shape production actually has: re-running the same decision over the
+    same certified generation reproduces the same RESULT but not the same artifact
+    bytes, so a result-keyed retention path made the later run overwrite the evidence
+    the earlier record still bound.  Each execution must keep its own immutable
+    artifact, and the earlier record must still verify after the repeat.
+    """
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn, request={"tracing_id": "acceptance-primary"})
+        first_path = Path(first["decision_artifact_ref"])
+        first_bytes = first_path.read_bytes()
+
+        second = _decision(conn, request={"tracing_id": "acceptance-repeat"})
+        second_path = Path(second["decision_artifact_ref"])
+
+        # Same decision, different execution: two records, two retained artifacts.
+        assert second["result_sha256"] == first["result_sha256"]
+        assert second["decision_record_id"] != first["decision_record_id"]
+        assert second_path != first_path
+        assert second_path.exists()
+        assert second_path.read_bytes() != first_bytes
+        assert first_path.read_bytes() == first_bytes, "the earlier artifact was overwritten"
+
+        # The record the repeat used to destroy still verifies, and so does the repeat.
+        assert gs.verify_decision(conn, first["decision_record_id"])["verified"] is True
+        assert gs.verify_decision(conn, second["decision_record_id"])["verified"] is True
+
+        # Neither retention left a publication temporary behind.
+        assert not [item.name for item in first_path.parent.glob("*.tmp-*")]
+    finally:
+        conn.close()
+
+
+def test_tampering_with_one_repeat_artifact_fails_only_that_record(tmp_path):
+    """Tampering is detected per RECORD: its own artifact breaks, the sibling does not."""
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn, request={"tracing_id": "acceptance-primary"})
+        second = _decision(conn, request={"tracing_id": "acceptance-repeat"})
+        second_path = Path(second["decision_artifact_ref"])
+        retained = second_path.read_bytes()
+
+        # Still valid JSON, different bytes: the digest binding is what must catch it.
+        second_path.write_bytes(retained + b"  ")
+        with pytest.raises(gs.GenerationRefused) as tampered:
+            gs.verify_decision(conn, second["decision_record_id"])
+        assert "does not match the decision record" in str(tampered.value)
+
+        # The sibling record is untouched by tampering with the other artifact.
+        assert gs.verify_decision(conn, first["decision_record_id"])["verified"] is True
+
+        # Restoring the retained bytes restores verification: nothing else was relied on.
+        second_path.write_bytes(retained)
+        assert gs.verify_decision(conn, second["decision_record_id"])["verified"] is True
+
+        # The same tampering against the FIRST record fails for that record in turn.
+        first_path = Path(first["decision_artifact_ref"])
+        first_bytes = first_path.read_bytes()
+        first_path.write_bytes(first_bytes + b"  ")
+        with pytest.raises(gs.GenerationRefused) as tampered_first:
+            gs.verify_decision(conn, first["decision_record_id"])
+        assert "does not match the decision record" in str(tampered_first.value)
+        assert gs.verify_decision(conn, second["decision_record_id"])["verified"] is True
+    finally:
+        conn.close()
+
+
+def test_a_retained_decision_artifact_is_never_replaced(tmp_path):
+    """An occupied retention path is refused, not overwritten."""
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        first = _decision(conn)
+        artifact_path = Path(first["decision_artifact_ref"])
+        foreign = b'{"schema": "not-this-decision"}\n'
+        artifact_path.write_bytes(foreign)
+
+        # The identical decision resolves to the SAME content-addressed path, where those
+        # bytes are occupied by something else: it may not be replaced by a write.
+        with pytest.raises(gs.DecisionRecordInvalid) as occupied:
+            _decision(conn)
+        assert "never replaced" in str(occupied.value)
+        assert artifact_path.read_bytes() == foreign
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 1
+        assert not [item.name for item in artifact_path.parent.glob("*.tmp-*")]
+    finally:
+        conn.close()
+
+
 def test_make_decision_pins_an_explicit_historical_generation(tmp_path):
     """``generation_id`` is a SELECTOR: a historical decision re-derives from ITS row."""
 
