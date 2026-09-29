@@ -15,7 +15,7 @@ manager-state, decision or safety gate is waived.
 | Predictive code identity (frozen at certification) | `983386e1674cf5d6c74fa08ee2c5fb4488e9c92ce9cca88da8462ebf089b02d5` |
 | Repair commit (the code this document records) | `ff18c2f491dfc5767d26c76dbf7a21b3a98ba00c` (tree `2e7d7eac09ae8da3504dad1ec1762de97660df57`, parent `78ea86853ba3f13829bb3be0e211352a75ce9119`) |
 | Acceptance-document commit | `deafe84cfed774129f2987424ffa6b5415b48ea5` (tree `969bf0bac87a49175d5a7ba783481f018504d717`) |
-| This candidate (exception + corrections) | filled by the commit that introduces the §16 corrections |
+| This candidate (exception + corrections) | `2b0e7a838e3a79c0aa8ddf7a80c23cbe67355ba6` (tree `86d24ae9ee00951e1b298512c1fec06ea2c6006c`, parent `7ef636345d8d90cf4ed517a91ff29084a27da24f`) — the commit that carries the §16 exception and the §6/§8/§10 corrections. This row is completed by that commit's **documentation-only child**, which is the tip of `feature/pe10-v1-acceptance`: the row you are reading is the child's *only* delta, and the child carries no code, test or evidence change (§16) |
 | Repair scope | `scripts/run_four_gw_decision.py` (+cutoff guard, cache location), `tests/test_pe9_production_decision.py` regressions; **0 files under `fpl_brain/`** |
 | Decision runner identity (executed) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
 | Authorization fingerprint (carried forward, identity-only) | `5b253d0f3b6078e6d25228cb89a6b54c5340371cfc51ace16ecb3abeaa9a822e` |
@@ -289,3 +289,13 @@ those two commits is **this document alone** (`git diff deafe84c 7ef63634` → o
 `docs/prediction-engine/PE-10-V1-ACCEPTANCE.md`): the code, tests and evidence Sol reviewed are
 byte-identical.  This correction is accompanied by a fresh Sol High review of this exact
 candidate, which resolves the citation literally rather than by inference.
+
+**Correction chain.**  Each step is separated so that its delta can be checked rather than
+taken on trust:
+`deafe84c` (tree `969bf0ba…`, the document commit Sol reviewed) → `7ef63634`
+(tree `bcf50506…`, the hosted-CI classification correction; `git diff deafe84c 7ef63634` =
+this document alone) → `2b0e7a8` (tree `86d24ae9…`, the §16 exception and the §6/§8/§10
+corrections; `git diff 7ef63634 2b0e7a8` = this document alone) → the **documentation-only
+child** that completes the §1 candidate row, whose only delta is that one row.  That child is
+the tip of `feature/pe10-v1-acceptance`: the exact commit CI ran on and the exact candidate
+Sol High reviewed.  No commit in this chain touches code, tests or evidence.
