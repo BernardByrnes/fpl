@@ -1,7 +1,11 @@
 # PE-10 — End-to-End V1 Acceptance
 
-**Status:** acceptance evidence recorded; V1 is **NOT frozen** by this document.  The freeze
-merge is a separate Product Owner decision.
+**Status:** acceptance evidence recorded; V1 is **READY_TO_FREEZE, pending the separate freeze
+merge**, which remains a Product Owner decision this document does not take.  One timing-evidence
+exception is recorded below with explicit Product Owner approval (§16): per-family Minutes and
+Monte Carlo durations were **not captured**, so no shares are claimed anywhere in this record.
+The exception waives the timing-evidence requirement only — no certification, provenance,
+manager-state, decision or safety gate is waived.
 
 ## 1. Identity of this acceptance
 
@@ -11,6 +15,7 @@ merge is a separate Product Owner decision.
 | Predictive code identity (frozen at certification) | `983386e1674cf5d6c74fa08ee2c5fb4488e9c92ce9cca88da8462ebf089b02d5` |
 | Repair commit (the code this document records) | `ff18c2f491dfc5767d26c76dbf7a21b3a98ba00c` (tree `2e7d7eac09ae8da3504dad1ec1762de97660df57`, parent `78ea86853ba3f13829bb3be0e211352a75ce9119`) |
 | Acceptance-document commit | `deafe84cfed774129f2987424ffa6b5415b48ea5` (tree `969bf0bac87a49175d5a7ba783481f018504d717`) |
+| This candidate (exception + corrections) | filled by the commit that introduces the §16 corrections |
 | Repair scope | `scripts/run_four_gw_decision.py` (+cutoff guard, cache location), `tests/test_pe9_production_decision.py` regressions; **0 files under `fpl_brain/`** |
 | Decision runner identity (executed) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
 | Authorization fingerprint (carried forward, identity-only) | `5b253d0f3b6078e6d25228cb89a6b54c5340371cfc51ace16ecb3abeaa9a822e` |
@@ -30,7 +35,7 @@ change, the predictive identity.
 | Planning cutoff | `2026-09-28T15:25:31Z` |
 | Execution UUID | `76660eb4-9d1d-4ef7-a493-dd26555821dd` |
 | Pinned snapshot | `c29cf985a4ab3a5ca517d967b9d3d8b678afd6f7e2afd6bf91de94b291c00d4a` |
-| Snapshot size / consistency window | 1,116,467,200 bytes / 10.000 s |
+| Snapshot size / capture / consistency window | 1,116,467,200 bytes / **9.635668 s** capture / 10.000 s consistency window |
 | Certificate generation | `sha256:454c51f289b0011620628ee3c818eda47c3e602f478cb7df46bc750e2cd76172` |
 | Previous generation (historical evidence only) | `sha256:27ae1b0ace157be36ef73758a635121d5a93b44f9cf26bdaa7a2c4085d48d4a0` |
 
@@ -96,6 +101,7 @@ reference or reproduction is claimed, exactly as for the previously accepted gen
 | Cutoff guard | `PASS` — `override_captured_at = 2026-09-28T15:16:59Z`, cutoff `2026-09-28T15:25:31Z`, delta 512.0 s |
 | Decision artifact file | `<runtime>/pe9_decisions/gw06/1e03814633816eb065f618e478d6dc6a.json`, sha256 `cff53ba58d617b194fe501f190431b574b4222ed8b96ba58ea89ad988f2cb28e` |
 | Suppressions | none (`suppression_reasons: []`) |
+| Chip result | **NOT APPLICABLE** — no chip was evaluated on this four-GW decision path and none was forced.  Grounded in the retained run summary and artifact: `predictive_certification_only: true`, `wildcard_evaluated: false`, `transfers_or_chips_executed: 0`, and the decision payload's `wildcard_screen: null` with no chip block emitted. |
 
 **Exact generation binding:** the identifier is identical across the verified generation, the
 generation row, `engine_decision_records.generation_id`, and the artifact's own provenance
@@ -120,16 +126,18 @@ re-played.
 
 ## 8. Reproducibility and cache non-authority
 
-| Execution | decision id | result digest | seconds |
-| --- | --- | --- | --- |
-| 2026-09-28T18:42:25Z | sha256:bf93b936cd73ce1f0… | sha256:1e03814633816eb06… | scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0 |
-| 2026-09-28T19:18:11Z | sha256:9de2a7f220777ef45… | sha256:1e03814633816eb06… | scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0 |
-| 2026-09-28T20:46:57Z | sha256:f186062538a1abaf4… | sha256:1e03814633816eb06… | scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0 |
-| cold-cache re-run | `sha256:f186062538a1abaf419b44bb02b51bbfb96573d7baaabd0e394aa3ac10eb7403` | `sha256:1e038146…` (identical) | 5075.7 |
+| Execution | created at | decision id | result digest | seconds |
+| --- | --- | --- | --- | ---: |
+| warm run 1 | 2026-09-28T18:42:25Z | `sha256:bf93b936cd73ce1f00fbf519710860598db59fa5af1bf1b8fafcd0d5d41404c1` | `sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc` | 1,965.2 |
+| warm repeat | 2026-09-28T19:18:11Z | `sha256:9de2a7f220777ef456173a62a17cb33bc85b1486c2e4664c6807ff2ade67b86e` | `sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc` | 2,015.1 |
+| cold cache | 2026-09-28T20:46:57Z | `sha256:f186062538a1abaf419b44bb02b51bbfb96573d7baaabd0e394aa3ac10eb7403` | `sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc` | 5,075.7 |
 
-Two independent executions of the same certified generation, manager packet, profile and
-request produced the **same** `result_sha256` (`sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc`); decision-record ids differ because
-the record binds its own creation context, while the decision result does not change.
+**Three** independent executions of the same certified generation, manager packet, profile and
+request produced the **same** `result_sha256`
+(`sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc`) and the same
+published artifact digest.  Decision-record ids differ because the record binds its own creation
+context; the decision result does not change.  Runner identity for all three:
+`scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0`.
 
 Cache non-authority: the second and third executions used the content-addressed world cache
 (`world_cache/manager_worlds`, keyed by generation id + run ids + Monte Carlo identity + draws
@@ -157,27 +165,39 @@ exercised directly through the same gate `make_decision` calls first
 
 ## 10. Operational timing
 
-| Stage | Seconds |
-| --- | ---: |
-| Official refresh | 2.943 |
-| Immutable snapshot capture | 10.000 (consistency window) |
-| Minutes + team + rates + xPts + Monte Carlo (GW6) | 758 |
-| … (GW7) | 498 |
-| … (GW8) | 497 |
-| … (GW9) | 487 |
-| Horizon certification + generation commit | 18 |
-| Certified-generation run, total (harness) | 2,281.0 |
-| Production decision (warm cache) | 1,965.2 |
-| Production decision (repeat, warm cache) | 2,015.1 |
-| Production decision (cold cache) | 5075.7 |
-| `verify_generation` | 18.273 |
-| `verify_decision` | 20.700 |
+Every value below is read from retained evidence; the source is named so the boundary of each
+number is unambiguous.
 
-Monte Carlo remains the dominant predictive stage and the exact route search dominates the
-decision stage; the decision is now comparable in cost to the whole predictive run.
-**PE10_OPERATIONAL_RUNTIME_CONCERN: YES** — a full acceptance cycle (refresh → snapshot →
-predictions → certification → decision) is roughly **70 minutes** with a warm cache, and the
-decision stage alone is ~33 minutes.  No optimisation was attempted during acceptance.
+| Stage | Seconds | Retained source / boundary |
+| --- | ---: | --- |
+| Official refresh | 2.0 (stage) / 2.943 (process) | `fetch_runs` id 49, 15:25:02→15:25:04Z; 2.943 s is the outer process measurement |
+| Immutable snapshot capture | 9.635668 | `snapshot_capture_seconds` (10.000 s is the consistency window, a different boundary) |
+| Freeze GW6 (minutes + 4 variants + team + rates + xPts + Monte Carlo) | 757.9 | `per_event.6.seconds`, ledger 15:25:47→15:38:25Z |
+| Freeze GW7 | 497.8 | `per_event.7.seconds` |
+| Freeze GW8 | 497.0 | `per_event.8.seconds` |
+| Freeze GW9 | 487.4 | `per_event.9.seconds` |
+| Horizon certification + generation commit | 18 | stage ledger 16:03:07→16:03:25Z |
+| **Predictive E2E** (refresh → certification) | **2,281** | harness `started_at` 15:25:31Z → `finished_at` 16:03:32Z; matches an independent 2,281.0 s measurement |
+| Production decision, warm run 1 | 1,965.2 | decision log (search 694.3 s inside) |
+| Production decision, warm repeat | 2,015.1 | repeat log |
+| Production decision, cold cache | 5,075.7 | cold log |
+| `verify_generation` / `verify_decision` | 18.273 / 20.700 | measured verifier invocations |
+| **Decision-inclusive E2E (warm)** | **4,246.2 ≈ 70.8 min** | defined as predictive E2E 2,281 s + warm decision 1,965.2 s |
+
+**PRIMARY E2E TOTAL (warm): 4,246.2 s**, defined as the predictive cycle plus one warm
+decision.  Earlier figures of "4,259 s" did not reconcile with retained values (≈13 s
+unattributed) and are superseded by this definition.
+
+**Slowest stage: the production decision (1,965.2 s).  Second slowest: Freeze GW6 (757.9 s).**
+Within the predictive cycle alone, the ordering is Freeze GW6 757.9 s then Freeze GW7 497.8 s.
+
+**Per-family Minutes and Monte Carlo durations and shares: NOT CAPTURED** for this run (see
+§16) — no share is claimed, and no dominance of one family over another is asserted.
+
+**PE10_OPERATIONAL_RUNTIME_CONCERN: YES.**  A full acceptance cycle (refresh → snapshot →
+predictions → certification → decision) is ~4,246 s (~70.8 min) with a warm cache and ~7,357 s
+(~122.6 min) with a cold cache, and the decision alone is ~33 min warm / ~85 min cold.  No
+optimisation was attempted during acceptance.
 
 ## 11. Test evidence
 
@@ -239,3 +259,33 @@ The authorization fingerprint is a function of identity fields only (`project`, 
 repair; the rejected candidates, the exhausted PE-9 repair ledger, the four Sol code reviews,
 both design-review rounds and the superseded service architecture all remain recorded and are
 not rewritten by this document.
+
+## 16. Approved timing-evidence exception — `PER_FAMILY_STAGE_TIMINGS_NOT_RETAINED`
+
+**Approved by the Product Owner (PE-10 only).**  The requirement to record separately measured
+Minutes and Monte Carlo durations (and any shares derived from them) is waived for this
+acceptance.  The waiver covers timing evidence only: no certification, provenance,
+manager-state, decision, or safety gate is waived, and every identity and digest in this record
+is unaffected by it.
+
+**Not captured:** per-family durations for Minutes and Monte Carlo anywhere in the retained
+artifacts — not in `certification_run.json` (`per_event.*` carries only `seconds`,
+`simulations`, `certified`, `freeze_return_code`), not in the stage ledger (`detail` is null on
+all five rows), not in the four `prediction_freeze_run*.json` artifacts (no timing fields), and
+not in the harness log (zero matches for per-family durations).  Each `FREEZE_GWx` stage wraps
+minutes (+ four variants), team, rates, xPts and Monte Carlo together, so the families cannot be
+separated from the retained evidence.  **No share is estimated, and no per-family dominance is
+claimed** — the previously drafted "Monte Carlo remains the dominant predictive stage" sentence
+and its "~48 min" figure were carried over from an earlier invocation's report and have been
+removed, not restated.
+
+**Retained instead:** the per-event freeze durations, the per-stage ledger, the predictive E2E
+boundary, the three decision timings and the two verifier timings (§10), which are sufficient for
+the stage-level runtime assessment and the runtime concern stated above.
+
+**Earlier-tree citation in Sol's review.**  Sol's final approval cites tree `969bf0ba…`, which is
+the `deafe84c` document commit rather than this candidate's tree `bcf50506`.  The delta between
+those two commits is **this document alone** (`git diff deafe84c 7ef63634` → one file,
+`docs/prediction-engine/PE-10-V1-ACCEPTANCE.md`): the code, tests and evidence Sol reviewed are
+byte-identical.  This correction is accompanied by a fresh Sol High review of this exact
+candidate, which resolves the citation literally rather than by inference.
