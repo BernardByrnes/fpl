@@ -22,12 +22,15 @@ recorded there as superseded.
 | Acceptance-document commit | `deafe84cfed774129f2987424ffa6b5415b48ea5` (tree `969bf0bac87a49175d5a7ba783481f018504d717`) |
 | Exception + correction chain (§16) | `7ef636345d8d90cf4ed517a91ff29084a27da24f` (tree `bcf50506…`) → `2b0e7a838e3a79c0aa8ddf7a80c23cbe67355ba6` (tree `86d24ae9…`) → `96578e8dc981613e59a3899d6e45c7d6f72d5500` (tree `d419a9c3…`) |
 | Retention repair commit (the code this document records) | `6261a91d945101486b1e926eb60a0c7b1162886b` (tree `c18d262f65418e1ae7292db7223ca103c68a1f23`, parent `96578e8dc981613e59a3899d6e45c7d6f72d5500`) — `fpl_brain/generation_store.py` and the `tests/test_pe9_production_decision.py` regressions; see §17 |
-| Decision runner identity (rebuilt evidence, §§6–8) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` |
-| Decision runner identity (historical, superseded executions — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
+| Atomic-publication repair commit (the code this document records) | `1b79bcdf8688554e3dee9614a9586b92c76fa300` (tree `f9cb3afafb6fda6f60fd9db0095e0d1247febed8`, parent `efd1ce5eeb8705bde3616ab543cc78bbe89210e5`) — `fpl_brain/generation_store.py` (staging under cleanup protection, atomic no-replace publication only) and `tests/test_pe9_production_decision.py` (+2 failure-path regressions) |
+| Decision runner identity (P2 rebuild, §§6–8) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f79e80df1b0811e4f810d22b452a452d5e5a941d954c09656a27e6cc409c679f` |
+| Decision runner identity (intermediate rebuild, superseded — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` |
+| Decision runner identity (the 2026-09-28 historical executions — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
 | Source-guard follow-up | `17682cab2bb3bf1b58f0875c9b7c14599624cdfe` (parent `6261a91d945101486b1e926eb60a0c7b1162886b`) — `tests/test_r4b2b_finalist_stability.py`: the two source-literal guards that the wrapper caught are updated to the renamed helper (§11, §17) |
-| This candidate (retention repair + re-evidenced decision) | the **documentation-only child** of `17682cab` that is the tip of `feature/pe10-v1-acceptance`; the row you are reading is its only delta, so this candidate differs from the guarded repair by this document alone |
+| This candidate (publication repair + P2-rebuilt decision) | the **documentation-only child** of `1b79bcdf` that is the tip of `feature/pe10-v1-acceptance`; the row you are reading is its only delta, so this candidate differs from the P2 repair by this document alone |
 | Repair scope (earlier, `ff18c2f4`) | `scripts/run_four_gw_decision.py` (+cutoff guard, cache location), `tests/test_pe9_production_decision.py` regressions; 0 files under `fpl_brain/` |
 | Repair scope (retention, `6261a91d`) | `fpl_brain/generation_store.py` (artifact retention only: naming + exclusive publish) and `tests/test_pe9_production_decision.py`; the predictive source set is untouched (§13) |
+| Repair scope (publication, `1b79bcdf`) | `fpl_brain/generation_store.py` (staging under cleanup protection; atomic no-replace publication only; refusal where linking is unavailable) and `tests/test_pe9_production_decision.py`; no model, optimizer, scoring or manager-state change (§13) |
 | Authorization fingerprint (carried forward, identity-only) | `5b253d0f3b6078e6d25228cb89a6b54c5340371cfc51ace16ecb3abeaa9a822e` |
 
 The predictive identity and the decision-runner identity are recorded **separately**: the
@@ -102,18 +105,18 @@ reference or reproduction is claimed, exactly as for the previously accepted gen
 
 ## 6. Production decision
 
-The decision below is the **rebuilt** primary execution (§8, arm 1), taken through
-`generation_store.make_decision` on the repaired code.
+The decision below is the **P2-rebuilt** primary execution (§8, arm 1), taken through
+`generation_store.make_decision` on the atomic-publication code.
 
 | Fact | Value |
 | --- | --- |
-| Decision id | `sha256:84b3b60d72422c45c17f9bbbdeaac8cfdf3585a798a97d7dd37939708ab2b73e` |
+| Decision id | `sha256:d9dc9be8f51a6746a903e5745d963acf6ebc0a563f8f511833682afe6ec4276b` |
 | Generation consumed | `sha256:454c51f289b0011620628ee3c818eda47c3e602f478cb7df46bc750e2cd76172` |
-| Result digest | `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42` |
+| Result digest | `sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d` |
 | Manager context digest | `sha256:833967288ac8e2aebcaf6d6154a523ff88f51d37096b32a1f414c200f5b46425` — recomputed from the consumed state, equal |
 | Cutoff guard | `PASS` — `override_captured_at = 2026-09-28T15:16:59Z`, cutoff `2026-09-28T15:25:31Z`, delta 512.0 s |
-| Retained decision artifact | `<runtime>/pe9_decisions/gw06/e04324c834b806f72af406e7018d277e-7d2679adceb7d81709b5ba62dace85e44a1da6dbde2cc66c5ab761772bdb9952.json`, 5,129,776 bytes, sha256 `7d2679adceb7d81709b5ba62dace85e44a1da6dbde2cc66c5ab761772bdb9952` — content-addressed, one file per execution (§17) |
-| Published runner artifact | `<runtime>/data/exports/pe10_repair_20260929/arm1_primary/gw06/four_gw_decision.json`, sha256 `a8c1e8c46edcee3edf8d2c66519d486f56c2a0c42c655e94776fc86bebe08ab5` (the runner's own copy; the retained artifact above is the one the record binds) |
+| Retained decision artifact | `C:\Users\USER\agent-workspaces\fpl-pe10-runtime\pe9_decisions\gw06\1e895a9cb06880fa5c96d20764f2ef26-c67cc9f1b4a13904a89317528a71104d877cbcb9981efe393cea2599caf91082.json`, 5,129,776 bytes, sha256 `c67cc9f1b4a13904a89317528a71104d877cbcb9981efe393cea2599caf91082` — content-addressed, one file per execution, published by atomic no-replace hard link (§17) |
+| Published runner artifact | `C:\Users\USER\agent-workspaces\fpl-pe10-runtime\data\exports\pe10_p2_20260929\arm1_primary_warm\gw06\four_gw_decision.json`, sha256 `1ec85fbab92b6daaceb5568bbcbbc01a8ad930e227f8917cf1a0ce0485d9c242` (the runner's own copy; the retained artifact above is the one the record binds) |
 | Suppressions | none (`suppression_reasons: []`) |
 | Chip result | **NOT APPLICABLE** — no chip was evaluated on this four-GW decision path and none was forced.  Grounded in the retained run summary and artifact: `predictive_certification_only: true`, `wildcard_evaluated: false`, `transfers_or_chips_executed: 0`, and the decision payload's `wildcard_screen: null` with no chip block emitted. |
 
@@ -126,34 +129,44 @@ generation row, `engine_decision_records.generation_id`, and the artifact's own 
 the retained `consumed_manager_state` (bank 7 / FT 3 / event-start FT `null`), the
 `manager_context_sha256` input and the verifier's re-derivation are identical.
 
-### 6b. Superseded historical decisions (2026-09-28)
+### 6b. Superseded decision generations (2026-09-28 records and the 2026-09-29 first rebuild)
 
 Three earlier records were taken against the **same** certified generation.  Their retained
 artifacts were destroyed by the retention collision described in §17 — all three pointed at one
 result-keyed path and the later executions overwrote it — so they are recorded here as
 **superseded**: not evidence of this acceptance, and not claimed to verify.
 
+A second generation of records — the **first rebuild** (four arms, 2026-09-29 early UTC) — is also
+superseded by this acceptance: the atomic-publication repair changed the runner identity again, so
+the acceptance binds the **P2 rebuild** (§8).  Those four records are **not** damaged — immutable
+per-execution retention means every one of them still verifies against its own artifact, which is
+itself the strongest evidence the retention defect is fixed — but they are not this acceptance's
+evidence and are not relied on.
+
 | Historical record | Executed | State now |
 | --- | --- | --- |
 | `sha256:bf93b936…d41404c1` (warm run 1 — the record the earlier draft of this document bound) | 2026-09-28T18:42:25Z | **SUPERSEDED — `DECISION_RECORD_INVALID`**: the retained file holds the last writer's bytes (`8d6896a4…`) and this record's own artifact bytes (`cff53ba5…`) are retained nowhere |
 | `sha256:9de2a7f2…de67b86e` (warm repeat) | 2026-09-28T19:18:11Z | **SUPERSEDED — `DECISION_RECORD_INVALID`**: same cause (`7aeca6da…` retained nowhere) |
 | `sha256:f1860625…10eb7403` (cold cache) | 2026-09-28T20:46:57Z | **SUPERSEDED**; it happens to be the last writer, so its artifact binding still verifies — it is nevertheless not this acceptance's evidence, because it predates the repair and its siblings are unrecoverable |
+| first rebuild, 4 records (`84b3b60d…`, `5c6a8603…`, `ffa76b7d…`, `d7dcbdb8…`) | 2026-09-29T04:29–07:04Z | **SUPERSEDED, and all four still verify** against their own distinct artifacts (`7d2679ad…`, `f9b10c20…`, `4268db4c…`, `40d57759…`) — superseded because the publication repair changed the runner identity, not because anything was lost |
 
 The records are append-only and were deliberately **not** rewritten, re-pointed or deleted: they
 stand exactly as written, and the verifier's refusal is the honest state of their evidence.
-Re-running cannot restore their bytes — only new records with immutable paths can, which is what
-the rebuilt evidence in §8 is.
+Re-running cannot restore the 2026-09-28 bytes — only new records with immutable paths can, which
+is what the P2-rebuilt evidence in §8 is.
 
 ## 7. Decision verification
 
-`verify_decision sha256:84b3b60d72422c45c17f9bbbdeaac8cfdf3585a798a97d7dd37939708ab2b73e` → `verified = true`, with `generation_verified`,
+`verify_decision sha256:d9dc9be8f51a6746a903e5745d963acf6ebc0a563f8f511833682afe6ec4276b` → `verified = true`, with `generation_verified`,
 `record_digest_recomputed`, `manager_packet_digest_verified`, `manager_context_digest_verified`,
 `request_digest_verified`, `result_digest_verified`, `runner_identity_verified`,
 `runner_code_identity_bound`, `decision_artifact = VERIFIED` at
-`7d2679adceb7d81709b5ba62dace85e44a1da6dbde2cc66c5ab761772bdb9952`.
+`c67cc9f1b4a13904a89317528a71104d877cbcb9981efe393cea2599caf91082`.
 
-Every rebuilt record was re-verified **after the last execution** (§8), not merely when it was
-written: all four report `verified = true`, each bound to its **own** artifact file.
+Every P2 record was re-verified **after the cold execution** (§8), not merely when it was written:
+all three report `verified = true`, each bound to its **own** artifact file.  The earlier
+generations of records behave exactly as §6b states — the first rebuild's four records still
+verify, the 2026-09-28 pair still refuses with its original recorded digests.
 
 Replay boundary, stated truthfully: `DECISION_REPLAY_NOT_PERFORMED` — the generation and the
 manager context re-derive from retained evidence; the decision is **not** claimed to have been
@@ -163,28 +176,25 @@ re-played.
 
 | Execution | window (UTC) | seconds | decision id | retained artifact byte digest | cache |
 | --- | --- | ---: | --- | --- | --- |
-| arm 1 — primary | 2026-09-29T03:52:26Z → 2026-09-29T04:29:39Z | 2,233 | `sha256:84b3b60d72422c45c17f9bbbdeaac8cfdf3585a798a97d7dd37939708ab2b73e` | `7d2679adceb7d81709b5ba62dace85e44a1da6dbde2cc66c5ab761772bdb9952` | warm |
-| arm 2 — repeat | 2026-09-29T04:29:39Z → 2026-09-29T05:07:43Z | 2,284 | `sha256:5c6a86037a5416377f11851b6ae0c1b8cf51ece005046e73385d9dfb99558ba5` | `f9b10c20b3578ca20e1edd91aad49f04e28a1c3f2dfcd764a4a7426fe9300146` | warm |
-| arm 3 — cold cache | 2026-09-29T05:07:44Z → 2026-09-29T06:30:47Z | 4,983 | `sha256:ffa76b7ddb961a8f25e2050be70bf91e9f2304bccc943d4879a97e2bea2f89c9` | `4268db4c96649318212321d4c25507406d37f993e6cdec83ca338373f6d2e5a8` | **cold** (cache removed) |
-| arm 4 — warm cache | 2026-09-29T06:30:48Z → 2026-09-29T07:04:08Z | 2,000 | `sha256:d7dcbdb8a155d3184ea102eecba3317abd87b5241d7c166304bb7bcb4386f51b` | `40d5775942d56b74df0bf35633ea86e1cc9568355a1844496d7afd00e7d87b4a` | warm (cache restored) |
+| arm 1 — primary | 2026-09-29T11:05:14Z → 2026-09-29T11:38:57Z | 2,023 | `sha256:d9dc9be8f51a6746a903e5745d963acf6ebc0a563f8f511833682afe6ec4276b` | `c67cc9f1b4a13904a89317528a71104d877cbcb9981efe393cea2599caf91082` | warm |
+| arm 2 — identical repeat | 2026-09-29T11:38:57Z → 2026-09-29T12:11:16Z | 1,939 | `sha256:3bbf3e15cdc152030a4d5c27ae2ee9a7c30cf84f71eec6b80d86022eab74bce0` | `ca8f8a0ba11a13f346d4cca3ba6c824e984a82717dd67f6175249d1dfdcf4ef7` | warm |
+| arm 3 — cold cache | 2026-09-29T12:11:16Z → 2026-09-29T13:36:45Z | 5,129 | `sha256:1906c576079d48f4f379c174c83c1bd879d0c5b568a5de56185149145ae5af45` | `676d1b1fe9167ed24922b2c16f5a87e939da1771d2b2b8c29f9fd73747887353` | **cold** (cache cleared) |
+**Three** independent executions of the same certified generation, manager packet, profile and
+request produced the **same** `result_sha256` (`sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d`) and the same decision
+content, while each kept its **own** retained artifact: three distinct paths, three distinct byte
+digests (table above), published by atomic no-replace hard link.  The **identical repeat** is the
+arm the original defect destroyed: under the pre-repair store it overwrote arm 1's artifact.
 
-**Four** independent executions of the same certified generation, manager packet, profile and
-request produced the **same** `result_sha256` (`sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42`) and the same decision
-content, while each kept its **own** retained artifact: four distinct paths, four distinct byte
-digests (table above).  That is the property §17's repair establishes — under the pre-repair store
-these executions shared one result-keyed path and only the last one survived.
+The P2 result digest differs from the first rebuild's `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42` in exactly
+**one** projection field — `runner_code_identity` — measured field by field (§13); the first
+rebuild's differed from the 2026-09-28 historical `sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc` for the same reason.  Every
+semantic field is identical across all three generations of decisions.
 
-The rebuilt result digest differs from the historical `sha256:1e03814633816eb065f618e478d6dc6a4eac61122f29ce59bb9e9515af9466fc` in exactly
-**one** projection field, `runner_code_identity`, because the decision-result identity covers the
-code that took the decision and this repair changes that code (§13 measures the rest of the
-projection field by field).  Decision-record ids differ because each record binds its own creation
-context and its own artifact bytes.
-
-Cache non-authority, re-established: arm 3 ran with the cache **removed** (8 files, contents
-preserved as evidence), re-derived every world, and produced the **same** result digest and the
-same decision content at 4,983 s against arms 1–2 at 2,233 s and 2,284 s; arm 4 then ran with the
-cache **restored** (byte-verified against the backup) and reproduced it again at 2,000 s.  The
-cache changes runtime only, and every arm's artifact is retained separately.
+Cache non-authority, re-established: arm 3 ran with the cache **cleared** (8 files removed against
+a byte-verified manifest), re-derived every world, and produced the **same** result digest and the
+same decision content at 5,129 s against arms 1–2 at 2,023 s and 1,939 s; the cache was then
+restored byte-verified.  The cache changes runtime only, and every arm's artifact is retained
+separately.
 
 ## 9. Fail-closed refusals (representative)
 
@@ -224,24 +234,24 @@ number is unambiguous.
 | Freeze GW9 | 487.4 | `per_event.9.seconds` |
 | Horizon certification + generation commit | 18 | stage ledger 16:03:07→16:03:25Z |
 | **Predictive E2E** (refresh → certification) | **2,281** | harness `started_at` 15:25:31Z → `finished_at` 16:03:32Z; matches an independent 2,281.0 s measurement |
-| Production decision, rebuilt arm 1 (warm) | 2,233 | `arms_summary.tsv` 03:52:26Z → 04:29:39Z |
-| Production decision, rebuilt arm 2 (repeat, warm) | 2,284 | `arms_summary.tsv` 04:29:39Z → 05:07:43Z |
-| Production decision, rebuilt arm 3 (cold cache) | 4,983 | `arms_summary.tsv` 05:07:44Z → 06:30:47Z |
-| Production decision, rebuilt arm 4 (warm cache restored) | 2,000 | `arms_summary.tsv` 06:30:48Z → 07:04:08Z |
-| (historical, superseded — §6b) warm 1 / repeat / cold | 1,965.2 / 2,015.1 / 5,075.7 | the pre-repair executions of 2026-09-28 |
+| Production decision, P2 arm 1 (primary, warm) | 2,023 | `pe10_p2_20260929/arms_summary.tsv` 2026-09-29T11:05:14Z → 2026-09-29T11:38:57Z |
+| Production decision, P2 arm 2 (identical repeat, warm) | 1,939 | 2026-09-29T11:38:57Z → 2026-09-29T12:11:16Z |
+| Production decision, P2 arm 3 (cold, cache cleared) | 5,129 | 2026-09-29T12:11:16Z → 2026-09-29T13:36:45Z |
+| (superseded — §6b) first rebuild, 4 arms | 2,233 / 2,284 / 4,983 / 2,000 | 2026-09-29 pre-P2 code |
+| (historical — §6b) warm 1 / repeat / cold | 1,965.2 / 2,015.1 / 5,075.7 | the pre-repair executions of 2026-09-28 |
 | `verify_generation` / `verify_decision` | 18.273 / 20.700 | measured verifier invocations |
 | **Decision-inclusive E2E (warm)** | **4,246.2 ≈ 70.8 min** | defined as predictive E2E 2,281 s + warm decision 1,965.2 s |
 
 **PRIMARY E2E TOTAL (warm): 4,246.2 s**, defined as the predictive cycle (2,281 s) plus the warm
 decision of that cycle (1,965.2 s).  Earlier figures of "4,259 s" did not reconcile with retained
-values (≈13 s unattributed) and are superseded by this definition.  The **rebuilt** cycle's
-decision-inclusive total is 2,281 + 2,233 = **4,514 s** (§8 arm 1); the predictive half of that
-cycle was not re-run, so 4,514 s mixes a historical predictive span with a rebuilt decision and is
-quoted only as an observed figure, not as the acceptance total.
+values (≈13 s unattributed) and are superseded by this definition.  The **P2 rebuild's**
+decision-inclusive observed figure is 2,281 + 2,023 = **4,304 s** (§8 arm 1); the
+predictive half was not re-run, so 4,304 s mixes a historical predictive span with a P2 decision
+and is quoted only as an observed figure, not as the acceptance total.
 
-**Slowest stage: the production decision — rebuilt arm 1 at 2,233 s (arms 2 and 4 at 2,284 s and
-2,000 s; the historical, superseded executions at 1,965.2 s).  Second slowest: Freeze GW6
-(757.9 s).**
+**Slowest stage: the production decision — P2 arm 3 (cold) at 5,129 s, then arm 1 (warm) at
+2,023 s and arm 2 at 1,939 s (the superseded earlier rebuilds at 1,965.2–2,284 s warm).
+Second slowest warm stage: Freeze GW6 (757.9 s).**
 Within the predictive cycle alone, the ordering is Freeze GW6 757.9 s then Freeze GW7 497.8 s.
 
 **Per-family Minutes and Monte Carlo durations and shares: NOT CAPTURED** for this run (see
@@ -250,11 +260,12 @@ Within the predictive cycle alone, the ordering is Freeze GW6 757.9 s then Freez
 **PE10_OPERATIONAL_RUNTIME_CONCERN: YES.**  A full acceptance cycle (refresh → snapshot →
 predictions → certification → decision) is ~4,246 s (~70.8 min) with a warm cache and ~7,357 s
 (~122.6 min) with a cold cache, and the decision alone is ~33 min warm / ~85 min cold.  The
-rebuilt decision arms measure the same shape: 2,233 s / 2,284 s / 2,000 s warm (four arms, two of
-them repeats on a restored cache) against 4,983 s cold, with the same result digest.  No
-optimisation was attempted during acceptance, and none is claimed by this repair — the retention
-change adds a single 5 MB write plus one link per decision (well under a second against a
-~2,000 s decision), so the arm-to-arm differences above are run-to-run variance, not repair cost.
+P2 decision arms measure the same shape: 2,023 s and 1,939 s warm
+(identical repeat) against 5,129 s cold, with the same result digest across all three.
+No optimisation was attempted during acceptance, and none is claimed by these repairs — retention
+and publication add a single staged 5 MB write plus one link per decision (well under a second
+against a ~2,000 s decision), so the arm-to-arm differences above are run-to-run variance, not
+repair cost.
 
 ## 11. Test evidence
 
@@ -273,7 +284,18 @@ change adds a single 5 MB write plus one link per decision (well under a second 
   3. an occupied retention path is **refused, not replaced** (the pre-repair store returned
      `DID NOT RAISE` here), the foreign bytes are left exactly as found, and no second record is
      appended.
-- Focused suites run on the repaired store: **209 passed, 1 skipped** across
+  4. a **staging failure** (forced `ENOSPC` on the staged temporary) leaves **no final artifact, no
+     temporary and no decision record** — the pre-P2 implementation returned `DID NOT RAISE` here,
+     because it never fsynced the staged file at all;
+  5. a filesystem **without hard links** refuses the decision (`DecisionRecordInvalid`) instead of
+     streaming the payload into the final path — the pre-P2 implementation left the final artifact
+     in place here.
+- Focused suites run on the P2 store: **117 passed, 1 skipped** (`test_pe9_production_decision.py`,
+  `test_r4b2b_finalist_stability.py`, `test_pe9_generation_store.py`, `test_pe9_verify_commands.py`)
+  and **127 passed, 1 skipped** (`test_pe9_certification_integration.py`,
+  `test_pe9_manager_packet_cli.py`, `test_pe10_optional_override.py`,
+  `test_r4b1_decision_correctness.py`, `test_free_hit_request_adapter.py`).
+- Focused suites on the first rebuild: **209 passed, 1 skipped** across
   `test_pe9_production_decision.py`, `test_pe9_generation_store.py`, `test_pe9_verify_commands.py`,
   `test_pe9_certification_integration.py`, `test_pe9_manager_packet_cli.py`,
   `test_pe10_optional_override.py`, `test_r4b1_decision_correctness.py` and
@@ -289,10 +311,12 @@ change adds a single 5 MB write plus one link per decision (well under a second 
   renamed).  Reported, not hidden: fixed in the follow-up `17682cab` (§1, §17), whose intent is
   unchanged — the guards still assert that suppression is applied before the artifact is assembled
   and that the store publishes the artifact reference from its own helper.
-- Wrapper on the **final candidate** `17682cab` (the code+test state of this candidate):
-  **2 failed (the two accepted ids below), 2601 passed, 31 skipped** in 4,090.57 s (1:08:10);
-  `unexpected failures: none`.  The extra three passes over the earlier local run are the three
-  new retention regressions.
+- Wrapper on the guarded repair `17682cab` (the pre-P2 code state): **2 failed (the two accepted
+  ids below), 2601 passed, 31 skipped** in 4,090.57 s (1:08:10); `unexpected failures: none`.  The
+  extra three passes over the earlier local run are the three retention regressions.
+- Wrapper on the **atomic-publication repair** `1b79bcdf` (the code+test state of this candidate):
+  **2 failed (the two accepted ids below), 2603 passed, 31 skipped** in 4,019.16 s (1:06:59);
+  `unexpected failures: none`.  The extra two passes are the two failure-path regressions.
 - Hosted CI on the acceptance head `78ea8685` (run `36421953185`, job `unit-tests`, SUCCESS):
   **2 failed (the same two accepted ids), 2578 passed, 49 skipped** in 3,260.77 s.
 - Hosted CI on the repair candidate `deafe84c` (run `36494119652`, job `unit-tests`, SUCCESS):
@@ -324,7 +348,7 @@ is established **by what the engine actually does**, not by a file list.
 (`analytics.SOURCE_SNAPSHOT_FILES`, 18 named files covering the models, the scoring rules, the
 calibration, the DEFCON term, the point-in-time boundary and the certification entry points), so
 the predictive code identity is unchanged.  Checked **before** any decision was re-run, with the
-repaired code in place:
+repaired code in place — before the first rebuild and again before the P2 rebuild:
 
 ```
 {"verified": true, "code_identity_reproduced_from_runs": true, "snapshot_identity": "VERIFIED", "planning_context_reproduced_from_snapshot": true, "bundle_identities_reproduced": true, "dependency_closure_reproduced": true, "manifest_digest_matches": true, "versions_valid": true}
@@ -341,7 +365,7 @@ field (route table, decision block, `decision_confidence`, `suppression_reasons`
 
 | Projection field | Historical | Rebuilt |
 | --- | --- | --- |
-| `runner_code_identity` | `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` | `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` |
+| `runner_code_identity` | `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` (2026-09-28) | `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` (first rebuild) → `sha256:f79e80df1b0811e4f810d22b452a452d5e5a941d954c09656a27e6cc409c679f` (P2 rebuild) |
 | every other field | — | **identical** |
 
 So the rebuilt result digest changes for one reason only: the decision-result identity binds the
@@ -360,9 +384,10 @@ handling, the four-event horizon, the H1 lineup/captain policy, the optimizer ra
 PE-9 certification guarantee are untouched by the repair: its diff is one store module (the
 artifact-retention helper and its publish site) and tests.
 
-**4. What did change, stated plainly.**  The decision runner code identity
-(`sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` → `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05`) and, with it, the
-rebuilt records' result digests.  Nothing else in the projection moved.
+**4. What did change, stated plainly.**  The decision runner code identity moved twice — once for
+the retention repair (`sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` → `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05`) and once for the
+publication repair (`sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` → `sha256:f79e80df1b0811e4f810d22b452a452d5e5a941d954c09656a27e6cc409c679f`) — and, with it, each rebuild's result
+digests.  Nothing else in the projection moved, measured against both preceding generations.
 
 ## 14. Source safety
 
@@ -399,8 +424,9 @@ and its "~48 min" figure were carried over from an earlier invocation's report a
 removed, not restated.
 
 **Retained instead:** the per-event freeze durations, the per-stage ledger, the predictive E2E
-boundary, the three decision timings and the two verifier timings (§10), which are sufficient for
-the stage-level runtime assessment and the runtime concern stated above.
+boundary, the per-arm decision timings of both decision rebuilds and the two verifier timings
+(§10), which are sufficient for the stage-level runtime assessment and the runtime concern stated
+above.
 
 **Earlier-tree citation in Sol's review.**  Sol's final approval cites tree `969bf0ba…`, which is
 the `deafe84c` document commit rather than the tree of the candidate it reviewed (`bcf50506…`,
@@ -419,10 +445,17 @@ corrections; `git diff 7ef63634 2b0e7a8` = this document alone) → the **docume
 child** that completes the §1 candidate row, whose only delta is that one row.  That child was
 the tip of `feature/pe10-v1-acceptance` and the exact candidate Sol High reviewed, and its review
 returned `FIX_REQUIRED / P1` on the retention defect of §17 — so the chain continues:
-`6261a91d945101486b1e926eb60a0c7b1162886b` (tree `c18d262f65418e1ae7292db7223ca103c68a1f23`, the **retention repair**; `git diff 96578e8d 6261a91d` =
-`fpl_brain/generation_store.py` + `tests/test_pe9_production_decision.py` only) → the
-documentation-only child that completes this document (§17), which is the final candidate.  No
-commit in this chain touches model, optimizer or scoring code, and none touches evidence.
+`6261a91d945101486b1e926eb60a0c7b1162886b` (tree `c18d262f…`, the **retention repair**) →
+`17682cab2bb3bf1b58f0875c9b7c14599624cdfe` (the **source-guard follow-up**: the two
+`test_r4b2b_finalist_stability.py` guards that assert the store's publish line as source TEXT are
+updated to the renamed helper — disclosed in §11 and §17, acknowledged by the Product Owner) →
+`efd1ce5eeb8705bde3616ab543cc78bbe89210e5` (the **retention-evidence document**, the candidate
+Sol High reviewed at `FIX_REQUIRED / P2`) →
+`1b79bcdf8688554e3dee9614a9586b92c76fa300` (tree `f9cb3afa…`, the **atomic-publication repair**
+Sol prescribed: staging under cleanup protection, publish only by atomic no-replace hard link,
+refuse where linking is unavailable) → the documentation-only child that completes this document,
+which is the final candidate.  No commit in this chain touches model, optimizer, scoring or
+manager-state code, and none touches evidence.
 
 ## 17. Decision-artifact retention — `DECISION_ARTIFACT_RETENTION_NOT_IMMUTABLE` (found, repaired, re-evidenced)
 
@@ -443,12 +476,23 @@ trigger protected the **rows**, not the files those rows point at.
 - the retention name is **content-addressed by the artifact bytes themselves**
   (`<result digest prefix>-<sha256 of the retained bytes>.json`), computed from the same buffer that
   is written, so the name cannot describe content other than what was retained;
-- publication is an **exclusive atomic write**: a private temporary is hard-linked into place, which
-  creates the name or fails when it is already taken (an exclusive create is the fallback where a
-  filesystem cannot link, and it refuses an occupied path too);
-- an occupied path is **confirmed or refused, never replaced**: identical bytes are reused (so an
-  identical repeated decision stays idempotent) and different bytes raise `DecisionRecordInvalid`;
-- no temporary is left behind on any path.
+- the payload is **staged under cleanup protection** — written, flushed and fsynced to a private
+  temporary inside the `try/finally` that always discards it — so no staging failure (a full disk,
+  a permission error) can leave a temporary behind, and a staging failure is reported as a
+  refusal, not as a bare `OSError`;
+- publication is an **atomic no-replace hard link**: it either creates the final name or fails
+  without touching it, and an occupied path is **confirmed or refused, never replaced** —
+  identical bytes are reused (so an identical repeated decision stays idempotent) and different
+  bytes raise `DecisionRecordInvalid`;
+- a filesystem that cannot hard-link is a **refusal, not a fallback write**: the decision is
+  refused (`DecisionRecordInvalid`) with the final path untouched, because a decision artifact is
+  never streamed into its retained name piece by piece.  There is no non-atomic publication path
+  left (`_create_exclusively` was deleted).
+
+Sol's review of the first repair (`FIX_REQUIRED / P2`) found that its fallback streamed into the
+final path and that the staging sat outside the cleanup block; both are fixed here, and the two
+failure-path regressions were shown to fail against that previous implementation before being
+accepted (§11).
 
 **Regressions (§11)** prove all three behaviours, and all three were shown to fail against the
 pre-repair store.
@@ -467,22 +511,26 @@ re-pointed or deleted — append-only means append-only.  Two of them can no lon
 their bytes are retained nowhere; no re-run can bring those bytes back.  What the repair restores is
 the **future**: every execution now keeps its own artifact.
 
-**The rebuilt evidence (§8).**  Four executions on the unchanged certified generation — primary,
-repeat, warm-cache and cold-cache — one result digest `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42`, four distinct
-retained artifact paths with four distinct byte digests, and every record re-verified **after the
-last execution**:
+**The P2-rebuilt evidence (§8).**  Three executions on the unchanged certified generation —
+primary warm, identical repeat warm, and cold after the cache was cleared — one result digest
+`sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d`, three distinct retained artifact paths with three distinct
+byte digests, and every record re-verified **after the cold execution**:
 
-| Execution | Decision record | Result digest | Retained artifact (distinct per execution) | Verified after the last run |
+| Execution | Decision record | Result digest | Retained artifact (distinct per execution) | Verified after the cold run |
 | --- | --- | --- | --- | --- |
-| arm 1 — primary | `sha256:84b3b60d72422c45c17f9bbbdeaac8cfdf3585a798a97d7dd37939708ab2b73e` | `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42` | `…-7d2679adceb7d817….json` | `verified = true` |
-| arm 2 — repeat | `sha256:5c6a86037a5416377f11851b6ae0c1b8cf51ece005046e73385d9dfb99558ba5` | `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42` | `…-f9b10c20b3578ca2….json` | `verified = true` |
-| arm 3 — cold cache | `sha256:ffa76b7ddb961a8f25e2050be70bf91e9f2304bccc943d4879a97e2bea2f89c9` | `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42` | `…-4268db4c96649318….json` | `verified = true` |
-| arm 4 — warm cache restored | `sha256:d7dcbdb8a155d3184ea102eecba3317abd87b5241d7c166304bb7bcb4386f51b` | `sha256:e04324c834b806f72af406e7018d277e09252796f7f56f41dc54d8990a49db42` | `…-40d5775942d56b74….json` | `verified = true` |
+| arm 1 — primary, warm | `sha256:d9dc9be8f51a6746a903e5745d963acf6ebc0a563f8f511833682afe6ec4276b` | `sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d` | `…-c67cc9f1b4a13904….json` | `verified = true` |
+| arm 2 — identical repeat, warm | `sha256:3bbf3e15cdc152030a4d5c27ae2ee9a7c30cf84f71eec6b80d86022eab74bce0` | `sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d` | `…-ca8f8a0ba11a13f3….json` | `verified = true` |
+| arm 3 — cold, cache cleared | `sha256:1906c576079d48f4f379c174c83c1bd879d0c5b568a5de56185149145ae5af45` | `sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d` | `…-676d1b1fe9167ed2….json` | `verified = true` |
+
+The first rebuild's four records (runner identity `…{RET_CODE[7:15]}…`) remain retained and still
+verify against their own artifacts (§6b); they are the intermediate evidence between the retention
+repair and this publication repair.
 
 Full artifact paths, byte sizes and digests, the arm timings and the retained world cache manifest
-are recorded under `<runtime>/data/exports/pe10_repair_20260929/` (`arms_evidence.json`,
+are recorded under `<runtime>/data/exports/pe10_p2_20260929/` (`arms_evidence.json`,
 `arms_summary.tsv`, `decision_evidence.json`, `world_cache_warm_manifest.json`,
-`frozen_semantics_audit.json`).
+`frozen_semantics_audit.json`), with the first rebuild's evidence retained under
+`<runtime>/data/exports/pe10_repair_20260929/`.
 
 **What this changes about the acceptance.**  The acceptance's decision evidence is now the rebuilt
 set; the pre-repair records stand as superseded history (§6b) and are not relied on.  The timing
