@@ -2948,18 +2948,6 @@ def _decision_artifact_bytes(artifact: Mapping[str, Any]) -> bytes:
     return (json.dumps(artifact, indent=2, sort_keys=True, default=str) + "\n").encode("utf-8")
 
 
-def _create_exclusively(path: Path, payload: bytes) -> None:
-    """Create ``path`` holding exactly ``payload``, refusing an occupied path."""
-
-    try:
-        with open(path, "xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except FileExistsError:
-        pass
-
-
 def _confirm_retained_artifact(path: Path, payload: bytes) -> str:
     """Confirm the artifact already retained at ``path`` IS these bytes, or refuse."""
 
@@ -2976,31 +2964,55 @@ def _confirm_retained_artifact(path: Path, payload: bytes) -> str:
 
 
 def _retain_decision_artifact(path: Path, payload: bytes) -> str:
-    """RETAIN a decision artifact: write it once, and never replace an existing one.
+    """RETAIN a decision artifact: publish it once, atomically, and never replace one.
 
     The name is content-addressed by ``payload`` itself, so two executions that produce
     the SAME bytes share one retained file (a repeated identical decision stays
     idempotent) while two executions that produce DIFFERENT bytes -- the reproducible
     decision whose volatile telemetry differs while its result digest does not -- each
     keep their own file instead of overwriting the evidence an earlier record still
-    binds.  Retention is atomic: a hard link either creates the name or fails if it is
-    already taken, and an occupied path is CONFIRMED or refused, never replaced.
+    binds.  Publication is ATOMIC and NO-REPLACE, with no state exposed that is not
+    complete: the payload is staged (written, flushed, fsynced) in a private temporary
+    inside this function's cleanup protection, then hard-linked into place, which
+    either creates the final name or fails without touching it.  A filesystem that
+    cannot hard-link is therefore a REFUSAL, never a streamed write into the final
+    path, and an occupied path is CONFIRMED or refused, never replaced.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-    temporary.write_bytes(payload)
     try:
+        try:
+            with open(temporary, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as failure:
+            # A staging failure must never surface as a bare OSError: the caller refused
+            # this decision, and the finally below discards the staged temporary.
+            raise DecisionRecordInvalid(
+                [
+                    f"the store could not stage a decision artifact before publication "
+                    f"({failure}); the staged temporary is discarded and nothing is retained"
+                ]
+            ) from failure
         try:
             os.link(temporary, path)
         except FileExistsError:
             # Some other execution got there first: reuse it only if it IS these bytes.
             return _confirm_retained_artifact(path, payload)
-        except OSError:
-            # A filesystem that cannot hard-link must still never REPLACE an artifact,
-            # so the fallback is an exclusive create, which refuses an occupied path too.
-            _create_exclusively(path, payload)
-            return _confirm_retained_artifact(path, payload)
+        except OSError as failure:
+            # No atomic no-replace publication is available, so there is nothing safe
+            # to do: refuse, leaving the final path untouched, rather than stream into
+            # it and expose an incomplete artifact under its retained name.
+            raise DecisionRecordInvalid(
+                [
+                    "the store cannot publish a decision artifact atomically on this filesystem "
+                    f"(hard links are unavailable: {failure}); the staged artifact is discarded "
+                    "and the final path is left untouched -- a decision artifact is never "
+                    "written in place piece by piece"
+                ]
+            ) from failure
     finally:
         temporary.unlink(missing_ok=True)
     return str(path)

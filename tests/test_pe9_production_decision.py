@@ -729,6 +729,58 @@ def test_a_retained_decision_artifact_is_never_replaced(tmp_path):
         conn.close()
 
 
+def test_a_staging_failure_leaves_no_artifact_no_temporary_and_no_record(tmp_path, monkeypatch):
+    """Staging runs under cleanup protection: an fsync failure leaves nothing behind."""
+
+    import errno
+    import os as os_module
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        def no_space(fd):
+            raise OSError(errno.ENOSPC, "simulated: no space left on device")
+
+        monkeypatch.setattr(os_module, "fsync", no_space)
+        with pytest.raises(gs.DecisionRecordInvalid) as staged:
+            _decision(conn)
+        assert "could not stage a decision artifact" in str(staged.value)
+
+        artifact_dir = tmp_path / "pe9_decisions" / "gw05"
+        assert artifact_dir.is_dir()
+        assert list(artifact_dir.iterdir()) == [], "a partial artifact or temporary survived"
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_a_filesystem_without_hard_links_refuses_instead_of_streaming(tmp_path, monkeypatch):
+    """No atomic no-replace publication => refuse; the final path is never written in place."""
+
+    import errno
+    import os as os_module
+
+    path = tmp_path / "fpl.db"
+    _world(path)
+    conn = connect_database(path)
+    try:
+        def no_links(source, destination):
+            raise OSError(errno.ENOSYS, "simulated: hard links unavailable")
+
+        monkeypatch.setattr(os_module, "link", no_links)
+        with pytest.raises(gs.DecisionRecordInvalid) as refused:
+            _decision(conn)
+        assert "atomically" in str(refused.value)
+
+        artifact_dir = tmp_path / "pe9_decisions" / "gw05"
+        assert artifact_dir.is_dir()
+        assert list(artifact_dir.iterdir()) == [], "the final path or a temporary was created"
+        assert conn.execute("SELECT COUNT(*) FROM engine_decision_records").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_make_decision_pins_an_explicit_historical_generation(tmp_path):
     """``generation_id`` is a SELECTOR: a historical decision re-derives from ITS row."""
 
