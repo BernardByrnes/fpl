@@ -27,7 +27,7 @@ recorded there as superseded.
 | Decision runner identity (intermediate rebuild, superseded — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05` |
 | Decision runner identity (the 2026-09-28 historical executions — §6b) | `scripts/run_four_gw_decision.py:route_optimizer_v8b_1.0.0` / `sha256:f29ed44a2e65159489e8a354f51979ed1df2e32f06c7151bcf97619331f37c62` |
 | Source-guard follow-up | `17682cab2bb3bf1b58f0875c9b7c14599624cdfe` (parent `6261a91d945101486b1e926eb60a0c7b1162886b`) — `tests/test_r4b2b_finalist_stability.py`: the two source-literal guards that the wrapper caught are updated to the renamed helper (§11, §17) |
-| This candidate (publication repair + P2-rebuilt decision) | the **documentation-only child** of `1b79bcdf` that is the tip of `feature/pe10-v1-acceptance`; the row you are reading is its only delta, so this candidate differs from the P2 repair by this document alone |
+| This candidate (publication repair + P2-rebuilt decision) | the **documentation-only child** of `1b79bcdf` that is the tip of `feature/pe10-v1-acceptance`: **this document is that child's only file delta**, so the candidate differs from the P2 repair commit (`fpl_brain/generation_store.py` + `tests/test_pe9_production_decision.py`) by the acceptance record alone |
 | Repair scope (earlier, `ff18c2f4`) | `scripts/run_four_gw_decision.py` (+cutoff guard, cache location), `tests/test_pe9_production_decision.py` regressions; 0 files under `fpl_brain/` |
 | Repair scope (retention, `6261a91d`) | `fpl_brain/generation_store.py` (artifact retention only: naming + exclusive publish) and `tests/test_pe9_production_decision.py`; the predictive source set is untouched (§13) |
 | Repair scope (publication, `1b79bcdf`) | `fpl_brain/generation_store.py` (staging under cleanup protection; atomic no-replace publication only; refusal where linking is unavailable) and `tests/test_pe9_production_decision.py`; no model, optimizer, scoring or manager-state change (§13) |
@@ -494,8 +494,12 @@ final path and that the staging sat outside the cleanup block; both are fixed he
 failure-path regressions were shown to fail against that previous implementation before being
 accepted (§11).
 
-**Regressions (§11)** prove all three behaviours, and all three were shown to fail against the
-pre-repair store.
+**Regressions (§11).**  Five regressions cover this evidence and every one was shown to fail
+against the implementation it replaced: the three retention regressions (a repeat keeps both
+artifacts and both records verify; tampering fails that record only; an occupied path is refused,
+not replaced) against the pre-repair store, and the two publication regressions (a staging failure
+leaves no artifact, no temporary and no record; a filesystem without hard links refuses instead of
+streaming into the final path) against the pre-P2 store.
 
 **The rename was caught by the wrapper, not by me.**  The first authoritative wrapper run on the
 repair commit reported **two unexpected failures** — `test_r4b2b_finalist_stability.py`'s two
@@ -522,7 +526,7 @@ byte digests, and every record re-verified **after the cold execution**:
 | arm 2 — identical repeat, warm | `sha256:3bbf3e15cdc152030a4d5c27ae2ee9a7c30cf84f71eec6b80d86022eab74bce0` | `sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d` | `…-ca8f8a0ba11a13f3….json` | `verified = true` |
 | arm 3 — cold, cache cleared | `sha256:1906c576079d48f4f379c174c83c1bd879d0c5b568a5de56185149145ae5af45` | `sha256:1e895a9cb06880fa5c96d20764f2ef26b62323e3cb26cdf7ca121a8e229d301d` | `…-676d1b1fe9167ed2….json` | `verified = true` |
 
-The first rebuild's four records (runner identity `…{RET_CODE[7:15]}…`) remain retained and still
+The first rebuild's four records (runner identity `sha256:5dcee9e8774c4dd83ca9fae860d7c668f46e9279ff00cfb55982e5f9da9c0c05`) remain retained and still
 verify against their own artifacts (§6b); they are the intermediate evidence between the retention
 repair and this publication repair.
 
