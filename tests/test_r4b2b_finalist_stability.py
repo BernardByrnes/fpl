@@ -633,7 +633,7 @@ def test_no_best_h1_fallback_and_confidence_never_changes_the_preferred_route():
     assert source.rindex("_suppress_transfer_recommendation(") < artifact_index
     assert source.rindex("assess_search_stability(") < artifact_index
     store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
-    assert "artifact_ref = _write_decision_artifact(artifact_path, artifact)" in store
+    assert "artifact_ref = _retain_decision_artifact(artifact_path, artifact_bytes)" in store
     # confidence is computed after the ranked decision, and the preferred route
     # comes from the decision (confidence never supplies or changes a route)
     assert source.rindex("fg.evaluate_four_gw_decision(") < source.index("classify_decision_confidence(")
@@ -816,7 +816,7 @@ def test_runner_artifact_asserts_the_refinement_and_never_advertises_a_ladder():
     assert source.rindex("_suppress_transfer_recommendation(") < artifact_index
     assert source.rindex("assess_search_stability(") < artifact_index
     store = (REPO_ROOT / "fpl_brain" / "generation_store.py").read_text(encoding="utf-8")
-    assert "artifact_ref = _write_decision_artifact(artifact_path, artifact)" in store
+    assert "artifact_ref = _retain_decision_artifact(artifact_path, artifact_bytes)" in store
     # no open-ended ladder: exactly one escalation call site
     assert source.count("escalation=_escalation_runner(") == 1
     assert source.count("rs.budget_config(") == 1
