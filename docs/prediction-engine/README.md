@@ -88,14 +88,42 @@ The PE-8 contract is defined in
 
 ### PE-9 — Certification Integration
 
-**STATUS: NEXT**
+**STATUS: CLOSED — ACCEPTED FOR THIS CANDIDATE**
+
+Bernard's dated decision accepts the PE-9 closure and supersedes this roadmap's
+historical NEXT label for this candidate. The decision is retained separately
+with its capture time; see the approved final packet SHA-256
+120377EB09246809C7D462CC70B5F52C43EEAD365DE003220482F829E90DFD83 and the
+decision record SHA-256 974B4D151ABF468D13DF52E23F7E8B868065C99EAFB4E9E896F504F4CE59408A.
+The recorded code-closure point is d27de7164900ef7900828bb7f1ac12710200b08b;
+subsequent retention and publication corrections remain in their original history.
+This proposal preserves earlier roadmap snapshots and authorization deviations.
 
 The PE-9 contract is defined in
 [PE-9-CERTIFICATION-INTEGRATION.md](PE-9-CERTIFICATION-INTEGRATION.md).
 
 ### PE-10 — End-to-End Acceptance / Prediction Engine V1 Freeze
 
-**STATUS: BLOCKED on PE-9**
+**STATUS: MERGED — CANDIDATE ACCEPTED; FREEZE PENDING SEPARATE APPROVAL**
+
+Bernard's dated decision accepts candidate 226ac4544bfa3889840da5d77801a68b42914f5f
+(tree d31da0a127b16993ad49fe6e9c9aa5ee82911b7f) and supersedes the historical
+BLOCKED on PE-9 label for this candidate. The candidate was promoted by normal
+fast-forward from ca251f0aba18ae5287a3885fe886c08569f0694d; Git and GitHub ref
+readbacks confirmed main at the candidate SHA and the exact tree.
+
+Evidence: exact-SHA CI run 36604095548 and unit job 109528571747 succeeded on
+this SHA, including the authoritative wrapper. The retained raw pytest result has
+two accepted failures (test_13_manager_state_prose_derives_from_actual_state and
+test_13b_zero_ft_prose_is_also_derived) and no unexpected failures. Sol High's
+follow-up review approves acceptance of this exact SHA and tree; see the final
+packet and retained review evidence.
+
+This is a merge and candidate-acceptance record only. The operational runtime
+concern remains unaccepted; PE-10 freeze and deployment remain unapproved, and
+PE-11 remains unapproved. The timing-only exception remains limited to the scope
+already recorded in PE-10 section 16. The earlier Sol stop and authorization
+deviations remain historical evidence and are not retroactively authorized.
 
 ## Phase policy
 
