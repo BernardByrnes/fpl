@@ -1,7 +1,10 @@
 # PE-10 — End-to-End V1 Acceptance
 
-**Status:** acceptance evidence recorded; V1 is **READY_TO_FREEZE, pending the separate freeze
-merge**, which remains a Product Owner decision this document does not take.  One timing-evidence
+**Status:** acceptance evidence recorded; PE-10 V1 is **FROZEN** at main SHA
+ff878dc0f137f08e5dc7093cf58bcb510ab73da0 (tree
+0a4f9af549efb666b9ce57da2efa82fcb7904bba), under Bernard's retained approval
+record SHA-256
+99f72ba638735bf053e01a52df3d6562b782287539d00e8414e4c7bde7d2be8e.  One timing-evidence
 exception is recorded below with explicit Product Owner approval (§16): per-family Minutes and
 Monte Carlo durations were **not captured**, so no shares are claimed anywhere in this record.
 The exception waives the timing-evidence requirement only — no certification, provenance,

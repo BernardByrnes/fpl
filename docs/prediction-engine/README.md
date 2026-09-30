@@ -104,7 +104,7 @@ The PE-9 contract is defined in
 
 ### PE-10 — End-to-End Acceptance / Prediction Engine V1 Freeze
 
-**STATUS: MERGED — CANDIDATE ACCEPTED; FREEZE PENDING SEPARATE APPROVAL**
+**STATUS: FROZEN — PE-10 V1, CANDIDATE ff878dc0f137f08e5dc7093cf58bcb510ab73da0**
 
 Bernard's dated decision accepts candidate 226ac4544bfa3889840da5d77801a68b42914f5f
 (tree d31da0a127b16993ad49fe6e9c9aa5ee82911b7f) and supersedes the historical
@@ -119,11 +119,16 @@ test_13b_zero_ft_prose_is_also_derived) and no unexpected failures. Sol High's
 follow-up review approves acceptance of this exact SHA and tree; see the final
 packet and retained review evidence.
 
-This is a merge and candidate-acceptance record only. The operational runtime
-concern remains unaccepted; PE-10 freeze and deployment remain unapproved, and
-PE-11 remains unapproved. The timing-only exception remains limited to the scope
-already recorded in PE-10 section 16. The earlier Sol stop and authorization
-deviations remain historical evidence and are not retroactively authorized.
+Bernard's retained freeze decision (approval record SHA-256
+99f72ba638735bf053e01a52df3d6562b782287539d00e8414e4c7bde7d2be8e) applies to
+main SHA ff878dc0f137f08e5dc7093cf58bcb510ab73da0 (tree
+0a4f9af549efb666b9ce57da2efa82fcb7904bba); exact-SHA CI run
+36648695497 passed, including the authoritative wrapper. The decision explicitly
+accepts PE10_OPERATIONAL_RUNTIME_CONCERN: YES for this freeze. The existing
+PER_FAMILY_STAGE_TIMINGS_NOT_RETAINED exception remains timing-only; no other
+acceptance gate is waived. Deployment and PE-11 remain unapproved. The earlier
+Sol stop and authorization deviations remain historical evidence and are not
+retroactively authorized.
 
 ## Phase policy
 
