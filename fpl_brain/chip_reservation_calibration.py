@@ -105,7 +105,12 @@ class VerifiedOpportunity:
         return expiry_bucket(self.weeks_to_expiry)
 
 
-def _verify_pair(evidence: Mapping[str, Any], row: Mapping[str, Any]) -> None:
+def _verify_pair(
+    evidence: Mapping[str, Any],
+    row: Mapping[str, Any],
+    *,
+    retained_outcome_record: Mapping[str, Any],
+) -> None:
     if evidence.get("schema") != CAUSAL_EVIDENCE_SCHEMA:
         raise ReservationCalibrationError("causal evidence has an unsupported schema")
     if evidence.get("policy") != CAUSAL_EVIDENCE_POLICY:
@@ -176,10 +181,22 @@ def _verify_pair(evidence: Mapping[str, Any], row: Mapping[str, Any]) -> None:
         raise ReservationCalibrationError("causal label has no content-addressed outcome record")
     if _canonical_sha256(outcome_record) != outcome_digest:
         raise ReservationCalibrationError("causal label outcome-record digest does not verify")
-    if _number(label.get("realized_reservation_value"), name="realized reservation value") != _number(
-        row.get("realized_value"), name="realized reservation value"
+    if (
+        _canonical_sha256(retained_outcome_record) != outcome_digest
+        or dict(retained_outcome_record) != dict(outcome_record)
     ):
-        raise ReservationCalibrationError("causal evidence label differs from the supplied outcome")
+        raise ReservationCalibrationError(
+            "causal outcome differs from the separately retained outcome record"
+        )
+    realized_value = _number(label.get("realized_reservation_value"), name="realized reservation value")
+    row_value = _number(row.get("realized_value"), name="realized reservation value")
+    outcome_value = _number(
+        retained_outcome_record.get("observed_points"), name="outcome record observed_points",
+    )
+    if realized_value != row_value or realized_value != outcome_value:
+        raise ReservationCalibrationError(
+            "causal evidence label is not reproduced by the retained outcome record"
+        )
     if str(label.get("available_at")) != str(row.get("label_available_at")):
         raise ReservationCalibrationError("causal evidence outcome availability differs from the row")
 
@@ -217,7 +234,19 @@ def validate_observation(
         raise ReservationCalibrationError(f"retained causal evidence did not verify: {failure}") from failure
     if not isinstance(evidence, Mapping) or _canonical_sha256(evidence) != expected_digest:
         raise ReservationCalibrationError("retained causal-evidence content digest does not match")
-    _verify_pair(evidence, row)
+    label = evidence.get("label")
+    outcome_reference = str(label.get("outcome_record_ref") or "") if isinstance(label, Mapping) else ""
+    if not outcome_reference:
+        raise ReservationCalibrationError("causal evidence has no retained outcome-record reference")
+    try:
+        retained_outcome_record = evidence_verifier(outcome_reference)
+    except Exception as failure:
+        raise ReservationCalibrationError(
+            f"retained outcome record did not verify: {failure}"
+        ) from failure
+    if not isinstance(retained_outcome_record, Mapping):
+        raise ReservationCalibrationError("retained outcome record is not a JSON object")
+    _verify_pair(evidence, row, retained_outcome_record=retained_outcome_record)
     forecast = evidence.get("forecast")
     if not isinstance(forecast, Mapping):
         raise ReservationCalibrationError("causal evidence has no retained origin forecast")

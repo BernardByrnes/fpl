@@ -13,6 +13,7 @@ from fpl_brain import chip_assessment_store as store
 from fpl_brain import chip_assessment as assessment
 from fpl_brain import chip_decision as cd
 from fpl_brain import chip_reservation_calibration as calibration
+from fpl_brain import free_hit_production as fhp
 from fpl_brain.chip_assessment import assemble_assessment_record
 
 
@@ -101,6 +102,24 @@ def _causal_row(index: int, *, noise: float = 0.0):
     return row, evidence
 
 
+def _store_causal_evidence(store_map, row, evidence):
+    store_map[row["causal_evidence_ref"]] = evidence
+    label = evidence["label"]
+    store_map[label["outcome_record_ref"]] = label["outcome_record"]
+
+
+def _causal_evidence_resolver(evidence, *, retained_outcome=None):
+    label = evidence["label"]
+    retained = label["outcome_record"] if retained_outcome is None else retained_outcome
+
+    def resolve(reference):
+        if str(reference) == str(label["outcome_record_ref"]):
+            return retained
+        return evidence
+
+    return resolve
+
+
 def _context():
     events = cd.canonical_chip_horizon(5)
     return {
@@ -130,7 +149,7 @@ def test_calibration_requires_verified_paired_temporal_causal_evidence():
         noise = (-2.0, -1.0, 0.0, 1.0, 2.0, 0.0, 1.0, -1.0)[index % 8]
         row, evidence = _causal_row(index, noise=noise)
         rows.append(row)
-        stored[row["causal_evidence_ref"]] = evidence
+        _store_causal_evidence(stored, row, evidence)
 
     last_label = datetime.fromisoformat(rows[-1]["label_available_at"].replace("Z", "+00:00"))
     artifact = calibration.evaluate_reservation_calibration(
@@ -161,7 +180,7 @@ def test_calibration_loader_rejects_self_asserted_model_even_with_recomputed_has
         noise = (-2.0, -1.0, 0.0, 1.0, 2.0, 0.0, 1.0, -1.0)[index % 8]
         row, evidence = _causal_row(index, noise=noise)
         rows.append(row)
-        stored[row["causal_evidence_ref"]] = evidence
+        _store_causal_evidence(stored, row, evidence)
     last_label = datetime.fromisoformat(rows[-1]["label_available_at"].replace("Z", "+00:00"))
     artifact = calibration.evaluate_reservation_calibration(
         rows,
@@ -191,7 +210,7 @@ def test_calibration_is_uncalibrated_without_rows_and_rejects_future_leakage():
     row, evidence = _causal_row(1)
     row["forecast_made_at"] = "2025-01-09T00:00:00Z"
     with pytest.raises(calibration.ReservationCalibrationError, match="after its origin cutoff"):
-        calibration.validate_observation(row, evidence_verifier=lambda _ref: evidence)
+        calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
 
 def test_calibration_rejects_mixed_scenario_arms_and_any_tampered_causal_row():
@@ -199,18 +218,18 @@ def test_calibration_rejects_mixed_scenario_arms_and_any_tampered_causal_row():
     evidence["counterfactual_pair"]["save"]["scenario_identity"] = "different-scenario"
     row["causal_evidence_sha256"] = _sha(evidence)
     with pytest.raises(calibration.ReservationCalibrationError, match="same scenario_identity"):
-        calibration.validate_observation(row, evidence_verifier=lambda _ref: evidence)
+        calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
     stored = {}
     rows = []
     for index in range(55):
         good_row, good_evidence = _causal_row(index)
         rows.append(good_row)
-        stored[good_row["causal_evidence_ref"]] = good_evidence
+        _store_causal_evidence(stored, good_row, good_evidence)
     bad_row, bad_evidence = _causal_row(56)
     bad_row["causal_evidence_ref"] = "tampered-causal-evidence"
     bad_evidence["label"]["realized_reservation_value"] += 9.0
-    stored[bad_row["causal_evidence_ref"]] = bad_evidence
+    _store_causal_evidence(stored, bad_row, bad_evidence)
     bad_row["causal_evidence_sha256"] = _sha(bad_evidence)
     rows.append(bad_row)
     last_label = datetime.fromisoformat(rows[-1]["label_available_at"].replace("Z", "+00:00"))
@@ -224,6 +243,22 @@ def test_calibration_rejects_mixed_scenario_arms_and_any_tampered_causal_row():
     assert result["rejected_observations"]
 
 
+def test_calibration_rejects_label_not_reproduced_by_retained_outcome_record():
+    row, evidence = _causal_row(0)
+    retained_outcome = dict(evidence["label"]["outcome_record"])
+    # A coordinated edit to the row and label must still fail when the
+    # content-addressed outcome record says the observed value was 15.
+    row["realized_value"] = 999.0
+    evidence["label"]["realized_reservation_value"] = 999.0
+    row["causal_evidence_sha256"] = _sha(evidence)
+    with pytest.raises(calibration.ReservationCalibrationError,
+                       match="not reproduced by the retained outcome record"):
+        calibration.validate_observation(
+            row,
+            evidence_verifier=_causal_evidence_resolver(evidence, retained_outcome=retained_outcome),
+        )
+
+
 def test_calibration_does_not_override_an_evaluators_execution_permission():
     stored = {}
     rows = []
@@ -231,7 +266,7 @@ def test_calibration_does_not_override_an_evaluators_execution_permission():
         noise = (-2.0, -1.0, 0.0, 1.0, 2.0, 0.0, 1.0, -1.0)[index % 8]
         row, evidence = _causal_row(index, noise=noise)
         rows.append(row)
-        stored[row["causal_evidence_ref"]] = evidence
+        _store_causal_evidence(stored, row, evidence)
     last_label = datetime.fromisoformat(rows[-1]["label_available_at"].replace("Z", "+00:00"))
     artifact = calibration.evaluate_reservation_calibration(
         rows, evidence_verifier=stored.__getitem__,
@@ -414,10 +449,18 @@ def test_assessment_store_verifies_both_retained_free_hit_arms_and_restoration()
     }
     manager_state["manager_state_identity"] = store.manager_state_identity(manager_state)
     context.update({"manager_state_identity": manager_state["manager_state_identity"]})
-    shared = {
+    source_identity = fhp._source_decision_identity(SimpleNamespace(
+        source_decision_id=context["source_decision_id"],
+        source_result_sha256=context["source_decision_result_sha256"],
+        source_artifact_sha256=context["source_decision_artifact_sha256"],
+    ))
+    assert source_identity == {
         "source_decision_id": context["source_decision_id"],
         "source_result_sha256": context["source_decision_result_sha256"],
         "source_artifact_sha256": context["source_decision_artifact_sha256"],
+    }
+    shared = {
+        **source_identity,
         "generation_id": context["generation_id"],
         "cutoff": context["cutoff"],
         "data_snapshot_sha256": context["data_snapshot_sha256"],
@@ -460,13 +503,11 @@ def test_assessment_store_verifies_both_retained_free_hit_arms_and_restoration()
         "play": play, "save": save, "restore_at_h2": restoration,
     })
     arms = {
+        **source_identity,
         "play": play,
         "save": save,
         "restore_at_h2": restoration,
         "arm_identity": arm_identity,
-        "source_decision_id": context["source_decision_id"],
-        "source_result_sha256": context["source_decision_result_sha256"],
-        "source_artifact_sha256": context["source_decision_artifact_sha256"],
     }
     evaluation = cd.ChipEvaluation(
         action=cd.CHIP_ACTION_FH,
@@ -509,6 +550,29 @@ def test_assessment_store_verifies_both_retained_free_hit_arms_and_restoration()
     results[cd.CHIP_ACTION_FH]["arm_evidence"]["arm_identity"] = forged_arm_identity
     results[cd.CHIP_ACTION_FH]["arm_identity"] = forged_arm_identity
     with pytest.raises(store.ChipAssessmentStoreError, match="PLAY start state"):
+        store.build_assessment_record(
+            context=context,
+            manager_state=manager_state,
+            chip_results=results,
+            decision={"recommended_action": cd.CHIP_ACTION_NO_CHIP,
+                      "status": cd.STATUS_CHIP_REVIEW_REQUIRED,
+                      "calibration_status": cd.CALIBRATION_UNCALIBRATED},
+        )
+
+    results[cd.CHIP_ACTION_FH]["arm_evidence"]["play"]["start_state"]["free_transfers"] = 3
+    restoration = results[cd.CHIP_ACTION_FH]["arm_evidence"]["restore_at_h2"]
+    restoration.update({
+        "permanent_squad_ids": [9000], "restored_squad_ids": [9000],
+        "permanent_purchase_price_tenths": {"9000": 50},
+        "restored_purchase_price_tenths": {"9000": 50},
+        "permanent_bank_tenths": 999, "restored_bank_tenths": 999,
+        "current_h1_free_transfers": 99, "event_start_h1_free_transfers": 99,
+        "restored_h2_free_transfers": 99, "restoration_problems": [],
+    })
+    forged_arm_identity = store.free_hit_arm_identity(results[cd.CHIP_ACTION_FH]["arm_evidence"])
+    results[cd.CHIP_ACTION_FH]["arm_evidence"]["arm_identity"] = forged_arm_identity
+    results[cd.CHIP_ACTION_FH]["arm_identity"] = forged_arm_identity
+    with pytest.raises(store.ChipAssessmentStoreError, match="restoration evidence does not reproduce"):
         store.build_assessment_record(
             context=context,
             manager_state=manager_state,

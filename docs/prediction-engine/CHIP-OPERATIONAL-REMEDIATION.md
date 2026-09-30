@@ -10,9 +10,9 @@ start PE-11.
 The worktree started at frozen commit
 `1c5b8348a463261cb70f626b4637dfa118b36e63` (tree
 `d31da0a127b16993ad49fe6e9c9aa5ee82911b7f`) on
-`codex/chip-operational-remediation`. The implementation is still being
-validated; the candidate has not yet been committed or assigned a candidate
-SHA.
+`codex/chip-operational-remediation`. Candidate SHA and validation results are
+tracked against the exact code commit in the acceptance report; this document
+describes the implementation and its operational prerequisites.
 
 ## Historical manager-state boundary
 
@@ -46,11 +46,13 @@ certification. A sequence assembled from later GW7/GW8 planning runs cannot
 replace the missing GW6 prefix.
 
 Focused evidence covers 6- and 10-event products, the unchanged four-event
-product, short/gapped/length-mismatched horizons, and refusal of substituted
-prefix runs. These are fixture-backed results, not a production Wildcard
-generation. The available prediction inventory reaches GW8; verified same-cutoff
-projection runs for any needed later events, including GW9/GW10 when requested,
-remain a data prerequisite.
+product, short/gapped/length-mismatched horizons, refusal of substituted
+prefix runs, and the production builder's separate value generation bound to
+the exact normal four-event prefix. The connected manager-state comparison
+also has a production-adapter regression. These are fixture-backed results,
+not a production Wildcard generation. The available prediction inventory
+reaches GW8; verified same-cutoff projection runs for any needed later events,
+including GW9/GW10 when requested, remain a data prerequisite.
 
 ## Proposed BB/TC scenario
 
@@ -81,26 +83,32 @@ H2 restoration state.
 
 The immutable record verifier checks the two arms use the same certified
 generation, cutoff, snapshot, certification, canonical manager digest and H1
-world identity. It checks SAVE begins from current H1 squad/bank/current FT and
+world identity. It checks the restoration manifest against the canonical
+manager state, then checks SAVE begins from current H1 squad/bank/current FT and
 acquisition basis; PLAY begins at H2 with permanent squad/bank/acquisition
 basis restored and event-start FT preserved. It also verifies the route event
-sequences, configs and arm digest.
+sequences, configs, source decision hashes and arm digest.
 
 Focused evidence: `test_free_hit_h2_state_uses_event_start_ft_not_current_remaining_ft`,
+`test_free_hit_production_builder_emits_retained_play_save_arms`,
 `test_assessment_store_verifies_both_retained_free_hit_arms_and_restoration`,
-and the forged PLAY-start-state refusal in that test. The complete production
-assembly has not been run against a fresh, factually confirmed snapshot or a
-new production decision. That run stays deferred until its inputs are ready.
+and forged PLAY-start/restoration-state refusals in those tests. The complete
+production assembly has not been run against a fresh, factually confirmed
+snapshot or a new production decision. That run stays deferred until its inputs
+are ready.
 
 ## Calibration and evaluator execution gates
 
 Reservation calibration now accepts only retained, content-addressed causal
 evidence containing separate PLAY/SAVE arms for the same proposed squad,
-lineup, scenario and worlds, plus a matured future outcome. It uses the
-pre-registered expanding-origin protocol and label-maturity checks. Loading a
-calibrated artifact re-reads each referenced causal record through an explicit
-verifier and reproduces the dataset, reports and model under the locked
-criteria; a self-hashed `CALIBRATED` label alone is rejected.
+lineup, scenario and worlds, plus a matured future outcome. The outcome must
+also exist as its own retained record; the verifier checks its content digest
+and equality with the outcome embedded in causal evidence, and the label must
+reproduce its recorded `observed_points`. It uses the pre-registered
+expanding-origin protocol and label-maturity checks. Loading a calibrated
+artifact re-reads each causal record and outcome through the explicit verifier
+and reproduces the dataset, reports and model under the locked criteria; a
+self-hashed `CALIBRATED` label alone is rejected.
 
 The local read-only inventory found zero `outcome_observations` and zero
 `calibration_records`; the available `player_gameweeks` are point outcomes,
@@ -125,16 +133,15 @@ disposition for BB, TC, FH and WC. Per-run records are retained atomically with
 no-replace semantics and verified against their digest and chip-specific
 contracts.
 
-Focused implementation tests pass (42 passed); the corrected synthetic-route
-refusal regression passes (1 passed). The authoritative wrapper on this exact
-pre-commit worktree state reports 2,627 passed, 31 skipped, and only the two
-accepted failures at
-`test_causal_bundle_integrity::test_13_manager_state_prose_derives_from_actual_state`
+Focused test results, the authoritative wrapper, exact-SHA CI, and independent
+review are reported against the exact candidate commit in the acceptance
+report. The authoritative acceptance recognizes only these two
+configuration-dependent test IDs:
+`tests/test_causal_bundle_integrity.py::test_13_manager_state_prose_derives_from_actual_state`
 and
-`test_causal_bundle_integrity::test_13b_zero_ft_prose_is_also_derived`;
-unexpected failures: zero. Exact-SHA CI and Sol review remain pending for the
-candidate commit. No operational run has been used to discover missing
-prerequisites. The outstanding operational facts are:
+`tests/test_causal_bundle_integrity.py::test_13b_zero_ft_prose_is_also_derived`.
+No operational run has been used to discover missing prerequisites. The
+outstanding operational facts are:
 
 1. A manager-confirmed event-start FT, current FT, bank and squad captured
    before a new snapshot and its cutoff.

@@ -186,6 +186,26 @@ def _validate_context(record: Mapping[str, Any]) -> None:
             or restore.get("restoration_problems")
         ):
             raise ChipAssessmentStoreError("evaluated FH does not preserve its permanent squad/bank/FT basis")
+        manager_squad = sorted(int(pid) for pid in manager_state["squad_ids"])
+        manager_basis = {
+            str(int(pid)): int(price)
+            for pid, price in dict(manager_state["purchase_price_tenths"]).items()
+        }
+        expected_restoration = {
+            "permanent_squad_ids": manager_squad,
+            "restored_squad_ids": manager_squad,
+            "permanent_purchase_price_tenths": manager_basis,
+            "restored_purchase_price_tenths": manager_basis,
+            "permanent_bank_tenths": int(manager_state["bank_tenths"]),
+            "restored_bank_tenths": int(manager_state["bank_tenths"]),
+            "current_h1_free_transfers": int(manager_state["free_transfers"]),
+            "event_start_h1_free_transfers": int(manager_state["event_start_free_transfers"]),
+            "restored_h2_free_transfers": int(manager_state["event_start_free_transfers"]),
+        }
+        if any(restore.get(name) != value for name, value in expected_restoration.items()):
+            raise ChipAssessmentStoreError(
+                "evaluated FH restoration evidence does not reproduce from the canonical manager state"
+            )
         expected_events = tuple(int(value) for value in horizon)
         play_actions = play.get("actions") or ()
         save_actions = save.get("actions") or ()

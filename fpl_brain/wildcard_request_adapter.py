@@ -211,6 +211,22 @@ class WildcardCertifiedInputs:
     value_generation_id: str | None = None
 
 
+def _manager_fields_equal(name: str, supplied: Any, expected: Any) -> bool:
+    """Compare canonical manager fields using their actual scalar/map shape."""
+
+    if name in {"squad_ids", "chip_availability"}:
+        return tuple(supplied) == tuple(expected)
+    if name in {
+        "purchase_price_tenths",
+        "market_price_tenths",
+        "cached_selling_price_tenths",
+    }:
+        return {int(key): int(value) for key, value in dict(supplied).items()} == {
+            int(key): int(value) for key, value in dict(expected).items()
+        }
+    return supplied == expected
+
+
 # ---------------------------------------------------------------------------
 # The assembly
 # ---------------------------------------------------------------------------
@@ -297,15 +313,7 @@ def build_wildcard_request(
                      "market_price_tenths", "cached_selling_price_tenths", "chip_availability"):
             expected = getattr(canonical_manager, name)
             supplied = getattr(manager, name)
-            if name in {"squad_ids", "chip_availability"}:
-                equal = tuple(supplied) == tuple(expected)
-            elif name.endswith("_tenths") or name == "purchase_price_tenths":
-                equal = {int(k): int(v) for k, v in dict(supplied).items()} == {
-                    int(k): int(v) for k, v in dict(expected).items()
-                }
-            else:
-                equal = supplied == expected
-            if not equal:
+            if not _manager_fields_equal(name, supplied, expected):
                 manager_disagreements.append(name)
         if manager_disagreements:
             raise WildcardAdapterError(

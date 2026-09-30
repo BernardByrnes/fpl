@@ -31,6 +31,16 @@ class FreeHitProductionError(ValueError):
     """A production Free Hit arm cannot be built from the verified route world."""
 
 
+def _source_decision_identity(route: VerifiedNormalRoute) -> dict[str, str]:
+    """Return the shared source-decision fields consumed by arm retention."""
+
+    return {
+        "source_decision_id": str(route.source_decision_id),
+        "source_result_sha256": str(route.source_result_sha256),
+        "source_artifact_sha256": str(route.source_artifact_sha256),
+    }
+
+
 def _config_from_source_decision(
     conn: sqlite3.Connection, route: VerifiedNormalRoute, generation: Any
 ) -> ro.OptimizerConfig:
@@ -375,9 +385,7 @@ def build_free_hit_production_request(
         })
         arm_evidence = {
             "schema": "fpl_brain.free_hit_arm_assembly.v1",
-            "source_decision_id": save_route.source_decision_id,
-            "source_decision_result_sha256": save_route.source_result_sha256,
-            "source_decision_artifact_sha256": save_route.source_artifact_sha256,
+            **_source_decision_identity(save_route),
             "source_save_route_id": save_route.route_id,
             "source_save_route_input_sha256": save_route.route_input_sha256,
             "generation_id": generation.generation_id,
