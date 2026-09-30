@@ -101,14 +101,23 @@ are ready.
 
 Reservation calibration now accepts only retained, content-addressed causal
 evidence containing separate PLAY/SAVE arms for the same proposed squad,
-lineup, scenario and worlds, plus a matured future outcome. The outcome must
-also exist as its own retained record; the verifier checks its content digest
-and equality with the outcome embedded in causal evidence, and the label must
-reproduce its recorded `observed_points`. It uses the pre-registered
-expanding-origin protocol and label-maturity checks. Loading a calibrated
-artifact re-reads each causal record and outcome through the explicit verifier
-and reproduces the dataset, reports and model under the locked criteria; a
-self-hashed `CALIBRATED` label alone is rejected.
+lineup, scenario and worlds, plus a matured future outcome. Each outcome is a
+versioned paired record bound to the observation, chip action, planning origin,
+scenario, world, source decision/generation, and both arm IDs and artifact
+digests. Its fixed label definition is recomputed from the captured event
+points and each retained arm's explicit scoring weights; a caller-supplied
+`observed_points` value alone is insufficient. Every capture must be event
+grain, officially final, and carry the declared official player-gameweek
+provenance. At production load time, the evidence reader resolves every
+capture digest against `outcome_observation_captures`, recomputes its content
+digest, and checks the retained fields and points. Outcome availability is
+derived from the latest capture time and must match both the row and label;
+captures must postdate official finality and the forecast origin. The
+pre-registered expanding-origin protocol then excludes outcomes not mature by
+its evaluation cutoff and by each training origin. Loading a calibrated
+artifact re-reads each causal record and outcome through that production
+verifier and reproduces the dataset, reports and model under the locked
+criteria; a self-hashed `CALIBRATED` label alone is rejected.
 
 The local read-only inventory found zero `outcome_observations` and zero
 `calibration_records`; the available `player_gameweeks` are point outcomes,

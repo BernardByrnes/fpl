@@ -17,8 +17,25 @@ from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpl_brain import chip_assessment, chip_assessment_store
+from fpl_brain import chip_assessment, chip_assessment_store, chip_reservation_calibration
 from fpl_brain.season_rules import SeasonRules
+
+
+def _calibration_evidence_loader(evidence_root: Path, conn: sqlite3.Connection):
+    root = evidence_root.resolve()
+
+    def load(reference: str) -> dict:
+        evidence_path = (root / str(reference)).resolve()
+        if not evidence_path.is_relative_to(root):
+            raise ValueError("causal evidence reference escapes its configured root")
+        value = json.loads(evidence_path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("causal evidence artifact must be a JSON object")
+        if value.get("schema") == chip_reservation_calibration.CAUSAL_OUTCOME_RECORD_SCHEMA:
+            chip_reservation_calibration.verify_outcome_record_capture_sources(conn, value)
+        return value
+
+    return load
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -58,18 +75,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parser.error("reservation calibration artifact must be a JSON object")
             calibration = raw
 
-            evidence_root = args.calibration_evidence_dir.resolve()
-
-            def calibration_evidence(reference: str) -> dict:
-                evidence_path = (evidence_root / str(reference)).resolve()
-                if not evidence_path.is_relative_to(evidence_root):
-                    raise ValueError("causal evidence reference escapes its configured root")
-                value = json.loads(evidence_path.read_text(encoding="utf-8"))
-                if not isinstance(value, dict):
-                    raise ValueError("causal evidence artifact must be a JSON object")
-                return value
-
-            calibration_evidence_verifier = calibration_evidence
+            calibration_evidence_verifier = _calibration_evidence_loader(
+                args.calibration_evidence_dir, conn,
+            )
         record = chip_assessment.run_production_chip_assessment(
             conn,
             decision_id=str(args.decision_id),

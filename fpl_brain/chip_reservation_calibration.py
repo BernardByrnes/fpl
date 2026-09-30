@@ -12,15 +12,20 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from . import chip_decision as cd
+from . import outcome_ledger as ol
 
 CALIBRATION_SCHEMA = "fpl_brain.chip_reservation_calibration.v1"
 CAUSAL_EVIDENCE_SCHEMA = "fpl_brain.chip_reservation_causal_evidence.v1"
-CALIBRATION_VERSION = "chip_reservation_walkforward_v1.0.0"
+CAUSAL_OUTCOME_RECORD_SCHEMA = "fpl_brain.chip_reservation_outcome_record.v1"
+OUTCOME_CAPTURE_SET_SCHEMA = "fpl_brain.outcome_ledger_capture_set.v1"
+OUTCOME_LABEL_DEFINITION = "PAIRED_PLAY_MINUS_SAVE_CAPTURED_POINTS_V1"
+CALIBRATION_VERSION = "chip_reservation_walkforward_v2.0.0"
 CAUSAL_EVIDENCE_POLICY = "SAME_SCENARIO_PAIRED_PLAY_SAVE_TEMPORAL_LABELS_v1"
 
 # These criteria are fixed in code before labels are evaluated. A caller cannot
@@ -73,6 +78,237 @@ def _is_sha256(value: Any) -> bool:
     if text.startswith("sha256:"):
         text = text[7:]
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text.lower())
+
+
+def _verify_outcome_record(
+    outcome_record: Mapping[str, Any],
+    *,
+    evidence: Mapping[str, Any],
+    row: Mapping[str, Any],
+    label: Mapping[str, Any],
+    play: Mapping[str, Any],
+    save: Mapping[str, Any],
+) -> float:
+    """Bind a matured paired score to its origin, arms and official captures."""
+
+    if outcome_record.get("schema") != CAUSAL_OUTCOME_RECORD_SCHEMA:
+        raise ReservationCalibrationError("retained outcome record has an unsupported schema")
+    identity = {
+        "observation_id": row.get("observation_id"),
+        "action": row.get("action"),
+        "planning_event": int(row.get("planning_event")),
+        "origin_cutoff": row.get("origin_cutoff"),
+        "scenario_identity": play.get("scenario_identity"),
+        "world_identity": play.get("world_identity"),
+        "play_arm_id": play.get("arm_id"),
+        "play_artifact_sha256": play.get("artifact_sha256"),
+        "save_arm_id": save.get("arm_id"),
+        "save_artifact_sha256": save.get("artifact_sha256"),
+    }
+    if not str(outcome_record.get("record_id") or "").strip():
+        raise ReservationCalibrationError("retained outcome record has no record id")
+    if any(outcome_record.get(name) != value for name, value in identity.items()):
+        raise ReservationCalibrationError(
+            "retained outcome record does not match its observation, action, scenario or paired arms"
+        )
+    source_identity = evidence.get("source")
+    if not isinstance(source_identity, Mapping):
+        raise ReservationCalibrationError("causal evidence has no source identity")
+    for name in (
+        "source_decision_id", "source_result_sha256", "source_artifact_sha256",
+        "generation_id", "planning_event", "cutoff", "data_snapshot_sha256",
+        "certification_identity", "world_identity",
+    ):
+        if str(outcome_record.get(name) or "") != str(source_identity.get(name) or ""):
+            raise ReservationCalibrationError(f"retained outcome record is not bound to source {name}")
+    if outcome_record.get("label_definition_version") != OUTCOME_LABEL_DEFINITION:
+        raise ReservationCalibrationError("retained outcome record uses an unsupported paired-label definition")
+
+    source = outcome_record.get("source")
+    captures = source.get("captures") if isinstance(source, Mapping) else None
+    if (
+        not isinstance(source, Mapping)
+        or source.get("schema") != OUTCOME_CAPTURE_SET_SCHEMA
+        or not isinstance(captures, list)
+        or not captures
+    ):
+        raise ReservationCalibrationError("retained outcome record has no official capture set")
+    realization_event = int(outcome_record.get("realization_event") or -1)
+    if realization_event <= int(row.get("planning_event") or -1):
+        raise ReservationCalibrationError("paired outcome is not from a future event")
+    player_points: dict[str, float] = {}
+    capture_ids: set[str] = set()
+    capture_times: list[datetime] = []
+    for capture in captures:
+        if not isinstance(capture, Mapping):
+            raise ReservationCalibrationError("outcome capture manifest is malformed")
+        digest = str(capture.get("capture_digest") or "")
+        if not _is_sha256(digest) or digest in capture_ids:
+            raise ReservationCalibrationError("outcome capture manifest has an invalid or duplicate digest")
+        capture_ids.add(digest)
+        if (
+            capture.get("grain") != "player_event"
+            or int(capture.get("event") or -1) != realization_event
+            or capture.get("fixture_id") is not None
+            or capture.get("observation_state") != ol.OBSERVATION_FINAL
+            or capture.get("source_name") != "player_gameweeks_final"
+            or capture.get("source_identity") != f"player_gameweeks:{realization_event}"
+        ):
+            raise ReservationCalibrationError(
+                "outcome capture is not a final event-grain official player-gameweek result"
+            )
+        player_id = str(int(capture.get("player_id")))
+        if player_id in player_points:
+            raise ReservationCalibrationError("outcome capture set repeats a player in the realization event")
+        player_points[player_id] = _number(capture.get("total_points"), name="captured player total_points")
+        final_at = _utc(capture.get("official_final_at"), name="outcome official_final_at")
+        captured_at = _utc(capture.get("captured_at"), name="outcome captured_at")
+        if captured_at < final_at:
+            raise ReservationCalibrationError("outcome capture predates official finality")
+        capture_times.append(captured_at)
+    available_at = max(capture_times)
+    declared_available = _utc(outcome_record.get("available_at"), name="outcome available_at")
+    source_available = _utc(source.get("available_at"), name="capture-set available_at")
+    if declared_available != available_at or source_available != available_at:
+        raise ReservationCalibrationError("outcome availability does not match its latest official capture")
+    if (
+        available_at != _utc(label.get("available_at"), name="causal label available_at")
+        or available_at != _utc(row.get("label_available_at"), name="row label_available_at")
+    ):
+        raise ReservationCalibrationError("outcome capture availability differs from the causal label")
+    if available_at <= _utc(row.get("origin_cutoff"), name="origin_cutoff"):
+        raise ReservationCalibrationError("paired outcome was available at or before its origin")
+
+    paired_results = outcome_record.get("paired_results")
+    if not isinstance(paired_results, Mapping):
+        raise ReservationCalibrationError("outcome record has no paired PLAY/SAVE results")
+    scores: dict[str, float] = {}
+    for arm_name, arm in (("play", play), ("save", save)):
+        result = paired_results.get(arm_name)
+        weights = arm.get("scoring_weights")
+        payload = arm.get("artifact_payload")
+        payload_weights = payload.get("scoring_weights") if isinstance(payload, Mapping) else None
+        result_weights = result.get("scoring_weights") if isinstance(result, Mapping) else None
+        if (
+            not isinstance(result, Mapping)
+            or not isinstance(weights, Mapping)
+            or not weights
+            or not isinstance(payload, Mapping)
+            or not isinstance(payload_weights, Mapping)
+            or not isinstance(result_weights, Mapping)
+            or dict(payload_weights) != dict(weights)
+            or dict(result_weights) != dict(weights)
+        ):
+            raise ReservationCalibrationError(f"{arm_name.upper()} score is not bound to its retained arm scorer")
+        score = 0.0
+        scored_player_ids: set[str] = set()
+        for raw_player_id, raw_weight in weights.items():
+            player_id = str(int(raw_player_id))
+            if int(player_id) <= 0 or player_id in scored_player_ids:
+                raise ReservationCalibrationError(f"{arm_name.upper()} scorer has an invalid or duplicate player id")
+            scored_player_ids.add(player_id)
+            weight = _number(raw_weight, name=f"{arm_name} scoring weight")
+            if weight < 0 or player_id not in player_points:
+                raise ReservationCalibrationError(f"{arm_name.upper()} score lacks a captured player result")
+            score += player_points[player_id] * weight
+        declared_score = _number(result.get("observed_points"), name=f"{arm_name} observed points")
+        if declared_score != score:
+            raise ReservationCalibrationError(f"{arm_name.upper()} score does not reproduce from official captures")
+        scores[arm_name] = score
+    realized_value = scores["play"] - scores["save"]
+    if _number(outcome_record.get("observed_points"), name="paired observed points") != realized_value:
+        raise ReservationCalibrationError("paired observed reservation value does not reproduce from PLAY/SAVE scores")
+    return realized_value
+
+
+def verify_outcome_record_capture_sources(
+    conn: sqlite3.Connection, outcome_record: Mapping[str, Any]
+) -> None:
+    """Resolve retained outcome captures against the append-only official ledger.
+
+    A caller-supplied digest or ``source`` string is not authoritative. The
+    production reader calls this function before returning an outcome artifact
+    to the calibration validator; every cited capture must exist in the local
+    append-only ledger and reproduce its content-derived capture digest.
+    """
+
+    if outcome_record.get("schema") != CAUSAL_OUTCOME_RECORD_SCHEMA:
+        raise ReservationCalibrationError("outcome record has an unsupported schema")
+    source = outcome_record.get("source")
+    captures = source.get("captures") if isinstance(source, Mapping) else None
+    if (
+        not isinstance(source, Mapping)
+        or source.get("schema") != OUTCOME_CAPTURE_SET_SCHEMA
+        or not isinstance(captures, list)
+        or not captures
+    ):
+        raise ReservationCalibrationError("outcome record has no official capture set")
+
+    for capture in captures:
+        if not isinstance(capture, Mapping):
+            raise ReservationCalibrationError("outcome capture reference is malformed")
+        digest = str(capture.get("capture_digest") or "")
+        if not _is_sha256(digest):
+            raise ReservationCalibrationError("outcome capture reference has no SHA-256 digest")
+        try:
+            row = conn.execute(
+                "SELECT * FROM outcome_observation_captures WHERE capture_digest=?",
+                (digest,),
+            ).fetchone()
+        except sqlite3.Error as failure:
+            raise ReservationCalibrationError(
+                f"official outcome capture ledger is unavailable: {failure}"
+            ) from failure
+        if row is None:
+            raise ReservationCalibrationError("outcome capture digest is not retained in the official ledger")
+        stored = dict(row)
+        try:
+            payload = json.loads(stored.get("payload_json") or "{}")
+        except (TypeError, ValueError) as failure:
+            raise ReservationCalibrationError("retained outcome capture payload is invalid JSON") from failure
+        if not isinstance(payload, Mapping):
+            raise ReservationCalibrationError("retained outcome capture payload is not an object")
+        computed = ol.capture_digest_for(
+            grain=str(stored["grain"]),
+            event=int(stored["event"]),
+            player_id=int(stored["player_id"]),
+            fixture_id=None if stored.get("fixture_id") is None else int(stored["fixture_id"]),
+            captured_at=str(stored["captured_at"]),
+            observation_state=str(stored["observation_state"]),
+            source_name=str(stored["source_name"]),
+            source_identity=stored.get("source_identity"),
+            source_payload_sha256=stored.get("source_payload_sha256"),
+            archive_capture_id=stored.get("archive_capture_id"),
+            payload=payload,
+        )
+        if computed != digest or str(stored.get("observation_state")) != ol.OBSERVATION_FINAL:
+            raise ReservationCalibrationError(
+                "outcome capture digest or official-final state does not verify"
+            )
+        if (
+            str(stored.get("source_name") or "") != "player_gameweeks_final"
+            or str(stored.get("grain") or "") != ol.GRAIN_PLAYER_EVENT
+            or stored.get("fixture_id") is not None
+            or str(stored.get("source_identity") or "") != f"player_gameweeks:{int(stored['event'])}"
+        ):
+            raise ReservationCalibrationError("outcome capture is not from the official player-gameweek source")
+        expected = {
+            "capture_digest": digest,
+            "grain": str(stored["grain"]),
+            "event": int(stored["event"]),
+            "player_id": int(stored["player_id"]),
+            "fixture_id": None if stored.get("fixture_id") is None else int(stored["fixture_id"]),
+            "observation_state": str(stored["observation_state"]),
+            "official_final_at": stored.get("official_final_at"),
+            "captured_at": str(stored["captured_at"]),
+            "source_name": str(stored["source_name"]),
+            "source_identity": stored.get("source_identity"),
+            "total_points": payload.get("total_points"),
+        }
+        if any(capture.get(name) != value for name, value in expected.items()):
+            raise ReservationCalibrationError(
+                "outcome capture manifest differs from the retained official capture"
+            )
 
 
 def expiry_bucket(weeks_to_expiry: int | None) -> str:
@@ -170,6 +406,10 @@ def _verify_pair(
         for name in (*paired_fields, *source_arm_fields, "arm_id"):
             if artifact_payload.get(name) != arm.get(name):
                 raise ReservationCalibrationError(f"{arm_name} arm artifact disagrees on {name}")
+        if not isinstance(arm.get("scoring_weights"), Mapping):
+            raise ReservationCalibrationError(f"{arm_name} arm has no retained outcome scoring weights")
+        if dict(artifact_payload.get("scoring_weights") or {}) != dict(arm.get("scoring_weights") or {}):
+            raise ReservationCalibrationError(f"{arm_name} arm scoring weights differ from its retained artifact")
         _number(artifact_payload.get("paired_value"), name=f"{arm_name} paired value")
     if str(play.get("arm_id")) == str(save.get("arm_id")):
         raise ReservationCalibrationError("PLAY and SAVE must be separately retained counterfactual arms")
@@ -188,17 +428,21 @@ def _verify_pair(
         raise ReservationCalibrationError(
             "causal outcome differs from the separately retained outcome record"
         )
-    realized_value = _number(label.get("realized_reservation_value"), name="realized reservation value")
-    row_value = _number(row.get("realized_value"), name="realized reservation value")
-    outcome_value = _number(
-        retained_outcome_record.get("observed_points"), name="outcome record observed_points",
+    realized_value = _verify_outcome_record(
+        retained_outcome_record,
+        evidence=evidence,
+        row=row,
+        label=label,
+        play=play,
+        save=save,
     )
-    if realized_value != row_value or realized_value != outcome_value:
+    if (
+        realized_value != _number(label.get("realized_reservation_value"), name="realized reservation value")
+        or realized_value != _number(row.get("realized_value"), name="realized reservation value")
+    ):
         raise ReservationCalibrationError(
-            "causal evidence label is not reproduced by the retained outcome record"
+            "causal evidence label is not reproduced by the retained paired outcome"
         )
-    if str(label.get("available_at")) != str(row.get("label_available_at")):
-        raise ReservationCalibrationError("causal evidence outcome availability differs from the row")
 
 
 def validate_observation(

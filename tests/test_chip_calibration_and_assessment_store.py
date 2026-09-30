@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -14,7 +15,9 @@ from fpl_brain import chip_assessment as assessment
 from fpl_brain import chip_decision as cd
 from fpl_brain import chip_reservation_calibration as calibration
 from fpl_brain import free_hit_production as fhp
+from fpl_brain import outcome_ledger as ol
 from fpl_brain.chip_assessment import assemble_assessment_record
+from scripts import run_chip_assessment
 
 
 def _sha(payload):
@@ -31,11 +34,7 @@ def _causal_row(index: int, *, noise: float = 0.0):
     label_text = label_time.isoformat().replace("+00:00", "Z")
     forecast_time = (origin - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     event = index + 1
-    outcome_record = {
-        "record_id": f"outcome-{index}",
-        "observed_points": 15.0 + noise,
-        "source": "verified_outcome_ledger_fixture",
-    }
+    realized_value = 15.0 + noise
     source = {
         "source_decision_id": f"decision-{index}",
         "source_result_sha256": _sha({"result": index}),
@@ -57,8 +56,16 @@ def _causal_row(index: int, *, noise: float = 0.0):
             "generation_id", "cutoff", "data_snapshot_sha256", "certification_identity",
         )},
     }
-    play_arm_payload = {"arm_id": f"play-{index}", "paired_value": 3.0, **common}
-    save_arm_payload = {"arm_id": f"save-{index}", "paired_value": 1.0, **common}
+    play_weights = {"1": 1.0}
+    save_weights = {"2": 1.0}
+    play_arm_payload = {
+        "arm_id": f"play-{index}", "paired_value": 3.0,
+        "scoring_weights": play_weights, **common,
+    }
+    save_arm_payload = {
+        "arm_id": f"save-{index}", "paired_value": 1.0,
+        "scoring_weights": save_weights, **common,
+    }
     evidence = {
         "schema": calibration.CAUSAL_EVIDENCE_SCHEMA,
         "policy": calibration.CAUSAL_EVIDENCE_POLICY,
@@ -72,19 +79,82 @@ def _causal_row(index: int, *, noise: float = 0.0):
         "counterfactual_pair": {
             "play": {"arm_id": f"play-{index}", "artifact_ref": f"play-{index}.json",
                      "artifact_sha256": _sha(play_arm_payload),
-                     "artifact_payload": play_arm_payload, **common},
+                     "artifact_payload": play_arm_payload, "scoring_weights": play_weights, **common},
             "save": {"arm_id": f"save-{index}", "artifact_ref": f"save-{index}.json",
                      "artifact_sha256": _sha(save_arm_payload),
-                     "artifact_payload": save_arm_payload, **common},
+                     "artifact_payload": save_arm_payload, "scoring_weights": save_weights, **common},
         },
-        "label": {
-            "kind": "OBSERVED_FUTURE_OUTCOME",
-            "outcome_record_ref": f"outcome-{index}.json",
-            "outcome_record": outcome_record,
-            "outcome_record_sha256": _sha(outcome_record),
-            "realized_reservation_value": 15.0 + noise,
+    }
+    captures = []
+    for player_id, total_points in ((1, realized_value), (2, 0.0)):
+        capture_payload = {"total_points": total_points}
+        capture_digest = ol.capture_digest_for(
+            grain=ol.GRAIN_PLAYER_EVENT,
+            event=event + 1,
+            player_id=player_id,
+            fixture_id=None,
+            captured_at=label_text,
+            observation_state=ol.OBSERVATION_FINAL,
+            source_name="player_gameweeks_final",
+            source_identity=f"player_gameweeks:{event + 1}",
+            source_payload_sha256=None,
+            archive_capture_id=None,
+            payload=capture_payload,
+        )
+        captures.append({
+            "capture_digest": capture_digest,
+            "grain": ol.GRAIN_PLAYER_EVENT,
+            "event": event + 1,
+            "player_id": player_id,
+            "fixture_id": None,
+            "observation_state": ol.OBSERVATION_FINAL,
+            "official_final_at": label_text,
+            "captured_at": label_text,
+            "source_name": "player_gameweeks_final",
+            "source_identity": f"player_gameweeks:{event + 1}",
+            "total_points": total_points,
+        })
+    outcome_record = {
+        "schema": calibration.CAUSAL_OUTCOME_RECORD_SCHEMA,
+        "record_id": f"outcome-{index}",
+        "observation_id": evidence["observation_id"],
+        "action": evidence["action"],
+        "planning_event": event,
+        "origin_cutoff": origin_text,
+        "scenario_identity": common["scenario_identity"],
+        "world_identity": common["world_identity"],
+        "play_arm_id": f"play-{index}",
+        "play_artifact_sha256": _sha(play_arm_payload),
+        "save_arm_id": f"save-{index}",
+        "save_artifact_sha256": _sha(save_arm_payload),
+        "source_decision_id": source["source_decision_id"],
+        "source_result_sha256": source["source_result_sha256"],
+        "source_artifact_sha256": source["source_artifact_sha256"],
+        "generation_id": source["generation_id"],
+        "cutoff": source["cutoff"],
+        "data_snapshot_sha256": source["data_snapshot_sha256"],
+        "certification_identity": source["certification_identity"],
+        "label_definition_version": calibration.OUTCOME_LABEL_DEFINITION,
+        "realization_event": event + 1,
+        "available_at": label_text,
+        "source": {
+            "schema": calibration.OUTCOME_CAPTURE_SET_SCHEMA,
             "available_at": label_text,
+            "captures": captures,
         },
+        "paired_results": {
+            "play": {"scoring_weights": play_weights, "observed_points": realized_value},
+            "save": {"scoring_weights": save_weights, "observed_points": 0.0},
+        },
+        "observed_points": realized_value,
+    }
+    evidence["label"] = {
+        "kind": "OBSERVED_FUTURE_OUTCOME",
+        "outcome_record_ref": f"outcome-{index}.json",
+        "outcome_record": outcome_record,
+        "outcome_record_sha256": _sha(outcome_record),
+        "realized_reservation_value": realized_value,
+        "available_at": label_text,
     }
     row = {
         "observation_id": f"obs-{index}",
@@ -95,7 +165,7 @@ def _causal_row(index: int, *, noise: float = 0.0):
         "forecast_made_at": forecast_time,
         "forecast_value": 10.0,
         "label_available_at": label_text,
-        "realized_value": 15.0 + noise,
+        "realized_value": realized_value,
         "causal_evidence_ref": f"evidence-{index}",
         "causal_evidence_sha256": _sha(evidence),
     }
@@ -252,11 +322,136 @@ def test_calibration_rejects_label_not_reproduced_by_retained_outcome_record():
     evidence["label"]["realized_reservation_value"] = 999.0
     row["causal_evidence_sha256"] = _sha(evidence)
     with pytest.raises(calibration.ReservationCalibrationError,
-                       match="not reproduced by the retained outcome record"):
+                       match="not reproduced by the retained paired outcome"):
         calibration.validate_observation(
             row,
             evidence_verifier=_causal_evidence_resolver(evidence, retained_outcome=retained_outcome),
         )
+
+
+def test_calibration_rejects_cross_action_scenario_reuse_across_training_rows():
+    row, evidence = _causal_row(0)
+    outcome = dict(evidence["label"]["outcome_record"])
+    outcome["action"] = cd.CHIP_ACTION_TC
+    evidence["label"]["outcome_record"] = outcome
+    evidence["label"]["outcome_record_sha256"] = _sha(outcome)
+    row["causal_evidence_sha256"] = _sha(evidence)
+    with pytest.raises(calibration.ReservationCalibrationError, match="does not match its observation"):
+        calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
+
+    tc_row, tc_evidence = _causal_row(2)
+    tc_row["action"] = cd.CHIP_ACTION_TC
+    tc_evidence["action"] = cd.CHIP_ACTION_TC
+    tc_outcome = tc_evidence["label"]["outcome_record"]
+    tc_outcome["action"] = cd.CHIP_ACTION_TC
+    tc_evidence["label"]["outcome_record_sha256"] = _sha(tc_outcome)
+    tc_row["causal_evidence_sha256"] = _sha(tc_evidence)
+    calibration.validate_observation(
+        tc_row, evidence_verifier=_causal_evidence_resolver(tc_evidence),
+    )
+
+    stored = {}
+    rows = []
+    for index in range(60, 115):
+        bb_row, bb_evidence = _causal_row(index)
+        bb_evidence["label"]["outcome_record_ref"] = "shared-tc-outcome.json"
+        bb_evidence["label"]["outcome_record"] = tc_outcome
+        bb_evidence["label"]["outcome_record_sha256"] = _sha(tc_outcome)
+        bb_row["causal_evidence_sha256"] = _sha(bb_evidence)
+        rows.append(bb_row)
+        _store_causal_evidence(stored, bb_row, bb_evidence)
+        stored["shared-tc-outcome.json"] = tc_outcome
+    latest_label = datetime.fromisoformat(rows[-1]["label_available_at"].replace("Z", "+00:00"))
+    result = calibration.evaluate_reservation_calibration(
+        rows,
+        evidence_verifier=stored.__getitem__,
+        evaluation_cutoff=(latest_label + timedelta(days=1)).isoformat().replace("+00:00", "Z"),
+    )
+    assert result["status"] == cd.CALIBRATION_UNCALIBRATED
+    assert result["models"] == {}
+    assert len(result["rejected_observations"]) == len(rows)
+
+
+def test_calibration_excludes_a_consistent_but_unmatured_outcome():
+    row, evidence = _causal_row(1)
+    outcome = evidence["label"]["outcome_record"]
+    future_time = "2099-01-01T00:00:00Z"
+    outcome["available_at"] = future_time
+    outcome["source"]["available_at"] = future_time
+    for capture in outcome["source"]["captures"]:
+        capture["official_final_at"] = future_time
+        capture["captured_at"] = future_time
+        capture["capture_digest"] = ol.capture_digest_for(
+            grain=capture["grain"],
+            event=capture["event"],
+            player_id=capture["player_id"],
+            fixture_id=capture["fixture_id"],
+            captured_at=future_time,
+            observation_state=capture["observation_state"],
+            source_name=capture["source_name"],
+            source_identity=capture["source_identity"],
+            source_payload_sha256=None,
+            archive_capture_id=None,
+            payload={"total_points": capture["total_points"]},
+        )
+    evidence["label"]["available_at"] = future_time
+    evidence["label_available_at"] = future_time
+    row["label_available_at"] = future_time
+    evidence["label"]["outcome_record_sha256"] = _sha(outcome)
+    row["causal_evidence_sha256"] = _sha(evidence)
+    calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
+    result = calibration.evaluate_reservation_calibration(
+        [row],
+        evidence_verifier=_causal_evidence_resolver(evidence),
+        evaluation_cutoff="2026-09-30T00:00:00Z",
+    )
+    assert result["verified_observations"] == 0
+    assert result["rejected_observations"] == []
+    assert result["models"] == {}
+    assert result["status"] == cd.CALIBRATION_UNCALIBRATED
+
+
+def test_production_outcome_loader_verifies_append_only_official_captures(tmp_path):
+    _row, evidence = _causal_row(0)
+    outcome = evidence["label"]["outcome_record"]
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE outcome_observation_captures (
+           capture_digest TEXT, grain TEXT, event INTEGER, player_id INTEGER,
+           fixture_id INTEGER, official_final_at TEXT, captured_at TEXT,
+           observation_state TEXT, source_name TEXT, source_identity TEXT,
+           source_payload_sha256 TEXT, archive_capture_id TEXT, payload_json TEXT
+        )"""
+    )
+    for capture in outcome["source"]["captures"]:
+        payload = {"total_points": capture["total_points"]}
+        conn.execute(
+            """INSERT INTO outcome_observation_captures VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                capture["capture_digest"], capture["grain"], capture["event"],
+                capture["player_id"], capture["fixture_id"], capture["official_final_at"],
+                capture["captured_at"], capture["observation_state"], capture["source_name"],
+                capture["source_identity"], None, None, json.dumps(payload),
+            ),
+        )
+    (tmp_path / "outcome.json").write_text(json.dumps(outcome), encoding="utf-8")
+    loader = run_chip_assessment._calibration_evidence_loader(tmp_path, conn)
+    assert loader("outcome.json") == outcome
+
+    forged = json.loads(json.dumps(outcome))
+    forged["source"]["captures"][0]["total_points"] += 1
+    (tmp_path / "forged.json").write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(calibration.ReservationCalibrationError, match="manifest differs"):
+        loader("forged.json")
+
+    missing_capture = json.loads(json.dumps(outcome))
+    missing_capture["source"]["captures"][0]["capture_digest"] = "a" * 64
+    (tmp_path / "missing.json").write_text(json.dumps(missing_capture), encoding="utf-8")
+    with pytest.raises(calibration.ReservationCalibrationError, match="not retained in the official ledger"):
+        loader("missing.json")
+    conn.close()
 
 
 def test_calibration_does_not_override_an_evaluators_execution_permission():
