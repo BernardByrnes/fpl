@@ -924,6 +924,12 @@ def decide_chip_action(
     supplied_state = (chosen.evidence.get("save_policy") or {}).get("post_save_state_for_reservation")
     if isinstance(supplied_state, Mapping):
         reservation_state.update(supplied_state)
+    # A chip evaluator may carry a separately produced, point-in-time raw
+    # reservation forecast. Pass it through to a verified calibration provider
+    # when present; never derive or default one in the arbiter.
+    raw_reservation = chosen.candidate_metrics.get("raw_reservation_value")
+    if raw_reservation is not None:
+        reservation_state["raw_reservation_value"] = raw_reservation
     estimate = (reservation or UncalibratedReservation()).estimate(
         action=chosen.action,
         planning_event=planning_event,

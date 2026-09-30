@@ -43,6 +43,7 @@ from .candidate_universe import OFFICIAL_PLAYER_POOL_INCOMPLETE
 WILDCARD_ADAPTER_VERSION = "wildcard_adapter_v1.0.0"
 
 WC_MANAGER_STATE_MISSING = "WILDCARD_PRODUCTION_MANAGER_STATE_MISSING"
+WC_MANAGER_STATE_MISMATCH = "WILDCARD_PRODUCTION_MANAGER_STATE_MISMATCH"
 
 
 class WildcardAdapterError(wc.WildcardInputError):
@@ -203,6 +204,11 @@ class WildcardCertifiedInputs:
     players: Mapping[int, wc.WildcardPlayer]
     worlds_by_event: Mapping[int, wc.WildcardWorldInputs]
     generation: Mapping[str, Any]
+    #: Separate persisted PE-9 products. ``generation`` above remains the
+    #: accepted official player-pool identity for compatibility; these ids bind
+    #: the normal four-event decision and the distinct 6–10 event value product.
+    chip_generation_id: str | None = None
+    value_generation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +225,9 @@ def build_wildcard_request(
     data_snapshot_sha256: str,
     reservation: Any | None = None,
     conn: sqlite3.Connection | None = None,
+    #: Read-only pinned snapshot for manager, pool and price authorities. ``conn``
+    #: remains the certified prediction/evidence store.
+    manager_source_conn: sqlite3.Connection | None = None,
     pool_binding: wc.WildcardPoolBinding | None = None,
     canonical_route: Any | None = None,
     #: Authoritative evaluation INPUTS for the canonical route: the world
@@ -248,6 +257,12 @@ def build_wildcard_request(
             f"{WC_MANAGER_STATE_MISSING}: {'; '.join(manager_problems[:6])}",
             reasons=(WC_MANAGER_STATE_MISSING,),
         )
+    if conn is not None and canonical_route is None:
+        raise WildcardAdapterError(
+            f"{wc.WC_SAVE_ROUTE_MISSING}: production SAVE requires the canonical normal route; "
+            "a preconstructed WildcardSaveRoute is not authoritative",
+            reasons=(wc.WC_SAVE_ROUTE_MISSING,),
+        )
 
     # --- pool identity: the STORE is the authority, not the caller's list
     #
@@ -258,8 +273,9 @@ def build_wildcard_request(
     # A supplied binding is at most evidence: if it disagrees with the store
     # that is a contradiction and it refuses.
     supplied_binding = pool_binding
+    authority_conn = manager_source_conn or conn
     if conn is not None:
-        resolved_binding = wc.pool_binding_from_store(conn)
+        resolved_binding = wc.pool_binding_from_store(authority_conn)
         if supplied_binding is not None and supplied_binding.as_dict() != resolved_binding.as_dict():
             raise WildcardAdapterError(
                 f"{OFFICIAL_PLAYER_POOL_INCOMPLETE}: the supplied pool binding disagrees with "
@@ -267,6 +283,37 @@ def build_wildcard_request(
                 reasons=(OFFICIAL_PLAYER_POOL_INCOMPLETE,),
             )
         pool_binding = resolved_binding
+        canonical_manager = wildcard_manager_state(
+            authority_conn,
+            int(manager.entry_id),
+            int(manager.planning_event),
+            cutoff=str(certified.value_horizon_binding.decision_cutoff),
+            eligible_ids=pool_binding.eligible_ids,
+            as_of=str(certified.value_horizon_binding.decision_cutoff),
+        )
+        manager_disagreements: list[str] = []
+        for name in ("entry_id", "planning_event", "squad_ids", "bank_tenths",
+                     "event_start_free_transfers", "purchase_price_tenths",
+                     "market_price_tenths", "cached_selling_price_tenths", "chip_availability"):
+            expected = getattr(canonical_manager, name)
+            supplied = getattr(manager, name)
+            if name in {"squad_ids", "chip_availability"}:
+                equal = tuple(supplied) == tuple(expected)
+            elif name.endswith("_tenths") or name == "purchase_price_tenths":
+                equal = {int(k): int(v) for k, v in dict(supplied).items()} == {
+                    int(k): int(v) for k, v in dict(expected).items()
+                }
+            else:
+                equal = supplied == expected
+            if not equal:
+                manager_disagreements.append(name)
+        if manager_disagreements:
+            raise WildcardAdapterError(
+                f"{WC_MANAGER_STATE_MISMATCH}: supplied manager fields disagree with the pinned "
+                f"snapshot at {certified.value_horizon_binding.decision_cutoff}: "
+                f"{manager_disagreements}",
+                reasons=(WC_MANAGER_STATE_MISMATCH,),
+            )
     else:
         # Synthetic/evaluator-level construction.  Still requires an EXPLICIT
         # accepted generation -- absence is never acceptance.
@@ -281,6 +328,90 @@ def build_wildcard_request(
             f"{wc.WC_VALUE_BINDING_MISMATCH}: {'; '.join(binding_problems[:6])}",
             reasons=(wc.WC_VALUE_BINDING_MISMATCH,),
         )
+
+    if conn is not None:
+        # A production Wildcard must bind both of its certified products from
+        # the persisted store. The old ``generation`` field is the official
+        # player-pool binding, not a prediction-generation authority.
+        if not certified.chip_generation_id or not certified.value_generation_id:
+            raise WildcardAdapterError(
+                f"{wc.WC_VALUE_BINDING_MISMATCH}: production Wildcard requires persisted "
+                "four-event and 6–10 event generation ids",
+                reasons=(wc.WC_VALUE_BINDING_MISMATCH,),
+            )
+        from . import generation_store as gs
+
+        try:
+            chip_generation = gs.load_generation(conn, str(certified.chip_generation_id))
+            value_generation = gs.load_generation(conn, str(certified.value_generation_id))
+            chip_report = gs.verify_generation(conn, chip_generation.generation_id)
+            value_report = gs.verify_generation(conn, value_generation.generation_id)
+        except gs.GenerationRefused as failure:
+            raise WildcardAdapterError(
+                f"{wc.WC_VALUE_BINDING_MISMATCH}: a required certified generation refused: {failure}",
+                reasons=(wc.WC_VALUE_BINDING_MISMATCH,),
+            ) from failure
+        if not chip_report.get("verified") or not value_report.get("verified"):
+            raise WildcardAdapterError(
+                f"{wc.WC_VALUE_BINDING_MISMATCH}: a required certified generation did not verify",
+                reasons=(wc.WC_VALUE_BINDING_MISMATCH,),
+            )
+        chip_snapshot = (chip_generation.manifest.get("data_snapshot") or {}).get("sha256")
+        value_snapshot = (value_generation.manifest.get("data_snapshot") or {}).get("sha256")
+        chip_code = str(chip_generation.manifest.get("code_snapshot_sha256") or "")
+        value_code = str(value_generation.manifest.get("code_snapshot_sha256") or "")
+        disagreements = []
+        if chip_generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW:
+            disagreements.append("the chip decision generation is not FOUR_GW")
+        if value_generation.horizon_kind != gs.HORIZON_KIND_WILDCARD_VALUE:
+            disagreements.append("the Wildcard value generation is not WILDCARD_VALUE")
+        if tuple(chip_generation.events) != tuple(certified.chip_horizon_binding.horizon_events):
+            disagreements.append("the chip generation events differ from the four-event binding")
+        if tuple(value_generation.events) != tuple(certified.horizon.events):
+            disagreements.append("the value generation events differ from the Wildcard horizon")
+        if int(chip_generation.planning_event) != int(manager.planning_event) or int(
+            value_generation.planning_event
+        ) != int(manager.planning_event):
+            disagreements.append("a certified generation has a different planning event")
+        if str(chip_generation.cutoff) != str(value_binding.decision_cutoff) or str(
+            value_generation.cutoff
+        ) != str(value_binding.decision_cutoff):
+            disagreements.append("the two certified generations differ from the Wildcard cutoff")
+        if str(chip_snapshot) != str(value_snapshot) or str(chip_snapshot) != str(
+            value_binding.data_snapshot_sha256
+        ) or str(chip_snapshot) != str(data_snapshot_sha256):
+            disagreements.append("the two certified generations differ from the Wildcard data snapshot")
+        if not chip_code or chip_code != value_code or chip_code != str(
+            value_binding.source_snapshot_sha256
+        ):
+            disagreements.append("the two certified generations differ from the predictive source identity")
+        chip_bundle_identities = {
+            str(int(event)): str(
+                ((chip_generation.manifest.get("per_event") or {}).get(str(int(event)) or {})
+                 or {}).get("bundle_identity") or ""
+            )
+            for event in chip_generation.events
+        }
+        expected_chip_certification_identity = gs._certification_identity_for_bundles(
+            cutoff=str(chip_generation.cutoff),
+            bundle_identities=chip_bundle_identities,
+            snapshot_sha256=str(chip_snapshot or ""),
+        )
+        if str(certified.chip_horizon_binding.certification_identity) != str(
+            expected_chip_certification_identity
+        ):
+            disagreements.append(
+                "the chip binding does not name the persisted FOUR_GW bundle certification identity"
+            )
+        if str(value_binding.prediction_generation) != value_generation.generation_id:
+            disagreements.append("the value binding does not name the persisted WILDCARD_VALUE generation")
+        if tuple(value_generation.events[:4]) != tuple(chip_generation.events):
+            disagreements.append("the normal four events are not the exact prefix of the Wildcard product")
+        if disagreements:
+            raise WildcardAdapterError(
+                f"{wc.WC_VALUE_BINDING_MISMATCH}: " + "; ".join(disagreements[:8]),
+                reasons=(wc.WC_VALUE_BINDING_MISMATCH,),
+            )
 
     # --- the universe must cover the whole eligible pool
     missing = [pid for pid in pool_binding.eligible_ids if int(pid) not in certified.players]
@@ -369,15 +500,6 @@ def build_wildcard_request(
             config=route_config,
             events=route_events,
         )
-    elif route is not None and conn is not None:
-        # A production call (a live connection is present) may not take a
-        # hand-built SAVE route as authority.
-        raise WildcardAdapterError(
-            f"{wc.WC_SAVE_ROUTE_MISSING}: production SAVE requires the canonical normal route; "
-            "a preconstructed WildcardSaveRoute is not authoritative",
-            reasons=(wc.WC_SAVE_ROUTE_MISSING,),
-        )
-
     # --- build the request; the evaluator's own validation does the rest
     return wc.WildcardRequest(
         planning_event=int(manager.planning_event),

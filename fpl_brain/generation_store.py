@@ -44,13 +44,20 @@ DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v1"
 #: (planning_event, horizon_kind); manager-specific state never enters its identity.
 HORIZON_KIND_FOUR_GW = "FOUR_GW"
 HORIZON_KIND_MANAGER_WORLD = "MANAGER_WORLD"
-HORIZON_KINDS: tuple[str, ...] = (HORIZON_KIND_FOUR_GW, HORIZON_KIND_MANAGER_WORLD)
+HORIZON_KIND_WILDCARD_VALUE = "WILDCARD_VALUE"
+HORIZON_KINDS: tuple[str, ...] = (
+    HORIZON_KIND_FOUR_GW,
+    HORIZON_KIND_MANAGER_WORLD,
+    HORIZON_KIND_WILDCARD_VALUE,
+)
 
 #: The horizon LENGTH each kind is certified over.  The four-Gameweek normal-transfer
 #: horizon is the frozen product rule; a manager-world generation covers exactly the
 #: events it declares.  The length is part of the manifest, so the gate a generation
 #: passed is reproducible rather than inferred from the caller's context.
 HORIZON_LENGTHS: dict[str, int] = {HORIZON_KIND_FOUR_GW: 4}
+WILDCARD_VALUE_MIN_EVENTS = 6
+WILDCARD_VALUE_MAX_EVENTS = 10
 
 # --- refusal tokens ---------------------------------------------------------
 DIAG_GENERATION_UNKNOWN = "UNKNOWN_GENERATION_ID"
@@ -203,6 +210,42 @@ class ProductionDescriptorOnly(GenerationRefused):
 
     def __init__(self, reasons: Sequence[str]) -> None:
         super().__init__(DIAG_PRODUCTION_DESCRIPTOR_ONLY, reasons)
+
+
+def _wildcard_value_horizon_problems(
+    *, planning_event: int, events: Sequence[int], horizon_length: int, last_event: int
+) -> list[str]:
+    """Validate Wildcard's separate 6–10 event certification contract.
+
+    This product is intentionally distinct from ``FOUR_GW``. Its events must
+    be one complete, contiguous sequence beginning at the planning event, and
+    every declared event must exist in the pinned season snapshot.
+    """
+
+    resolved = tuple(int(event) for event in events)
+    problems: list[str] = []
+    if not (WILDCARD_VALUE_MIN_EVENTS <= len(resolved) <= WILDCARD_VALUE_MAX_EVENTS):
+        problems.append(
+            f"Wildcard value horizon needs {WILDCARD_VALUE_MIN_EVENTS}-{WILDCARD_VALUE_MAX_EVENTS} "
+            f"events, got {len(resolved)}"
+        )
+    if int(horizon_length) != len(resolved):
+        problems.append(
+            f"Wildcard value horizon length {int(horizon_length)} does not match its "
+            f"{len(resolved)} declared events"
+        )
+    if not resolved or resolved[0] != int(planning_event):
+        problems.append("Wildcard value events must begin at the planning event")
+    if len(set(resolved)) != len(resolved):
+        problems.append("Wildcard value events contain duplicates")
+    expected = tuple(range(int(planning_event), int(planning_event) + len(resolved)))
+    if resolved != expected:
+        problems.append(f"Wildcard value events {list(resolved)} are not contiguous from GW{planning_event}")
+    if resolved and resolved[-1] > int(last_event):
+        problems.append(
+            f"Wildcard value horizon ends at GW{resolved[-1]}, beyond pinned season end GW{last_event}"
+        )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +782,20 @@ def certify_generation(
             ],
         )
     resolved_last_event = snapshot_last_event
+    resolved_length = int(
+        horizon_length
+        if horizon_length is not None
+        else HORIZON_LENGTHS.get(str(horizon_kind), len(resolved_events))
+    )
+    if horizon_kind == HORIZON_KIND_WILDCARD_VALUE:
+        problems = _wildcard_value_horizon_problems(
+            planning_event=int(planning_event),
+            events=resolved_events,
+            horizon_length=resolved_length,
+            last_event=resolved_last_event,
+        )
+        if problems:
+            raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED, problems)
 
     from .database import write_transaction
 
@@ -862,11 +919,6 @@ def certify_generation(
         if contextless:
             raise GenerationRefused(DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED, contextless)
 
-        resolved_length = int(
-            horizon_length
-            if horizon_length is not None
-            else HORIZON_LENGTHS.get(str(horizon_kind), len(resolved_events))
-        )
         horizon = fg.evaluate_horizon(
             planning_event=int(resolved_events[0]) if resolved_events else int(planning_event),
             support_by_event=support,
@@ -970,6 +1022,143 @@ def certify_generation(
             (int(planning_event), str(horizon_kind), generation_id, str(created_at)),
         )
     return load_generation(conn, generation_id)
+
+
+def certify_wildcard_value_generation(
+    conn: sqlite3.Connection,
+    *,
+    chip_generation_id: str,
+    planning_event: int,
+    cutoff: str,
+    events: Sequence[int],
+    runs_by_event: Mapping[int, Mapping[str, int]],
+    snapshot: Mapping[str, Any] | None,
+    calibration: Mapping[str, Any] | None = None,
+    calibration_artifact_ref: str | Path | None = None,
+    require_calibration: bool = False,
+    controller: Any = None,
+    clock: Callable[[], str] | None = None,
+) -> CertifiedGeneration:
+    """Certify Wildcard's 6–10 event value product against a normal generation.
+
+    The four-event normal-transfer generation remains a separate, unchanged
+    product. This entry point requires a verified ``FOUR_GW`` generation for
+    the same planning event and exact first four events, and binds the Wildcard
+    value generation to that generation's cutoff, pinned snapshot and
+    predictive code identity. Later planning runs cannot be stitched together
+    by supplying a different cutoff, snapshot or code identity.
+    """
+
+    value_events = tuple(int(event) for event in events)
+    base = load_generation(conn, str(chip_generation_id))
+    base_report = verify_generation(conn, base.generation_id)
+    if not base_report.get("verified"):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the normal four-event generation did not verify"],
+        )
+    if base.horizon_kind != HORIZON_KIND_FOUR_GW:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"the Wildcard value product requires a FOUR_GW base, got {base.horizon_kind!r}"],
+        )
+    if int(base.planning_event) != int(planning_event):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard and normal products have different planning events"],
+        )
+    if tuple(base.events) != value_events[:4]:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the normal four-event product is not the exact first four Wildcard value events"],
+        )
+    normalized_runs = {
+        int(event): {str(family): int(run_id) for family, run_id in families.items()}
+        for event, families in runs_by_event.items()
+    }
+    prefix_run_disagreements = [
+        f"GW{event}: Wildcard runs {normalized_runs.get(event)!r} do not exactly reuse "
+        f"the normal certified runs {base.runs_for(event)!r}"
+        for event in base.events
+        if normalized_runs.get(int(event)) != base.runs_for(int(event))
+    ]
+    if prefix_run_disagreements:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                "the first four Wildcard value events must reuse the exact normal-generation "
+                "run ids and dependency closure; separately generated later planning runs "
+                "cannot be stitched into this assessment",
+                *prefix_run_disagreements,
+            ],
+        )
+    if str(base.cutoff) != str(cutoff):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard and normal products have different cutoffs"],
+        )
+    snapshot_block = _snapshot_identity_block(snapshot)
+    base_snapshot = base.manifest.get("data_snapshot") or {}
+    if str(snapshot_block.get("sha256")) != str(base_snapshot.get("sha256")):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard value product does not use the normal product's pinned data snapshot"],
+        )
+    base_code = str(base.manifest.get("code_snapshot_sha256") or "")
+    if not base_code or base_code != authoritative_code_identity():
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the normal product's predictive code identity differs from the current declared identity"],
+        )
+
+    result = certify_generation(
+        conn,
+        planning_event=int(planning_event),
+        cutoff=str(cutoff),
+        runs_by_event=runs_by_event,
+        snapshot=snapshot_block,
+        horizon_kind=HORIZON_KIND_WILDCARD_VALUE,
+        events=value_events,
+        horizon_length=len(value_events),
+        calibration=calibration,
+        calibration_artifact_ref=calibration_artifact_ref,
+        require_calibration=require_calibration,
+        controller=controller,
+        clock=clock,
+    )
+    report = verify_generation(conn, result.generation_id)
+    if not report.get("verified"):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the newly certified Wildcard value generation failed its independent verification"],
+        )
+    if (
+        str(result.cutoff) != str(base.cutoff)
+        or str(result.manifest.get("code_snapshot_sha256")) != base_code
+        or str((result.manifest.get("data_snapshot") or {}).get("sha256"))
+        != str(base_snapshot.get("sha256"))
+    ):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard and normal products do not reproduce one predictive identity"],
+        )
+    base_events = base.manifest.get("per_event") or {}
+    result_events = result.manifest.get("per_event") or {}
+    dependency_disagreements = [
+        int(event)
+        for event in base.events
+        if (base_events.get(str(int(event))) or {}).get("dependency_closure")
+        != (result_events.get(str(int(event))) or {}).get("dependency_closure")
+    ]
+    if dependency_disagreements:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                "the first four Wildcard events do not reproduce the normal generation's "
+                f"dependency closure for {dependency_disagreements}"
+            ],
+        )
+    return result
 
 
 def assert_writer_lease_held(conn: sqlite3.Connection, controller: Any) -> str:
@@ -1465,6 +1654,20 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     generation = load_generation(conn, generation_id)
     manifest = dict(generation.manifest)
     failures: list[str] = []
+    if generation.horizon_kind not in HORIZON_KINDS:
+        failures.append(f"the generation declares unknown horizon kind {generation.horizon_kind!r}")
+    elif generation.horizon_kind == HORIZON_KIND_WILDCARD_VALUE:
+        try:
+            failures.extend(
+                _wildcard_value_horizon_problems(
+                    planning_event=int(generation.planning_event),
+                    events=generation.events,
+                    horizon_length=int(manifest.get("horizon_length") or 0),
+                    last_event=int(manifest.get("last_event") or 0),
+                )
+            )
+        except (TypeError, ValueError) as failure:
+            failures.append(f"the Wildcard value horizon declaration is malformed: {failure}")
     authoritative_versions = {
         str(family): str(version) for family, version in cb.declared_required_versions().items()
     }
