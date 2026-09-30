@@ -104,20 +104,29 @@ evidence containing separate PLAY/SAVE arms for the same proposed squad,
 lineup, scenario and worlds, plus a matured future outcome. Each outcome is a
 versioned paired record bound to the observation, chip action, planning origin,
 scenario, world, source decision/generation, and both arm IDs and artifact
-digests. Its fixed label definition is recomputed from the captured event
-points and each retained arm's explicit scoring weights; a caller-supplied
-`observed_points` value alone is insufficient. Every capture must be event
-grain, officially final, and carry the declared official player-gameweek
-provenance. At production load time, the evidence reader resolves every
-capture digest against `outcome_observation_captures`, recomputes its content
-digest, and checks the retained fields and points. Outcome availability is
-derived from the latest capture time and must match both the row and label;
-captures must postdate official finality and the forecast origin. The
-pre-registered expanding-origin protocol then excludes outcomes not mature by
-its evaluation cutoff and by each training origin. Loading a calibrated
-artifact re-reads each causal record and outcome through that production
-verifier and reproduces the dataset, reports and model under the locked
-criteria; a self-hashed `CALIBRATED` label alone is rejected.
+digests. The outcome scorer is versioned and derives arm weights from the
+action, legal 15-player lineup, pinned player positions, official appearance
+minutes, and captured event points. It uses the normal lineup engine's legal
+autosubs and captain/vice fallback, scores all appearing players for Bench
+Boost, and applies the extra captain copy for Triple Captain. Caller-supplied
+weights are checked against those reconstructed weights; changing a weight and
+rehashing the artifacts cannot change the label. Wildcard and Free Hit remain
+ineligible for reservation calibration until their action-specific outcome
+scorers are implemented.
+
+Every capture must be event-grain, officially final, and carry the declared
+official player-gameweek provenance, including minutes and total points. At
+production load time, the evidence reader resolves every capture digest
+against `outcome_observation_captures`, recomputes its content digest, checks
+the retained fields and points, and verifies the arm's player positions against
+the source generation's pinned snapshot. Outcome availability is derived from
+the latest capture time and must match both the row and label; captures must
+postdate official finality and the forecast origin. The pre-registered
+expanding-origin protocol then excludes outcomes not mature by its evaluation
+cutoff and by each training origin. Loading a calibrated artifact re-reads
+each causal record and outcome through that production verifier and
+reproduces the dataset, reports and model under the locked criteria; a
+self-hashed `CALIBRATED` label alone is rejected.
 
 The local read-only inventory found zero `outcome_observations` and zero
 `calibration_records`; the available `player_gameweeks` are point outcomes,

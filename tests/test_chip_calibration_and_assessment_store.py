@@ -27,7 +27,7 @@ def _sha(payload):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _causal_row(index: int, *, noise: float = 0.0):
+def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_BB):
     origin = datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=7 * index)
     label_time = origin + timedelta(days=2)
     origin_text = origin.isoformat().replace("+00:00", "Z")
@@ -46,18 +46,38 @@ def _causal_row(index: int, *, noise: float = 0.0):
         "certification_identity": "sha256:" + _sha({"certification": index}),
         "world_identity": "sha256:" + _sha({"world": index}),
     }
+    lineup = {
+        "starter_ids": [1, 3, 4, 5, 8, 9, 10, 11, 13, 14, 15],
+        "bench_gk_id": 2,
+        "bench_outfield_order": [6, 12, 7],
+        "captain_id": 8,
+        "vice_captain_id": 9,
+    }
+    player_positions = {
+        "1": "GKP", "2": "GKP", "3": "DEF", "4": "DEF", "5": "DEF",
+        "6": "DEF", "7": "DEF", "8": "MID", "9": "MID", "10": "MID",
+        "11": "MID", "12": "MID", "13": "FWD", "14": "FWD", "15": "FWD",
+    }
     common = {
         "scenario_identity": f"scenario-{index}",
         "world_identity": "sha256:" + _sha({"world": index}),
         "proposed_squad_ids": list(range(1, 16)),
-        "lineup": {"starters": list(range(1, 12)), "captain": 1, "vice": 2},
+        "lineup": lineup,
+        "player_positions": player_positions,
         **{key: source[key] for key in (
             "source_decision_id", "source_result_sha256", "source_artifact_sha256",
             "generation_id", "cutoff", "data_snapshot_sha256", "certification_identity",
         )},
     }
-    play_weights = {"1": 1.0}
-    save_weights = {"2": 1.0}
+    starters = set(lineup["starter_ids"])
+    save_weights = {str(player_id): 1.0 for player_id in starters}
+    save_weights[str(lineup["captain_id"])] += 1.0
+    if action == cd.CHIP_ACTION_BB:
+        play_weights = {str(player_id): 1.0 for player_id in range(1, 16)}
+        play_weights[str(lineup["captain_id"])] += 1.0
+    else:
+        play_weights = dict(save_weights)
+        play_weights[str(lineup["captain_id"])] += 1.0
     play_arm_payload = {
         "arm_id": f"play-{index}", "paired_value": 3.0,
         "scoring_weights": play_weights, **common,
@@ -70,7 +90,7 @@ def _causal_row(index: int, *, noise: float = 0.0):
         "schema": calibration.CAUSAL_EVIDENCE_SCHEMA,
         "policy": calibration.CAUSAL_EVIDENCE_POLICY,
         "observation_id": f"obs-{index}",
-        "action": cd.CHIP_ACTION_BB,
+        "action": action,
         "planning_event": event,
         "origin_cutoff": origin_text,
         "label_available_at": label_text,
@@ -86,8 +106,15 @@ def _causal_row(index: int, *, noise: float = 0.0):
         },
     }
     captures = []
-    for player_id, total_points in ((1, realized_value), (2, 0.0)):
-        capture_payload = {"total_points": total_points}
+    for player_id in range(1, 16):
+        total_points = (
+            realized_value
+            if (action == cd.CHIP_ACTION_BB and player_id == 6)
+            or (action == cd.CHIP_ACTION_TC and player_id == lineup["captain_id"])
+            else 0.0
+        )
+        minutes = 90.0
+        capture_payload = {"total_points": total_points, "minutes": minutes}
         capture_digest = ol.capture_digest_for(
             grain=ol.GRAIN_PLAYER_EVENT,
             event=event + 1,
@@ -113,6 +140,7 @@ def _causal_row(index: int, *, noise: float = 0.0):
             "source_name": "player_gameweeks_final",
             "source_identity": f"player_gameweeks:{event + 1}",
             "total_points": total_points,
+            "minutes": minutes,
         })
     outcome_record = {
         "schema": calibration.CAUSAL_OUTCOME_RECORD_SCHEMA,
@@ -135,6 +163,7 @@ def _causal_row(index: int, *, noise: float = 0.0):
         "data_snapshot_sha256": source["data_snapshot_sha256"],
         "certification_identity": source["certification_identity"],
         "label_definition_version": calibration.OUTCOME_LABEL_DEFINITION,
+        "scoring_rule_version": calibration.OUTCOME_SCORING_RULE_VERSION,
         "realization_event": event + 1,
         "available_at": label_text,
         "source": {
@@ -143,8 +172,24 @@ def _causal_row(index: int, *, noise: float = 0.0):
             "captures": captures,
         },
         "paired_results": {
-            "play": {"scoring_weights": play_weights, "observed_points": realized_value},
-            "save": {"scoring_weights": save_weights, "observed_points": 0.0},
+            "play": {
+                "lineup": lineup,
+                "player_positions": player_positions,
+                "scoring_weights": play_weights,
+                "observed_points": sum(
+                    item["total_points"] * play_weights.get(str(item["player_id"]), 0.0)
+                    for item in captures
+                ),
+            },
+            "save": {
+                "lineup": lineup,
+                "player_positions": player_positions,
+                "scoring_weights": save_weights,
+                "observed_points": sum(
+                    item["total_points"] * save_weights.get(str(item["player_id"]), 0.0)
+                    for item in captures
+                ),
+            },
         },
         "observed_points": realized_value,
     }
@@ -158,7 +203,7 @@ def _causal_row(index: int, *, noise: float = 0.0):
     }
     row = {
         "observation_id": f"obs-{index}",
-        "action": cd.CHIP_ACTION_BB,
+        "action": action,
         "planning_event": event,
         "weeks_to_expiry": 3,
         "origin_cutoff": origin_text,
@@ -329,6 +374,42 @@ def test_calibration_rejects_label_not_reproduced_by_retained_outcome_record():
         )
 
 
+def test_rehashed_arbitrary_chip_weights_cannot_manufacture_calibration_labels():
+    row, evidence = _causal_row(0)
+    outcome = evidence["label"]["outcome_record"]
+    play = evidence["counterfactual_pair"]["play"]
+    forged_weights = dict(play["scoring_weights"])
+    forged_weights["6"] = 100.0
+    forged_payload = dict(play["artifact_payload"])
+    forged_payload["scoring_weights"] = forged_weights
+    play["scoring_weights"] = forged_weights
+    play["artifact_payload"] = forged_payload
+    play["artifact_sha256"] = _sha(forged_payload)
+    outcome["play_artifact_sha256"] = play["artifact_sha256"]
+    result = outcome["paired_results"]["play"]
+    result["scoring_weights"] = forged_weights
+    result["observed_points"] = sum(
+        capture["total_points"] * forged_weights.get(str(capture["player_id"]), 0.0)
+        for capture in outcome["source"]["captures"]
+    )
+    save_score = outcome["paired_results"]["save"]["observed_points"]
+    forged_label = result["observed_points"] - save_score
+    outcome["observed_points"] = forged_label
+    evidence["label"]["realized_reservation_value"] = forged_label
+    evidence["label"]["outcome_record_sha256"] = _sha(outcome)
+    row["realized_value"] = forged_label
+    row["causal_evidence_sha256"] = _sha(evidence)
+
+    with pytest.raises(calibration.ReservationCalibrationError, match="canonical BB scorer"):
+        calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
+
+
+def test_calibration_fails_closed_for_actions_without_a_canonical_outcome_scorer():
+    row, evidence = _causal_row(0, action=cd.CHIP_ACTION_FH)
+    with pytest.raises(calibration.ReservationCalibrationError, match="no canonical reservation outcome scorer"):
+        calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
+
+
 def test_calibration_rejects_cross_action_scenario_reuse_across_training_rows():
     row, evidence = _causal_row(0)
     outcome = dict(evidence["label"]["outcome_record"])
@@ -339,13 +420,8 @@ def test_calibration_rejects_cross_action_scenario_reuse_across_training_rows():
     with pytest.raises(calibration.ReservationCalibrationError, match="does not match its observation"):
         calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
-    tc_row, tc_evidence = _causal_row(2)
-    tc_row["action"] = cd.CHIP_ACTION_TC
-    tc_evidence["action"] = cd.CHIP_ACTION_TC
+    tc_row, tc_evidence = _causal_row(2, action=cd.CHIP_ACTION_TC)
     tc_outcome = tc_evidence["label"]["outcome_record"]
-    tc_outcome["action"] = cd.CHIP_ACTION_TC
-    tc_evidence["label"]["outcome_record_sha256"] = _sha(tc_outcome)
-    tc_row["causal_evidence_sha256"] = _sha(tc_evidence)
     calibration.validate_observation(
         tc_row, evidence_verifier=_causal_evidence_resolver(tc_evidence),
     )
@@ -392,7 +468,7 @@ def test_calibration_excludes_a_consistent_but_unmatured_outcome():
             source_identity=capture["source_identity"],
             source_payload_sha256=None,
             archive_capture_id=None,
-            payload={"total_points": capture["total_points"]},
+            payload={"total_points": capture["total_points"], "minutes": capture["minutes"]},
         )
     evidence["label"]["available_at"] = future_time
     evidence["label_available_at"] = future_time
@@ -425,7 +501,7 @@ def test_production_outcome_loader_verifies_append_only_official_captures(tmp_pa
         )"""
     )
     for capture in outcome["source"]["captures"]:
-        payload = {"total_points": capture["total_points"]}
+        payload = {"total_points": capture["total_points"], "minutes": capture["minutes"]}
         conn.execute(
             """INSERT INTO outcome_observation_captures VALUES
                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -437,9 +513,18 @@ def test_production_outcome_loader_verifies_append_only_official_captures(tmp_pa
             ),
         )
     (tmp_path / "outcome.json").write_text(json.dumps(outcome), encoding="utf-8")
-    loader = run_chip_assessment._calibration_evidence_loader(tmp_path, conn)
+    source_positions = evidence["counterfactual_pair"]["play"]["player_positions"]
+    loader = run_chip_assessment._calibration_evidence_loader(
+        tmp_path, conn, source_position_resolver=lambda _record: source_positions,
+    )
     assert loader("outcome.json") == outcome
-
+    incorrect_source_positions = dict(source_positions)
+    incorrect_source_positions["6"] = "MID"
+    wrong_position_loader = run_chip_assessment._calibration_evidence_loader(
+        tmp_path, conn, source_position_resolver=lambda _record: incorrect_source_positions,
+    )
+    with pytest.raises(calibration.ReservationCalibrationError, match="pinned generation snapshot"):
+        wrong_position_loader("outcome.json")
     forged = json.loads(json.dumps(outcome))
     forged["source"]["captures"][0]["total_points"] += 1
     (tmp_path / "forged.json").write_text(json.dumps(forged), encoding="utf-8")
@@ -452,6 +537,44 @@ def test_production_outcome_loader_verifies_append_only_official_captures(tmp_pa
     with pytest.raises(calibration.ReservationCalibrationError, match="not retained in the official ledger"):
         loader("missing.json")
     conn.close()
+
+
+def test_production_position_resolver_reads_the_bound_generation_snapshot(monkeypatch):
+    _row, evidence = _causal_row(0)
+    outcome = evidence["label"]["outcome_record"]
+    position_map = evidence["counterfactual_pair"]["play"]["player_positions"]
+    generation = SimpleNamespace(
+        generation_id=outcome["generation_id"],
+        planning_event=outcome["planning_event"],
+        horizon_kind=run_chip_assessment.generation_store.HORIZON_KIND_FOUR_GW,
+        cutoff=outcome["cutoff"],
+        snapshot={"sha256": outcome["data_snapshot_sha256"]},
+    )
+    monkeypatch.setattr(
+        run_chip_assessment.generation_store, "load_generation", lambda _conn, _id: generation,
+    )
+    monkeypatch.setattr(
+        run_chip_assessment.generation_store, "verify_generation",
+        lambda _conn, _id: {"verified": True},
+    )
+    monkeypatch.setattr(
+        run_chip_assessment.generation_store, "_open_generation_snapshot",
+        lambda _generation: SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(
+        run_chip_assessment.repositories, "player_candidates",
+        lambda _conn: [
+            {"id": int(player_id), "position_short_name": position}
+            for player_id, position in position_map.items()
+        ],
+    )
+    resolver = run_chip_assessment._pinned_generation_position_resolver(sqlite3.connect(":memory:"))
+    assert resolver(outcome) == position_map
+
+    mismatched = dict(outcome)
+    mismatched["data_snapshot_sha256"] = _sha({"different snapshot": 1})
+    with pytest.raises(ValueError, match="event, cutoff or snapshot"):
+        resolver(mismatched)
 
 
 def test_calibration_does_not_override_an_evaluators_execution_permission():

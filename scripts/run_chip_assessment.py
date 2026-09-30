@@ -18,11 +18,77 @@ from typing import Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import chip_assessment, chip_assessment_store, chip_reservation_calibration
+from fpl_brain import generation_store, repositories
 from fpl_brain.season_rules import SeasonRules
 
 
-def _calibration_evidence_loader(evidence_root: Path, conn: sqlite3.Connection):
+def _pinned_generation_position_resolver(conn: sqlite3.Connection):
+    cache: dict[str, dict[str, str]] = {}
+    cache_identity: dict[str, tuple[int, str, str]] = {}
+
+    def resolve(outcome_record: dict) -> dict[str, str]:
+        generation_id = str(outcome_record.get("generation_id") or "")
+        if not generation_id:
+            raise ValueError("outcome record has no source generation id")
+        wanted_identity = (
+            int(outcome_record.get("planning_event") or -1),
+            str(outcome_record.get("cutoff") or ""),
+            str(outcome_record.get("data_snapshot_sha256") or ""),
+        )
+        if generation_id in cache_identity and cache_identity[generation_id] != wanted_identity:
+            raise ValueError("outcome source generation does not match its event, cutoff or snapshot")
+        if generation_id not in cache:
+            generation = generation_store.load_generation(conn, generation_id)
+            if (
+                generation.horizon_kind != generation_store.HORIZON_KIND_FOUR_GW
+                or generation.planning_event != int(outcome_record.get("planning_event") or -1)
+                or generation.cutoff != str(outcome_record.get("cutoff") or "")
+                or str(generation.snapshot.get("sha256") or "")
+                != str(outcome_record.get("data_snapshot_sha256") or "")
+            ):
+                raise ValueError("outcome source generation does not match its event, cutoff or snapshot")
+            report = generation_store.verify_generation(conn, generation_id)
+            if not report.get("verified"):
+                raise ValueError("outcome source generation is not verified")
+            snapshot_conn = generation_store._open_generation_snapshot(generation)
+            try:
+                rows = repositories.player_candidates(snapshot_conn)
+            finally:
+                snapshot_conn.close()
+            all_positions = {
+                str(int(row["id"])): str(row.get("position_short_name") or "")
+                for row in rows
+                if row.get("position_short_name")
+            }
+            paired = outcome_record.get("paired_results") or {}
+            play = paired.get("play") if isinstance(paired, dict) else None
+            lineup = play.get("lineup") if isinstance(play, dict) else None
+            if not isinstance(lineup, dict):
+                raise ValueError("outcome record has no canonical source lineup")
+            player_ids = {
+                *(int(value) for value in lineup.get("starter_ids", ())),
+                int(lineup["bench_gk_id"]),
+                *(int(value) for value in lineup.get("bench_outfield_order", ())),
+            }
+            if len(player_ids) != 15 or any(str(player_id) not in all_positions for player_id in player_ids):
+                raise ValueError("pinned generation lacks positions for the complete 15-player policy")
+            cache[generation_id] = {
+                str(player_id): all_positions[str(player_id)] for player_id in sorted(player_ids)
+            }
+            cache_identity[generation_id] = wanted_identity
+        return dict(cache[generation_id])
+
+    return resolve
+
+
+def _calibration_evidence_loader(
+    evidence_root: Path,
+    conn: sqlite3.Connection,
+    *,
+    source_position_resolver=None,
+):
     root = evidence_root.resolve()
+    resolve_positions = source_position_resolver or _pinned_generation_position_resolver(conn)
 
     def load(reference: str) -> dict:
         evidence_path = (root / str(reference)).resolve()
@@ -32,7 +98,9 @@ def _calibration_evidence_loader(evidence_root: Path, conn: sqlite3.Connection):
         if not isinstance(value, dict):
             raise ValueError("causal evidence artifact must be a JSON object")
         if value.get("schema") == chip_reservation_calibration.CAUSAL_OUTCOME_RECORD_SCHEMA:
-            chip_reservation_calibration.verify_outcome_record_capture_sources(conn, value)
+            chip_reservation_calibration.verify_outcome_record_capture_sources(
+                conn, value, source_position_resolver=resolve_positions,
+            )
         return value
 
     return load

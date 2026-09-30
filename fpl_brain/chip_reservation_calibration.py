@@ -18,15 +18,17 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from . import chip_decision as cd
+from . import manager_lineup as ml
 from . import outcome_ledger as ol
 
 CALIBRATION_SCHEMA = "fpl_brain.chip_reservation_calibration.v1"
-CAUSAL_EVIDENCE_SCHEMA = "fpl_brain.chip_reservation_causal_evidence.v1"
-CAUSAL_OUTCOME_RECORD_SCHEMA = "fpl_brain.chip_reservation_outcome_record.v1"
+CAUSAL_EVIDENCE_SCHEMA = "fpl_brain.chip_reservation_causal_evidence.v2"
+CAUSAL_OUTCOME_RECORD_SCHEMA = "fpl_brain.chip_reservation_outcome_record.v2"
 OUTCOME_CAPTURE_SET_SCHEMA = "fpl_brain.outcome_ledger_capture_set.v1"
-OUTCOME_LABEL_DEFINITION = "PAIRED_PLAY_MINUS_SAVE_CAPTURED_POINTS_V1"
-CALIBRATION_VERSION = "chip_reservation_walkforward_v2.0.0"
-CAUSAL_EVIDENCE_POLICY = "SAME_SCENARIO_PAIRED_PLAY_SAVE_TEMPORAL_LABELS_v1"
+OUTCOME_LABEL_DEFINITION = "CANONICAL_BB_TC_PLAY_MINUS_SAVE_EVENT_POINTS_V2"
+OUTCOME_SCORING_RULE_VERSION = "manager_lineup_and_bb_tc_realized_scores_v1"
+CALIBRATION_VERSION = "chip_reservation_walkforward_v3.0.0"
+CAUSAL_EVIDENCE_POLICY = "SAME_SCENARIO_PAIRED_PLAY_SAVE_TEMPORAL_LABELS_v2"
 
 # These criteria are fixed in code before labels are evaluated. A caller cannot
 # loosen them in a record after seeing the results.
@@ -80,6 +82,102 @@ def _is_sha256(value: Any) -> bool:
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text.lower())
 
 
+def _canonical_scoring_weights(
+    *,
+    action: str,
+    arm_name: str,
+    arm: Mapping[str, Any],
+    player_points: Mapping[int, float],
+    player_minutes: Mapping[int, float],
+) -> dict[str, float]:
+    """Rebuild realized BB/TC point weights from the retained FPL policy.
+
+    Caller-provided weights are data to verify, never the scoring authority.
+    FH/WC need action-specific squad and transfer-state scorers; until those are
+    implemented, they cannot contribute calibration labels.
+    """
+
+    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        raise ReservationCalibrationError(
+            f"{action} has no canonical reservation outcome scorer"
+        )
+    if arm_name not in {"play", "save"}:
+        raise ReservationCalibrationError("paired outcome arm name is invalid")
+    try:
+        squad_ids = tuple(int(value) for value in arm.get("proposed_squad_ids", ()))
+        lineup = arm.get("lineup")
+        if not isinstance(lineup, Mapping):
+            raise ValueError("lineup is missing")
+        policy = ml.ManagerPolicy(
+            starter_ids=tuple(int(value) for value in lineup["starter_ids"]),
+            bench_gk_id=int(lineup["bench_gk_id"]),
+            bench_outfield_order=tuple(int(value) for value in lineup["bench_outfield_order"]),
+            captain_id=int(lineup["captain_id"]),
+            vice_captain_id=int(lineup["vice_captain_id"]),
+        )
+        raw_positions = arm.get("player_positions")
+        if not isinstance(raw_positions, Mapping):
+            raise ValueError("source player positions are missing")
+        positions: dict[int, str] = {}
+        for raw_player_id, value in raw_positions.items():
+            player_id = int(raw_player_id)
+            if player_id in positions:
+                raise ValueError("duplicate player position")
+            positions[player_id] = str(value)
+    except (KeyError, TypeError, ValueError) as failure:
+        raise ReservationCalibrationError(
+            f"{arm_name.upper()} arm has an invalid canonical scoring policy: {failure}"
+        ) from failure
+
+    policy_ids = ml.policy_player_ids(policy)
+    if (
+        len(squad_ids) != ml.SQUAD_SIZE
+        or len(set(squad_ids)) != ml.SQUAD_SIZE
+        or set(squad_ids) != policy_ids
+        or set(positions) != policy_ids
+    ):
+        raise ReservationCalibrationError(
+            f"{arm_name.upper()} arm does not retain one complete 15-player scoring policy"
+        )
+    legality = ml.policy_legality_errors(policy, positions)
+    if legality:
+        raise ReservationCalibrationError(
+            f"{arm_name.upper()} arm scoring policy is not a legal FPL lineup: {', '.join(legality)}"
+        )
+    if policy_ids - set(player_points) or policy_ids - set(player_minutes):
+        raise ReservationCalibrationError(
+            f"{arm_name.upper()} arm lacks official points or minutes for its full squad"
+        )
+
+    points = {player_id: float(player_points[player_id]) for player_id in policy_ids}
+    minutes = {player_id: float(player_minutes[player_id]) for player_id in policy_ids}
+    normal = ml.resolve_world(
+        policy, positions, minutes, points, require_player_ids=policy_ids,
+    )
+    weights = {str(player_id): 1.0 for player_id in normal.counted_ids}
+    armband_player: int | None = None
+    if minutes[policy.captain_id] > 0.0:
+        armband_player = policy.captain_id
+    elif minutes[policy.vice_captain_id] > 0.0:
+        armband_player = policy.vice_captain_id
+    if armband_player is not None:
+        weights[str(armband_player)] = weights.get(str(armband_player), 0.0) + 1.0
+
+    if action == cd.CHIP_ACTION_BB and arm_name == "play":
+        weights = {
+            str(player_id): 1.0
+            for player_id in policy_ids
+            if minutes[player_id] > 0.0
+        }
+        if armband_player is not None:
+            weights[str(armband_player)] += 1.0
+    elif action == cd.CHIP_ACTION_TC and arm_name == "play" and armband_player is not None:
+        # The normal arm already has the standard extra captain copy; TC adds
+        # one more copy to the same captain/vice selected by appearance.
+        weights[str(armband_player)] += 1.0
+    return dict(sorted(weights.items(), key=lambda item: int(item[0])))
+
+
 def _verify_outcome_record(
     outcome_record: Mapping[str, Any],
     *,
@@ -123,6 +221,8 @@ def _verify_outcome_record(
             raise ReservationCalibrationError(f"retained outcome record is not bound to source {name}")
     if outcome_record.get("label_definition_version") != OUTCOME_LABEL_DEFINITION:
         raise ReservationCalibrationError("retained outcome record uses an unsupported paired-label definition")
+    if outcome_record.get("scoring_rule_version") != OUTCOME_SCORING_RULE_VERSION:
+        raise ReservationCalibrationError("retained outcome record uses an unsupported canonical scoring rule")
 
     source = outcome_record.get("source")
     captures = source.get("captures") if isinstance(source, Mapping) else None
@@ -137,6 +237,7 @@ def _verify_outcome_record(
     if realization_event <= int(row.get("planning_event") or -1):
         raise ReservationCalibrationError("paired outcome is not from a future event")
     player_points: dict[str, float] = {}
+    player_minutes: dict[str, float] = {}
     capture_ids: set[str] = set()
     capture_times: list[datetime] = []
     for capture in captures:
@@ -161,6 +262,10 @@ def _verify_outcome_record(
         if player_id in player_points:
             raise ReservationCalibrationError("outcome capture set repeats a player in the realization event")
         player_points[player_id] = _number(capture.get("total_points"), name="captured player total_points")
+        minutes = _number(capture.get("minutes"), name="captured player minutes")
+        if minutes < 0.0:
+            raise ReservationCalibrationError("captured player minutes cannot be negative")
+        player_minutes[player_id] = minutes
         final_at = _utc(capture.get("official_final_at"), name="outcome official_final_at")
         captured_at = _utc(capture.get("captured_at"), name="outcome captured_at")
         if captured_at < final_at:
@@ -200,17 +305,42 @@ def _verify_outcome_record(
             or dict(result_weights) != dict(weights)
         ):
             raise ReservationCalibrationError(f"{arm_name.upper()} score is not bound to its retained arm scorer")
-        score = 0.0
-        scored_player_ids: set[str] = set()
+        if (
+            result.get("lineup") != arm.get("lineup")
+            or result.get("player_positions") != arm.get("player_positions")
+        ):
+            raise ReservationCalibrationError(
+                f"{arm_name.upper()} outcome scorer differs from its retained lineup or source positions"
+            )
+        expected_weights = _canonical_scoring_weights(
+            action=str(row.get("action") or ""),
+            arm_name=arm_name,
+            arm=arm,
+            player_points={int(key): value for key, value in player_points.items()},
+            player_minutes={int(key): value for key, value in player_minutes.items()},
+        )
+        normalized_weights: dict[str, float] = {}
         for raw_player_id, raw_weight in weights.items():
-            player_id = str(int(raw_player_id))
-            if int(player_id) <= 0 or player_id in scored_player_ids:
-                raise ReservationCalibrationError(f"{arm_name.upper()} scorer has an invalid or duplicate player id")
-            scored_player_ids.add(player_id)
-            weight = _number(raw_weight, name=f"{arm_name} scoring weight")
-            if weight < 0 or player_id not in player_points:
-                raise ReservationCalibrationError(f"{arm_name.upper()} score lacks a captured player result")
-            score += player_points[player_id] * weight
+            try:
+                player_id = str(int(raw_player_id))
+            except (TypeError, ValueError) as failure:
+                raise ReservationCalibrationError(
+                    f"{arm_name.upper()} scorer has an invalid player id"
+                ) from failure
+            if player_id in normalized_weights:
+                raise ReservationCalibrationError(
+                    f"{arm_name.upper()} scorer has a duplicate player id"
+                )
+            normalized_weights[player_id] = _number(raw_weight, name=f"{arm_name} scoring weight")
+        if normalized_weights != expected_weights:
+            raise ReservationCalibrationError(
+                f"{arm_name.upper()} scoring weights do not reproduce from the canonical "
+                f"{row.get('action')} scorer"
+            )
+        score = sum(
+            player_points[player_id] * weight
+            for player_id, weight in expected_weights.items()
+        )
         declared_score = _number(result.get("observed_points"), name=f"{arm_name} observed points")
         if declared_score != score:
             raise ReservationCalibrationError(f"{arm_name.upper()} score does not reproduce from official captures")
@@ -222,7 +352,10 @@ def _verify_outcome_record(
 
 
 def verify_outcome_record_capture_sources(
-    conn: sqlite3.Connection, outcome_record: Mapping[str, Any]
+    conn: sqlite3.Connection,
+    outcome_record: Mapping[str, Any],
+    *,
+    source_position_resolver: Callable[[Mapping[str, Any]], Mapping[str, str]] | None = None,
 ) -> None:
     """Resolve retained outcome captures against the append-only official ledger.
 
@@ -304,10 +437,40 @@ def verify_outcome_record_capture_sources(
             "source_name": str(stored["source_name"]),
             "source_identity": stored.get("source_identity"),
             "total_points": payload.get("total_points"),
+            "minutes": payload.get("minutes"),
         }
         if any(capture.get(name) != value for name, value in expected.items()):
             raise ReservationCalibrationError(
                 "outcome capture manifest differs from the retained official capture"
+            )
+
+    paired_results = outcome_record.get("paired_results")
+    if not isinstance(paired_results, Mapping):
+        raise ReservationCalibrationError("outcome record has no paired PLAY/SAVE results")
+    play_result, save_result = paired_results.get("play"), paired_results.get("save")
+    if not isinstance(play_result, Mapping) or not isinstance(save_result, Mapping):
+        raise ReservationCalibrationError("outcome record has malformed paired PLAY/SAVE results")
+    play_positions = play_result.get("player_positions")
+    save_positions = save_result.get("player_positions")
+    if not isinstance(play_positions, Mapping) or dict(play_positions) != dict(save_positions or {}):
+        raise ReservationCalibrationError("paired outcome scoring does not use one retained source position map")
+    if source_position_resolver is not None:
+        try:
+            expected_positions = source_position_resolver(outcome_record)
+        except Exception as failure:
+            raise ReservationCalibrationError(
+                f"source generation positions could not be verified: {failure}"
+            ) from failure
+        if not isinstance(expected_positions, Mapping):
+            raise ReservationCalibrationError("source generation position resolver returned no mapping")
+        try:
+            normalized_expected = {str(int(key)): str(value) for key, value in expected_positions.items()}
+            normalized_play = {str(int(key)): str(value) for key, value in play_positions.items()}
+        except (TypeError, ValueError) as failure:
+            raise ReservationCalibrationError("paired outcome contains an invalid source position map") from failure
+        if normalized_play != normalized_expected:
+            raise ReservationCalibrationError(
+                "paired outcome source positions differ from the pinned generation snapshot"
             )
 
 
@@ -378,7 +541,9 @@ def _verify_pair(
     play, save = pair.get("play"), pair.get("save")
     if not isinstance(play, Mapping) or not isinstance(save, Mapping):
         raise ReservationCalibrationError("causal evidence must retain both PLAY and SAVE arms")
-    paired_fields = ("scenario_identity", "world_identity", "proposed_squad_ids", "lineup")
+    paired_fields = (
+        "scenario_identity", "world_identity", "proposed_squad_ids", "lineup", "player_positions",
+    )
     for name in paired_fields:
         if play.get(name) != save.get(name) or play.get(name) in (None, "", [], {}):
             raise ReservationCalibrationError(f"PLAY and SAVE do not share the same {name}")
