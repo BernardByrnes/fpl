@@ -60,23 +60,25 @@ def _pinned_generation_position_resolver(conn: sqlite3.Connection):
                 for row in rows
                 if row.get("position_short_name")
             }
-            paired = outcome_record.get("paired_results") or {}
-            play = paired.get("play") if isinstance(paired, dict) else None
-            lineup = play.get("lineup") if isinstance(play, dict) else None
-            if not isinstance(lineup, dict):
-                raise ValueError("outcome record has no canonical source lineup")
-            player_ids = {
-                *(int(value) for value in lineup.get("starter_ids", ())),
-                int(lineup["bench_gk_id"]),
-                *(int(value) for value in lineup.get("bench_outfield_order", ())),
-            }
-            if len(player_ids) != 15 or any(str(player_id) not in all_positions for player_id in player_ids):
-                raise ValueError("pinned generation lacks positions for the complete 15-player policy")
-            cache[generation_id] = {
-                str(player_id): all_positions[str(player_id)] for player_id in sorted(player_ids)
-            }
+            cache[generation_id] = all_positions
             cache_identity[generation_id] = wanted_identity
-        return dict(cache[generation_id])
+
+        paired = outcome_record.get("paired_results") or {}
+        play = paired.get("play") if isinstance(paired, dict) else None
+        lineup = play.get("lineup") if isinstance(play, dict) else None
+        if not isinstance(lineup, dict):
+            raise ValueError("outcome record has no canonical source lineup")
+        player_ids = {
+            *(int(value) for value in lineup.get("starter_ids", ())),
+            int(lineup["bench_gk_id"]),
+            *(int(value) for value in lineup.get("bench_outfield_order", ())),
+        }
+        generation_positions = cache[generation_id]
+        if len(player_ids) != 15 or any(str(player_id) not in generation_positions for player_id in player_ids):
+            raise ValueError("pinned generation lacks positions for the complete 15-player policy")
+        return {
+            str(player_id): generation_positions[str(player_id)] for player_id in sorted(player_ids)
+        }
 
     return resolve
 

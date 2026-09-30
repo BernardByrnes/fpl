@@ -565,11 +565,18 @@ def test_production_position_resolver_reads_the_bound_generation_snapshot(monkey
         run_chip_assessment.repositories, "player_candidates",
         lambda _conn: [
             {"id": int(player_id), "position_short_name": position}
-            for player_id, position in position_map.items()
+            for player_id, position in {**position_map, "16": "DEF"}.items()
         ],
     )
     resolver = run_chip_assessment._pinned_generation_position_resolver(sqlite3.connect(":memory:"))
     assert resolver(outcome) == position_map
+
+    second_lineup_outcome = json.loads(json.dumps(outcome))
+    second_lineup_outcome["paired_results"]["play"]["lineup"]["bench_outfield_order"][0] = 16
+    second_positions = dict(position_map)
+    second_positions.pop("6")
+    second_positions["16"] = "DEF"
+    assert resolver(second_lineup_outcome) == second_positions
 
     mismatched = dict(outcome)
     mismatched["data_snapshot_sha256"] = _sha({"different snapshot": 1})
