@@ -206,14 +206,41 @@ def _verify_pair_matches_selected_forecast(
     forecast: Mapping[str, Any],
     pair: Mapping[str, Any],
 ) -> None:
-    """Bind BB/TC causal arms to the evaluator policies frozen at the origin."""
+    """Bind causal arms to the selected event and any frozen origin policies."""
 
-    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
-        return
     try:
         selected_event = int(forecast["selected_event"])
     except (KeyError, TypeError, ValueError) as failure:
         raise ReservationCalibrationError("raw reservation forecast has no selected event") from failure
+    if set(pair) != {"play", "save"}:
+        raise ReservationCalibrationError("causal evidence does not retain exactly one PLAY/SAVE pair")
+    for role in ("play", "save"):
+        retained_arm = pair.get(role)
+        payload = retained_arm.get("artifact_payload") if isinstance(retained_arm, Mapping) else None
+        if not isinstance(payload, Mapping):
+            raise ReservationCalibrationError(f"retained {role.upper()} policy is malformed")
+        expected_role = role.upper()
+        for location, artifact in (("manifest", retained_arm), ("artifact", payload)):
+            declared_event = artifact.get("event")
+            if (
+                isinstance(declared_event, bool)
+                or not isinstance(declared_event, int)
+                or declared_event != selected_event
+            ):
+                raise ReservationCalibrationError(
+                    f"retained {role.upper()} {location} event differs from the selected forecast opportunity"
+                )
+            if artifact.get("action") != action:
+                raise ReservationCalibrationError(
+                    f"retained {role.upper()} {location} action differs from the selected forecast opportunity"
+                )
+            if artifact.get("counterfactual_role") != expected_role:
+                raise ReservationCalibrationError(
+                    f"retained {role.upper()} {location} role differs from the selected forecast opportunity"
+                )
+
+    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        return
     opportunities = forecast.get("opportunities")
     if not isinstance(opportunities, list):
         raise ReservationCalibrationError("raw reservation forecast has no selected event manifest")
@@ -236,8 +263,6 @@ def _verify_pair_matches_selected_forecast(
         raise ReservationCalibrationError(
             "selected forecast opportunity omits its frozen PLAY/SAVE policies"
         )
-    if set(pair) != {"play", "save"}:
-        raise ReservationCalibrationError("causal evidence does not retain exactly one PLAY/SAVE pair")
     for role in ("play", "save"):
         retained_arm = pair.get(role)
         expected_arm = expected_arms.get(role)

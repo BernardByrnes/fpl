@@ -151,10 +151,12 @@ content-addressed artifacts. Focused tests exercise finalization from official
 ledger captures, different FH/WC arm squads, and refusal of missing or nonfinal
 captures. The origin writer freezes the paired policies belonging to the
 forecast's selected future event. Both maturation and later calibration
-validation bind BB/TC causal arms back to those exact selected forecast
-policies. FH restoration evidence must be complete, typed, bound to the SAVE
-arm's permanent squad/bank/acquisition basis/event-start FT, and restore in H2
-after the actual PLAY event. Regressions cover TC arm substitution during
+validation bind every PLAY and SAVE arm's declared event, action and role to
+that selected forecast event; BB/TC arms are also bound to the exact selected
+forecast policies. FH restoration evidence must be complete, typed, bound to
+the SAVE arm's permanent squad/bank/acquisition basis/event-start FT, and
+restore in H2 after the actual PLAY event. Regressions cover FH event
+substitution during maturation and validation, TC arm substitution during
 maturation and validation, incomplete FH restoration, and production position
 resolution across the union of different FH PLAY/SAVE squads. These checks
 reject a substituted TC captain policy and incomplete or self-asserted Free

@@ -637,6 +637,51 @@ def test_fh_reservation_scorer_rejects_incomplete_restoration_evidence():
         calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
 
+@pytest.mark.parametrize("validation_path", ["maturation", "validation"])
+def test_fh_arms_must_match_selected_forecast_event_even_when_rehashed(validation_path, tmp_path):
+    row, evidence = _causal_row(0, action=cd.CHIP_ACTION_FH)
+    retained = {}
+    _store_causal_evidence(retained, row, evidence)
+
+    play = evidence["counterfactual_pair"]["play"]
+    play["event"] = 99
+    play["action_semantics"]["restore_at_h2"]["restore_event"] = 100
+    payload = dict(play["artifact_payload"])
+    payload["event"] = 99
+    payload["action_semantics"] = play["action_semantics"]
+    play["artifact_payload"] = payload
+    play["artifact_sha256"] = _sha(payload)
+    retained[play["artifact_ref"]] = payload
+
+    outcome = evidence["label"]["outcome_record"]
+    outcome["play_artifact_sha256"] = play["artifact_sha256"]
+    evidence["label"]["outcome_record_sha256"] = _sha(outcome)
+    retained[evidence["label"]["outcome_record_ref"]] = outcome
+    row["causal_evidence_sha256"] = _sha(evidence)
+
+    expected_error = "PLAY manifest event differs from the selected forecast opportunity"
+    if validation_path == "maturation":
+        evidence.pop("label")
+        conn = _official_outcome_connection(2)
+        try:
+            with pytest.raises(calibration.ReservationCalibrationError, match=expected_error):
+                calibration.finalize_causal_observation(
+                    conn,
+                    evidence,
+                    realization_event=2,
+                    evidence_root=tmp_path,
+                    evidence_verifier=retained.__getitem__,
+                )
+            assert list(tmp_path.iterdir()) == []
+        finally:
+            conn.close()
+    else:
+        with pytest.raises(calibration.ReservationCalibrationError, match=expected_error):
+            calibration.validate_observation(
+                row, evidence_verifier=retained.__getitem__,
+            )
+
+
 def test_tc_calibration_rejects_causal_arms_substituted_for_selected_forecast_policies():
     row, evidence = _causal_row(0, action=cd.CHIP_ACTION_TC)
     for arm in evidence["counterfactual_pair"].values():
