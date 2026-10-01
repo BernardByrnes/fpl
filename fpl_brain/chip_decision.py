@@ -36,7 +36,8 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from .season_rules import CANONICAL_CHIP_NAMES, normalise_chip_name
 
-CHIP_DECISION_VERSION = "chip_decision_v1.0.0"
+CHIP_DECISION_VERSION = "chip_decision_v2.0.0"
+CHIP_COMPARISON_BASIS = "EXPECTED_POINTS_PER_EVENT_WEIGHT_UNIT_V1"
 
 # --- action space ----------------------------------------------------------
 
@@ -514,6 +515,40 @@ def canonical_chip_horizon(planning_event: int, *, last_event: int | None = None
     )
 
 
+def _comparison_value(evaluation: ChipEvaluation) -> float | None:
+    """Normalize action value to the shared expected-points-per-event unit.
+
+    BB/TC forecast the one event in which their scoring effect applies. FH
+    compares its canonical four-event arms. WC compares the separately bound
+    6-10 event tapered objective, normalized by its declared total weight.
+    Missing WC horizon weights are a refusal to compare, not a guessed scale.
+    """
+
+    uplift = evaluation.mean_uplift
+    if uplift is None:
+        return None
+    if evaluation.action in {CHIP_ACTION_BB, CHIP_ACTION_TC}:
+        return float(uplift)
+    if evaluation.action == CHIP_ACTION_FH:
+        events = tuple(evaluation.evidence.get("horizon_events") or ())
+        if len(events) != CHIP_HORIZON_LENGTH:
+            return None
+        return float(uplift) / float(CHIP_HORIZON_LENGTH)
+    if evaluation.action == CHIP_ACTION_WC:
+        horizon = evaluation.evidence.get("wildcard_horizon") or {}
+        weights = horizon.get("weights") if isinstance(horizon, Mapping) else None
+        if not isinstance(weights, Sequence) or isinstance(weights, (str, bytes)) or not weights:
+            return None
+        try:
+            denominator = sum(float(value) for value in weights)
+        except (TypeError, ValueError):
+            return None
+        if denominator <= 0.0:
+            return None
+        return float(uplift) / denominator
+    return None
+
+
 @dataclass(frozen=True)
 class ChipHorizonBinding:
     """The exact certified four-event identity a chip decision is authorised for.
@@ -904,98 +939,198 @@ def decide_chip_action(
             evaluations_considered=considered,
         )
 
-    # Deterministic selection: net uplift first, then the canonical action order.
-    def rank(evaluation: ChipEvaluation) -> tuple[float, int]:
-        uplift = evaluation.mean_uplift
-        value = float("-inf") if uplift is None else float(uplift)
-        return (-value, CHIP_ACTIONS.index(evaluation.action))
-
-    chosen = sorted(eligible, key=rank)[0]
-
-    chosen_definitions = availability.get(chosen.action, {}).get("definitions") or []
-    active_definition, window_problem = _active_definition(chosen_definitions)
-    if window_problem is not None:
-        # The action was admitted by some row, yet no single row establishes a
-        # live window: the horizon the reservation would be valued against is
-        # unknown, so refuse rather than guess one.
-        n_active = sum(1 for row in chosen_definitions if row.get("eligible"))
+    # A malformed/overlapping live window means the action's expiry is not
+    # identifiable. Do not estimate its reservation or rank the remaining
+    # actions against a knowingly incomplete candidate set.
+    ambiguous_windows = sorted({
+        problem
+        for evaluation in eligible
+        for _active, problem in (
+            _active_definition(availability.get(evaluation.action, {}).get("definitions") or []),
+        )
+        if problem is not None
+    })
+    if ambiguous_windows:
         return refuse(
-            window_problem,
-            f"{chosen.action} is eligible but its active window is not uniquely "
-            f"identifiable ({n_active} active definition rows of {len(chosen_definitions)})",
+            ambiguous_windows[0],
+            "an eligible chip window is not uniquely identifiable; refusing to rank an incomplete action set",
+            extra=ambiguous_windows[1:],
         )
-    # The reservation provider receives the squad plus, when the evaluator
-    # supplies one, its AUTHORITATIVE post-SAVE state (post-route squad, bank, FT,
-    # chip availability).  This is how a chip whose decision turns on a projected
-    # future state hands that state onward WITHOUT the evaluator ever calling the
-    # reservation itself -- the arbiter remains the single seam.  Route-bound
-    # BB/TC evaluations carry the verified post-H1 normal route state; standalone
-    # evaluator results without route context continue to use the input squad.
-    reservation_state: dict[str, Any] = {"squad_ids": list(squad_ids)}
-    supplied_state = (chosen.evidence.get("save_policy") or {}).get("post_save_state_for_reservation")
-    if isinstance(supplied_state, Mapping):
-        reservation_state.update(supplied_state)
-    # A chip evaluator may carry a separately produced, point-in-time raw
-    # reservation forecast. Pass it through to a verified calibration provider
-    # when present; never derive or default one in the arbiter.
-    forecast = dict(reservation_forecasts or {}).get(chosen.action)
-    if isinstance(forecast, Mapping):
-        reservation_state["raw_reservation_forecast"] = forecast
-        reservation_state["raw_reservation_value"] = forecast.get("raw_value")
-    else:
-        # Legacy custom ReservationValue implementations can continue to consume
-        # their own candidate metric; the verified production calibration
-        # provider independently requires a content-addressed forecast artifact.
-        raw_reservation = chosen.candidate_metrics.get("raw_reservation_value")
-        if raw_reservation is not None:
-            reservation_state["raw_reservation_value"] = raw_reservation
-    estimate = (reservation or UncalibratedReservation()).estimate(
-        action=chosen.action,
-        planning_event=planning_event,
-        expiry_event=active_definition.get("window_stop_event"),
-        state=reservation_state,
-    )
-    uplift = chosen.mean_uplift
-    net = None if (uplift is None or estimate.value is None) else float(uplift) - float(estimate.value)
-    lower = chosen.uncertainty.get("paired_interval_low")
-    material = net is not None and float(net) > float(materiality)
 
-    if uplift is None:
-        status = STATUS_INSUFFICIENT_EVIDENCE
-        verdicts = [DIAG_CHIP_UPLIFT_NOT_MATERIAL]
-    elif float(uplift) <= float(materiality):
-        # The play arm is not even better in H1, and saving keeps the chip.
+    # Compare every applicable eligible candidate AFTER its reservation. The
+    # shared unit is expected points per declared event-weight unit. An unknown
+    # reservation or blocked evaluator is not zero and therefore makes the
+    # cross-action ranking incomplete.
+    comparisons: dict[str, dict[str, Any]] = {}
+    ranked: list[tuple[ChipEvaluation, ReservationEstimate, float, Mapping[str, Any]]] = []
+    estimates_by_action: dict[str, ReservationEstimate] = {}
+    net_by_action: dict[str, float | None] = {}
+    unranked: list[str] = []
+    readiness_blocked = False
+    forecast_by_action = dict(reservation_forecasts or {})
+    reservation_provider = reservation or UncalibratedReservation()
+
+    for evaluation in eligible:
+        action = evaluation.action
+        comparison_value = _comparison_value(evaluation)
+        definitions = availability.get(action, {}).get("definitions") or []
+        active_definition, window_problem = _active_definition(definitions)
+        if window_problem is not None:
+            comparisons[action] = {
+                "status": "UNRANKABLE_WINDOW",
+                "comparison_value": comparison_value,
+                "reason_code": window_problem,
+            }
+            unranked.append(action)
+            continue
+
+        # The reservation provider receives the exact SAVE state supplied by
+        # the evaluator, with no player/squad defaults beyond the input manager
+        # identity. Forecasts remain independently content-verified upstream.
+        reservation_state: dict[str, Any] = {"squad_ids": list(squad_ids)}
+        supplied_state = (evaluation.evidence.get("save_policy") or {}).get(
+            "post_save_state_for_reservation"
+        )
+        if isinstance(supplied_state, Mapping):
+            reservation_state.update(supplied_state)
+        forecast = forecast_by_action.get(action)
+        if isinstance(forecast, Mapping):
+            reservation_state["raw_reservation_forecast"] = forecast
+            reservation_state["raw_reservation_value"] = forecast.get("raw_value")
+            declared_units = forecast.get("value_units")
+            if declared_units is not None and declared_units != CHIP_COMPARISON_BASIS:
+                comparisons[action] = {
+                    "status": "UNRANKABLE_VALUE_UNITS",
+                    "comparison_value": comparison_value,
+                    "reason_code": DIAG_CHIP_EVALUATION_CONTEXT_MISMATCH,
+                }
+                unranked.append(action)
+                continue
+        else:
+            # Custom providers may still use their own candidate metric. The
+            # verified production calibration provider requires a retained
+            # content-addressed forecast and will return UNKNOWN without it.
+            raw_reservation = evaluation.candidate_metrics.get("raw_reservation_value")
+            if raw_reservation is not None:
+                reservation_state["raw_reservation_value"] = raw_reservation
+        estimate = reservation_provider.estimate(
+            action=action,
+            planning_event=planning_event,
+            expiry_event=active_definition.get("window_stop_event"),
+            state=reservation_state,
+        )
+        net = (
+            None if comparison_value is None or estimate.value is None
+            else float(comparison_value) - float(estimate.value)
+        )
+        estimates_by_action[action] = estimate
+        net_by_action[action] = net
+        blocker: str | None = None
+        if comparison_value is None:
+            blocker = "CHIP_COMPARISON_VALUE_UNAVAILABLE"
+            readiness_blocked = True
+        elif estimate.value is None or estimate.calibration_status != CALIBRATION_CALIBRATED:
+            blocker = DIAG_CHIP_RESERVATION_UNCALIBRATED
+        elif not evaluation.execution_permitted:
+            blocker = DIAG_CHIP_EVALUATOR_UNCALIBRATED
+            readiness_blocked = True
+        elif evaluation.calibration_status not in {
+            CALIBRATION_UNCALIBRATED, CALIBRATION_UNCALIBRATED_PROVISIONAL, CALIBRATION_CALIBRATED,
+        }:
+            blocker = DIAG_CHIP_EVALUATOR_UNCALIBRATED
+            readiness_blocked = True
+
+        comparisons[action] = {
+            "status": "RANKABLE" if blocker is None else "UNRANKABLE",
+            "raw_evaluator_uplift": evaluation.mean_uplift,
+            "comparison_value": comparison_value,
+            "reservation_value": estimate.value,
+            "reservation_calibration_status": estimate.calibration_status,
+            "net_value": net,
+            "execution_permitted": bool(evaluation.execution_permitted),
+            "reason_code": blocker,
+            "forecast_sha256": forecast.get("artifact_sha256") if isinstance(forecast, Mapping) else None,
+        }
+        if blocker is None and net is not None:
+            ranked.append((evaluation, estimate, net, active_definition))
+        else:
+            unranked.append(action)
+
+    # An eligible action with no evaluator is unresolved. Do not make the
+    # remaining known candidates look like a complete ranking.
+    missing_eligible = sorted(
+        action for action, row in availability.items()
+        if bool(row.get("eligible")) and action not in supplied
+    )
+    for action in missing_eligible:
+        comparisons[action] = {
+            "status": "UNRANKABLE_EVALUATOR_MISSING",
+            "comparison_value": None,
+            "reservation_value": None,
+            "net_value": None,
+            "reason_code": f"{DIAG_CHIP_EVALUATOR_NOT_IMPLEMENTED}:{action}",
+        }
+        unranked.append(action)
+        readiness_blocked = True
+
+    # Net expected value is the primary ordering; canonical action order breaks
+    # exact ties. Reservation is evaluated once for every rankable candidate and
+    # is never subtracted again after this point.
+    ranked.sort(key=lambda row: (-row[2], CHIP_ACTIONS.index(row[0].action)))
+    if ranked:
+        chosen, chosen_estimate, net, _chosen_window = ranked[0]
+    else:
+        # Keep the best available point estimate visible for review, but never
+        # call an unknown reservation/readiness result a zero-cost chip.
+        chosen = sorted(
+            eligible,
+            key=lambda item: (
+                float("-inf") if _comparison_value(item) is None else -float(_comparison_value(item)),
+                CHIP_ACTIONS.index(item.action),
+            ),
+        )[0]
+        chosen_estimate = estimates_by_action.get(chosen.action) or ReservationEstimate(
+            value=None,
+            calibration_status=CALIBRATION_UNCALIBRATED,
+            terminal_value=0.0,
+            weeks_to_expiry=None,
+        )
+        net = net_by_action.get(chosen.action)
+
+    no_positive_gross_uplift = bool(comparisons) and all(
+        row.get("comparison_value") is not None
+        and float(row["comparison_value"]) <= float(materiality)
+        for row in comparisons.values()
+    ) and not missing_eligible
+    if no_positive_gross_uplift:
+        # Reservation is an opportunity cost and cannot improve a non-positive
+        # gross chip uplift. This does not impute an unknown reservation as
+        # zero; the candidate comparison still reports it as UNKNOWN.
         status = STATUS_NO_CHIP
-        verdicts = [DIAG_CHIP_UPLIFT_NON_POSITIVE]
-    elif estimate.calibration_status != CALIBRATION_CALIBRATED or net is None:
-        # Positive evidence, but the future-opportunity term is unknown: the
-        # system must not endorse.  A materially positive interval asks for a
-        # recheck; one that still straddles zero asks for review.
-        status = (
-            STATUS_CHIP_REVIEW_REQUIRED
-            if (lower is None or float(lower) <= 0.0)
-            else STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
-        )
+        verdicts = [DIAG_CHIP_UPLIFT_NOT_MATERIAL]
+    elif unranked and readiness_blocked:
+        # A different eligible candidate may beat the visible best net value;
+        # report the comparison but hold the recommendation for review.
+        status = STATUS_CHIP_REVIEW_REQUIRED
         verdicts = [DIAG_CHIP_UPLIFT_POSITIVE, DIAG_CHIP_RESERVATION_UNCALIBRATED]
-    elif not chosen.execution_permitted:
-        # The evaluation's OWN value model is not fit to execute on, so a
-        # calibrated reservation is NOT sufficient: the system still must not
-        # endorse.  A positive interval asks for a recheck; a straddling one for
-        # review.  Keying on this dedicated field (default True) rather than on
-        # ``calibration_status`` is what leaves every pre-existing evaluator --
-        # notably Triple Captain -- with its exact established semantics.
-        status = (
-            STATUS_CHIP_REVIEW_REQUIRED
-            if (lower is None or float(lower) <= 0.0)
-            else STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
-        )
-        verdicts = [DIAG_CHIP_UPLIFT_POSITIVE, DIAG_CHIP_EVALUATOR_UNCALIBRATED]
-    elif material:
+    elif unranked:
+        status = STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
+        verdicts = [DIAG_CHIP_UPLIFT_POSITIVE, DIAG_CHIP_RESERVATION_UNCALIBRATED]
+    elif net is not None and float(net) > float(materiality):
         status = STATUS_PLAY_CHIP
         verdicts = [DIAG_CHIP_UPLIFT_POSITIVE]
     else:
         status = STATUS_NO_CHIP
         verdicts = [DIAG_CHIP_UPLIFT_NOT_MATERIAL]
+    chosen_comparison = _comparison_value(chosen)
+    lower = chosen.uncertainty.get("paired_interval_low")
+    if chosen_comparison is not None and chosen.mean_uplift is not None:
+        if chosen.action == CHIP_ACTION_FH:
+            lower = None if lower is None else float(lower) / CHIP_HORIZON_LENGTH
+        elif chosen.action == CHIP_ACTION_WC:
+            weights = (chosen.evidence.get("wildcard_horizon") or {}).get("weights") or ()
+            denom = sum(float(value) for value in weights) if weights else 0.0
+            lower = None if lower is None or denom <= 0.0 else float(lower) / denom
 
     return ChipDecision(
         recommended_action=(
@@ -1004,34 +1139,46 @@ def decide_chip_action(
         status=status,
         planning_event=planning_event,
         chip_availability=availability_rows,
-        calibration_status=estimate.calibration_status,
+        calibration_status=chosen_estimate.calibration_status,
         evidence={
             "certification_identity": certification_identity,
             "data_snapshot_sha256": data_snapshot_sha256,
             "horizon_events": list(events),
             "evaluator_version": chosen.evaluator_version,
+            "decision_policy_version": CHIP_DECISION_VERSION,
+            "comparison_basis": CHIP_COMPARISON_BASIS,
             **dict(chosen.evidence),
         },
-        reason_codes=tuple(sorted({*verdicts, *chosen.reason_codes, *reasons, *estimate.reason_codes})),
+        reason_codes=tuple(sorted({
+            *verdicts, *chosen.reason_codes, *reasons, *chosen_estimate.reason_codes,
+            *(f"UNRANKABLE_ELIGIBLE_ACTION:{action}" for action in unranked),
+            *(str(row["reason_code"]) for row in comparisons.values() if row.get("reason_code")),
+        })),
         uncertainty=dict(chosen.uncertainty),
         candidate_metrics={
             **dict(chosen.candidate_metrics),
             "selected_chip_action": chosen.action,
+            "decision_policy_version": CHIP_DECISION_VERSION,
+            "comparison_basis": CHIP_COMPARISON_BASIS,
+            "comparison_value": chosen_comparison,
+            "candidate_comparisons": comparisons,
             "raw_reservation_value": (
-                forecast.get("raw_value")
-                if isinstance(forecast, Mapping)
+                forecast_by_action.get(chosen.action, {}).get("raw_value")
+                if isinstance(forecast_by_action.get(chosen.action), Mapping)
                 else chosen.candidate_metrics.get("raw_reservation_value")
             ),
             "raw_reservation_forecast_sha256": (
-                forecast.get("artifact_sha256") if isinstance(forecast, Mapping) else None
+                forecast_by_action.get(chosen.action, {}).get("artifact_sha256")
+                if isinstance(forecast_by_action.get(chosen.action), Mapping) else None
             ),
             "raw_reservation_forecast_coverage_status": (
-                forecast.get("coverage_status") if isinstance(forecast, Mapping) else None
+                forecast_by_action.get(chosen.action, {}).get("coverage_status")
+                if isinstance(forecast_by_action.get(chosen.action), Mapping) else None
             ),
-            "reservation_value": estimate.value,
-            "reservation_terminal_value": estimate.terminal_value,
-            "reservation_weeks_to_expiry": estimate.weeks_to_expiry,
-            "reservation_conditional_on": list(estimate.conditional_on),
+            "reservation_value": chosen_estimate.value,
+            "reservation_terminal_value": chosen_estimate.terminal_value,
+            "reservation_weeks_to_expiry": chosen_estimate.weeks_to_expiry,
+            "reservation_conditional_on": list(chosen_estimate.conditional_on),
             "net_of_reservation": net,
             "materiality": float(materiality),
             "eligible_actions": sorted(evaluation.action for evaluation in eligible),

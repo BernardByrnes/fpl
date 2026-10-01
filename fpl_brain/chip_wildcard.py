@@ -626,6 +626,7 @@ class WildcardSaveRouteEvent:
     mean_net_core: float
     hit_points: int = 0
     actions: tuple = ()
+    policy: Mapping[str, Any] | None = None
 
     def problems(self) -> list[str]:
         found: list[str] = []
@@ -650,6 +651,7 @@ class WildcardSaveRouteEvent:
             "free_transfers": int(self.free_transfers),
             "mean_net_core": round(float(self.mean_net_core), 6),
             "hit_points": int(self.hit_points),
+            "policy": None if self.policy is None else dict(self.policy),
         }
 
 
@@ -1293,7 +1295,13 @@ def _event_policy(
     )
 
 
-def _event_value(request: WildcardRequest, squad: Sequence[int], event: int) -> float:
+def _event_value(
+    request: WildcardRequest,
+    squad: Sequence[int],
+    event: int,
+    *,
+    policy: manager_lineup.ManagerPolicy | None = None,
+) -> float:
     """Expected event points for a squad, resolved by the ACCEPTED engine.
 
     For every supplied world the legal lineup, captain fallback and outfield /
@@ -1310,7 +1318,7 @@ def _event_value(request: WildcardRequest, squad: Sequence[int], event: int) -> 
             f"{WC_WORLD_INPUTS_MISSING}: no world inputs for event {event}",
             reasons=(WC_WORLD_INPUTS_MISSING,),
         )
-    policy = _event_policy(request, squad, event)
+    policy = policy or _event_policy(request, squad, event)
     if policy is None:
         # A squad that cannot field a legal XI/bench has no event value; it is
         # reported as zero rather than being silently scored on a partial lineup.
@@ -1438,6 +1446,7 @@ class WildcardSquadValue:
     repairability: Mapping[str, Any]
     event_points: Mapping[int, float]
     objective: float
+    event_policies: Mapping[int, manager_lineup.ManagerPolicy] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1452,6 +1461,20 @@ class WildcardSquadValue:
             "cost_tenths": int(self.cost_tenths),
             "repairability": dict(self.repairability),
             "objective": round(self.objective, 6),
+            "event_points": {
+                str(int(event)): round(float(value), 6)
+                for event, value in sorted(self.event_points.items())
+            },
+            "event_policies": {
+                str(int(event)): {
+                    "starter_ids": list(policy.starter_ids),
+                    "bench_gk_id": int(policy.bench_gk_id),
+                    "bench_outfield_order": list(policy.bench_outfield_order),
+                    "captain_id": int(policy.captain_id),
+                    "vice_captain_id": int(policy.vice_captain_id),
+                }
+                for event, policy in sorted(self.event_policies.items())
+            },
         }
 
 
@@ -1461,11 +1484,15 @@ def evaluate_squad(request: WildcardRequest, squad: Sequence[int]) -> WildcardSq
     horizon = request.horizon
     available, cost, bank_after = _budget_and_cost(request, squad)
     event_points: dict[int, float] = {}
+    event_policies: dict[int, manager_lineup.ManagerPolicy] = {}
     horizon_points = 0.0
     near = 0.0
     medium = 0.0
     for index, event in enumerate(horizon.events):
-        value = _event_value(request, squad, event)
+        policy = _event_policy(request, squad, event)
+        if policy is not None:
+            event_policies[int(event)] = policy
+        value = _event_value(request, squad, event, policy=policy)
         event_points[event] = value
         weighted = horizon.weight_for(event) * value
         horizon_points += weighted
@@ -1497,6 +1524,7 @@ def evaluate_squad(request: WildcardRequest, squad: Sequence[int]) -> WildcardSq
         repairability=repair,
         event_points=event_points,
         objective=objective,
+        event_policies=event_policies,
     )
 
 
@@ -1860,6 +1888,7 @@ def evaluate_wildcard(request: WildcardRequest):
         # is what keeps a calibrated reservation from making PLAY_WC reachable.
         calibration_status=cd.CALIBRATION_UNCALIBRATED,
         execution_permitted=False,
+        data_snapshot_bound=True,
         evidence={
             "certification_identity": request.certification_identity,
             "data_snapshot_sha256": request.data_snapshot_sha256,

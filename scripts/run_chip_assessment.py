@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fpl_brain import chip_assessment, chip_assessment_store, chip_decision
 from fpl_brain import chip_reservation_calibration
+from fpl_brain import chip_evaluator_readiness
 from fpl_brain import generation_store, repositories
-from fpl_brain.season_rules import SeasonRules
 
 
 def _pinned_generation_position_resolver(conn: sqlite3.Connection):
@@ -156,6 +156,36 @@ def _load_reservation_forecast_inputs(
     return forecasts, verifier
 
 
+def _load_evaluator_readiness_inputs(
+    readiness_root: Path,
+    evidence_root: Path,
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, dict], Any]:
+    """Load one action-specific readiness record and its verified evidence reader."""
+
+    root = readiness_root.resolve()
+    verifier = _calibration_evidence_loader(evidence_root, conn)
+    artifacts: dict[str, dict] = {}
+    for action in (
+        chip_decision.CHIP_ACTION_BB,
+        chip_decision.CHIP_ACTION_FH,
+        chip_decision.CHIP_ACTION_WC,
+    ):
+        path = root / f"{action}.json"
+        if not path.is_file():
+            continue
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("evaluator readiness path escapes its configured root")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"evaluator readiness artifact must be a JSON object: {path}")
+        chip_evaluator_readiness.verify_retained_readiness_integrity(raw)
+        if raw.get("action") != action:
+            raise ValueError(f"evaluator readiness artifact action differs from its filename: {path}")
+        artifacts[action] = raw
+    return artifacts, verifier
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path, help="existing runtime database (read only)")
@@ -176,6 +206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="root directory for the calibration's retained causal evidence artifacts")
     parser.add_argument("--reservation-forecast-dir", type=Path,
                         help="directory with content-addressed opportunity inputs and optional BB/TC/FH/WC forecast JSON files")
+    parser.add_argument("--evaluator-readiness-dir", type=Path,
+                        help="directory with action-specific BB.json, FH.json and WC.json readiness artifacts")
+    parser.add_argument("--evaluator-readiness-evidence-dir", type=Path,
+                        help="root for retained causal observations cited by readiness artifacts")
     args = parser.parse_args(argv)
 
     if not args.db.is_file():
@@ -189,6 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         calibration_evidence_verifier = None
         reservation_forecasts = {}
         reservation_forecast_evidence_verifier = None
+        evaluator_readiness_artifacts = {}
+        evaluator_readiness_evidence_verifier = None
         if args.reservation_calibration is not None:
             if args.calibration_evidence_dir is None or not args.calibration_evidence_dir.is_dir():
                 parser.error("--reservation-calibration requires an existing --calibration-evidence-dir")
@@ -206,12 +242,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             reservation_forecasts, reservation_forecast_evidence_verifier = (
                 _load_reservation_forecast_inputs(args.reservation_forecast_dir, conn)
             )
+        if args.evaluator_readiness_dir is not None:
+            if not args.evaluator_readiness_dir.is_dir():
+                parser.error("--evaluator-readiness-dir must be an existing directory")
+            if (
+                args.evaluator_readiness_evidence_dir is None
+                or not args.evaluator_readiness_evidence_dir.is_dir()
+            ):
+                parser.error(
+                    "--evaluator-readiness-dir requires an existing --evaluator-readiness-evidence-dir"
+                )
+            evaluator_readiness_artifacts, evaluator_readiness_evidence_verifier = (
+                _load_evaluator_readiness_inputs(
+                    args.evaluator_readiness_dir,
+                    args.evaluator_readiness_evidence_dir,
+                    conn,
+                )
+            )
         record = chip_assessment.run_production_chip_assessment(
             conn,
             decision_id=str(args.decision_id),
             entry_id=int(args.entry_id),
             route_id=str(args.route_id),
-            rules=SeasonRules(season=str(args.season)),
+            rules=None,
+            season=str(args.season),
             certification_path=args.certification,
             wildcard_value_generation_id=args.wildcard_value_generation_id,
             cache_dir=None if args.cache_dir is None else str(args.cache_dir),
@@ -219,6 +273,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             reservation_calibration_evidence_verifier=calibration_evidence_verifier,
             reservation_forecasts=reservation_forecasts,
             reservation_forecast_evidence_verifier=reservation_forecast_evidence_verifier,
+            evaluator_readiness_artifacts=evaluator_readiness_artifacts,
+            evaluator_readiness_evidence_verifier=evaluator_readiness_evidence_verifier,
         )
         receipt = chip_assessment_store.retain_assessment(record, args.evidence_dir)
         verified = chip_assessment_store.verify_assessment(receipt["path"])

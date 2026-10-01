@@ -385,14 +385,34 @@ def build_free_hit_request(
     # authority object at all, so "B agrees with B, therefore B is trusted" has no
     # production path.  Price retrieval below uses the CERTIFIED cutoff, so a later
     # caller cutoff can never pull post-cutoff prices into this decision.
-    if not str(certification_path or "").strip():
+    if conn is not None and generation is None:
+        try:
+            generation = gs.resolve_generation(conn, planning_event=int(manager.planning_event))
+        except Exception as failure:
+            raise FreeHitAdapterError(
+                f"{FH_CERTIFICATION_REQUIRED}: no canonical certified generation could be resolved: {failure}",
+                reasons=(FH_CERTIFICATION_REQUIRED,),
+            ) from failure
+    requested_events = tuple(int(value) for value in certified.horizon_binding.horizon_events)
+    use_continuation_authority = bool(
+        conn is not None
+        and generation is not None
+        and generation.horizon_kind == gs.HORIZON_KIND_CHIP_RESERVATION
+        and tuple(generation.events[:4]) != requested_events
+    )
+    if not str(certification_path or "").strip() and not use_continuation_authority:
         raise FreeHitAdapterError(
             f"{FH_CERTIFICATION_REQUIRED}: production Free Hit must load the canonical certification "
             "artifact; no caller-supplied decision authority is accepted",
             reasons=(FH_CERTIFICATION_REQUIRED,),
         )
     try:
-        authority = fh.load_decision_authority(certification_path)
+        if use_continuation_authority:
+            authority = fh.FreeHitDecisionAuthority.from_verified_continuation_generation(
+                conn, generation.generation_id, events=requested_events,
+            )
+        else:
+            authority = fh.load_decision_authority(certification_path)
     except fh.FreeHitAuthorityError as exc:
         raise FreeHitAdapterError(
             f"{FH_CERTIFICATION_REQUIRED}: the canonical certification could not be loaded: {exc}",

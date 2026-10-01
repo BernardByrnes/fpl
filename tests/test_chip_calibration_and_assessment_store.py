@@ -14,6 +14,7 @@ import pytest
 from fpl_brain import chip_assessment_store as store
 from fpl_brain import chip_assessment as assessment
 from fpl_brain import chip_decision as cd
+from fpl_brain import chip_evaluator_readiness as readiness
 from fpl_brain import chip_reservation_calibration as calibration
 from fpl_brain import chip_reservation_forecast as forecast
 from fpl_brain import database
@@ -36,12 +37,13 @@ _RAW_FORECAST_FIXTURES = {}
 def _causal_row(
     index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_BB,
     reservation_forecast_state: dict | None = None,
+    evaluator_forecast_value: float | None = None,
 ):
     origin = datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=7 * index)
     label_time = origin + timedelta(days=2)
     origin_text = origin.isoformat().replace("+00:00", "Z")
     label_text = label_time.isoformat().replace("+00:00", "Z")
-    forecast_time = (origin - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    forecast_time = (origin + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     event = index + 1
     realized_value = 15.0 + noise
     source = {
@@ -124,6 +126,13 @@ def _causal_row(
                     "restored_bank_tenths": 70,
                     "event_start_h1_free_transfers": 3,
                     "restored_h2_free_transfers": 3,
+                    "restored_h2_start_state": {
+                        "event": event + 2,
+                        "squad_ids": list(save_squad),
+                        "purchase_price_tenths": {str(pid): 50 for pid in save_squad},
+                        "bank_tenths": 70,
+                        "free_transfers": 3,
+                    },
                 }
             elif action == cd.CHIP_ACTION_FH:
                 values["action_semantics"]["retains_chip_option"] = True
@@ -150,11 +159,7 @@ def _causal_row(
     )
     forecast_state = dict(reservation_forecast_state or save_reservation_state)
     save_common["reservation_state"] = save_reservation_state
-    play_common["reservation_state"] = (
-        dict(play_common["action_semantics"]["transfer_state"])
-        if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}
-        else dict(save_reservation_state)
-    )
+    play_common["reservation_state"] = dict(save_reservation_state)
     starters = set(lineup["starter_ids"])
     save_weights = {str(player_id): 1.0 for player_id in starters}
     save_weights[str(lineup["captain_id"])] += 1.0
@@ -185,34 +190,83 @@ def _causal_row(
     forecast_source["origin_cutoff"] = origin_text
     forecast_refs = []
     forecast_records = {}
+    selected_evaluator_value = (
+        10.0 if evaluator_forecast_value is None else float(evaluator_forecast_value)
+    )
     for future_event in range(event + 1, event + 4):
         reference = f"forecast-opportunity-{index}-{future_event}.json"
-        outcome_arms = None
-        if action in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
-            outcome_arms = {}
-            for role, arm_payload in (("play", play_arm_payload), ("save", save_arm_payload)):
-                frozen_arm = dict(arm_payload)
-                frozen_arm["event"] = future_event
-                frozen_arm["reservation_state"] = forecast_state
-                if future_event != event + 1:
-                    frozen_arm["scenario_identity"] = f"scenario-{index}-{future_event}"
-                    frozen_arm["arm_id"] = f"{role}-{index}-{future_event}"
-                outcome_arms[role] = frozen_arm
+        outcome_arms = {}
+        for role, arm_payload in (("play", play_arm_payload), ("save", save_arm_payload)):
+            frozen_arm = json.loads(json.dumps(arm_payload))
+            frozen_arm["event"] = future_event
+            frozen_arm["reservation_state"] = forecast_state
+            if future_event != event + 1:
+                frozen_arm["scenario_identity"] = f"scenario-{index}-{future_event}"
+                frozen_arm["arm_id"] = f"{role}-{index}-{future_event}"
+                if action == cd.CHIP_ACTION_FH and role == "play":
+                    frozen_arm["action_semantics"]["restore_at_h2"]["restore_event"] = future_event + 1
+                    frozen_arm["action_semantics"]["restore_at_h2"]["restored_h2_start_state"]["event"] = future_event + 1
+            outcome_arms[role] = frozen_arm
         opportunity = forecast.build_event_opportunity_record(
             action=action,
             planning_event=event,
             event=future_event,
             origin_cutoff=origin_text,
             made_at=forecast_time,
-            expected_incremental_points=10.0 if future_event == event + 1 else 0.0,
+            expected_incremental_points=(
+                selected_evaluator_value if future_event == event + 1 else 0.0
+            ),
             opportunity_model=f"fixture_{action.lower()}_future_opportunity_v1",
             source_identity=forecast_source,
             reservation_state=forecast_state,
             world_identity=source["world_identity"],
             outcome_arms=outcome_arms,
+            input_as_of=origin_text,
+            evaluator_identity={
+                "evaluator_version": f"fixture-{action.lower()}-evaluator-v1",
+                "action": action,
+                "event": future_event,
+                "expected_incremental_points": (
+                    selected_evaluator_value if future_event == event + 1 else 0.0
+                ),
+                "uncertainty": {"paired_interval_low": -2.0, "paired_interval_high": 2.0},
+                "world_identity": source["world_identity"],
+            },
         )
         forecast_refs.append(reference)
         forecast_records[reference] = opportunity
+    coverage_horizon = (
+        cd.CHIP_HORIZON_LENGTH if action == cd.CHIP_ACTION_FH
+        else 8 if action == cd.CHIP_ACTION_WC else 1
+    )
+    required_last = event + 3 + coverage_horizon - 1
+    coverage_events = list(range(event, required_last + 1))
+    coverage_product = {
+        "schema": forecast.RESERVATION_COVERAGE_PRODUCT_SCHEMA,
+        "action": action,
+        "planning_event": event,
+        "expiry_event": event + 3,
+        "forecast_events": list(range(event + 1, event + 4)),
+        "opportunity_horizon_length": coverage_horizon,
+        "required_product_events": coverage_events,
+        "product_events": coverage_events,
+        "missing_events": [],
+        "coverage_known": True,
+        "coverage_complete": True,
+        "coverage_status": forecast.FORECAST_READY,
+        "coverage_reason": None,
+        "source_identity": forecast_source,
+        "root_generation_id": forecast_source["generation_id"],
+        "product_generation_id": f"fixture-continuation-{index}",
+        "product_generation_manifest_sha256": f"fixture-continuation-{index}",
+        "origin_cutoff": origin_text,
+        "input_as_of": origin_text,
+        "data_snapshot_sha256": forecast_source["data_snapshot_sha256"],
+        "predictive_code_snapshot_sha256": forecast_source["predictive_code_snapshot_sha256"],
+        "product_runs_by_event": {str(value): {"fixture": value} for value in coverage_events},
+        "wildcard_value_horizon_length": 8 if action == cd.CHIP_ACTION_WC else None,
+    }
+    coverage_product["product_sha256"] = _sha(coverage_product)
     forecast_artifact = forecast.build_reservation_forecast(
         action=action,
         planning_event=event,
@@ -223,6 +277,7 @@ def _causal_row(
         reservation_state=forecast_state,
         opportunity_refs=forecast_refs,
         evidence_verifier=forecast_records.__getitem__,
+        coverage_product=coverage_product,
     )
     forecast_reference = f"forecast-{index}.json"
     _RAW_FORECAST_FIXTURES[forecast_reference] = forecast_artifact
@@ -358,7 +413,7 @@ def _causal_row(
         "weeks_to_expiry": 3,
         "origin_cutoff": origin_text,
         "forecast_made_at": forecast_time,
-        "forecast_value": 10.0,
+        "forecast_value": selected_evaluator_value,
         "label_available_at": label_text,
         "realized_value": realized_value,
         "causal_evidence_ref": f"evidence-{index}",
@@ -489,6 +544,62 @@ def test_calibration_requires_verified_paired_temporal_causal_evidence():
     assert estimate.value == pytest.approx(15.0, abs=0.6)
 
 
+def test_action_specific_evaluator_readiness_uses_matured_prospective_fixture_evidence():
+    """Fixture evidence exercises the permit path but is not production validation."""
+
+    stored = {}
+    rows = []
+    for index in range(30):
+        row, evidence = _causal_row(index, noise=0.0, evaluator_forecast_value=15.0)
+        rows.append(row)
+        _store_causal_evidence(stored, row, evidence)
+    artifact = readiness.build_evaluator_readiness(
+        rows,
+        action=cd.CHIP_ACTION_BB,
+        evaluator_version="fixture-bb-evaluator-v1",
+        evidence_verifier=stored.__getitem__,
+        evaluation_cutoff="2026-12-31T00:00:00Z",
+    )
+    assert artifact["status"] == readiness.READINESS_READY
+    assert artifact["metrics"]["matured_origins"] == 30
+    assert artifact["metrics"]["mae_points"] == pytest.approx(0.0)
+    assert artifact["evidence_class"] == "PRODUCTION"
+
+    evaluation = cd.ChipEvaluation(
+        action=cd.CHIP_ACTION_BB,
+        evaluator_version="fixture-bb-evaluator-v1",
+        candidate_metrics={"mean_paired_uplift": 3.0},
+        reason_codes=("CHIP_BB_EVALUATED", "CHIP_BB_REVIEW_ONLY_UNCALIBRATED"),
+        execution_permitted=False,
+        data_snapshot_bound=True,
+        evidence={
+            "certification_identity": "fixture-certification",
+            "data_snapshot_sha256": "a" * 64,
+            "planning_event": 5,
+            "horizon_events": list(cd.canonical_chip_horizon(5)),
+            "evaluator_version": "fixture-bb-evaluator-v1",
+        },
+    )
+    permitted, report = readiness.apply_verified_readiness(
+        evaluation, artifact, None,
+        current_cutoff="2027-01-01T00:00:00Z",
+        evidence_verifier=stored.__getitem__,
+    )
+    assert permitted.execution_permitted is True
+    assert "CHIP_BB_REVIEW_ONLY_UNCALIBRATED" not in permitted.reason_codes
+    assert report["status"] == readiness.READINESS_READY
+    assert report["artifact_sha256"] == artifact["artifact_sha256"]
+
+    with pytest.raises(readiness.EvaluatorReadinessError, match="action/evaluator version"):
+        readiness.verify_evaluator_readiness(
+            artifact,
+            None,
+            action=cd.CHIP_ACTION_FH,
+            evaluator_version="fixture-bb-evaluator-v1",
+            evidence_verifier=stored.__getitem__,
+        )
+
+
 def test_calibration_loader_rejects_self_asserted_model_even_with_recomputed_hashes():
     stored = {}
     rows = []
@@ -524,8 +635,8 @@ def test_calibration_is_uncalibrated_without_rows_and_rejects_future_leakage():
     assert empty["models"] == {}
 
     row, evidence = _causal_row(1)
-    row["forecast_made_at"] = "2025-01-09T00:00:00Z"
-    with pytest.raises(calibration.ReservationCalibrationError, match="after its origin cutoff"):
+    row["forecast_input_as_of"] = "2025-01-09T00:00:00Z"
+    with pytest.raises(calibration.ReservationCalibrationError, match="later than the origin cutoff"):
         calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
 
@@ -646,6 +757,7 @@ def test_fh_arms_must_match_selected_forecast_event_even_when_rehashed(validatio
     play = evidence["counterfactual_pair"]["play"]
     play["event"] = 99
     play["action_semantics"]["restore_at_h2"]["restore_event"] = 100
+    play["action_semantics"]["restore_at_h2"]["restored_h2_start_state"]["event"] = 100
     payload = dict(play["artifact_payload"])
     payload["event"] = 99
     payload["action_semantics"] = play["action_semantics"]
@@ -971,7 +1083,7 @@ def test_causal_finalizer_refuses_forecast_bound_to_a_different_save_state(tmp_p
     positions = evidence["counterfactual_pair"]["play"]["player_positions"]
     conn = _official_outcome_connection(2)
     try:
-        with pytest.raises(calibration.ReservationCalibrationError, match="not bound to the retained SAVE arm state"):
+        with pytest.raises(calibration.ReservationCalibrationError, match="matured SAVE arm differs from the selected-event SAVE state"):
             calibration.finalize_causal_observation(
                 conn,
                 evidence,
@@ -1225,7 +1337,7 @@ def test_bb_tc_assessment_refuses_mixed_hypothetical_scenarios():
         action=cd.CHIP_ACTION_BB, evaluator_version="fixture",
         candidate_metrics={"mean_paired_uplift": 2.0},
         uncertainty={"paired_interval_low": 1.0, "paired_interval_high": 3.0},
-        evidence=dict(base_evidence), data_snapshot_bound=True,
+        evidence=dict(base_evidence), execution_permitted=False, data_snapshot_bound=True,
     )
     tc_evidence = {**base_evidence, "scenario_identity": "captured-lineup-scenario"}
     tc = cd.ChipEvaluation(

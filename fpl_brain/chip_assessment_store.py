@@ -16,7 +16,7 @@ from . import chip_decision as cd
 from . import chip_reservation_forecast as crf
 
 ASSESSMENT_SCHEMA = "fpl_brain.chip_operational_assessment.v1"
-ASSESSMENT_VERSION = "chip_assessment_store_v1.1.0"
+ASSESSMENT_VERSION = "chip_assessment_store_v1.2.0"
 ASSESSMENT_ACTIONS = (cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC, cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC)
 
 ASSESSMENT_INVALID = "CHIP_ASSESSMENT_RECORD_INVALID"
@@ -133,6 +133,54 @@ def _validate_context(record: Mapping[str, Any]) -> None:
             ):
                 raise ChipAssessmentStoreError(f"{action} evaluation is not bound to assessment context")
             evaluated[action] = evaluation
+            if action in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
+                readiness = item.get("evaluator_readiness")
+                readiness_artifact = (
+                    readiness.get("artifact") if isinstance(readiness, Mapping) else None
+                )
+                if bool(evaluation.get("execution_permitted")):
+                    if not isinstance(readiness_artifact, Mapping):
+                        raise ChipAssessmentStoreError(
+                            f"{action} execution permission has no retained readiness artifact"
+                        )
+                    from . import chip_evaluator_readiness as cer
+
+                    try:
+                        report = cer.verify_retained_readiness_integrity(readiness_artifact)
+                    except Exception as failure:
+                        raise ChipAssessmentStoreError(
+                            f"{action} readiness evidence does not verify: {failure}"
+                        ) from failure
+                    evaluator_identity = evidence.get("evaluator_readiness")
+                    if (
+                        readiness_artifact.get("action") != action
+                        or readiness_artifact.get("evaluator_version") != evaluation.get("evaluator_version")
+                        or readiness_artifact.get("status") != cer.READINESS_READY
+                        or not report.get("execution_permitted")
+                        or readiness.get("execution_permitted") is not True
+                        or not isinstance(evaluator_identity, Mapping)
+                        or evaluator_identity.get("artifact_sha256") != report.get("artifact_sha256")
+                    ):
+                        raise ChipAssessmentStoreError(
+                            f"{action} execution permission disagrees with its action-specific readiness evidence"
+                        )
+                elif isinstance(readiness_artifact, Mapping):
+                    from . import chip_evaluator_readiness as cer
+
+                    try:
+                        report = cer.verify_retained_readiness_integrity(readiness_artifact)
+                    except Exception as failure:
+                        raise ChipAssessmentStoreError(
+                            f"{action} readiness evidence does not verify: {failure}"
+                        ) from failure
+                    if (
+                        readiness_artifact.get("action") != action
+                        or readiness_artifact.get("evaluator_version") != evaluation.get("evaluator_version")
+                        or bool(report.get("execution_permitted")) != bool(readiness.get("execution_permitted"))
+                    ):
+                        raise ChipAssessmentStoreError(
+                            f"{action} readiness report differs from its retained artifact"
+                        )
             raw_forecast = item.get("raw_reservation_forecast")
             if raw_forecast is not None:
                 source_identity = {

@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -729,6 +729,169 @@ def load_certified_event_chip_worlds(
         ) from failure
 
 
+def load_certified_continuation_event_chip_worlds(
+    conn: sqlite3.Connection,
+    route: VerifiedNormalRoute,
+    *,
+    event: int,
+    action: str,
+    expiry_event: int,
+    coverage_product: Mapping[str, Any],
+    cache_dir: str | Path | None = None,
+) -> tuple[Any, Mapping[int, Any], Any]:
+    """Load one post-route event from the verified origin-pinned continuation.
+
+    The evaluator's normal four-event binding remains unchanged. The event-world
+    identity additionally commits to the continuation generation, event bundle,
+    exact runs and expiry product.
+    """
+
+    from . import chip_decision as cd, chip_reservation_forecast as crf
+    from . import candidate_universe as cu
+
+    event = int(event)
+    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: continuation world loader supports only BB/TC"
+        )
+    if event <= int(route.events[-1]):
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: GW{event} is not beyond the normal route horizon"
+        )
+    try:
+        root_generation = gs.load_generation(conn, route.generation_id)
+        continuation_id = str(coverage_product.get("product_generation_id") or "")
+        continuation = gs.load_generation(conn, continuation_id)
+        root_report = gs.verify_generation(conn, root_generation.generation_id)
+        continuation_report = gs.verify_generation(conn, continuation.generation_id)
+        source_identity = {
+            "source_decision_id": route.source_decision_id,
+            "source_result_sha256": route.source_result_sha256,
+            "source_artifact_sha256": route.source_artifact_sha256,
+            "generation_id": route.generation_id,
+            "planning_event": int(route.planning_event),
+            "origin_cutoff": str(route.cutoff),
+            "data_snapshot_sha256": str(route.data_snapshot_sha256),
+            "predictive_code_snapshot_sha256": str(
+                root_generation.manifest.get("code_snapshot_sha256") or ""
+            ),
+            "certification_identity": str(route.certification_identity),
+        }
+        crf.verify_reservation_coverage_product(
+            conn,
+            coverage_product,
+            expected={
+                "action": action,
+                "planning_event": int(route.planning_event),
+                "expiry_event": int(expiry_event),
+                "source_identity": source_identity,
+            },
+        )
+        if (
+            not root_report.get("verified")
+            or root_generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW
+            or tuple(int(value) for value in root_generation.events) != route.events
+            or not continuation_report.get("verified")
+            or continuation.horizon_kind != gs.HORIZON_KIND_CHIP_RESERVATION
+            or int(continuation.planning_event) != int(route.planning_event)
+            or str(continuation.cutoff) != str(root_generation.cutoff)
+            or str(continuation.snapshot.get("sha256")) != str(root_generation.snapshot.get("sha256"))
+            or str(continuation.manifest.get("code_snapshot_sha256"))
+            != str(root_generation.manifest.get("code_snapshot_sha256"))
+            or tuple(int(value) for value in continuation.events[:4]) != route.events
+            or any(
+                continuation.runs_for(int(root_event)) != root_generation.runs_for(int(root_event))
+                for root_event in route.events
+            )
+            or event not in tuple(int(value) for value in continuation.events)
+            or event not in tuple(int(value) for value in coverage_product.get("product_events") or ())
+            or event in tuple(int(value) for value in coverage_product.get("missing_events") or ())
+        ):
+            raise ValueError("continuation generation does not verify the required root and event identities")
+        declared_runs = (coverage_product.get("product_runs_by_event") or {}).get(str(event))
+        if not isinstance(declared_runs, Mapping) or {
+            str(key): int(value) for key, value in declared_runs.items()
+        } != continuation.runs_for(event):
+            raise ValueError(f"GW{event} continuation runs differ from the retained coverage product")
+
+        record = gs.load_engine_decision_record(conn, route.source_decision_id)
+        artifact = json.loads(Path(str(record["decision_artifact_ref"])).read_text(encoding="utf-8"))
+        raw_config = dict((artifact.get("search") or {}).get("config") or {})
+        allowed = {field.name for field in fields(ro.OptimizerConfig)}
+        raw_config["events"] = route.events
+        config = ro.OptimizerConfig(**{key: value for key, value in raw_config.items() if key in allowed})
+        source_conn = gs._open_generation_snapshot(continuation)
+        try:
+            from .chip_wildcard import pool_binding_from_store
+
+            pool = pool_binding_from_store(source_conn)
+            official_ids = tuple(sorted(int(pid) for pid in pool.eligible_ids))
+            if not official_ids:
+                raise ValueError("continuation snapshot has an empty official player pool")
+        finally:
+            source_conn.close()
+        matrix, _details = ro.build_event_worlds(
+            conn,
+            continuation,
+            event,
+            official_ids,
+            config,
+            cache_dir=None if cache_dir is None else Path(cache_dir),
+        )
+        bundle_identity = str(
+            ((continuation.manifest.get("per_event") or {}).get(str(event)) or {}).get("bundle_identity") or ""
+        )
+        if not bundle_identity:
+            raise ValueError(f"GW{event} continuation bundle has no certified identity")
+        world_identity = analytics.canonical_hash({
+            "schema": "fpl_brain.chip_reservation_continuation_world.v1",
+            "root_generation_id": route.generation_id,
+            "root_certification_identity": route.certification_identity,
+            "continuation_generation_id": continuation.generation_id,
+            "continuation_bundle_identity": bundle_identity,
+            "continuation_runs": continuation.runs_for(event),
+            "coverage_product_sha256": coverage_product.get("product_sha256"),
+            "source_event": event,
+            "origin_cutoff": str(route.cutoff),
+            "data_snapshot_sha256": str(route.data_snapshot_sha256),
+            "predictive_code_snapshot_sha256": source_identity["predictive_code_snapshot_sha256"],
+            "optimizer_config": config.as_dict(),
+        })
+        worlds = cd.ChipWorldInputs.from_world_matrix(
+            matrix,
+            planning_event=int(route.planning_event),
+            horizon_events=route.events,
+            certification_identity=route.certification_identity,
+            data_snapshot_sha256=route.data_snapshot_sha256,
+            world_seed=int(config.seed),
+            world_identity=world_identity,
+            code_snapshot_sha256=source_identity["predictive_code_snapshot_sha256"],
+            source_event=event,
+        )
+        worlds.validate()
+        source_conn = gs._open_generation_snapshot(continuation)
+        try:
+            pool_rows = cu.load_pool(source_conn)
+        finally:
+            source_conn.close()
+        squad_ids = {int(pid) for pid in route.partial.state.by_id()}
+        positions = {
+            int(pid): str(pool_rows[int(pid)]["position"])
+            for pid in squad_ids
+            if int(pid) in pool_rows and pool_rows[int(pid)].get("position")
+        }
+        if set(positions) != squad_ids:
+            raise ValueError("terminal route squad has missing pinned positions in continuation snapshot")
+        return worlds, positions, matrix
+    except ChipRouteAssemblyError:
+        raise
+    except Exception as failure:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: verified continuation event assembly refused: "
+            f"{type(failure).__name__}: {failure}"
+        ) from failure
+
+
 def build_future_event_chip_opportunity(
     conn: sqlite3.Connection,
     route: VerifiedNormalRoute,
@@ -738,12 +901,17 @@ def build_future_event_chip_opportunity(
     reservation_state: Mapping[str, Any],
     made_at: str,
     cache_dir: str | Path | None = None,
+    coverage_product: Mapping[str, Any] | None = None,
+    rules: Any | None = None,
+    rules_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Produce one future BB/TC opportunity from the normal certified route.
+    """Produce one future BB/TC opportunity from certified event worlds.
 
-    Event worlds and the future route lineup are resolved from the same verified
-    four-event generation and decision. FH/WC use different squad/route models
-    and remain unavailable through this producer.
+    Events inside the normal generation use that generation's retained route
+    policy. Later events require a verified CHIP_RESERVATION product and use
+    the explicitly declared no-transfer continuation from the route terminal
+    state, with a separately ranked legal lineup for each event. The normal
+    decision horizon remains four events.
     """
 
     from . import chip_decision as cd
@@ -755,49 +923,130 @@ def build_future_event_chip_opportunity(
         raise ChipRouteAssemblyError(
             f"{ROUTE_RECONSTRUCTION_INVALID}: {action} has no future-event production evaluator"
         )
-    if event <= int(route.planning_event) or event not in route.events:
+    if event <= int(route.planning_event):
         raise ChipRouteAssemblyError(
-            f"{ROUTE_RECONSTRUCTION_INVALID}: forecast event {event} is not a future event in the certified route"
+            f"{ROUTE_RECONSTRUCTION_INVALID}: forecast event {event} is not after the planning event"
         )
     try:
         generation = gs.load_generation(conn, route.generation_id)
         report = gs.verify_generation(conn, generation.generation_id)
         if not report.get("verified") or generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW:
             raise ValueError("normal four-event generation did not verify")
-        decision_record = gs.load_engine_decision_record(conn, route.source_decision_id)
-        artifact = json.loads(Path(str(decision_record["decision_artifact_ref"])).read_text(encoding="utf-8"))
-        route_record = (((artifact.get("finalist_refinement") or {}).get("route_table") or {})
-                        .get("routes") or {}).get(str(route.route_id))
-        if not isinstance(route_record, Mapping):
-            raise ValueError("selected normal route is absent from the verified decision artifact")
-        policy = _policy_from_route(route_record, event=event)
-        route_action = next((
-            row for row in route.partial.actions if int(row.get("event", -1)) == event
-        ), None)
-        if not isinstance(route_action, Mapping):
-            raise ValueError("verified normal route has no replayed state for the future event")
-        transition = route_action.get("transition")
-        event_state = getattr(transition, "next_event_state", None)
-        if event_state is None:
-            raise ValueError("verified normal route has no canonical post-transfer event state")
-        squad_ids = set(int(pid) for pid in event_state.by_id())
-        if squad_ids != set(ml.policy_player_ids(policy)):
-            raise ValueError("future route lineup does not match its replayed 15-player squad")
-        source_conn = gs._open_generation_snapshot(generation)
-        try:
-            pool = cu.load_pool(source_conn)
-        finally:
-            source_conn.close()
-        positions = {
-            int(pid): str(pool[int(pid)]["position"])
-            for pid in squad_ids
-            if int(pid) in pool and pool[int(pid)].get("position")
-        }
-        if set(positions) != squad_ids:
-            raise ValueError("future route squad has missing pinned player positions")
-        worlds = load_certified_event_chip_worlds(
-            conn, route, event=event, cache_dir=cache_dir,
-        )
+        continuation_context = None
+        coverage_product_sha256 = None
+        if coverage_product is not None:
+            product_identity = str(coverage_product.get("product_sha256") or "")
+            if len(product_identity) != 64:
+                raise ValueError("expiry coverage product has no SHA-256 identity")
+            coverage_product_sha256 = product_identity
+
+        if event in route.events:
+            decision_record = gs.load_engine_decision_record(conn, route.source_decision_id)
+            artifact = json.loads(Path(str(decision_record["decision_artifact_ref"])).read_text(encoding="utf-8"))
+            route_record = (((artifact.get("finalist_refinement") or {}).get("route_table") or {})
+                            .get("routes") or {}).get(str(route.route_id))
+            if not isinstance(route_record, Mapping):
+                raise ValueError("selected normal route is absent from the verified decision artifact")
+            policy = _policy_from_route(route_record, event=event)
+            route_action = next((
+                row for row in route.partial.actions if int(row.get("event", -1)) == event
+            ), None)
+            if not isinstance(route_action, Mapping):
+                raise ValueError("verified normal route has no replayed state for the future event")
+            transition = route_action.get("transition")
+            event_state = getattr(transition, "next_event_state", None)
+            if event_state is None:
+                raise ValueError("verified normal route has no canonical post-transfer event state")
+            squad_ids = set(int(pid) for pid in event_state.by_id())
+            if squad_ids != set(ml.policy_player_ids(policy)):
+                raise ValueError("future route lineup does not match its replayed 15-player squad")
+            source_conn = gs._open_generation_snapshot(generation)
+            try:
+                pool = cu.load_pool(source_conn)
+            finally:
+                source_conn.close()
+            positions = {
+                int(pid): str(pool[int(pid)]["position"])
+                for pid in squad_ids
+                if int(pid) in pool and pool[int(pid)].get("position")
+            }
+            if set(positions) != squad_ids:
+                raise ValueError("future route squad has missing pinned player positions")
+            worlds = load_certified_event_chip_worlds(
+                conn, route, event=event, cache_dir=cache_dir,
+            )
+        else:
+            if coverage_product is None:
+                raise ValueError("post-route BB/TC forecasts require a verified CHIP_RESERVATION coverage product")
+            from . import season_rules as sr
+
+            if not isinstance(rules, sr.SeasonRules):
+                raise ValueError("post-route BB/TC forecasts require season rules resolved from the pinned official snapshot")
+            if not isinstance(rules_evidence, Mapping):
+                raise ValueError("post-route BB/TC forecasts require verified origin season-rule evidence")
+            sr.verify_pinned_season_rules_evidence(
+                rules_evidence,
+                rules,
+                cutoff=route.cutoff,
+                data_snapshot_sha256=route.data_snapshot_sha256,
+                allow_fixture=True,
+            )
+            expiry_event = coverage_product.get("expiry_event")
+            if expiry_event is None or event > int(expiry_event):
+                raise ValueError("post-route event is outside the declared chip-expiry window")
+            worlds, positions, matrix = load_certified_continuation_event_chip_worlds(
+                conn,
+                route,
+                event=event,
+                action=action,
+                expiry_event=int(expiry_event),
+                coverage_product=coverage_product,
+                cache_dir=cache_dir,
+            )
+            event_state = _no_transfer_continuation_state(route, event=event, rules=rules)
+            squad_ids = {int(pid) for pid in event_state.by_id()}
+            if set(positions) != squad_ids:
+                raise ValueError("continuation event squad differs from its certified player positions")
+            ranked = ml.rank_policies(sorted(squad_ids), positions, matrix, top_k=1)
+            top_policies = list(ranked.get("top_policies") or ())
+            if not top_policies or not isinstance(top_policies[0], ml.ManagerPolicy):
+                raise ValueError("continuation event did not produce a canonical legal lineup")
+            policy = top_policies[0]
+            state_payload = {
+                "event": int(event_state.event),
+                "squad_ids": sorted(squad_ids),
+                "purchase_price_tenths": {
+                    str(int(player.player_id)): int(player.purchase_price_tenths)
+                    for player in event_state.players
+                },
+                "bank_tenths": int(event_state.bank_tenths),
+                "free_transfers": int(event_state.free_transfers),
+                "event_start_free_transfers": (
+                    None if event_state.event_start_free_transfers is None
+                    else int(event_state.event_start_free_transfers)
+                ),
+                "chip_state": list(event_state.chip_state),
+                "continuation_model": "CARRY_TERMINAL_ROUTE_STATE_NO_TRANSFERS_PER_EVENT_LINEUP_V1",
+            }
+            context = {
+                "schema": "fpl_brain.chip_reservation_continuation_event.v1",
+                "model": "CARRY_TERMINAL_ROUTE_STATE_NO_TRANSFERS_PER_EVENT_LINEUP_V1",
+                "action": action,
+                "event": int(event),
+                "coverage_product_sha256": coverage_product_sha256,
+                "world_identity": str(worlds.world_identity),
+                "event_manager_state": state_payload,
+                "event_policy": policy.as_dict(),
+                "player_positions": {str(int(pid)): str(value) for pid, value in sorted(positions.items())},
+                "season_rules": asdict(rules),
+                "season_rules_sha256": crf.canonical_sha256(asdict(rules)),
+                "season_rules_source": str(rules_evidence["source"]),
+                "season_rules_evidence": dict(rules_evidence),
+                "advanced_no_transfer_events": list(range(int(route.events[-1]) + 1, int(event))),
+                "origin_cutoff": str(route.cutoff),
+            }
+            context["context_sha256"] = crf.canonical_sha256(context)
+            continuation_context = context
         binding = cd.ChipHorizonBinding(
             planning_event=int(route.planning_event),
             horizon_events=tuple(route.events),
@@ -825,6 +1074,9 @@ def build_future_event_chip_opportunity(
             source_identity=source_identity,
             reservation_state=reservation_state,
             made_at=made_at,
+            input_as_of=str(route.cutoff),
+            coverage_product_sha256=coverage_product_sha256,
+            continuation_context=continuation_context,
         )
     except ChipRouteAssemblyError:
         raise
@@ -833,6 +1085,76 @@ def build_future_event_chip_opportunity(
             f"{ROUTE_RECONSTRUCTION_INVALID}: future {action} opportunity refused: "
             f"{type(failure).__name__}: {failure}"
         ) from failure
+
+
+def _no_transfer_continuation_state(
+    route: VerifiedNormalRoute,
+    *,
+    event: int,
+    rules: Any,
+) -> ts.RouteState:
+    """Carry the verified route's terminal squad/bank through no-transfer GWs.
+
+    This is an explicit forecast model, not a claim that a manager will make no
+    transfers. Every intervening no-transfer GW advances FT under the supplied
+    official season rules; the proposed permanent squad, purchase basis, bank,
+    and chip state remain exactly those of the verified terminal route.
+    """
+
+    from . import season_rules as sr
+
+    state = route.partial.state
+    target = int(event)
+    if state.event != int(route.events[-1]) + 1 or target < int(state.event):
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: terminal route state cannot seed GW{target} continuation"
+        )
+    while int(state.event) < target:
+        next_ft = sr.free_transfers_after_gameweek(rules, int(state.free_transfers), 0)
+        state = ts.RouteState(
+            event=int(state.event) + 1,
+            players=tuple(state.players),
+            bank_tenths=int(state.bank_tenths),
+            free_transfers=int(next_ft),
+            chip_state=tuple(state.chip_state),
+            event_start_free_transfers=int(next_ft),
+        )
+    return state
+
+
+def _post_h1_save_reservation_state(route: VerifiedNormalRoute) -> dict[str, Any]:
+    """Derive the sole SAVE state that future BB/TC opportunities may carry."""
+
+    if not route.partial.actions:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: verified normal route has no H1 SAVE transition"
+        )
+    transition = route.partial.actions[0].get("transition")
+    state = getattr(transition, "next_event_state", None)
+    if state is None or int(state.event) != int(route.planning_event) + 1:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: verified normal route has no canonical post-H1 SAVE state"
+        )
+    squad_ids = tuple(sorted(int(pid) for pid in state.by_id()))
+    return {
+        "event": int(state.event),
+        "squad_ids": list(squad_ids),
+        "purchase_price_tenths": {
+            str(int(player.player_id)): int(player.purchase_price_tenths)
+            for player in state.players
+        },
+        "bank_tenths": int(state.bank_tenths),
+        "free_transfers": int(state.free_transfers),
+        "event_start_free_transfers": (
+            None if state.event_start_free_transfers is None
+            else int(state.event_start_free_transfers)
+        ),
+        "chip_state": list(state.chip_state),
+        "source_decision_id": route.source_decision_id,
+        "generation_id": route.generation_id,
+        "route_id": route.route_id,
+        "route_input_sha256": route.route_input_sha256,
+    }
 
 
 def build_bb_tc_reservation_forecast(
@@ -845,12 +1167,17 @@ def build_bb_tc_reservation_forecast(
     made_at: str,
     evidence_root: str | Path,
     cache_dir: str | Path | None = None,
+    continuation_generation_id: str | None = None,
+    rules: Any | None = None,
 ) -> dict[str, Any]:
     """Retain the route-backed BB/TC future forecast through known coverage.
 
-    The normal generation contributes only its verified future events. If a
-    known chip expiry extends beyond that coverage, the returned artifact stays
-    incomplete with an unknown numeric value.
+    The normal generation contributes the exact future-route events in its
+    four-event window. A separately certified CHIP_RESERVATION generation can
+    extend one-event BB/TC forecasts through expiry; the terminal route state is
+    carried with no transfers and receives a newly ranked legal lineup per
+    continuation event. If either the product or the continuation model inputs
+    are missing, coverage stays explicitly incomplete and numerically unknown.
     """
 
     from . import chip_decision as cd
@@ -860,30 +1187,16 @@ def build_bb_tc_reservation_forecast(
         raise ChipRouteAssemblyError(
             f"{ROUTE_RECONSTRUCTION_INVALID}: {action} has no production future-reservation route"
         )
+    expected_reservation_state = _post_h1_save_reservation_state(route)
+    if dict(reservation_state) != expected_reservation_state:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: reservation SAVE state differs from the verified post-H1 route"
+        )
     root = Path(evidence_root)
     root.mkdir(parents=True, exist_ok=True)
     opportunity_refs: list[str] = []
     local_records: dict[str, Mapping[str, Any]] = {}
-    for event in route.events[1:]:
-        if expiry_event is not None and int(event) > int(expiry_event):
-            break
-        opportunity = build_future_event_chip_opportunity(
-            conn,
-            route,
-            action=action,
-            event=int(event),
-            reservation_state=reservation_state,
-            made_at=made_at,
-            cache_dir=cache_dir,
-        )
-        receipt = crf.retain_event_opportunity_record(opportunity, root)
-        reference = Path(receipt["path"]).name
-        opportunity_refs.append(reference)
-        local_records[reference] = opportunity
-    if not opportunity_refs and int(expiry_event or -1) != int(route.planning_event):
-        raise ChipRouteAssemblyError(
-            f"{ROUTE_RECONSTRUCTION_INVALID}: no certified future event is available for the reservation forecast"
-        )
+    source_generation = gs.load_generation(conn, route.generation_id)
     source_identity = {
         "source_decision_id": route.source_decision_id,
         "source_result_sha256": route.source_result_sha256,
@@ -892,11 +1205,86 @@ def build_bb_tc_reservation_forecast(
         "planning_event": int(route.planning_event),
         "origin_cutoff": str(route.cutoff),
         "data_snapshot_sha256": str(route.data_snapshot_sha256),
-        "predictive_code_snapshot_sha256": str(
-            gs.load_generation(conn, route.generation_id).manifest.get("code_snapshot_sha256") or ""
-        ),
+        "predictive_code_snapshot_sha256": str(source_generation.manifest.get("code_snapshot_sha256") or ""),
         "certification_identity": str(route.certification_identity),
     }
+    coverage_product = None
+    if continuation_generation_id is not None:
+        coverage_product = crf.build_reservation_coverage_product(
+            conn,
+            action=action,
+            source_identity=source_identity,
+            expiry_event=None if expiry_event is None else int(expiry_event),
+            product_generation_id=str(continuation_generation_id),
+        )
+    product_events = (
+        {int(value) for value in coverage_product.get("product_events") or ()}
+        if coverage_product is not None else set(route.events)
+    )
+    forecast_events = (
+        [int(value) for value in coverage_product.get("forecast_events") or ()]
+        if coverage_product is not None
+        else [int(event) for event in route.events[1:]
+              if expiry_event is None or int(event) <= int(expiry_event)]
+    )
+    from . import season_rules as sr
+
+    continuation_rules: Any | None = None
+    continuation_rules_evidence: Mapping[str, Any] | None = None
+    if (
+        coverage_product is not None
+        and isinstance(rules, sr.SeasonRules)
+        and any(int(event) > int(route.events[-1]) for event in forecast_events)
+    ):
+        pinned_snapshot_conn = None
+        try:
+            pinned_snapshot_conn = gs._open_generation_snapshot(source_generation)
+            pinned = sr.resolve_origin_pinned_season_rules(
+                pinned_snapshot_conn,
+                season=str(getattr(rules, "season", "")),
+                cutoff=str(route.cutoff),
+                data_snapshot_sha256=str(route.data_snapshot_sha256),
+            )
+        except (sr.SeasonRulesError, sqlite3.Error, OSError, ValueError):
+            pinned = None
+        finally:
+            if pinned_snapshot_conn is not None:
+                pinned_snapshot_conn.close()
+        if pinned is not None:
+            if asdict(rules) != asdict(pinned.rules):
+                raise ChipRouteAssemblyError(
+                    f"{ROUTE_RECONSTRUCTION_INVALID}: caller season rules differ from the origin-pinned official settings"
+                )
+            continuation_rules = pinned.rules
+            continuation_rules_evidence = dict(pinned.evidence)
+    for event in forecast_events:
+        if int(event) not in product_events:
+            continue
+        if int(event) > int(route.events[-1]) and (
+            coverage_product is None or continuation_rules is None or continuation_rules_evidence is None
+        ):
+            # A verified product alone provides worlds, but the explicitly
+            # versioned state-continuation rules are also required to score the
+            # correct carried manager state. Keep this forecast UNKNOWN.
+            continue
+        opportunity = build_future_event_chip_opportunity(
+            conn,
+            route,
+            action=action,
+            event=int(event),
+            reservation_state=reservation_state,
+            made_at=made_at,
+            cache_dir=cache_dir,
+            coverage_product=coverage_product,
+            rules=continuation_rules if int(event) > int(route.events[-1]) else None,
+            rules_evidence=(
+                continuation_rules_evidence if int(event) > int(route.events[-1]) else None
+            ),
+        )
+        receipt = crf.retain_event_opportunity_record(opportunity, root)
+        reference = Path(receipt["path"]).name
+        opportunity_refs.append(reference)
+        local_records[reference] = opportunity
     forecast = crf.build_reservation_forecast(
         action=action,
         planning_event=int(route.planning_event),
@@ -907,6 +1295,8 @@ def build_bb_tc_reservation_forecast(
         reservation_state=reservation_state,
         opportunity_refs=opportunity_refs,
         evidence_verifier=local_records.__getitem__,
+        input_as_of=str(route.cutoff),
+        coverage_product=coverage_product,
     )
     receipt = crf.retain_reservation_forecast(forecast, root)
     return {

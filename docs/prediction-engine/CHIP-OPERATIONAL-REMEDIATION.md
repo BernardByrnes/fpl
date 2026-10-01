@@ -7,12 +7,94 @@ for a complete four-chip assessment. It does not change the frozen V1 branch,
 rewrite retained assessments, run an FPL account action, merge the candidate, or
 start PE-11.
 
-The worktree started at accepted remediation milestone commit
-`3411ad27a315f686e04d75661a03f88705188d42` (tree
-`eb2d1d9e21496cf0afcdf05f545a67181b6ddc82`) on
-`codex/chip-operational-remediation`. Candidate SHA and validation results are
-tracked against the exact code commit in the acceptance report; this document
-describes the implementation and its operational prerequisites.
+The accepted remediation milestone is commit
+`e960ca08d34802d519dc761289317b88227b9356` (tree
+`2d425f68cbd2a1e2d295d81eae66469480f6458d`) on
+`codex/chip-operational-remediation`. The work below is a dirty, unpinned
+replacement candidate based on that milestone. It is not accepted until its
+focused gates, authoritative wrapper, exact-SHA CI and Sol review finish. Do
+not describe fixture evidence as production validation.
+
+## Requirement-to-implementation matrix
+
+| Requirement | Implemented and accepted at `e960ca0` | Current replacement candidate | Remaining dependency or restriction |
+| --- | --- | --- | --- |
+| 1. FH/WC future opportunities | Existing canonical chip and maturation contracts | Dedicated FH/WC producers create action-specific PLAY/SAVE future-event opportunities, retain them at origin and feed maturation/calibration. The FH producer re-derives its decision authority from the verified origin CHIP_RESERVATION generation and compares all selected bundle contexts. Event 7/8 lifecycle fixtures assert policies, world/source identities, outcome maturation, FH permanent-state restoration and WC transfer-state semantics. | Fixtures are not a live production assessment. Fresh cutoff-consistent manager, generation and outcome inputs are still required. |
+| 2. Reservation through expiry | Normal decision remains FOUR_GW; WC value horizon remains separate at 6–10 events | A verified CHIP_RESERVATION product reuses the exact four-event prefix and binds continuation runs to the same cutoff, snapshot and predictive identity. BB/TC continuation carries the route terminal squad and bank with no transfers and a per-event ranked lineup. Future WC 6–10 event windows are certified only from the same origin product, with exact run IDs and dependency closures preserved; FH authority is loaded from that verified product. Origin-pinned bootstrap rules are digest-checked and retained. | A real product, bootstrap archive capture and each event opportunity must be available through confirmed expiry. Missing or unverifiable rules keep beyond-route coverage incomplete. No-transfer continuation is a forecast model, not observed future manager behavior. |
+| 3. Evaluator readiness | Existing execution-permission field is preserved | Action-specific readiness evidence can clear BB/FH/WC review-only gates only after retained prospective causal observations pass independent criteria. Before applying it, the current evaluation must also carry a finite value, allowlisted success reasons, the matching evaluator version, canonical horizon, certification/snapshot identities and a required snapshot-bound flag. The readiness artifact's evaluation cutoff must be at or before the current assessment cutoff; a later artifact cannot authorize an earlier assessment. Refused evaluations remain unchanged. Fixtures demonstrate permitted and refused paths. | No production readiness evidence exists. BB/FH/WC remain execution-blocked until compatible real evidence verifies. TC retains its established gate. |
+| 4. Arbiter ranking | Canonical action and reservation contracts remain in place | Each eligible candidate is compared after its reservation in shared units; an unknown reservation or blocked evaluator remains unrankable. Regression covers 10−9 versus 8−2 and chooses net 6. | Requires a calibrated reservation and readiness for every eligible executable candidate. |
+| 5. Forecast timestamps | Origin cutoff and outcome-availability safeguards remain enforced | Inputs must be as-of the origin cutoff; `made_at` records actual forecast issuance and may be later. Historical replay is excluded from evaluator-readiness evidence. | No forecasts or labels are backdated. Live validation still needs a fresh certified snapshot and later official final captures. |
+
+### Current candidate status groups
+
+**Implemented and accepted:** the `e960ca0` milestone preserves the existing
+outcome scoring, tamper refusal, historical manager-state boundary, normal
+FOUR_GW contract, separate WC value horizon, scenario identities and canonical
+Free Hit permanent-squad restoration checks. None of the historical evidence is
+rewritten.
+
+**Implemented in this candidate, awaiting acceptance:** FH/WC future-event
+production and the origin-to-maturation lifecycle; BB/TC certified expiry
+coverage and continuation; action-specific readiness; net-after-reservation
+ranking; and later-issued prospective forecast timestamps. The focused evidence
+and exact source paths are recorded below.
+
+**Still unimplemented or not production-validated:** a real certified
+continuation generation and real future-event opportunity records through the
+manager-confirmed expiry; an operational adapter invocation using those exact
+retained inputs; and production readiness/calibration evidence. No expensive
+operational computation has been run to discover missing prerequisites.
+
+**Missing certified inputs:** current planning event, complete permanent squad,
+bank, current FT, separately confirmed event-start FT, chip availability/expiry,
+and a fresh manager observation captured before its snapshot and cutoff. For
+future continuation, the required same-origin certified event runs and pinned
+season rules must also be available. Team `241392` is known; no other current
+manager facts are confirmed.
+
+**Missing calibration evidence:** the retained inventory has no matured paired
+chip reservation outcomes suitable for real calibration. Synthetic fixtures
+exercise the calibration path only.
+
+**Evaluator readiness restrictions:** BB, FH and WC stay blocked without their
+own action-specific evidence. Reservation calibration cannot grant that
+permission. TC keeps its existing execution gate, and reservation calibration
+is still required before any `PLAY_CHIP` endorsement.
+
+## Context-resume checklist
+
+- [x] Accepted base recorded as `e960ca0` / tree `2d425f68`.
+- [x] FH/WC event 7/8 producer-to-calibration fixtures completed.
+- [x] Certified CHIP_RESERVATION extension and BB/TC continuation contracts implemented with focused fixtures.
+- [x] Readiness pass/refusal fixtures, net-ranking regression and timestamp safeguards implemented.
+- [x] FH/WC selected-event producer → retained-origin → maturation → calibration fixtures cover event substitution and chip-specific state restoration.
+- [x] Reservation expiry fixtures cover WC-6/WC-10, unknown expiry and incomplete FH horizon; a no-rule-evidence continuation remains incomplete with null value.
+- [x] Pinned season-rule resolver selects only an accepted bootstrap capture at/before the origin cutoff, verifies raw archive bytes, and refuses a tampered archive.
+- [x] Readiness refuses to elevate a current action refusal even when its separate readiness artifact passes; permit/refuse paths remain fixture-only.
+- [x] Readiness application requires the current assessment cutoff and refuses a verified artifact whose evaluation cutoff is later, preventing temporal lookahead.
+- [x] Earlier contract-focused set passed: 127 tests in 45.64 seconds on 2026-10-01; includes readiness, FH/WC lifecycle, forecast, season-rule provenance, continuation and WC evaluator tests.
+- [x] Refreshed cross-contract set passed: 230 tests in 286.10 seconds, including PE-9 production decision, chip operational remediation, FH/WC, readiness and season-rule provenance.
+- [x] FH preflight refusal without origin-pinned season rules, BB continuation, and season-rule provenance follow-up passed: 10 tests in 0.93 seconds.
+- [x] Readiness permit/refuse and assessment-cutoff temporal-boundary tests passed: 15 tests in 0.61 seconds.
+- [x] Earlier five-gap focused integration bundle passed: 165 tests in 47.46 seconds before future-WC certification and FH continuation-authority revalidation were added.
+- [x] Future WC 6- and 10-event value windows certify from one origin continuation product without creating a future FOUR_GW decision pointer; an incomplete-expiry product refuses.
+- [x] Future FH authority is re-derived from the verified CHIP_RESERVATION product, exact event runs are asserted, and a gapped future FH horizon refuses.
+- [x] FH/WC lifecycle and future-WC certification focused integration passed: 5 tests in 16.57 seconds; FH substituted bundle-context refusal passed separately in the lifecycle bundle.
+- [x] Refreshed five-gap integration bundle passed after future-WC certification and FH authority-source verification: 189 tests in 56.49 seconds.
+- [x] Complete candidate diff and documentation review; code and documentation are final before pinning.
+- [ ] Pin one replacement candidate only after code and documentation are complete; run the wrapper on that exact candidate.
+- [ ] Run exact-SHA CI and final Sol review; do not merge or begin PE-11.
+- [ ] Report production inputs, calibration and evaluator-readiness restrictions separately from code acceptance.
+
+Current resume point: the replacement candidate is based on accepted milestone
+`e960ca08d34802d519dc761289317b88227b9356` on
+`codex/chip-operational-remediation`. Code and documentation are complete, the
+diff has been reviewed, and the refreshed five-gap focused integration bundle
+passed after future-WC certification and FH authority-source verification.
+Next: pin one replacement candidate, run the authoritative wrapper against that
+exact candidate, then exact-SHA CI and Sol review. Do not merge or begin PE-11.
+Keep production inputs, calibration and readiness evidence as separate
+prerequisites; do not merge or begin PE-11.
 
 ## Historical manager-state boundary
 
@@ -76,6 +158,14 @@ execution UUID and predictive code identity. It verifies again after
 certification. A sequence assembled from later GW7/GW8 planning runs cannot
 replace the missing GW6 prefix.
 
+For future Wildcard opportunity windows, `certify_future_wildcard_value_generation`
+selects a contiguous 6–10 event slice from the verified origin
+`CHIP_RESERVATION` product. It obtains the run IDs and snapshot from that
+product, rechecks the root FOUR_GW prefix and cutoff/snapshot/code identity, and
+compares every selected event's dependency closure after certification. It
+cannot accept caller-supplied run IDs or later planning runs, and it does not
+publish a future FOUR_GW decision product.
+
 Focused evidence covers 6- and 10-event products, the unchanged four-event
 product, short/gapped/length-mismatched horizons, refusal of substituted
 prefix runs, and the production builder's separate value generation bound to
@@ -84,6 +174,35 @@ also has a production-adapter regression. These are fixture-backed results,
 not a production Wildcard generation. The available prediction inventory
 reaches GW8; verified same-cutoff projection runs for any needed later events,
 including GW9/GW10 when requested, remain a data prerequisite.
+
+## BB/TC expiry continuation
+
+For expiry beyond the normal route's four-event horizon, the supported
+prediction input is a separate `CHIP_RESERVATION` generation. Certification
+requires a contiguous origin-starting event sequence, the exact normal
+four-event run prefix, and matching cutoff, pinned data snapshot and predictive
+code identity. It does not widen the normal decision horizon. The coverage
+product binds this generation and the exact runs through the known expiry.
+
+BB/TC event opportunities after the normal horizon start from the replayed
+normal route's terminal permanent squad, bank, purchase-price basis and chip
+state. The declared continuation model makes no transfers in intervening
+events, advances FT using the supplied season rules, and ranks a legal lineup
+for each future event from that event's certified continuation worlds. The
+event record binds the continuation generation, event bundle/runs, coverage
+product, manager state, lineup, rule payload and world identity. The rules must
+be resolved by the caller from the origin-pinned official snapshot. This is a
+forecast assumption, not an observation of later manager behavior.
+
+The reservation builder produces only opportunities supported by the verified
+product. If the product, continuation rules or any event opportunity is
+missing, the forecast remains `INCOMPLETE` with `raw_value = null`; a complete
+prediction product alone cannot force a numeric forecast. Focused evidence:
+`test_chip_reservation_product_extends_verified_four_event_prefix_through_expiry`,
+`test_bb_continuation_opportunity_binds_terminal_state_and_per_event_lineup`,
+and `test_complete_prediction_product_with_missing_event_forecast_stays_unknown`.
+These are fixture-backed product and model checks. No real continuation
+generation exists for a confirmed current manager cutoff.
 
 ## Proposed BB/TC scenario
 
@@ -184,29 +303,37 @@ not paired chip reservation trials. Synthetic fixtures test the calibration
 implementation only. The reservation-forecast artifact contract verifies
 per-event point-in-time expected-opportunity records bound to a certified
 source and exact SAVE state. A route-backed BB/TC producer now evaluates each
-future event available in the verified normal four-event generation and
-retains the event's paired scoring policies. Both current BB/TC assessments
-and their future reservation forecasts bind the same verified proposed route;
-the SAVE identity includes the post-H1 squad, acquisition-price basis, bank,
-free transfers, chip state and route identity. Per-event PLAY/SAVE scoring
-policies use the same proposed squad, lineup and certified worlds. If known
-expiry extends past the four-event coverage, the forecast remains incomplete
-with no numeric value. FH/WC's
-current arm builders do not yet produce future-event opportunity policies, so
-their reservation forecasts remain unavailable through this producer. The
-production assessor can consume retained forecasts, and the CLI accepts their
-verified artifact directory. Fixture forecasts are not evidence of a live
-forecast. There is not enough retained causal evidence to create a production
-calibration, and no production forecast currently has complete coverage to
-expiry. Reservation therefore remains uncalibrated and cannot support a
-production `PLAY_CHIP` endorsement.
+future event available in the verified normal four-event generation and, with
+the separately certified continuation product, through known expiry. It
+retains event-specific paired policies and exact source identities. Both
+current BB/TC assessments and their future reservation forecasts bind the same
+verified proposed route; the SAVE identity includes the post-H1 squad,
+acquisition-price basis, bank, free transfers, chip state and route identity.
+FH/WC also have dedicated future-event producers using their canonical typed
+requests and chip-specific route/generation machinery. Fixture lifecycle tests
+cover production, origin retention, maturation and calibration for selected
+event substitution at events 7 and 8. These fixtures are not a live forecast.
+The production assessor can consume retained forecasts, and the CLI accepts
+their verified artifact directory. No production forecast currently has
+complete coverage through an actual manager-confirmed expiry.
 
-The evaluator gates remain independent: BB is review-only, TC retains its
-existing permitted gate, and FH/WC are review-only. Reservation calibration
-cannot override an evaluator whose `execution_permitted` is false. It also
-cannot supply the missing production raw forecast. The gate behavior is covered
-by the focused remediation test and the existing BB, FH and WC review-only
-tests.
+Reservation calibration still requires validated, matured causal paired
+outcomes; none exist in the retained inventory. Reservation therefore remains
+uncalibrated and cannot support a production `PLAY_CHIP` endorsement.
+
+The candidate now reads action-specific evaluator-readiness artifacts built
+from independently revalidated prospective causal observations. Different
+criteria apply to BB, FH and WC, and the readiness artifact must match the
+action and evaluator version before its execution permission can be applied.
+The artifact's evaluation cutoff must also be no later than the current
+assessment cutoff, preventing later matured evidence from enabling a historical
+assessment. Fixture tests demonstrate both permission and refusal for BB/FH/WC,
+including insufficient samples, incompatible evaluator versions, historical
+replay and an artifact that postdates the assessment. These simulated
+observations are explicitly not production evidence. In the
+absence of real readiness evidence BB/FH/WC remain execution-blocked; TC keeps
+its existing gate. Reservation calibration remains a separate requirement and
+cannot by itself grant evaluator execution permission.
 
 ## Assessment retention and remaining dependencies
 
@@ -235,12 +362,15 @@ outstanding operational facts are:
    certification matching that same snapshot.
 3. One consistent 6–10 event Wildcard product with all required event runs at
    that same cutoff, snapshot, execution UUID and code identity.
-4. Certified event forecasts with complete coverage to each chip's known
-   expiry. BB/TC are supported within the normal four-event product; FH/WC
-   future-event producers and any events beyond available certified coverage
-   remain implementation/data gates.
-5. Validated retained paired chip causal outcomes before any
-   reservation-calibrated recommendation can be supported.
+4. A same-origin CHIP_RESERVATION generation with its exact four-event prefix
+   and sufficient certified events through every known expiry, plus all
+   action-specific event opportunities. The matching snapshot must also retain
+   the accepted bootstrap capture and intact archive payload needed to resolve
+   season rules. The code path exists; production products and complete forecast
+   artifacts are missing.
+5. Validated retained paired chip causal outcomes for reservation calibration
+   and action-specific evaluator readiness. These are separate evidence gates;
+   neither has real retained production samples.
 
 The validation report must distinguish fixture-backed implementation from
 operational evidence, preserve the historical Run #1 refusals and the two

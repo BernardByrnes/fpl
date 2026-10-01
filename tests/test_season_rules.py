@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -15,8 +16,12 @@ from fpl_brain.season_rules import (
     price_engine_matches_rules,
     season_rules_from_bootstrap,
     season_rules_from_game_settings,
+    resolve_origin_pinned_season_rules,
+    verify_pinned_season_rules_evidence,
     transfer_hit_cost,
 )
+from fpl_brain import raw_archive, repositories as repo
+from fpl_brain.database import connect_database
 
 OFFICIAL_SETTINGS = {
     "squad_squadsize": 15,
@@ -103,3 +108,70 @@ def test_price_engine_drift_check_flags_fee_change():
     )
     ok, message = price_engine_matches_rules(drifted)
     assert not ok and "element_sell_at_purchase_price" in message
+
+
+def test_continuation_rules_resolve_from_the_accepted_pre_cutoff_bootstrap_capture(tmp_path):
+    conn = connect_database(tmp_path / "origin.db")
+    raw_dir = tmp_path / "raw"
+
+    def retain(captured_at: str, settings: dict[str, object]) -> None:
+        run_id = repo.create_fetch_run(conn, "fetch_fpl", str(raw_dir), started_at=captured_at)
+        payload = {"game_settings": settings}
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+        raw_archive.archive_raw_capture(
+            raw_dir,
+            source="bootstrap_static",
+            observed_at=captured_at,
+            body=body,
+            run_id=run_id,
+        )
+        repo.record_bootstrap_generation(
+            conn,
+            captured_at=captured_at,
+            accepted=True,
+            official_element_count=1,
+            parsed_count=1,
+            persisted_count=1,
+            element_ids=(1,),
+            element_ids_sha256=hashlib.sha256(b"1").hexdigest(),
+            acceptance_rule="fixture-complete",
+            acceptance_rule_version="fixture-v1",
+            fetch_run_id=run_id,
+        )
+
+    try:
+        retain("2026-09-20T08:00:00Z", dict(OFFICIAL_SETTINGS))
+        retain("2026-10-02T08:00:00Z", {**OFFICIAL_SETTINGS, "max_extra_free_transfers": 3})
+        pinned = resolve_origin_pinned_season_rules(
+            conn,
+            season="2026/27",
+            cutoff="2026-09-29T20:27:01Z",
+            data_snapshot_sha256="d" * 64,
+        )
+        assert pinned.rules.max_free_transfers == 5
+        assert pinned.evidence["captured_at"] == "2026-09-20T08:00:00Z"
+        assert pinned.evidence["source"] == "ACCEPTED_BOOTSTRAP_CAPTURE_IN_ORIGIN_SNAPSHOT_ARCHIVE"
+        assert verify_pinned_season_rules_evidence(
+            pinned.evidence,
+            pinned.rules,
+            cutoff="2026-09-29T20:27:01Z",
+            data_snapshot_sha256="d" * 64,
+        ) is True
+        with pytest.raises(SeasonRulesError, match="differs from the origin"):
+            verify_pinned_season_rules_evidence(
+                pinned.evidence,
+                season_rules_from_game_settings("2026/27", {**OFFICIAL_SETTINGS, "max_extra_free_transfers": 3}),
+                cutoff="2026-09-29T20:27:01Z",
+                data_snapshot_sha256="d" * 64,
+            )
+        archived_payload = raw_dir / raw_archive.ARCHIVE_DIRNAME / pinned.evidence["archive_relative_path"]
+        archived_payload.write_bytes(b"tampered")
+        with pytest.raises(SeasonRulesError, match="payload digest does not verify"):
+            resolve_origin_pinned_season_rules(
+                conn,
+                season="2026/27",
+                cutoff="2026-09-29T20:27:01Z",
+                data_snapshot_sha256="d" * 64,
+            )
+    finally:
+        conn.close()

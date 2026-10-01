@@ -34,7 +34,7 @@ def _source():
     }
 
 
-def _inputs():
+def _inputs(*, coverage_product_sha256=None):
     source = _source()
     state = {
         "squad_ids": list(range(1, 16)),
@@ -46,29 +46,82 @@ def _inputs():
             planning_event=6,
             event=event,
             origin_cutoff="2026-10-01T08:00:00Z",
-            made_at="2026-10-01T07:59:00Z",
+            made_at="2026-10-01T08:00:05Z",
+            input_as_of="2026-10-01T08:00:00Z",
             expected_incremental_points=value,
             opportunity_model="fixture_tc_expected_captain_uplift_v1",
             source_identity=source,
             reservation_state=state,
             world_identity=_sha({"world": event}),
+            coverage_product_sha256=coverage_product_sha256,
         )
         records[f"event-{event}"] = artifact
     return source, state, records
 
 
-def _build(records, *, expiry_event):
+def _fixture_coverage_product(source, *, action, expiry_event, product_last=None, horizon_length=1):
+    origin = int(source["planning_event"])
+    required_last = origin - 1 if expiry_event is None else int(expiry_event) + int(horizon_length) - 1
+    if product_last is None:
+        product_last = max(origin + 3, required_last)
+    events = list(range(origin, int(product_last) + 1))
+    required = [] if expiry_event is None else list(range(origin, required_last + 1))
+    missing = [event for event in required if event not in events]
+    coverage_known = expiry_event is not None
+    coverage_complete = bool(coverage_known and not missing)
+    body = {
+        "schema": forecast.RESERVATION_COVERAGE_PRODUCT_SCHEMA,
+        "action": action,
+        "planning_event": origin,
+        "expiry_event": expiry_event,
+        "forecast_events": [] if expiry_event is None else list(range(origin + 1, int(expiry_event) + 1)),
+        "opportunity_horizon_length": int(horizon_length),
+        "required_product_events": required,
+        "product_events": events,
+        "missing_events": missing,
+        "coverage_known": coverage_known,
+        "coverage_complete": coverage_complete,
+        "coverage_status": forecast.FORECAST_READY if coverage_complete else forecast.FORECAST_INCOMPLETE,
+        "coverage_reason": (
+            None if coverage_complete
+            else "CHIP_EXPIRY_UNKNOWN" if not coverage_known
+            else "REQUIRED_PRODUCT_EVENTS_MISSING"
+        ),
+        "source_identity": source,
+        "root_generation_id": source["generation_id"],
+        "product_generation_id": "fixture-continuation-product",
+        "product_generation_manifest_sha256": "fixture-continuation-product",
+        "origin_cutoff": source["origin_cutoff"],
+        "input_as_of": source["origin_cutoff"],
+        "data_snapshot_sha256": source["data_snapshot_sha256"],
+        "predictive_code_snapshot_sha256": source["predictive_code_snapshot_sha256"],
+        "product_runs_by_event": {str(event): {"fixture": event} for event in events},
+        "wildcard_value_horizon_length": horizon_length if action == cd.CHIP_ACTION_WC else None,
+    }
+    body["product_sha256"] = _sha(body)
+    return body
+
+
+def _build(records, *, expiry_event, product_last=None):
     source, state, _ = _inputs()
+    coverage_product = (
+        None if expiry_event is None else _fixture_coverage_product(
+            source, action=cd.CHIP_ACTION_TC, expiry_event=expiry_event,
+            product_last=product_last,
+        )
+    )
     return forecast.build_reservation_forecast(
         action=cd.CHIP_ACTION_TC,
         planning_event=6,
         origin_cutoff="2026-10-01T08:00:00Z",
-        made_at="2026-10-01T07:59:30Z",
+        made_at="2026-10-01T08:00:30Z",
+        input_as_of="2026-10-01T08:00:00Z",
         expiry_event=expiry_event,
         source_identity=source,
         reservation_state=state,
         opportunity_refs=tuple(records),
         evidence_verifier=records.__getitem__,
+        coverage_product=coverage_product,
     )
 
 
@@ -107,7 +160,8 @@ def test_complete_nonpositive_forecast_still_binds_earliest_best_event_for_matur
             planning_event=6,
             event=event,
             origin_cutoff="2026-10-01T08:00:00Z",
-            made_at="2026-10-01T07:59:00Z",
+            made_at="2026-10-01T08:00:05Z",
+            input_as_of="2026-10-01T08:00:00Z",
             expected_incremental_points=value,
             opportunity_model="fixture_tc_expected_captain_uplift_v1",
             source_identity=source,
@@ -166,7 +220,8 @@ def test_certified_evaluator_builds_and_retains_future_event_causal_origin(actio
         positions=positions,
         source_identity=source,
         reservation_state=reservation_state,
-        made_at="2026-10-01T07:59:00Z",
+        made_at="2026-10-01T08:00:05Z",
+        input_as_of="2026-10-01T08:00:00Z",
     )
     play_policy = event_record["outcome_arms"]["play"]["lineup"]
     save_policy = event_record["outcome_arms"]["save"]["lineup"]
@@ -188,12 +243,16 @@ def test_certified_evaluator_builds_and_retains_future_event_causal_origin(actio
         action=action,
         planning_event=6,
         origin_cutoff=source["origin_cutoff"],
-        made_at="2026-10-01T07:59:30Z",
+        made_at="2026-10-01T08:00:30Z",
+        input_as_of="2026-10-01T08:00:00Z",
         expiry_event=7,
         source_identity=source,
         reservation_state=reservation_state,
         opportunity_refs=tuple(records),
         evidence_verifier=records.__getitem__,
+        coverage_product=_fixture_coverage_product(
+            source, action=action, expiry_event=7, product_last=7,
+        ),
     )
     retained = calibration.retain_causal_origin_observation(
         observation_id=f"{action.lower()}-origin-1",
@@ -215,7 +274,10 @@ def test_certified_evaluator_builds_and_retains_future_event_causal_origin(actio
 def test_short_or_unknown_coverage_remains_unknown_not_zero(expiry_event):
     _, _, records = _inputs()
     partial = {"event-7": records["event-7"]}
-    artifact = _build(partial, expiry_event=expiry_event)
+    artifact = _build(
+        partial, expiry_event=expiry_event,
+        product_last=8 if expiry_event is not None else None,
+    )
     assert artifact["coverage_complete"] is False
     assert artifact["coverage_status"] == forecast.FORECAST_INCOMPLETE
     assert artifact["raw_value"] is None
@@ -223,14 +285,94 @@ def test_short_or_unknown_coverage_remains_unknown_not_zero(expiry_event):
     forecast.verify_reservation_forecast(artifact, expected={})
 
 
-def test_raw_forecast_rejects_future_dated_and_mismatched_opportunity_sources():
+def test_unknown_expiry_coverage_product_is_explicitly_incomplete_even_with_future_runs():
+    source, state, _ = _inputs()
+    product = _fixture_coverage_product(
+        source,
+        action=cd.CHIP_ACTION_TC,
+        expiry_event=None,
+        product_last=12,
+    )
+    artifact = forecast.build_reservation_forecast(
+        action=cd.CHIP_ACTION_TC,
+        planning_event=6,
+        origin_cutoff="2026-10-01T08:00:00Z",
+        made_at="2026-10-01T08:00:30Z",
+        input_as_of="2026-10-01T08:00:00Z",
+        expiry_event=None,
+        source_identity=source,
+        reservation_state=state,
+        opportunity_refs=(),
+        evidence_verifier={}.__getitem__,
+        coverage_product=product,
+    )
+    assert product["coverage_known"] is False
+    assert product["coverage_complete"] is False
+    assert product["coverage_reason"] == "CHIP_EXPIRY_UNKNOWN"
+    assert artifact["coverage_complete"] is False
+    assert artifact["raw_value"] is None
+    assert artifact["reason_code"] == "CHIP_RESERVATION_FORECAST_COVERAGE_INCOMPLETE"
+    forecast.verify_reservation_forecast(artifact, expected={})
+
+
+def test_complete_prediction_product_with_missing_event_forecast_stays_unknown():
+    source, state, _ = _inputs()
+    product = _fixture_coverage_product(
+        source,
+        action=cd.CHIP_ACTION_TC,
+        expiry_event=8,
+        product_last=8,
+    )
+    source, state, records = _inputs(coverage_product_sha256=product["product_sha256"])
+    artifact = forecast.build_reservation_forecast(
+        action=cd.CHIP_ACTION_TC,
+        planning_event=6,
+        origin_cutoff="2026-10-01T08:00:00Z",
+        made_at="2026-10-01T08:00:30Z",
+        input_as_of="2026-10-01T08:00:00Z",
+        expiry_event=8,
+        source_identity=source,
+        reservation_state=state,
+        opportunity_refs=["event-7"],
+        evidence_verifier=records.__getitem__,
+        coverage_product=product,
+    )
+    assert product["coverage_complete"] is True
+    assert artifact["coverage_complete"] is False
+    assert artifact["coverage_status"] == forecast.FORECAST_INCOMPLETE
+    assert artifact["raw_value"] is None
+    forecast.verify_reservation_forecast(artifact, expected={})
+
+
+def test_prospective_forecast_may_issue_after_cutoff_but_not_use_later_inputs():
     source, state, records = _inputs()
-    with pytest.raises(forecast.ReservationForecastError, match="after its origin cutoff"):
+    prospective = forecast.build_event_opportunity_record(
+        action=cd.CHIP_ACTION_TC,
+        planning_event=6,
+        event=7,
+        origin_cutoff="2026-10-01T08:00:00Z",
+        input_as_of="2026-10-01T08:00:00Z",
+        made_at="2026-10-01T08:00:01Z",
+        expected_incremental_points=4.0,
+        opportunity_model="fixture_tc_expected_captain_uplift_v1",
+        source_identity=source,
+        reservation_state=state,
+        world_identity=_sha({"world": 7}),
+    )
+    assert prospective["input_as_of"] == "2026-10-01T08:00:00Z"
+    assert prospective["made_at"] == "2026-10-01T08:00:01Z"
+    forecast._verify_event_opportunity(
+        prospective, action=cd.CHIP_ACTION_TC, planning_event=6,
+        origin_cutoff=source["origin_cutoff"], source_identity=source,
+        reservation_state=state,
+    )
+    with pytest.raises(forecast.ReservationForecastError, match="later than the origin cutoff"):
         forecast.build_event_opportunity_record(
             action=cd.CHIP_ACTION_TC,
             planning_event=6,
             event=7,
             origin_cutoff="2026-10-01T08:00:00Z",
+            input_as_of="2026-10-01T08:00:01Z",
             made_at="2026-10-01T08:00:01Z",
             expected_incremental_points=4.0,
             opportunity_model="fixture_tc_expected_captain_uplift_v1",
@@ -243,7 +385,7 @@ def test_raw_forecast_rejects_future_dated_and_mismatched_opportunity_sources():
     mismatch["reservation_state"]["free_transfers"] = 0
     mismatch["artifact_sha256"] = _sha({key: value for key, value in mismatch.items()
                                          if key != "artifact_sha256"})
-    with pytest.raises(forecast.ReservationForecastError, match="not bound to the exact SAVE state"):
+    with pytest.raises(forecast.ReservationForecastError, match="SAVE-state digest does not verify"):
         _build({"mismatch": mismatch}, expiry_event=7)
 
 
@@ -306,7 +448,7 @@ def test_assessment_cli_refuses_ambiguous_content_addressed_forecasts(tmp_path):
     _, _, records = _inputs()
     first = _build(records, expiry_event=8)
     partial = {"event-7": records["event-7"]}
-    second = _build(partial, expiry_event=9)
+    second = _build(partial, expiry_event=9, product_last=8)
     forecast.retain_reservation_forecast(first, tmp_path)
     forecast.retain_reservation_forecast(second, tmp_path)
     conn = sqlite3.connect(":memory:")

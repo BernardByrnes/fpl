@@ -8,11 +8,13 @@ loads any world matrices or runs either route optimizer.
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
 from . import (
     chip_decision as cd,
+    chip_evaluator_readiness as cer,
     chip_route_assembly as cra,
     chip_reservation_forecast as crf,
     free_hit_production as fhp,
@@ -20,6 +22,7 @@ from . import (
     generation_store as gs,
     planning,
     repositories as repo,
+    season_rules as sr,
     wildcard_production as wcp,
     wildcard_request_adapter as wa,
 )
@@ -34,6 +37,7 @@ CHIP_MANAGER_CONFIRMATION_REQUIRED = "CHIP_PRODUCTION_MANAGER_CONFIRMATION_REQUI
 CHIP_NORMAL_CONTEXT_INVALID = "CHIP_PRODUCTION_NORMAL_CONTEXT_INVALID"
 CHIP_WORLD_INPUTS_UNAVAILABLE = "CHIP_PRODUCTION_CERTIFIED_WORLDS_UNAVAILABLE"
 CHIP_ASSESSMENT_CALIBRATION_INVALID = "CHIP_RESERVATION_CALIBRATION_ARTIFACT_INVALID"
+CHIP_SEASON_RULES_SOURCE_MISSING = "CHIP_ORIGIN_PINNED_SEASON_RULES_MISSING"
 
 
 class ChipAssessmentPreflightError(ValueError):
@@ -83,6 +87,8 @@ def assemble_assessment_record(
     reservation: Any | None = None,
     reservation_forecasts: Mapping[str, Mapping[str, Any]] | None = None,
     reservation_forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
+    evaluator_readiness_artifacts: Mapping[str, Mapping[str, Any]] | None = None,
+    evaluator_readiness_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     chips_already_played_for_event: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Create the four-chip record and run the unchanged canonical arbiter."""
@@ -90,6 +96,36 @@ def assemble_assessment_record(
     by_action = cd._availability_by_action(availability, planning_event=int(context["planning_event"]))
     blocked = dict(blocked or {})
     extra_evidence = dict(extra_evidence or {})
+    readiness_artifacts = dict(evaluator_readiness_artifacts or {})
+    for action in (cd.CHIP_ACTION_BB, cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC):
+        evaluation = evaluations.get(action)
+        if evaluation is None:
+            continue
+        artifact = readiness_artifacts.get(action)
+        if artifact is None:
+            readiness = {
+                "status": cer.READINESS_INSUFFICIENT,
+                "execution_permitted": False,
+                "reason_code": "CHIP_EVALUATOR_READINESS_EVIDENCE_MISSING",
+            }
+        else:
+            try:
+                evaluation, readiness = cer.apply_verified_readiness(
+                    evaluation,
+                    artifact,
+                    None,
+                    current_cutoff=str(context["cutoff"]),
+                    evidence_verifier=evaluator_readiness_evidence_verifier,
+                )
+            except Exception as failure:
+                raise ChipAssessmentPreflightError(
+                    f"{cer.READINESS_INVALID}: {failure}"
+                ) from failure
+            evaluations = {**dict(evaluations), action: evaluation}
+        extra_evidence[action] = {
+            **dict(extra_evidence.get(action) or {}),
+            "evaluator_readiness": readiness,
+        }
     expiry_by_action: dict[str, int | None] = {}
     for action in cd.PLAYABLE_CHIP_ACTIONS:
         row = by_action.get(action) or {}
@@ -278,7 +314,8 @@ def run_production_chip_assessment(
     decision_id: str,
     entry_id: int,
     route_id: str,
-    rules: Any,
+    rules: Any | None = None,
+    season: str = "2026/27",
     certification_path: str | None = None,
     wildcard_value_generation_id: str | None = None,
     cache_dir: str | None = None,
@@ -286,6 +323,8 @@ def run_production_chip_assessment(
     reservation_calibration_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     reservation_forecasts: Mapping[str, Mapping[str, Any]] | None = None,
     reservation_forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
+    evaluator_readiness_artifacts: Mapping[str, Mapping[str, Any]] | None = None,
+    evaluator_readiness_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run only after an explicit pre-cutoff manager confirmation is pinned.
 
@@ -322,6 +361,53 @@ def run_production_chip_assessment(
         availability = [dict(row) for row in (manager_context.chips or ())]
         by_action = cd._availability_by_action(availability, planning_event=route.planning_event)
         eligible = {action for action, row in by_action.items() if row.get("eligible")}
+        season_rules_evidence: Mapping[str, Any] | None = None
+        season_rules_problem: str | None = None
+        requested_season = str(getattr(rules, "season", season) or season)
+        try:
+            pinned_rules = sr.resolve_origin_pinned_season_rules(
+                source_conn,
+                season=requested_season,
+                cutoff=str(route.cutoff),
+                data_snapshot_sha256=str(route.data_snapshot_sha256),
+            )
+            if rules is not None and asdict(rules) != asdict(pinned_rules.rules):
+                raise sr.SeasonRulesError(
+                    "caller-supplied season rules differ from the accepted origin-pinned bootstrap settings"
+                )
+            rules = pinned_rules.rules
+            season_rules_evidence = dict(pinned_rules.evidence)
+        except Exception as failure:
+            rules = None
+            season_rules_problem = f"{type(failure).__name__}: {failure}"
+        rule_dependent_actions = eligible.intersection({cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC})
+        if rule_dependent_actions and rules is None:
+            action_refusals = {
+                action: (CHIP_SEASON_RULES_SOURCE_MISSING, season_rules_problem or "official rules are unavailable")
+                for action in rule_dependent_actions
+            }
+            raise ChipAssessmentPreflightError(
+                f"{CHIP_SEASON_RULES_SOURCE_MISSING}: the accepted bootstrap settings in the verified "
+                f"origin snapshot could not establish {requested_season} rules; no chip worlds or routes were loaded",
+                action_refusals=action_refusals,
+            )
+
+        # Reject malformed readiness manifests before opening world matrices or
+        # entering either route optimizer. Full evidence revalidation is repeated
+        # when the concrete evaluator version is applied to its result.
+        for action, artifact in dict(evaluator_readiness_artifacts or {}).items():
+            if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
+                raise ChipAssessmentPreflightError(
+                    f"{cer.READINESS_INVALID}: unsupported readiness action {action}"
+                )
+            try:
+                cer.verify_retained_readiness_integrity(artifact)
+                if artifact.get("action") != action:
+                    raise ValueError("readiness artifact action differs from its map key")
+            except Exception as failure:
+                raise ChipAssessmentPreflightError(
+                    f"{cer.READINESS_INVALID}: {failure}"
+                ) from failure
 
         # Validate every eligible long-running path before the first world load
         # or route search. Missing manager facts, a mismatched certificate, or
@@ -520,6 +606,9 @@ def run_production_chip_assessment(
                 if evaluation.action in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}
             ), None),
             "manager_state_identity": manager_for_arbiter["manager_state_identity"],
+            "season_rules_evidence": (
+                None if season_rules_evidence is None else dict(season_rules_evidence)
+            ),
         }
         used_chips = tuple(
             str(row.get("name")) for row in availability
@@ -535,6 +624,8 @@ def run_production_chip_assessment(
             reservation=reservation,
             reservation_forecasts=reservation_forecasts,
             reservation_forecast_evidence_verifier=reservation_forecast_evidence_verifier,
+            evaluator_readiness_artifacts=evaluator_readiness_artifacts,
+            evaluator_readiness_evidence_verifier=evaluator_readiness_evidence_verifier,
             chips_already_played_for_event=used_chips,
         )
     finally:
