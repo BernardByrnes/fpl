@@ -201,6 +201,68 @@ def _verify_forecast_matches_save_state(
         raise ReservationCalibrationError("raw reservation forecast is not bound to the retained SAVE arm state")
 
 
+def _verify_pair_matches_selected_forecast(
+    action: str,
+    forecast: Mapping[str, Any],
+    pair: Mapping[str, Any],
+) -> None:
+    """Bind BB/TC causal arms to the evaluator policies frozen at the origin."""
+
+    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        return
+    try:
+        selected_event = int(forecast["selected_event"])
+    except (KeyError, TypeError, ValueError) as failure:
+        raise ReservationCalibrationError("raw reservation forecast has no selected event") from failure
+    opportunities = forecast.get("opportunities")
+    if not isinstance(opportunities, list):
+        raise ReservationCalibrationError("raw reservation forecast has no selected event manifest")
+    selected_payloads = []
+    for item in opportunities:
+        payload = item.get("artifact_payload") if isinstance(item, Mapping) else None
+        if isinstance(payload, Mapping):
+            try:
+                event = int(payload.get("event"))
+            except (TypeError, ValueError):
+                continue
+            if event == selected_event:
+                selected_payloads.append(payload)
+    if len(selected_payloads) != 1:
+        raise ReservationCalibrationError(
+            "raw reservation forecast does not identify exactly one selected event opportunity"
+        )
+    expected_arms = selected_payloads[0].get("outcome_arms")
+    if not isinstance(expected_arms, Mapping) or set(expected_arms) != {"play", "save"}:
+        raise ReservationCalibrationError(
+            "selected forecast opportunity omits its frozen PLAY/SAVE policies"
+        )
+    if set(pair) != {"play", "save"}:
+        raise ReservationCalibrationError("causal evidence does not retain exactly one PLAY/SAVE pair")
+    for role in ("play", "save"):
+        retained_arm = pair.get(role)
+        expected_arm = expected_arms.get(role)
+        if not isinstance(retained_arm, Mapping) or not isinstance(expected_arm, Mapping):
+            raise ReservationCalibrationError("selected forecast opportunity has a malformed causal arm")
+        payload = retained_arm.get("artifact_payload")
+        if not isinstance(payload, Mapping) or dict(payload) != dict(expected_arm):
+            raise ReservationCalibrationError(
+                f"retained {role.upper()} policy does not match the selected forecast opportunity"
+            )
+        expected_digest = _canonical_sha256(expected_arm)
+        if (
+            str(retained_arm.get("artifact_sha256") or "") != expected_digest
+            or str(retained_arm.get("arm_id") or "") != str(expected_arm.get("arm_id") or "")
+        ):
+            raise ReservationCalibrationError(
+                f"retained {role.upper()} identity does not match the selected forecast opportunity"
+            )
+        for name, value in expected_arm.items():
+            if retained_arm.get(name) != value:
+                raise ReservationCalibrationError(
+                    f"retained {role.upper()} {name} differs from the selected forecast opportunity"
+                )
+
+
 def _verify_action_pair_policies(
     action: str,
     play: Mapping[str, Any],
@@ -221,6 +283,7 @@ def _verify_action_pair_policies(
                 raise ReservationCalibrationError(f"PLAY and SAVE do not share the same {name}")
         return
 
+    transfer_states: dict[str, Mapping[str, Any]] = {}
     for arm_name, arm, expected_role in (
         ("PLAY", play, "PLAY"), ("SAVE", save, "SAVE"),
     ):
@@ -230,6 +293,7 @@ def _verify_action_pair_policies(
         state = semantics.get("transfer_state") if isinstance(semantics, Mapping) else None
         if not isinstance(semantics, Mapping) or not isinstance(state, Mapping):
             raise ReservationCalibrationError(f"{action} {arm_name} arm omits explicit transfer-state semantics")
+        transfer_states[expected_role] = state
         if semantics.get("role") != expected_role:
             raise ReservationCalibrationError(f"{action} {arm_name} action semantics disagree with its arm role")
         try:
@@ -259,16 +323,101 @@ def _verify_action_pair_policies(
         restoration = play_semantics.get("restore_at_h2")
         if not isinstance(restoration, Mapping):
             raise ReservationCalibrationError("FH PLAY omits its permanent-state restoration record")
-        equality_pairs = (
-            ("permanent_squad_ids", "restored_squad_ids"),
-            ("permanent_purchase_price_tenths", "restored_purchase_price_tenths"),
-            ("permanent_bank_tenths", "restored_bank_tenths"),
-            ("event_start_h1_free_transfers", "restored_h2_free_transfers"),
+        required_fields = (
+            "restore_event", "permanent_squad_ids", "restored_squad_ids",
+            "permanent_purchase_price_tenths", "restored_purchase_price_tenths",
+            "permanent_bank_tenths", "restored_bank_tenths",
+            "event_start_h1_free_transfers", "restored_h2_free_transfers",
         )
-        if any(restoration.get(left) != restoration.get(right) for left, right in equality_pairs):
+        missing = [name for name in required_fields if name not in restoration]
+        if missing:
+            raise ReservationCalibrationError(
+                "FH PLAY permanent-state restoration record is incomplete: " + ", ".join(missing)
+            )
+
+        def strict_int(value: Any, name: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ReservationCalibrationError(f"FH PLAY restoration {name} must be a non-negative integer")
+            return value
+
+        def squad_ids(
+            value: Any, name: str, *, require_squad_size: bool = True,
+        ) -> tuple[int, ...]:
+            if not isinstance(value, (list, tuple)):
+                raise ReservationCalibrationError(f"FH PLAY restoration {name} must be a player-id list")
+            values = tuple(strict_int(item, name) for item in value)
+            if len(set(values)) != len(values) or (
+                require_squad_size and len(values) != ml.SQUAD_SIZE
+            ):
+                raise ReservationCalibrationError(f"FH PLAY restoration {name} must contain 15 unique players")
+            return values
+
+        def prices(value: Any, name: str) -> dict[int, int]:
+            if not isinstance(value, Mapping):
+                raise ReservationCalibrationError(f"FH PLAY restoration {name} must be a purchase-price mapping")
+            result: dict[int, int] = {}
+            try:
+                for key, item in value.items():
+                    if isinstance(key, bool):
+                        raise ValueError("boolean player id")
+                    player_id = int(key)
+                    if player_id in result:
+                        raise ValueError("duplicate player id")
+                    result[player_id] = strict_int(item, name)
+            except (TypeError, ValueError) as failure:
+                raise ReservationCalibrationError(f"FH PLAY restoration {name} is malformed") from failure
+            return result
+
+        permanent_squad = squad_ids(restoration["permanent_squad_ids"], "permanent_squad_ids")
+        restored_squad = squad_ids(
+            restoration["restored_squad_ids"], "restored_squad_ids", require_squad_size=False,
+        )
+        permanent_prices = prices(
+            restoration["permanent_purchase_price_tenths"], "permanent_purchase_price_tenths",
+        )
+        restored_prices = prices(
+            restoration["restored_purchase_price_tenths"], "restored_purchase_price_tenths",
+        )
+        permanent_bank = strict_int(restoration["permanent_bank_tenths"], "permanent_bank_tenths")
+        restored_bank = strict_int(restoration["restored_bank_tenths"], "restored_bank_tenths")
+        event_start_ft = strict_int(
+            restoration["event_start_h1_free_transfers"], "event_start_h1_free_transfers",
+        )
+        restored_ft = strict_int(restoration["restored_h2_free_transfers"], "restored_h2_free_transfers")
+        if (
+            set(permanent_squad) != set(restored_squad)
+            or permanent_prices != restored_prices
+            or permanent_bank != restored_bank
+            or event_start_ft != restored_ft
+        ):
             raise ReservationCalibrationError("FH PLAY does not preserve permanent squad, bank, basis and event-start FT")
-        if int(restoration.get("restore_event", -1)) <= int(planning_event):
-            raise ReservationCalibrationError("FH permanent-state restoration is not after the PLAY event")
+        save_state = transfer_states["SAVE"]
+        try:
+            save_squad = squad_ids(save_state["squad_ids"], "SAVE squad_ids")
+            save_prices = prices(save_state["purchase_price_tenths"], "SAVE purchase_price_tenths")
+            save_bank = strict_int(save_state["bank_tenths"], "SAVE bank_tenths")
+            save_event_start_ft = strict_int(
+                save_state["event_start_free_transfers"], "SAVE event_start_free_transfers",
+            )
+            play_event = strict_int(play["event"], "PLAY event")
+            restore_event = strict_int(restoration["restore_event"], "restore_event")
+        except (KeyError, TypeError, ValueError, AttributeError) as failure:
+            raise ReservationCalibrationError(
+                f"FH PLAY restoration cannot be bound to the canonical SAVE state/event: {failure}"
+            ) from failure
+        if (
+            set(permanent_squad) != set(save_squad)
+            or permanent_prices != save_prices
+            or permanent_bank != save_bank
+            or event_start_ft != save_event_start_ft
+        ):
+            raise ReservationCalibrationError(
+                "FH PLAY restoration does not bind to the canonical permanent SAVE manager state"
+            )
+        if play_event <= int(planning_event) or restore_event != play_event + 1:
+            raise ReservationCalibrationError(
+                "FH permanent-state restoration must occur in H2 after the actual PLAY event"
+            )
         if save_semantics.get("retains_chip_option") is not True:
             raise ReservationCalibrationError("FH SAVE arm does not retain the Free Hit option")
     elif action == cd.CHIP_ACTION_WC:
@@ -857,6 +1006,7 @@ def finalize_causal_observation(
     except Exception as failure:
         raise ReservationCalibrationError(f"raw reservation forecast is not valid at its origin: {failure}") from failure
     _verify_forecast_matches_save_state(raw_forecast, save)
+    _verify_pair_matches_selected_forecast(action, raw_forecast, pair)
     expiry_event = raw_forecast.get("expiry_event")
     raw_value = raw_forecast.get("raw_value")
     if (
@@ -1237,10 +1387,6 @@ def validate_observation(
         ) from failure
     if not isinstance(retained_outcome_record, Mapping):
         raise ReservationCalibrationError("retained outcome record is not a JSON object")
-    _verify_pair(
-        evidence, row, retained_outcome_record=retained_outcome_record,
-        evidence_verifier=evidence_verifier,
-    )
     weeks = row.get("weeks_to_expiry")
     if weeks is None or int(weeks) < 0:
         raise ReservationCalibrationError("weeks_to_expiry must be an explicit non-negative integer")
@@ -1294,7 +1440,14 @@ def validate_observation(
     save_arm = pair.get("save") if isinstance(pair, Mapping) else None
     if not isinstance(save_arm, Mapping):
         raise ReservationCalibrationError("causal evidence omits the retained SAVE arm")
+    if not isinstance(pair, Mapping):
+        raise ReservationCalibrationError("causal evidence omits its retained PLAY/SAVE pair")
     _verify_forecast_matches_save_state(forecast_artifact, save_arm)
+    _verify_pair_matches_selected_forecast(action, forecast_artifact, pair)
+    _verify_pair(
+        evidence, row, retained_outcome_record=retained_outcome_record,
+        evidence_verifier=evidence_verifier,
+    )
     outcome_record = label.get("outcome_record") if isinstance(label, Mapping) else None
     selected_event = forecast_artifact.get("selected_event")
     if (

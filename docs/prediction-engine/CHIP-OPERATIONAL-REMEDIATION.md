@@ -150,15 +150,24 @@ append-only ledger; it retains the outcome and evidence as immutable
 content-addressed artifacts. Focused tests exercise finalization from official
 ledger captures, different FH/WC arm squads, and refusal of missing or nonfinal
 captures. The origin writer freezes the paired policies belonging to the
-forecast's selected future event, and maturation refuses a different event or
-a forecast tied to another SAVE state.
+forecast's selected future event. Both maturation and later calibration
+validation bind BB/TC causal arms back to those exact selected forecast
+policies. FH restoration evidence must be complete, typed, bound to the SAVE
+arm's permanent squad/bank/acquisition basis/event-start FT, and restore in H2
+after the actual PLAY event. Regressions cover TC arm substitution during
+maturation and validation, incomplete FH restoration, and production position
+resolution across the union of different FH PLAY/SAVE squads. These checks
+reject a substituted TC captain policy and incomplete or self-asserted Free
+Hit restoration evidence.
 
 Every capture must be event-grain, officially final, and carry the declared
 official player-gameweek provenance, including minutes and total points. At
 production load time, the evidence reader resolves every capture digest
 against `outcome_observation_captures`, recomputes its content digest, checks
 the retained fields and points, and verifies the arm's player positions against
-the source generation's pinned snapshot. Outcome availability is derived from
+the source generation's pinned snapshot. For different PLAY/SAVE squads, the
+resolver loads the union of both proposed squads before each arm is checked
+against its own pinned positions. Outcome availability is derived from
 the latest capture time and must match both the row and label; captures must
 postdate official finality and the forecast origin. The pre-registered
 expanding-origin protocol then excludes outcomes not mature by its evaluation

@@ -65,18 +65,27 @@ def _pinned_generation_position_resolver(conn: sqlite3.Connection):
             cache_identity[generation_id] = wanted_identity
 
         paired = outcome_record.get("paired_results") or {}
-        play = paired.get("play") if isinstance(paired, dict) else None
-        lineup = play.get("lineup") if isinstance(play, dict) else None
-        if not isinstance(lineup, dict):
-            raise ValueError("outcome record has no canonical source lineup")
-        player_ids = {
-            *(int(value) for value in lineup.get("starter_ids", ())),
-            int(lineup["bench_gk_id"]),
-            *(int(value) for value in lineup.get("bench_outfield_order", ())),
-        }
+        if not isinstance(paired, dict) or set(paired) != {"play", "save"}:
+            raise ValueError("outcome record has no complete canonical PLAY/SAVE arms")
+        player_ids: set[int] = set()
+        for arm_name in ("play", "save"):
+            arm = paired.get(arm_name)
+            if not isinstance(arm, dict):
+                raise ValueError(f"outcome record has no canonical {arm_name.upper()} arm")
+            try:
+                squad = [int(value) for value in arm["proposed_squad_ids"]]
+            except (KeyError, TypeError, ValueError) as failure:
+                raise ValueError(
+                    f"outcome record {arm_name.upper()} arm has no complete proposed squad"
+                ) from failure
+            if len(squad) != 15 or len(set(squad)) != 15:
+                raise ValueError(
+                    f"outcome record {arm_name.upper()} arm does not contain 15 unique players"
+                )
+            player_ids.update(squad)
         generation_positions = cache[generation_id]
-        if len(player_ids) != 15 or any(str(player_id) not in generation_positions for player_id in player_ids):
-            raise ValueError("pinned generation lacks positions for the complete 15-player policy")
+        if any(str(player_id) not in generation_positions for player_id in player_ids):
+            raise ValueError("pinned generation lacks positions for a complete PLAY/SAVE policy")
         return {
             str(player_id): generation_positions[str(player_id)] for player_id in sorted(player_ids)
         }
