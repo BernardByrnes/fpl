@@ -82,7 +82,9 @@ def _coverage_product(
     return body
 
 
-def _free_hit_request(event: int = FUTURE_EVENT):
+def _free_hit_request(
+    event: int = FUTURE_EVENT, *, current_ft: int = 3, event_start_ft: int = 3,
+):
     event = int(event)
     events = tuple(range(event, event + cd.CHIP_HORIZON_LENGTH))
     certificate = cf.certification_artifact(
@@ -101,8 +103,8 @@ def _free_hit_request(event: int = FUTURE_EVENT):
         owned_ids=owned,
         purchase_price_tenths={pid: 50 for pid in owned},
         bank_tenths=70,
-        free_transfers=3,
-        event_start_free_transfers=3,
+        free_transfers=current_ft,
+        event_start_free_transfers=event_start_ft,
         positions=fhfx.POSITION,
         clubs=fhfx.CLUB,
     )
@@ -416,7 +418,7 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
         positions = None
         for event in (FUTURE_EVENT, expiry):
             if action == cd.CHIP_ACTION_FH:
-                request, save_state = _free_hit_request(event)
+                request, save_state = _free_hit_request(event, current_ft=2, event_start_ft=3)
                 verified_authority = request.decision_authority
                 monkeypatch.setattr(
                     fh.FreeHitDecisionAuthority,
@@ -515,6 +517,13 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
                 assert len(play_arm["valuation_schedule"]["events"]) == cd.CHIP_HORIZON_LENGTH
                 assert len(save_arm["valuation_schedule"]["events"]) == cd.CHIP_HORIZON_LENGTH
                 restoration = play_arm["action_semantics"]["restore_at_h2"]
+                assert save_state["free_transfers"] == 2
+                assert save_state["event_start_free_transfers"] == 3
+                origin_manager_state = play_arm["action_semantics"]["origin_manager_state"]
+                assert origin_manager_state["free_transfers"] == 2
+                assert origin_manager_state["event_start_free_transfers"] == 3
+                assert restoration["event_start_h1_free_transfers"] == 3
+                assert restoration["restored_h2_free_transfers"] == 3
                 assert restoration["restore_event"] == event + 1
                 assert restoration["permanent_squad_ids"] == restoration["restored_squad_ids"]
                 assert restoration["permanent_squad_ids"] == save_state["squad_ids"]

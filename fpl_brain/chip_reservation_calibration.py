@@ -505,7 +505,13 @@ def _verify_action_pair_policies(
                 "event": int(planning_event),
                 "squad_ids": list(legacy_save_state.get("squad_ids") or ()),
                 "bank_tenths": int(legacy_save_state.get("bank_tenths", -1)),
-                "free_transfers": int(legacy_save_state.get("event_start_free_transfers", -1)),
+                "free_transfers": strict_int(
+                    legacy_save_state.get("free_transfers"), "origin manager free_transfers",
+                ),
+                "event_start_free_transfers": strict_int(
+                    legacy_save_state.get("event_start_free_transfers"),
+                    "origin manager event_start_free_transfers",
+                ),
                 "purchase_price_tenths": dict(legacy_save_state.get("purchase_price_tenths") or {}),
             }
             save_origin_state = origin_state
@@ -516,7 +522,8 @@ def _verify_action_pair_policies(
             save_prices = prices(origin_state["purchase_price_tenths"], "origin manager purchase_price_tenths")
             save_bank = strict_int(origin_state["bank_tenths"], "origin manager bank_tenths")
             save_event_start_ft = strict_int(
-                origin_state["free_transfers"], "origin manager free_transfers",
+                origin_state["event_start_free_transfers"],
+                "origin manager event_start_free_transfers",
             )
             play_event = strict_int(play["event"], "PLAY event")
             restore_event = strict_int(restoration["restore_event"], "restore_event")
@@ -792,8 +799,10 @@ def _verify_valuation_schedules(
             }
             or int(original.get("bank_tenths", -1)) != int(restoration.get("permanent_bank_tenths", -2))
             or int(original.get("bank_tenths", -1)) != int(restoration.get("restored_bank_tenths", -2))
-            or int(original.get("free_transfers", -1)) != int(restoration.get("event_start_h1_free_transfers", -2))
-            or int(original.get("free_transfers", -1)) != int(restoration.get("restored_h2_free_transfers", -2))
+            or int(original.get("event_start_free_transfers", -1))
+            != int(restoration.get("event_start_h1_free_transfers", -2))
+            or int(original.get("event_start_free_transfers", -1))
+            != int(restoration.get("restored_h2_free_transfers", -2))
             or str(restoration.get("origin_manager_state_sha256") or "") != original_digest
         ):
             raise ReservationCalibrationError("FH PLAY restoration does not reproduce the original permanent state")

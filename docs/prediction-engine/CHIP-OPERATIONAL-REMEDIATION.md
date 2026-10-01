@@ -14,16 +14,22 @@ The accepted remediation milestone is commit
 candidate based on that milestone. Candidate
 `f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b` passed its wrapper and exact-SHA CI
 but Sol High returned `FIX_REQUIRED` for absolute-interval coverage and FH
-interval units. The current unpinned changes address those findings and are
-not accepted until focused gates, a replacement candidate's authoritative
-wrapper, exact-SHA CI and Sol review finish. Do not describe fixture evidence
-as production validation.
+interval units. Replacement `0caa62a1899b71a6294e337a764ddb0915d63593`
+corrected those findings. Its focused tests passed (68 and 390 tests), wrapper
+completed with 2,703 passed, 31 skipped and the two exact accepted
+configuration failures (zero unexpected; 4,221.84 seconds), and exact-SHA CI
+completed with 2,685 passed, 49 skipped and the same accepted failures (zero
+unexpected; 3,262.03 seconds). Sol High then reproduced a separate P2 FH
+restoration defect: current FT and event-start FT were conflated. That SHA is
+not accepted. The unpinned working changes correct both validator sites and
+add an unequal-FT producer-to-calibration lifecycle fixture. Do not describe
+fixture evidence as production validation.
 
 ## Requirement-to-implementation matrix
 
 | Requirement | Implemented and accepted at `e960ca0` | Current replacement candidate | Remaining dependency or restriction |
 | --- | --- | --- | --- |
-| 1. FH/WC future opportunities | Existing canonical chip and maturation contracts | Dedicated FH/WC producers create action-specific PLAY/SAVE future-event opportunities, retain them at origin and feed maturation/calibration. The FH producer re-derives its decision authority from the verified origin CHIP_RESERVATION generation and compares all selected bundle contexts. Event 7/8 lifecycle fixtures assert policies, world/source identities, outcome maturation, FH permanent-state restoration and WC transfer-state semantics. | Fixtures are not a live production assessment. Fresh cutoff-consistent manager, generation and outcome inputs are still required. |
+| 1. FH/WC future opportunities | Existing canonical chip and maturation contracts | Dedicated FH/WC producers create action-specific PLAY/SAVE future-event opportunities, retain them at origin and feed maturation/calibration. The FH producer re-derives its decision authority from the verified origin CHIP_RESERVATION generation and compares all selected bundle contexts. Event 7/8 lifecycle fixtures assert policies, world/source identities, outcome maturation, FH permanent-state restoration and WC transfer-state semantics. The current FT 2 / event-start FT 3 fixture preserves SAVE current FT and restores PLAY/H2 from event-start FT through calibration. | Fixtures are not a live production assessment. Fresh cutoff-consistent manager, generation and outcome inputs are still required. |
 | 2. Reservation through expiry | Normal decision remains FOUR_GW; WC value horizon remains separate at 6–10 events | A verified CHIP_RESERVATION product reuses the exact four-event prefix and binds continuation runs to the same cutoff, snapshot and predictive identity. BB/TC continuation carries the route terminal squad and bank with no transfers and a per-event ranked lineup. Future WC 6–10 event windows are certified only from the same origin product, with exact run IDs and dependency closures preserved; FH authority is loaded from that verified product. Origin-pinned bootstrap rules are digest-checked and retained. | A real product, bootstrap archive capture and each event opportunity must be available through confirmed expiry. Missing or unverifiable rules keep beyond-route coverage incomplete. No-transfer continuation is a forecast model, not observed future manager behavior. |
 | 3. Evaluator readiness | Existing execution-permission field is preserved | Action-specific readiness uses absolute production interval endpoints and requires explicit action-specific units for both forecast and interval. FH's four-event route uplift and its interval/quantiles are normalized consistently to per-event value units; legacy FH evidence without the interval-unit declaration is refused. Readiness still requires retained prospective causal observations, finite value, allowlisted success reasons, matching evaluator version, canonical horizon, certification/snapshot identities and snapshot-bound evidence. A later readiness cutoff cannot authorize an earlier assessment. Refused evaluations remain unchanged and unrankable even if reservation calibration passes. Fixtures demonstrate permitted and refused paths. | No production readiness evidence exists. BB/FH/WC remain execution-blocked until compatible real evidence verifies. TC retains its established gate. |
 | 4. Arbiter ranking | Canonical action and reservation contracts remain in place | Each eligible candidate is compared after its reservation in shared units; an unknown reservation or blocked evaluator remains unrankable. Regression covers 10−9 versus 8−2 and chooses net 6. | Requires a calibrated reservation and readiness for every eligible executable candidate. |
@@ -41,8 +47,10 @@ rewritten.
 FH/WC future-event production and the origin-to-maturation lifecycle; BB/TC
 certified expiry coverage and continuation; action-specific readiness;
 net-after-reservation ranking; and later-issued prospective forecast
-timestamps. The Sol interval findings have focused corrections and tests, but
-the replacement candidate gates have not yet run.
+timestamps. The Sol interval findings have focused corrections and tests. The
+Sol unequal-FT finding is corrected in the current working tree and the FH/WC
+lifecycle/calibration suites pass; a replacement candidate and its gates are
+still outstanding.
 
 **Still unimplemented or not production-validated:** a real certified
 continuation generation and real future-event opportunity records through the
@@ -69,28 +77,24 @@ is still required before any `PLAY_CHIP` endorsement.
 ## Context-resume checklist
 
 - [x] Accepted base: `e960ca08d34802d519dc761289317b88227b9356` / tree `2d425f68cbd2a1e2d295d81eae66469480f6458d`.
-- [x] Five implementation paths have focused fixtures: FH/WC producer lifecycle, reservation continuation/expiry, readiness permit/refuse, net ranking, and later-issued forecasts.
-- [x] Candidate `f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b` wrapper: 2,702 passed, 31 skipped, two exact accepted configuration failures, zero unexpected; 4,502.54 seconds.
-- [x] Exact-SHA CI on `f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b`: unit job success; 2,684 passed, 49 skipped, same two accepted failures, zero unexpected; tests 3,345.12 seconds.
-- [x] Sol High returned `FIX_REQUIRED`: readiness coverage used forecast-relative instead of absolute bounds; FH intervals remained in four-event units.
-- [x] Corrected interval coverage, normalized FH interval/quantile endpoints, required explicit forecast and interval units, and added focused failure-path checks.
-- [x] Focused readiness, FH/WC lifecycle, forecast and calibration/retention tests passed: 68 passed in 15.00 seconds.
-- [x] Focused cross-contract bundle for chip expiry, ranking, scenarios, restoration, route/certification authority and PE-9 production decision passed: 390 passed in 407.82 seconds.
-- [x] Updated this requirement matrix and resume checklist to record the review finding, exact prior gate results, and current state.
-- [x] Focused gates and documentation are complete; this checklist is included in the replacement candidate commit.
-- [ ] Push/pin this exact commit on `feature/chip-operational-remediation-candidate` and run the remaining final gates.
-- [ ] Run the authoritative wrapper on that exact SHA; prior measured runtime was 4,502.54 seconds, with a full repeat allowed for failures.
-- [ ] Run exact-SHA CI; prior measured test runtime was 3,345.12 seconds, with a full repeat allowed for failures; then obtain Sol High review of that exact SHA.
+- [x] Five implementation gaps have focused fixtures: FH/WC producer lifecycle, reservation continuation/expiry, readiness permit/refuse, net ranking, and later-issued forecasts.
+- [x] Interval correction candidate `0caa62a1899b71a6294e337a764ddb0915d63593`: focused suites passed 68 and 390 tests; wrapper 2,703 passed, 31 skipped, two exact accepted configuration failures, zero unexpected (4,221.84 seconds); exact-SHA CI 2,685 passed, 49 skipped, same two failures, zero unexpected (3,262.03 seconds).
+- [x] Sol High returned `FIX_REQUIRED` on `0caa62a`: restoration validation compared current FT with event-start FT in two calibration checks. Reproduction used current FT 2 / event-start FT 3.
+- [x] Corrected both calibration checks to bind restoration to explicit event-start FT. Extended the real FH producer-to-retention-to-maturation-to-calibration fixture to preserve current FT 2 separately from event-start FT 3.
+- [x] Focused lifecycle and calibration/assessment-store suites passed: 36 passed in 17.79 seconds.
+- [x] Update documentation with the latest finding, focused evidence, measured gate results and resume checklist.
+- [x] Review the full diff; commit only the calibration fix, lifecycle regression and this documentation as one replacement candidate.
+- [ ] Push that exact candidate commit; run its authoritative wrapper, exact-SHA CI and Sol High review against that SHA. Previous measured durations: wrapper 4,221.84 seconds; CI 3,262.03 seconds. Gates may fail and require a full repeat.
 - [ ] Report code acceptance separately from missing manager facts, certified products, reservation calibration and evaluator-readiness evidence. No operational computation, merge or PE-11.
 
-Current resume point: the replacement candidate commit immediately follows
-`f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b`, whose Sol review failed. Both
-focused sets passed (68 and 390 tests). FH mean, intervals and quantiles now
-use normalized per-event units in the evaluator identity; the original
-four-event uncertainty is retained separately for audit. Readiness checks
-absolute bounds and refuses FH evidence without the interval-unit declaration.
-Next: push this exact commit to the candidate ref, then run its authoritative
-wrapper, exact-SHA CI and Sol High review.
+Current resume point: the interval corrections and five implementation paths
+are already present; the current working tree contains only the narrow FH
+current/event-start FT validation correction and lifecycle regression. The
+focused 36-test suites pass. The full diff was reviewed and committed as one
+replacement candidate. Next push that exact commit, then run its wrapper,
+exact-SHA CI and Sol High review. The exact prior candidate `0caa62a` is not
+accepted because Sol reproduced the unequal-FT case.
+
 ## Historical manager-state boundary
 
 Live Run #1 uses cutoff `2026-09-29T20:27:01Z`. Its retained
@@ -233,6 +237,13 @@ manager state, then checks SAVE begins from current H1 squad/bank/current FT and
 acquisition basis; PLAY begins at H2 with permanent squad/bank/acquisition
 basis restored and event-start FT preserved. It also verifies the route event
 sequences, configs, source decision hashes and arm digest.
+
+Current FT and event-start FT are stored independently. Calibration validation
+binds restored H2 FT to the explicit event-start value and keeps the normal
+SAVE route's current FT intact. The lifecycle regression uses current FT 2 and
+event-start FT 3 through production, origin retention, outcome maturation and
+calibration validation; this catches comparisons that treat the values as
+interchangeable.
 
 Focused evidence: `test_free_hit_h2_state_uses_event_start_ft_not_current_remaining_ft`,
 `test_free_hit_production_builder_emits_retained_play_save_arms`,
