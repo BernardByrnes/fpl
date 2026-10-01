@@ -530,11 +530,14 @@ def test_N2_a_calibrated_reservation_may_endorse_but_the_evaluator_is_review_onl
     state = ad.bench_boost_manager_state(conn, ENTRY, EVENT)
     evaluation = bb.evaluate_bench_boost(ad.build_bench_boost_request(state, _certified(), conn=conn))
     decision = _decide(evaluation, availability=_chip_rows(), reservation=_Calibrated(1.0))
-    # execution_permitted is False, so even a calibrated reservation cannot
-    # produce PLAY_CHIP while Bench Boost has no calibrated value model.
-    assert decision.status == cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
+    # Evaluator readiness is a separate gate: a calibrated reservation cannot
+    # make this unpermitted evaluation rankable or move it out of review.
+    assert decision.status == cd.STATUS_CHIP_REVIEW_REQUIRED
     assert cd.DIAG_CHIP_EVALUATOR_UNCALIBRATED in decision.reason_codes
     assert decision.recommended_action != cd.CHIP_ACTION_NO_CHIP
+    comparison = decision.candidate_metrics["candidate_comparisons"][cd.CHIP_ACTION_BB]
+    assert comparison["execution_permitted"] is False
+    assert comparison["status"] == "UNRANKABLE"
 
 
 def test_N3_a_non_positive_uplift_saves_the_chip(conn):
