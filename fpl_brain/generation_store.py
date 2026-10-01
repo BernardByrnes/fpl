@@ -38,7 +38,9 @@ from typing import Any, Callable, Mapping, Sequence
 from . import certified_bundle as cb
 
 MANIFEST_SCHEMA = "fpl_brain.pe9_generation_manifest.v1"
-DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v1"
+LEGACY_DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v1"
+DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v2"
+DECISION_RECORD_SCHEMAS = frozenset({LEGACY_DECISION_RECORD_SCHEMA, DECISION_RECORD_SCHEMA})
 
 #: The declared horizon kinds.  A generation is global predictive evidence for one
 #: (planning_event, horizon_kind); manager-specific state never enters its identity.
@@ -78,6 +80,7 @@ DIAG_PRODUCTION_DESCRIPTOR_ONLY = "PRODUCTION_DESCRIPTOR_ONLY"
 DIAG_PRODUCTION_PROFILE_UNKNOWN = "PRODUCTION_DECISION_PROFILE_UNKNOWN"
 DIAG_DECISION_REPLAY_ONLY = "DECISION_REPLAY_ONLY"
 DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED = "GENERATION_PLANNING_CONTEXT_REQUIRED"
+DIAG_PRODUCTION_SEARCH_PERMISSION_DENIED = "PRODUCTION_SEARCH_PERMISSION_DENIED"
 
 #: How far the PE-8 evidence reference was actually REPRODUCED by the verifier.
 #: ``NOT_CONSULTED`` is not a failure: no calibration claim was made.  There is no
@@ -368,7 +371,7 @@ def manifest_semantic_projection(manifest: Mapping[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             return None
 
-    return {
+    projection = {
         "schema": manifest.get("schema"),
         "planning_event": _int_or_none(manifest.get("planning_event")),
         "horizon_kind": (
@@ -398,6 +401,12 @@ def manifest_semantic_projection(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "pe8_evidence": manifest.get("pe8_evidence"),
         "disclosure": manifest.get("disclosure"),
     }
+    # Legacy generation rows predate retained temporal evidence. Keep their
+    # identity projection byte-for-byte compatible; new rows include the evidence
+    # block (including an explicit UNRESOLVED result when it cannot be derived).
+    if "search_permission_causality" in manifest:
+        projection["search_permission_causality"] = manifest.get("search_permission_causality")
+    return projection
 
 
 @dataclass(frozen=True)
@@ -471,6 +480,7 @@ def build_generation_manifest(
     last_event: int,
     pe8_evidence: Mapping[str, Any],
     disclosure: Mapping[str, Any],
+    search_permission_causality: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the canonical semantic manifest of ONE generation.
 
@@ -496,6 +506,8 @@ def build_generation_manifest(
             "size_bytes": snapshot.get("size_bytes"),
             "source_db_identity": snapshot.get("source_db_identity"),
             "execution_run_uuid": snapshot.get("execution_run_uuid"),
+            **({"manifest_path": snapshot.get("manifest_path")}
+               if snapshot.get("manifest_path") else {}),
         },
         "per_event": {
             str(int(event)): {
@@ -529,6 +541,15 @@ def build_generation_manifest(
         "last_event": int(last_event),
         "pe8_evidence": canonical_identity_value(dict(pe8_evidence)),
         "disclosure": canonical_identity_value(dict(disclosure)),
+        "search_permission_causality": (
+            canonical_identity_value(dict(search_permission_causality))
+            if isinstance(search_permission_causality, Mapping)
+            else {
+                "schema": "fpl_brain.generation_causality.v1",
+                "temporal_status": "UNRESOLVED",
+                "reasons": ["UNRESOLVED: causal timestamp evidence was not available at certification"],
+            }
+        ),
     }
     # Fails closed on any float the projection above let through.
     canonical_manifest_bytes(manifest)
@@ -788,6 +809,12 @@ def certify_generation(
     required_versions = cb.declared_required_versions()
     code_identity = authoritative_code_identity()
     snapshot_block = _snapshot_identity_block(snapshot)
+    search_permission_causality = _generation_causality_for_manifest(
+        conn,
+        snapshot=snapshot_block,
+        generation_planning_event=int(planning_event),
+        generation_cutoff=str(cutoff),
+    )
     calibration_digest, calibration_file_sha256 = _calibration_file_identity(
         calibration, calibration_artifact_ref, required=bool(require_calibration)
     )
@@ -1031,6 +1058,7 @@ def certify_generation(
             last_event=resolved_last_event,
             pe8_evidence=pe8_evidence,
             disclosure=disclosure,
+            search_permission_causality=search_permission_causality,
         )
         generation_id = generation_id_of(manifest)
         created_at = (clock or _utc_now)()
@@ -1660,7 +1688,128 @@ def _snapshot_identity_block(snapshot: Mapping[str, Any] | None) -> dict[str, An
         "size_bytes": int(snapshot_file.stat().st_size),
         "source_db_identity": identity,
         "execution_run_uuid": execution_run_uuid,
+        **({
+            "manifest_path": str(
+                snapshot.get("manifest_path") or snapshot.get("data_snapshot_manifest")
+            )
+        } if (snapshot.get("manifest_path") or snapshot.get("data_snapshot_manifest")) else {}),
     }
+
+
+def _derive_generation_causality(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: Mapping[str, Any],
+    generation_planning_event: int,
+    generation_cutoff: str,
+) -> dict[str, Any]:
+    """Reproduce temporal evidence from the snapshot manifest and execution row."""
+
+    from . import execution_snapshot as es
+
+    execution_run_uuid = str(snapshot.get("execution_run_uuid") or "")
+    if not execution_run_uuid:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the origin snapshot has no execution UUID for causal timestamp derivation"],
+        )
+    try:
+        run = conn.execute(
+            "SELECT planning_event, planning_cutoff, started_at FROM execution_runs WHERE run_uuid=?",
+            (execution_run_uuid,),
+        ).fetchone()
+    except sqlite3.Error as failure:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"the origin execution timestamp cannot be read: {failure}"],
+        ) from failure
+    if run is None:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"no retained execution run binds the origin snapshot UUID {execution_run_uuid}"],
+        )
+    if run["planning_event"] is None or not run["planning_cutoff"] or not run["started_at"]:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the retained origin execution omits planning event, cutoff, or started_at"],
+        )
+    if int(run["planning_event"]) != int(generation_planning_event):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                f"the origin execution planning event {int(run['planning_event'])} differs from "
+                f"generation planning event {int(generation_planning_event)}"
+            ],
+        )
+    origin_cutoff = str(run["planning_cutoff"])
+    if origin_cutoff != str(generation_cutoff):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                f"the origin execution cutoff {origin_cutoff} differs from generation cutoff "
+                f"{generation_cutoff}"
+            ],
+        )
+    return es.derive_generation_causality(
+        snapshot_path=str(snapshot.get("path") or ""),
+        data_snapshot_sha256=str(snapshot.get("sha256") or ""),
+        data_snapshot_size_bytes=int(snapshot.get("size_bytes") or 0),
+        source_db_identity=dict(snapshot.get("source_db_identity") or {}),
+        snapshot_manifest_path=(
+            str(snapshot.get("manifest_path")) if snapshot.get("manifest_path") else None
+        ),
+        execution_run_uuid=execution_run_uuid,
+        origin_planning_event=int(run["planning_event"]),
+        origin_cutoff=origin_cutoff,
+        execution_started_at=str(run["started_at"]),
+    )
+
+
+def _generation_causality_for_manifest(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: Mapping[str, Any],
+    generation_planning_event: int,
+    generation_cutoff: str,
+) -> dict[str, Any]:
+    """Persist a fail-closed temporal result even when required evidence is absent."""
+
+    from . import execution_snapshot as es
+
+    try:
+        return _derive_generation_causality(
+            conn,
+            snapshot=snapshot,
+            generation_planning_event=int(generation_planning_event),
+            generation_cutoff=str(generation_cutoff),
+        )
+    except Exception as failure:  # evidence absence is a retained UNRESOLVED result
+        detail = str(failure)
+        unresolved_paths = {
+            str(value)
+            for value in (
+                snapshot.get("path"),
+                snapshot.get("manifest_path"),
+                snapshot.get("data_snapshot_manifest"),
+                (
+                    Path(str(snapshot.get("path"))).parent / es.SNAPSHOT_MANIFEST
+                    if snapshot.get("path")
+                    else None
+                ),
+            )
+            if value
+        }
+        for path in sorted(unresolved_paths, key=len, reverse=True):
+            detail = detail.replace(path, "<retained-snapshot>")
+        return {
+            "schema": es.GENERATION_CAUSALITY_SCHEMA,
+            "origin_planning_event": None,
+            "origin_cutoff": str(generation_cutoff),
+            "execution_run_uuid": str(snapshot.get("execution_run_uuid") or ""),
+            "snapshot_sha256": str(snapshot.get("sha256") or ""),
+            "temporal_status": "UNRESOLVED",
+            "reasons": [f"UNRESOLVED: {type(failure).__name__}: {detail}"],
+        }
 
 
 def _run_identity_failures(
@@ -2030,6 +2179,39 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     except GenerationRefused as failure:
         raise failure
 
+    causal_evidence_reproduced: bool | None = None
+    if "search_permission_causality" in manifest:
+        causal_block = manifest.get("search_permission_causality")
+        if not isinstance(causal_block, Mapping):
+            failures.append("the retained search-permission causality block is not an object")
+        elif causal_block.get("schema") != "fpl_brain.generation_causality.v1":
+            failures.append("the retained search-permission causality block has an unknown schema")
+        elif causal_block.get("temporal_status") == "CAUSAL":
+            try:
+                reproduced_causality = _derive_generation_causality(
+                    conn,
+                    snapshot=snapshot,
+                    generation_planning_event=int(generation.planning_event),
+                    generation_cutoff=generation.cutoff,
+                )
+            except Exception as failure:
+                failures.append(
+                    "the generation's causal timestamp evidence cannot be reproduced: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+                causal_evidence_reproduced = False
+            else:
+                causal_evidence_reproduced = dict(causal_block) == reproduced_causality
+                if not causal_evidence_reproduced:
+                    failures.append(
+                        "the retained search-permission causality block differs from the "
+                        "canonical snapshot/execution timestamp derivation"
+                    )
+        elif causal_block.get("temporal_status") == "UNRESOLVED":
+            causal_evidence_reproduced = False
+        else:
+            failures.append("the retained search-permission causality status is malformed")
+
     base_bundles: dict[int, cb.CertifiedBundle] = {}
     dependency_ok = True
     runs_complete = True
@@ -2302,6 +2484,7 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
         "dependency_closure_reproduced": dependency_ok,
         "snapshot_identity": snapshot_status,
         "snapshot_source_identity_reproduced": True,
+        "causal_evidence_reproduced": causal_evidence_reproduced,
         "pe8_evidence_consulted": pe8_consulted,
         "pe8_evidence_artifact_digest_verified": pe8_artifact_verified,
         "pe8_evidence_refs_reproduce": pe8_reproduced,
@@ -2504,8 +2687,11 @@ def decision_identity_of(record: Mapping[str, Any]) -> str:
     """Recompute a decision record's id from its own persisted fields."""
 
     evidence = json.loads(str(record.get("evidence_json") or "{}"))
+    record_schema = str(evidence.get("schema") or "") if isinstance(evidence, Mapping) else ""
+    if record_schema not in DECISION_RECORD_SCHEMAS:
+        raise ValueError(f"decision record declares unsupported evidence schema {record_schema!r}")
     identity = {
-        "schema": DECISION_RECORD_SCHEMA,
+        "schema": record_schema,
         "generation_id": str(record.get("generation_id")),
         "planning_event": int(record.get("planning_event")),
         "horizon_kind": str(record.get("horizon_kind")),
@@ -2599,6 +2785,38 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
             DIAG_DECISION_RECORD_INVALID,
             [f"the decision artifact {artifact_ref} does not hold a decision payload"],
         )
+
+    permission_evidence_verified: bool | None = None
+    evidence_schema = str(evidence_record.get("schema") or "")
+    if evidence_schema == DECISION_RECORD_SCHEMA:
+        provenance = payload.get("provenance") or {}
+        permission = provenance.get("search_permission_evaluation") if isinstance(provenance, Mapping) else None
+        binding = evidence_record.get("search_permission")
+        if not isinstance(permission, Mapping) or not isinstance(binding, Mapping):
+            failures.append(
+                "the new-format decision record or artifact omits required search-permission evidence"
+            )
+            permission_evidence_verified = False
+        else:
+            from . import search_permission as sp
+
+            permission_evidence_verified = sp.verify_recorded_evaluation(
+                conn,
+                generation_id=str(record["generation_id"]),
+                evaluation=permission,
+                record_binding=binding,
+            )
+            if not permission_evidence_verified:
+                failures.append(
+                    "the retained search-permission block, digest, record binding, or origin identities "
+                    "do not reproduce from the verified generation and its pinned snapshot"
+                )
+    elif evidence_schema == LEGACY_DECISION_RECORD_SCHEMA:
+        # Explicit v1 evidence keeps its historical verifier contract. Missing
+        # permission evidence in a v2 record never falls back to this path.
+        permission_evidence_verified = None
+    else:
+        failures.append(f"the decision record evidence schema {evidence_schema!r} is unsupported")
 
     result_digest = result_identity_of(payload)
     if result_digest != str(record["result_sha256"]):
@@ -2724,7 +2942,7 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
     if failures:
         raise GenerationRefused(DIAG_DECISION_RECORD_INVALID, failures)
     return {
-        "schema": DECISION_RECORD_SCHEMA,
+        "schema": evidence_schema,
         "decision_id": str(decision_id),
         "generation_id": str(record["generation_id"]),
         "planning_event": int(record["planning_event"]),
@@ -2734,6 +2952,7 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
         "manager_context_digest_verified": bool(manager_context_verified),
         "request_digest_verified": bool(request_verified),
         "result_digest_verified": True,
+        "search_permission_evidence_verified": permission_evidence_verified,
         "runner_identity_verified": True,
         "runner_code_identity_bound": True,
         "runner_code_identity_replay_boundary": (
@@ -3664,6 +3883,17 @@ def make_decision(
         )
     require_snapshot_retained(generation)
 
+    from . import search_permission as sp
+
+    try:
+        search_permission_evaluation = sp.require_search_permission(
+            conn, generation.generation_id
+        )
+    except sp.SearchPermissionRefused as failure:
+        raise GenerationRefused(
+            DIAG_PRODUCTION_SEARCH_PERMISSION_DENIED, failure.reasons
+        ) from failure
+
     runner_code_identity = _decision_runner_code_identity(resolved_profile)
     executor = _decision_executor(resolved_profile)
     source_conn = _open_generation_snapshot(generation)
@@ -3781,6 +4011,7 @@ def make_decision(
             "generation_manifest": dict(generation.manifest),
             "pe8_evidence": generation.manifest.get("pe8_evidence"),
             "disclosure": generation.manifest.get("disclosure"),
+            "search_permission_evaluation": search_permission_evaluation,
         },
         "decision": decision_result.get("decision"),
         "screened_actions": decision_result.get("screened_actions"),
@@ -3831,6 +4062,7 @@ def make_decision(
             "calibration_consulted": bool(
                 (generation.manifest.get("pe8_evidence") or {}).get("consulted")
             ),
+            "search_permission": sp.decision_record_binding(search_permission_evaluation),
         },
         decision_artifact_ref=artifact_ref,
     )

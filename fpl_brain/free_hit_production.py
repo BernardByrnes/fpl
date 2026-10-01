@@ -159,6 +159,22 @@ def build_free_hit_production_request(
         raise FreeHitProductionError(
             f"{FH_PRODUCTION_ARMS_INVALID}: Free Hit requires a verified FOUR_GW generation"
         )
+    from . import search_permission as sp
+
+    try:
+        search_permission_evaluation = sp.require_search_permission(
+            conn,
+            generation.generation_id,
+            expected_origin_planning_event=int(generation.planning_event),
+            expected_origin_cutoff=str(generation.cutoff),
+            expected_snapshot_sha256=str(generation.snapshot.get("sha256") or ""),
+        )
+    except sp.SearchPermissionRefused:
+        raise
+    except Exception as failure:
+        raise sp.SearchPermissionRefused(
+            [f"Free Hit production origin permission could not be evaluated: {type(failure).__name__}: {failure}"]
+        ) from failure
     events = tuple(int(event) for event in generation.events)
     if len(events) != 4 or events != tuple(range(events[0], events[0] + 4)):
         raise FreeHitProductionError(
@@ -395,6 +411,7 @@ def build_free_hit_production_request(
             "predictive_code_snapshot_sha256": code_identity,
             "model_config_identity": model_config_identity,
             "certification_identity": chip_cert_identity,
+            "search_permission_evaluation": search_permission_evaluation,
             "manager_state_identity": manager_identity,
             "official_pool": pool_binding.as_dict(),
             "world_identity": expected_h1_key,
@@ -474,6 +491,22 @@ def build_future_free_hit_event_opportunity(
         raise FreeHitProductionError(
             f"{FH_PRODUCTION_ARMS_INVALID}: future FH request does not bind the requested event/origin"
         )
+    from . import search_permission as sp
+
+    try:
+        permission_evaluation = sp.require_search_permission(
+            conn,
+            str(source_identity.get("generation_id") or ""),
+            expected_origin_planning_event=origin_event,
+            expected_origin_cutoff=str(source_identity.get("origin_cutoff") or ""),
+            expected_snapshot_sha256=str(source_identity.get("data_snapshot_sha256") or ""),
+        )
+    except sp.SearchPermissionRefused:
+        raise
+    except Exception as failure:
+        raise sp.SearchPermissionRefused(
+            [f"future FH origin permission could not be evaluated: {type(failure).__name__}: {failure}"]
+        ) from failure
     try:
         crf.verify_reservation_coverage_product(
             conn,
@@ -867,7 +900,7 @@ def build_future_free_hit_event_opportunity(
             **source_fields,
         },
     }
-    return crf.build_event_opportunity_record(
+    record = crf.build_event_opportunity_record(
         action=cd.CHIP_ACTION_FH,
         planning_event=origin_event,
         event=event,
@@ -896,3 +929,4 @@ def build_future_free_hit_event_opportunity(
             "uncertainty_value_definition": "FOUR_EVENT_NORMALIZED_MEAN_POINTS",
         },
     )
+    return crf._attach_search_permission_evaluation(record, permission_evaluation)

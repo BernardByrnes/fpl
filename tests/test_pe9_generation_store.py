@@ -12,6 +12,7 @@ test below therefore attacks the EVIDENCE, not an object's identity.
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -753,20 +754,41 @@ def test_success_generation_verify_and_decision_verify_pass(tmp_path):
         artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
         from fpl_brain.execution_snapshot import file_sha256
 
-        decision_id = gs.append_engine_decision_record(
-            conn, generation=generation,
-            manager_packet_sha256=gs.packet_identity(packet),
-            request_sha256=gs.request_identity(
-                planning_event=5, horizon_kind=gs.HORIZON_KIND_FOUR_GW, cutoff=CUTOFF, request=request,
+        # This hand-built row models a persisted pre-permission record. Production
+        # appends are v2-only; the historical verifier still accepts stored v1 rows.
+        evidence = gs.canonical_identity_value({
+            "schema": gs.LEGACY_DECISION_RECORD_SCHEMA,
+            "runner_identity": "test",
+            "runner_code_identity": runner_code_identity,
+            "decision_artifact_file_sha256": file_sha256(artifact_path),
+        }, path="evidence")
+        identity = {
+            "schema": gs.LEGACY_DECISION_RECORD_SCHEMA,
+            "generation_id": generation.generation_id,
+            "planning_event": generation.planning_event,
+            "horizon_kind": generation.horizon_kind,
+            "manager_packet_sha256": gs.packet_identity(packet),
+            "request_sha256": gs.request_identity(
+                planning_event=5, horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+                cutoff=CUTOFF, request=request,
             ),
-            result_sha256=gs.result_identity_of(artifact),
-            runner_identity="test", evidence={
-                "schema": gs.DECISION_RECORD_SCHEMA,
-                "runner_identity": "test",
-                "runner_code_identity": runner_code_identity,
-                "decision_artifact_file_sha256": file_sha256(artifact_path),
-            },
-            decision_artifact_ref=str(artifact_path),
+            "result_sha256": gs.result_identity_of(artifact),
+            "runner_identity": "test",
+            "evidence": evidence,
+            "decision_artifact_ref": str(artifact_path),
+        }
+        decision_id = "sha256:" + hashlib.sha256(gs._canonical_decision_bytes(identity)).hexdigest()
+        conn.execute(
+            "INSERT INTO engine_decision_records(decision_id, generation_id, planning_event, "
+            "horizon_kind, manager_packet_sha256, request_sha256, result_sha256, runner_identity, "
+            "evidence_json, decision_artifact_ref, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                decision_id, generation.generation_id, generation.planning_event,
+                generation.horizon_kind, gs.packet_identity(packet), identity["request_sha256"],
+                identity["result_sha256"], "test",
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")),
+                str(artifact_path), "2026-09-19T11:02:00Z",
+            ),
         )
         conn.commit()
         verified = gs.verify_decision(conn, decision_id)

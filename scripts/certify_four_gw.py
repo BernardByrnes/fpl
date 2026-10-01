@@ -190,38 +190,16 @@ def decide_search_permission(
     history_completeness: Mapping[str, Any],
     snapshot_error: str | None = None,
 ) -> tuple[bool, list[str]]:
-    """Authorisation is COMPUTED from the conditions, never asserted.
+    """Compatibility entry point delegating to the shared decision-layer rule."""
 
-    Extracted from ``main`` so the rule is executable from a test.  Its earlier
-    inline form read an undefined local (``horizon_status``) and was only ever
-    checked by a source-text assertion, so the defect survived the accepted suite
-    while making the certification artifact impossible to write.
-
-    ``history_completeness`` is REQUIRED -- it is the audit from
-    ``history_completeness.audit_history_completeness`` evaluated against the SAME
-    immutable snapshot -- so a caller cannot obtain permission merely by
-    forgetting to evaluate the gate.  An incomplete audit WITHHOLDS permission:
-    a bundle may never be certified as fresh while an officially completed
-    event's required player history is missing.  The canonical token is always in
-    the reason so an operator can grep the artifact.
-    """
-
-    reasons: list[str] = []
-    if str(temporal_status).upper() != "CAUSAL":
-        reasons.append("temporal_status is not CAUSAL")
-    if str(dependency_validation).upper() != "COHERENT":
-        reasons.append("dependency_validation is not COHERENT")
-    if horizon_status != fg.DECISION_HORIZON_COMPLETE:
-        reasons.append(f"horizon status is {horizon_status}")
-    if not data_snapshot_sha256:
-        reasons.append("no data snapshot identity")
-    if snapshot_error:
-        reasons.append(str(snapshot_error))
-    if not history_completeness.get("complete"):
-        blocker = hc.blocking_reason_token(history_completeness)
-        detail = history_completeness.get("reasons") or []
-        reasons.append(blocker if not detail else f"{blocker} ({', '.join(str(item) for item in detail)})")
-    return (not reasons), reasons
+    return fg.decide_search_permission(
+        temporal_status=temporal_status,
+        dependency_validation=dependency_validation,
+        horizon_status=horizon_status,
+        data_snapshot_sha256=data_snapshot_sha256,
+        history_completeness=history_completeness,
+        snapshot_error=snapshot_error,
+    )
 
 
 def certified_bundle_runs(

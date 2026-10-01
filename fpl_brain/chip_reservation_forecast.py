@@ -643,8 +643,33 @@ def build_evaluated_event_opportunity_record(
     requests already assembled from verified chip-specific routes/generations.
     """
 
+    from . import search_permission as sp
+
+    if conn is None:
+        raise sp.SearchPermissionRefused(
+            ["a production event-opportunity evaluation requires the authoritative generation store"]
+        )
+    try:
+        origin_event = int(source_identity.get("planning_event") or -1)
+        permission_evaluation = sp.require_search_permission(
+            conn,
+            str(source_identity.get("generation_id") or ""),
+            expected_origin_planning_event=origin_event,
+            expected_origin_cutoff=str(source_identity.get("origin_cutoff") or ""),
+            expected_snapshot_sha256=str(source_identity.get("data_snapshot_sha256") or ""),
+        )
+    except sp.SearchPermissionRefused:
+        raise
+    except Exception as failure:
+        raise sp.SearchPermissionRefused(
+            [
+                "event-opportunity origin permission could not be evaluated: "
+                f"{type(failure).__name__}: {failure}"
+            ]
+        ) from failure
+
     if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
-        if conn is None or expiry_event is None or not isinstance(coverage_product, Mapping):
+        if expiry_event is None or not isinstance(coverage_product, Mapping):
             raise ReservationForecastError(
                 f"{action} future opportunity requires a verified connection and expiry-coverage product"
             )
@@ -822,7 +847,7 @@ def build_evaluated_event_opportunity_record(
         for role in ("play", "save")
     }
     model = f"{evaluation.evaluator_version}:mean_paired_uplift_v1"
-    return build_event_opportunity_record(
+    record = build_event_opportunity_record(
         action=action,
         planning_event=planning_event,
         event=event,
@@ -854,6 +879,20 @@ def build_evaluated_event_opportunity_record(
         },
         continuation_context=continuation_context,
     )
+    return _attach_search_permission_evaluation(record, permission_evaluation)
+
+
+def _attach_search_permission_evaluation(
+    record: Mapping[str, Any], evaluation: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Retain the derived permission block in a content-addressed opportunity."""
+
+    body = dict(record)
+    body.pop("artifact_sha256", None)
+    body["search_permission_evidence_schema"] = "fpl_brain.chip_opportunity_permission.v1"
+    body["search_permission_evaluation"] = dict(evaluation)
+    body["artifact_sha256"] = canonical_sha256(body)
+    return body
 
 
 def _verify_event_opportunity(
@@ -931,6 +970,50 @@ def _verify_event_opportunity(
         source["origin_cutoff"], name="event opportunity source origin_cutoff"
     ) != _time(origin_cutoff, name="forecast origin_cutoff"):
         raise ReservationForecastError("event opportunity source does not match its planning origin")
+    permission_marker = record.get("search_permission_evidence_schema")
+    permission_evaluation = record.get("search_permission_evaluation")
+    if permission_marker is None:
+        if permission_evaluation is not None:
+            raise ReservationForecastError("event opportunity has unversioned search-permission evidence")
+    else:
+        from . import search_permission as sp
+
+        if (
+            permission_marker != "fpl_brain.chip_opportunity_permission.v1"
+            or not isinstance(permission_evaluation, Mapping)
+            or permission_evaluation.get("schema") != sp.SEARCH_PERMISSION_EVALUATION_SCHEMA
+            or permission_evaluation.get("evaluation_sha256") != sp.evaluation_digest(permission_evaluation)
+            or permission_evaluation.get("permitted") is not True
+            or permission_evaluation.get("reasons") != []
+        ):
+            raise ReservationForecastError("event opportunity search-permission evidence is malformed or denied")
+        permission_origin = permission_evaluation.get("origin")
+        permission_conditions = permission_evaluation.get("conditions")
+        if not isinstance(permission_origin, Mapping) or not isinstance(permission_conditions, Mapping):
+            raise ReservationForecastError("event opportunity search-permission evidence omits its origin conditions")
+        if (
+            permission_origin.get("generation_id") != source.get("generation_id")
+            or permission_origin.get("generation_manifest_sha256") != source.get("generation_id")
+            or permission_origin.get("planning_event") != int(planning_event)
+            or permission_origin.get("horizon_kind") != "FOUR_GW"
+            or _time(permission_origin.get("cutoff"), name="permission origin cutoff")
+            != _time(origin_cutoff, name="forecast origin_cutoff")
+            or permission_origin.get("data_snapshot_sha256") != source.get("data_snapshot_sha256")
+            or permission_origin.get("predictive_code_snapshot_sha256")
+            != source.get("predictive_code_snapshot_sha256")
+            or permission_conditions.get("temporal_status") != "CAUSAL"
+            or permission_conditions.get("dependency_validation") != "COHERENT"
+            or not isinstance(permission_conditions.get("history_completeness"), Mapping)
+            or permission_conditions["history_completeness"].get("complete") is not True
+            or permission_conditions["history_completeness"].get("planning_event") != int(planning_event)
+            or _time(
+                permission_conditions["history_completeness"].get("cutoff"),
+                name="permission history audit cutoff",
+            ) != _time(origin_cutoff, name="forecast origin_cutoff")
+        ):
+            raise ReservationForecastError(
+                "event opportunity search-permission evidence does not bind a causal, complete origin"
+            )
     outcome_arms = record.get("outcome_arms")
     if outcome_arms is not None:
         rebuilt = build_event_opportunity_record(
@@ -952,6 +1035,8 @@ def _verify_event_opportunity(
             evaluator_identity=record.get("evaluator_identity"),
             continuation_context=record.get("continuation_context"),
         )
+        if permission_marker is not None:
+            rebuilt = _attach_search_permission_evaluation(rebuilt, permission_evaluation)
         if dict(rebuilt) != dict(record):
             raise ReservationForecastError("event opportunity outcome-arm manifest does not reproduce")
 

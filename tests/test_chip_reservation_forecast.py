@@ -13,7 +13,9 @@ from fpl_brain import chip_reservation_forecast as forecast
 from fpl_brain import chip_reservation_calibration as calibration
 from fpl_brain import chip_triple_captain as tc
 from fpl_brain import manager_lineup
+from fpl_brain import search_permission as sp
 from scripts import run_chip_assessment
+import generation_fixtures as gf
 
 
 def _sha(value):
@@ -175,8 +177,15 @@ def test_complete_nonpositive_forecast_still_binds_earliest_best_event_for_matur
 
 
 @pytest.mark.parametrize("action", [cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC])
-def test_certified_evaluator_builds_and_retains_future_event_causal_origin(action, tmp_path):
+def test_certified_evaluator_builds_and_retains_future_event_causal_origin(action, tmp_path, monkeypatch):
     source = _source()
+    monkeypatch.setattr(
+        sp,
+        "require_search_permission",
+        lambda _conn, _generation_id, **_kwargs: gf.fixture_search_permission_evaluation(
+            source, events=tuple(range(6, 10))
+        ),
+    )
     positions = {
         1: "GKP", 2: "GKP", 3: "DEF", 4: "DEF", 5: "DEF",
         6: "DEF", 7: "DEF", 8: "MID", 9: "MID", 10: "MID",
@@ -211,18 +220,23 @@ def test_certified_evaluator_builds_and_retains_future_event_causal_origin(actio
         data_snapshot_sha256=source["data_snapshot_sha256"],
     )
     reservation_state = {"squad_ids": list(range(1, 16))}
-    event_record = forecast.build_evaluated_event_opportunity_record(
-        action=action,
-        event=7,
-        worlds=worlds,
-        horizon_binding=binding,
-        policy=policy,
-        positions=positions,
-        source_identity=source,
-        reservation_state=reservation_state,
-        made_at="2026-10-01T08:00:05Z",
-        input_as_of="2026-10-01T08:00:00Z",
-    )
+    conn = sqlite3.connect(":memory:")
+    try:
+        event_record = forecast.build_evaluated_event_opportunity_record(
+            action=action,
+            event=7,
+            worlds=worlds,
+            horizon_binding=binding,
+            policy=policy,
+            positions=positions,
+            source_identity=source,
+            reservation_state=reservation_state,
+            made_at="2026-10-01T08:00:05Z",
+            input_as_of="2026-10-01T08:00:00Z",
+            conn=conn,
+        )
+    finally:
+        conn.close()
     play_policy = event_record["outcome_arms"]["play"]["lineup"]
     save_policy = event_record["outcome_arms"]["save"]["lineup"]
     assert play_policy == save_policy

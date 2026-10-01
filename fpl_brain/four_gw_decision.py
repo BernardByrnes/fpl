@@ -99,6 +99,44 @@ HORIZON_FLAGS = (
 WILDCARD_EVALUATION_SUPPORTED = "WILDCARD_EVALUATION_SUPPORTED"
 
 
+def decide_search_permission(
+    *,
+    temporal_status: Any,
+    dependency_validation: Any,
+    horizon_status: Any,
+    data_snapshot_sha256: Any,
+    history_completeness: Mapping[str, Any],
+    snapshot_error: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Derive search permission from canonical certification conditions.
+
+    Certification and production both call this shared predicate. Inputs must
+    come from canonical validators and the pinned-origin history audit; this
+    function does not accept a caller permission claim.
+    """
+
+    from . import history_completeness as hc
+
+    reasons: list[str] = []
+    if str(temporal_status).upper() != "CAUSAL":
+        reasons.append("temporal_status is not CAUSAL")
+    if str(dependency_validation).upper() != "COHERENT":
+        reasons.append("dependency_validation is not COHERENT")
+    if horizon_status != DECISION_HORIZON_COMPLETE:
+        reasons.append(f"horizon status is {horizon_status}")
+    if not data_snapshot_sha256:
+        reasons.append("no data snapshot identity")
+    if snapshot_error:
+        reasons.append(str(snapshot_error))
+    if not history_completeness.get("complete"):
+        blocker = hc.blocking_reason_token(history_completeness)
+        detail = history_completeness.get("reasons") or []
+        reasons.append(
+            blocker if not detail else f"{blocker} ({', '.join(str(item) for item in detail)})"
+        )
+    return (not reasons), reasons
+
+
 def sanitize_wildcard_screen(wildcard: Mapping[str, Any]) -> dict[str, Any]:
     """Strip any unverifiable actionable Wildcard claim from a passthrough block.
 

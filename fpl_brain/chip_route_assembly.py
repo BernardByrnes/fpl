@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 
 from . import analytics, generation_store as gs, manager_lineup as ml
 from . import route_comparator as rc, route_optimizer as ro, transfer_state as ts
+from . import search_permission as sp
 
 ROUTE_REPLAY_VERSION = "chip_normal_route_replay_v1"
 ROUTE_SOURCE_INVALID = "CHIP_SOURCE_DECISION_INVALID"
@@ -932,6 +933,23 @@ def build_future_event_chip_opportunity(
         report = gs.verify_generation(conn, generation.generation_id)
         if not report.get("verified") or generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW:
             raise ValueError("normal four-event generation did not verify")
+        try:
+            sp.require_search_permission(
+                conn,
+                generation.generation_id,
+                expected_origin_planning_event=int(route.planning_event),
+                expected_origin_cutoff=str(route.cutoff),
+                expected_snapshot_sha256=str(route.data_snapshot_sha256),
+            )
+        except sp.SearchPermissionRefused:
+            raise
+        except Exception as failure:
+            raise sp.SearchPermissionRefused(
+                [
+                    "future chip-opportunity origin permission could not be evaluated: "
+                    f"{type(failure).__name__}: {failure}"
+                ]
+            ) from failure
         continuation_context = None
         coverage_product_sha256 = None
         if coverage_product is not None:
@@ -1074,11 +1092,14 @@ def build_future_event_chip_opportunity(
             source_identity=source_identity,
             reservation_state=reservation_state,
             made_at=made_at,
+            conn=conn,
             input_as_of=str(route.cutoff),
             coverage_product_sha256=coverage_product_sha256,
             continuation_context=continuation_context,
         )
     except ChipRouteAssemblyError:
+        raise
+    except sp.SearchPermissionRefused:
         raise
     except Exception as failure:
         raise ChipRouteAssemblyError(

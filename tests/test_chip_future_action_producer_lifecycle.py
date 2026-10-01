@@ -16,6 +16,7 @@ if str(TESTS) not in sys.path:
 import free_hit_certification_fixtures as cf
 import test_chip_free_hit as fhfx
 import test_chip_wildcard as wcfx
+import generation_fixtures as gf
 from fpl_brain import chip_decision as cd
 from fpl_brain import chip_free_hit as fh
 from fpl_brain import chip_reservation_calibration as calibration
@@ -24,6 +25,7 @@ from fpl_brain import chip_wildcard as wc
 from fpl_brain import free_hit_route as free_hit_route
 from fpl_brain import free_hit_production as fhp
 from fpl_brain import generation_store as gs
+from fpl_brain import search_permission as sp
 from fpl_brain import outcome_ledger as ol
 from fpl_brain import season_rules as sr
 from fpl_brain import transfer_state as ts
@@ -400,6 +402,15 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
 ):
     """Fixture inputs exercise each canonical evaluator through the full causal lifecycle."""
 
+    # This lifecycle test uses deliberately synthetic source identities and focuses
+    # on producer → retention → maturation → calibration. Permission refusal/admission
+    # against a real persisted generation is covered by the dedicated gate tests.
+    monkeypatch.setattr(
+        sp,
+        "require_search_permission",
+        lambda _conn, _generation_id, **_kwargs: gf.fixture_search_permission_evaluation(SOURCE),
+    )
+
     expiry = FUTURE_EVENT + 1
     product = _coverage_product(
         action, 4 if action == cd.CHIP_ACTION_FH else 6, expiry_event=expiry,
@@ -605,6 +616,11 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
 
 
 def test_future_free_hit_producer_refuses_altered_continuation_bundle_context(monkeypatch):
+    monkeypatch.setattr(
+        sp,
+        "require_search_permission",
+        lambda _conn, _generation_id, **_kwargs: gf.fixture_search_permission_evaluation(SOURCE),
+    )
     request, save_state = _free_hit_request()
     product = _coverage_product(
         cd.CHIP_ACTION_FH, 4, expiry_event=FUTURE_EVENT,

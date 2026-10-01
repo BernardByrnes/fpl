@@ -109,13 +109,17 @@ def seed_certified_runs(
     stable_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     if Path(source_record["snapshot"]["path"]).resolve() != stable_snapshot_path.resolve():
         shutil.copyfile(source_record["snapshot"]["path"], stable_snapshot_path)
+    stable_snapshot = gf._write_fixture_snapshot_manifest({
+        **source_record["snapshot"],
+        "path": str(stable_snapshot_path),
+        "sha256": es.file_sha256(stable_snapshot_path),
+        "size_bytes": int(stable_snapshot_path.stat().st_size),
+        "source_db_identity": es.source_db_identity(stable_snapshot_path),
+        "manifest_path": None,
+    }, planning_cutoff=CUTOFF)
     source_record = {
         **source_record,
-        "snapshot": {
-            **source_record["snapshot"],
-            "path": str(stable_snapshot_path),
-            "source_db_identity": es.source_db_identity(stable_snapshot_path),
-        },
+        "snapshot": stable_snapshot,
     }
     gf.register_fixture_snapshot(conn, source_record)
     source_conn.close()

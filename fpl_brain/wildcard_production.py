@@ -270,6 +270,23 @@ def build_wildcard_production_request(
     if value_events != tuple(range(planning_event, planning_event + len(value_events))):
         raise WildcardProductionError(f"{WC_PRODUCTION_INPUTS_MISSING}: Wildcard value events are not contiguous")
 
+    from . import search_permission as sp
+
+    try:
+        search_permission_evaluation = sp.require_search_permission(
+            conn,
+            chip_generation.generation_id,
+            expected_origin_planning_event=planning_event,
+            expected_origin_cutoff=str(chip_generation.cutoff),
+            expected_snapshot_sha256=str(chip_generation.snapshot.get("sha256") or ""),
+        )
+    except sp.SearchPermissionRefused:
+        raise
+    except Exception as failure:
+        raise sp.SearchPermissionRefused(
+            [f"Wildcard production origin permission could not be evaluated: {type(failure).__name__}: {failure}"]
+        ) from failure
+
     source_conn = gs._open_generation_snapshot(chip_generation)
     try:
         pool_binding = pool_binding_from_store(source_conn)
@@ -412,6 +429,7 @@ def build_wildcard_production_request(
             "events": list(value_events),
             "cutoff": str(value_generation.cutoff),
             "data_snapshot_sha256": str(value_generation.snapshot.get("sha256") or ""),
+            "search_permission_evaluation": search_permission_evaluation,
             "source_snapshot_sha256": str(value_generation.manifest.get("code_snapshot_sha256") or ""),
             "model_config_identity": model_config_identity,
             "source_decision_id": route.source_decision_id,
@@ -462,10 +480,24 @@ def build_future_wildcard_event_opportunity(
     caller.
     """
 
-    from . import chip_wildcard as wc
+    from . import chip_wildcard as wc, search_permission as sp
 
     event = int(event)
     origin_event = int(source_identity.get("planning_event") or -1)
+    try:
+        permission_evaluation = sp.require_search_permission(
+            conn,
+            str(source_identity.get("generation_id") or ""),
+            expected_origin_planning_event=origin_event,
+            expected_origin_cutoff=str(source_identity.get("origin_cutoff") or ""),
+            expected_snapshot_sha256=str(source_identity.get("data_snapshot_sha256") or ""),
+        )
+    except sp.SearchPermissionRefused:
+        raise
+    except Exception as failure:
+        raise sp.SearchPermissionRefused(
+            [f"future WC origin permission could not be evaluated: {type(failure).__name__}: {failure}"]
+        ) from failure
     value_binding = getattr(request, "value_horizon_binding", None)
     chip_binding = getattr(request, "horizon_binding", None)
     try:
@@ -797,7 +829,7 @@ def build_future_wildcard_event_opportunity(
             **source_fields,
         },
     }
-    return crf.build_event_opportunity_record(
+    record = crf.build_event_opportunity_record(
         action=cd.CHIP_ACTION_WC, planning_event=origin_event, event=event,
         origin_cutoff=str(source_identity["origin_cutoff"]),
         input_as_of=str(source_identity["origin_cutoff"]), made_at=made_at,
@@ -820,3 +852,4 @@ def build_future_wildcard_event_opportunity(
             "opportunity_value_definition": "WEIGHTED_WC_HORIZON_MEAN_POINTS",
         },
     )
+    return crf._attach_search_permission_evaluation(record, permission_evaluation)

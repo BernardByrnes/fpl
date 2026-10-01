@@ -21,6 +21,7 @@ from fpl_brain import chip_assessment_store as chip_store
 from fpl_brain import chip_assessment as chip_assessment
 from fpl_brain import chip_decision as cd, chip_free_hit as fh, chip_route_assembly as cra, free_hit_production as fhp
 from fpl_brain import chip_reservation_forecast as crf
+from fpl_brain import search_permission as sp
 from fpl_brain import free_hit_decision_authority as fhauthority
 from fpl_brain import chip_wildcard as cw, wildcard_request_adapter as wa
 from fpl_brain import free_hit_request_adapter as fha, manager_lineup as ml
@@ -29,7 +30,31 @@ from fpl_brain import season_rules as sr
 from fpl_brain import wildcard_production as wcp
 
 
+def _allow_synthetic_permission(monkeypatch, *, predictive_code_snapshot_sha256, events):
+    """Keep legacy optimizer/builder fixtures scoped away from the real gate."""
+
+    def allow(_conn, generation_id, **kwargs):
+        identity = {
+            "generation_id": str(generation_id),
+            "planning_event": int(kwargs["expected_origin_planning_event"]),
+            "origin_cutoff": str(kwargs["expected_origin_cutoff"]),
+            "data_snapshot_sha256": str(kwargs["expected_snapshot_sha256"]),
+            "predictive_code_snapshot_sha256": str(predictive_code_snapshot_sha256),
+        }
+        return gf.fixture_search_permission_evaluation(identity, events=events)
+
+    monkeypatch.setattr(sp, "require_search_permission", allow)
+
+
 def _certify_with_lease(conn, **kwargs):
+    snapshot = kwargs.get("snapshot")
+    if isinstance(snapshot, dict):
+        gf.ensure_fixture_execution_run(
+            conn,
+            planning_event=int(kwargs["planning_event"]),
+            cutoff=str(kwargs["cutoff"]),
+            snapshot=snapshot,
+        )
     controller = execution.ExecutionController(conn)
     controller.create_run(
         planning_event=int(kwargs["planning_event"]),
@@ -629,6 +654,9 @@ def test_bb_continuation_opportunity_binds_terminal_state_and_per_event_lineup(m
     )
     code_sha = "sha256:" + "5" * 64
     world_identity = "sha256:" + "w" * 64
+    _allow_synthetic_permission(
+        monkeypatch, predictive_code_snapshot_sha256=code_sha, events=events
+    )
     player_ids = tuple(sorted(proposed))
     worlds = cd.ChipWorldInputs(
         worlds=4,
@@ -1057,6 +1085,9 @@ def test_free_hit_production_builder_emits_retained_play_save_arms(monkeypatch, 
         manifest={"code_snapshot_sha256": code_sha},
         runs_for=lambda event: runs[int(event)],
     )
+    _allow_synthetic_permission(
+        monkeypatch, predictive_code_snapshot_sha256=code_sha, events=events
+    )
     pool_binding = SimpleNamespace(
         eligible_ids=eligible_ids,
         as_dict=lambda: {
@@ -1367,6 +1398,9 @@ def test_wildcard_production_builder_binds_six_event_product_to_four_event_prefi
     value_generation = generation(
         "wildcard-value-generation-fixture", gs.HORIZON_KIND_WILDCARD_VALUE,
         value_events, value_runs,
+    )
+    _allow_synthetic_permission(
+        monkeypatch, predictive_code_snapshot_sha256=code_sha, events=chip_events
     )
     route = SimpleNamespace(
         source_decision_id="decision-fixture",
