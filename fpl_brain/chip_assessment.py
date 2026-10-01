@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping
 from . import (
     chip_decision as cd,
     chip_route_assembly as cra,
+    chip_reservation_forecast as crf,
     free_hit_production as fhp,
     free_hit_request_adapter as fha,
     generation_store as gs,
@@ -80,6 +81,8 @@ def assemble_assessment_record(
     blocked: Mapping[str, tuple[str, str]] | None = None,
     extra_evidence: Mapping[str, Mapping[str, Any]] | None = None,
     reservation: Any | None = None,
+    reservation_forecasts: Mapping[str, Mapping[str, Any]] | None = None,
+    reservation_forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     chips_already_played_for_event: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Create the four-chip record and run the unchanged canonical arbiter."""
@@ -87,6 +90,81 @@ def assemble_assessment_record(
     by_action = cd._availability_by_action(availability, planning_event=int(context["planning_event"]))
     blocked = dict(blocked or {})
     extra_evidence = dict(extra_evidence or {})
+    expiry_by_action: dict[str, int | None] = {}
+    for action in cd.PLAYABLE_CHIP_ACTIONS:
+        row = by_action.get(action) or {}
+        definitions = row.get("definitions") or ()
+        if definitions:
+            active_definition, window_problem = cd._active_definition(definitions)
+            expiry_by_action[action] = (
+                None if window_problem is not None or active_definition is None
+                else (None if active_definition.get("window_stop_event") is None
+                      else int(active_definition["window_stop_event"]))
+            )
+        else:
+            expiry_by_action[action] = (
+                None if row.get("window_stop_event") is None else int(row["window_stop_event"])
+            )
+    verified_forecasts: dict[str, Mapping[str, Any]] = {}
+    if reservation_forecasts and reservation_forecast_evidence_verifier is None:
+        raise ChipAssessmentPreflightError(
+            f"{crf.FORECAST_IDENTITY_INVALID}: a retained event-opportunity verifier is required"
+        )
+    for action, artifact in dict(reservation_forecasts or {}).items():
+        row = by_action.get(str(action))
+        if action not in cd.PLAYABLE_CHIP_ACTIONS or row is None or not bool(row.get("eligible")):
+            raise ChipAssessmentPreflightError(
+                f"{crf.FORECAST_IDENTITY_INVALID}: forecast supplied for an unavailable chip action {action}"
+            )
+        expiry_event = expiry_by_action[str(action)]
+        source_identity = {
+            "source_decision_id": context["source_decision_id"],
+            "source_result_sha256": context["source_decision_result_sha256"],
+            "source_artifact_sha256": context["source_decision_artifact_sha256"],
+            "generation_id": context["generation_id"],
+            "planning_event": int(context["planning_event"]),
+            "origin_cutoff": str(context["cutoff"]),
+            "data_snapshot_sha256": context["data_snapshot_sha256"],
+            "predictive_code_snapshot_sha256": context.get("predictive_code_snapshot_sha256"),
+            "certification_identity": context["certification_identity"],
+        }
+        try:
+            crf.verify_reservation_forecast(
+                artifact,
+                expected={
+                    "action": str(action),
+                    "planning_event": int(context["planning_event"]),
+                    "origin_cutoff": str(context["cutoff"]),
+                    "expiry_event": None if expiry_event is None else int(expiry_event),
+                    "source_identity": source_identity,
+                },
+                evidence_verifier=reservation_forecast_evidence_verifier,
+            )
+        except Exception as failure:
+            raise ChipAssessmentPreflightError(
+                f"{crf.FORECAST_IDENTITY_INVALID}: {failure}"
+            ) from failure
+        evaluation = evaluations.get(str(action))
+        if evaluation is None:
+            raise ChipAssessmentPreflightError(
+                f"{crf.FORECAST_IDENTITY_INVALID}: forecast has no evaluated SAVE policy for {action}"
+            )
+        expected_state: dict[str, Any] = {"squad_ids": list(manager_state.get("squad_ids") or ())}
+        save_policy = (evaluation.evidence.get("save_policy") or {}).get(
+            "post_save_state_for_reservation"
+        )
+        if isinstance(save_policy, Mapping):
+            expected_state.update(dict(save_policy))
+        forecast_state = artifact.get("reservation_state")
+        if not isinstance(forecast_state, Mapping) or dict(forecast_state) != expected_state:
+            raise ChipAssessmentPreflightError(
+                f"{crf.FORECAST_IDENTITY_INVALID}: {action} forecast does not match its verified SAVE state"
+            )
+        verified_forecasts[str(action)] = dict(artifact)
+        extra_evidence[str(action)] = {
+            **dict(extra_evidence.get(str(action)) or {}),
+            "raw_reservation_forecast": dict(artifact),
+        }
     chip_results: dict[str, dict[str, Any]] = {}
     for action in cd.PLAYABLE_CHIP_ACTIONS:
         evaluation = evaluations.get(action)
@@ -126,12 +204,15 @@ def assemble_assessment_record(
         chip_availability=availability,
         evaluations=evaluations,
         reservation=reservation or cd.UncalibratedReservation(),
+        reservation_forecasts=verified_forecasts,
         certification_valid=True,
         manager_state=manager_state,
         chips_already_played_for_event=chips_already_played_for_event,
     )
+    retained_context = dict(context)
+    retained_context["chip_expiry_events"] = dict(expiry_by_action)
     return build_assessment_record(
-        context=context,
+        context=retained_context,
         manager_state=manager_state,
         chip_results=chip_results,
         decision=decision,
@@ -203,6 +284,8 @@ def run_production_chip_assessment(
     cache_dir: str | None = None,
     reservation_calibration_artifact: Mapping[str, Any] | None = None,
     reservation_calibration_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
+    reservation_forecasts: Mapping[str, Mapping[str, Any]] | None = None,
+    reservation_forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run only after an explicit pre-cutoff manager confirmation is pinned.
 
@@ -401,6 +484,7 @@ def run_production_chip_assessment(
                 reservation = VerifiedReservationCalibration.from_artifact(
                     reservation_calibration_artifact,
                     evidence_verifier=reservation_calibration_evidence_verifier,
+                    forecast_evidence_verifier=reservation_forecast_evidence_verifier,
                 )
             except Exception as failure:
                 raise ChipAssessmentPreflightError(
@@ -449,6 +533,8 @@ def run_production_chip_assessment(
             blocked=blocked,
             extra_evidence=extras,
             reservation=reservation,
+            reservation_forecasts=reservation_forecasts,
+            reservation_forecast_evidence_verifier=reservation_forecast_evidence_verifier,
             chips_already_played_for_event=used_chips,
         )
     finally:

@@ -17,7 +17,8 @@ from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fpl_brain import chip_assessment, chip_assessment_store, chip_reservation_calibration
+from fpl_brain import chip_assessment, chip_assessment_store, chip_decision
+from fpl_brain import chip_reservation_calibration
 from fpl_brain import generation_store, repositories
 from fpl_brain.season_rules import SeasonRules
 
@@ -108,6 +109,44 @@ def _calibration_evidence_loader(
     return load
 
 
+def _load_reservation_forecast_inputs(
+    forecast_root: Path,
+    conn: sqlite3.Connection,
+) -> tuple[dict[str, dict], Any]:
+    """Read explicit action files or one unambiguous retained content address."""
+
+    root = forecast_root.resolve()
+    verifier = _calibration_evidence_loader(root, conn)
+    forecasts: dict[str, dict] = {}
+    for action in chip_decision.PLAYABLE_CHIP_ACTIONS:
+        explicit = root / f"{action}.json"
+        if explicit.is_file():
+            candidates = [explicit]
+        else:
+            candidates = []
+            for path in sorted(root.glob("chip-reservation-forecast-*.json")):
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and raw.get("action") == action:
+                    candidates.append(path)
+        identities: dict[str, tuple[Path, dict]] = {}
+        for path in candidates:
+            if not path.resolve().is_relative_to(root):
+                raise ValueError("reservation forecast path escapes its configured root")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError(f"reservation forecast must be a JSON object: {path}")
+            identity = str(raw.get("artifact_sha256") or path.name)
+            if identity in identities and identities[identity][1] != raw:
+                raise ValueError(f"different reservation forecast bytes claim the same digest: {identity}")
+            identities[identity] = (path, raw)
+        if len(identities) > 1:
+            raise ValueError(f"multiple retained reservation forecasts found for {action}; select one explicitly")
+        if identities:
+            _path, raw = next(iter(identities.values()))
+            forecasts[action] = raw
+    return forecasts, verifier
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, type=Path, help="existing runtime database (read only)")
@@ -126,6 +165,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="content-addressed reservation calibration artifact")
     parser.add_argument("--calibration-evidence-dir", type=Path,
                         help="root directory for the calibration's retained causal evidence artifacts")
+    parser.add_argument("--reservation-forecast-dir", type=Path,
+                        help="directory with content-addressed opportunity inputs and optional BB/TC/FH/WC forecast JSON files")
     args = parser.parse_args(argv)
 
     if not args.db.is_file():
@@ -137,6 +178,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         calibration = None
         calibration_evidence_verifier = None
+        reservation_forecasts = {}
+        reservation_forecast_evidence_verifier = None
         if args.reservation_calibration is not None:
             if args.calibration_evidence_dir is None or not args.calibration_evidence_dir.is_dir():
                 parser.error("--reservation-calibration requires an existing --calibration-evidence-dir")
@@ -147,6 +190,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             calibration_evidence_verifier = _calibration_evidence_loader(
                 args.calibration_evidence_dir, conn,
+            )
+        if args.reservation_forecast_dir is not None:
+            if not args.reservation_forecast_dir.is_dir():
+                parser.error("--reservation-forecast-dir must be an existing directory")
+            reservation_forecasts, reservation_forecast_evidence_verifier = (
+                _load_reservation_forecast_inputs(args.reservation_forecast_dir, conn)
             )
         record = chip_assessment.run_production_chip_assessment(
             conn,
@@ -159,6 +208,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_dir=None if args.cache_dir is None else str(args.cache_dir),
             reservation_calibration_artifact=calibration,
             reservation_calibration_evidence_verifier=calibration_evidence_verifier,
+            reservation_forecasts=reservation_forecasts,
+            reservation_forecast_evidence_verifier=reservation_forecast_evidence_verifier,
         )
         receipt = chip_assessment_store.retain_assessment(record, args.evidence_dir)
         verified = chip_assessment_store.verify_assessment(receipt["path"])

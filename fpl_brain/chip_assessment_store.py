@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import chip_decision as cd
+from . import chip_reservation_forecast as crf
 
 ASSESSMENT_SCHEMA = "fpl_brain.chip_operational_assessment.v1"
-ASSESSMENT_VERSION = "chip_assessment_store_v1.0.0"
+ASSESSMENT_VERSION = "chip_assessment_store_v1.1.0"
 ASSESSMENT_ACTIONS = (cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC, cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC)
 
 ASSESSMENT_INVALID = "CHIP_ASSESSMENT_RECORD_INVALID"
@@ -132,6 +133,48 @@ def _validate_context(record: Mapping[str, Any]) -> None:
             ):
                 raise ChipAssessmentStoreError(f"{action} evaluation is not bound to assessment context")
             evaluated[action] = evaluation
+            raw_forecast = item.get("raw_reservation_forecast")
+            if raw_forecast is not None:
+                source_identity = {
+                    "source_decision_id": context["source_decision_id"],
+                    "source_result_sha256": context["source_decision_result_sha256"],
+                    "source_artifact_sha256": context["source_decision_artifact_sha256"],
+                    "generation_id": context["generation_id"],
+                    "planning_event": event,
+                    "origin_cutoff": str(context["cutoff"]),
+                    "data_snapshot_sha256": context["data_snapshot_sha256"],
+                    "predictive_code_snapshot_sha256": context.get("predictive_code_snapshot_sha256"),
+                    "certification_identity": certification,
+                }
+                try:
+                    expiry_map = context.get("chip_expiry_events")
+                    crf.verify_reservation_forecast(
+                        raw_forecast,
+                        expected={
+                            "action": action,
+                            "planning_event": event,
+                            "origin_cutoff": str(context["cutoff"]),
+                            **({"expiry_event": expiry_map[action]}
+                               if isinstance(expiry_map, Mapping) and action in expiry_map else {}),
+                            "source_identity": source_identity,
+                        },
+                    )
+                except Exception as failure:
+                    raise ChipAssessmentStoreError(
+                        f"{action} raw reservation forecast is invalid: {failure}"
+                    ) from failure
+                expected_state: dict[str, Any] = {
+                    "squad_ids": list(manager_state.get("squad_ids") or ())
+                }
+                save_state = (evidence.get("save_policy") or {}).get(
+                    "post_save_state_for_reservation"
+                )
+                if isinstance(save_state, Mapping):
+                    expected_state.update(dict(save_state))
+                if dict(raw_forecast.get("reservation_state") or {}) != expected_state:
+                    raise ChipAssessmentStoreError(
+                        f"{action} raw reservation forecast is not bound to the retained SAVE state"
+                    )
         elif not item.get("reason_codes"):
             raise ChipAssessmentStoreError(f"{action} refusal omits its structured reason code")
 
@@ -278,6 +321,19 @@ def _validate_context(record: Mapping[str, Any]) -> None:
     decision = record.get("decision")
     if not isinstance(decision, Mapping):
         raise ChipAssessmentStoreError("assessment has no arbiter decision")
+    decision_metrics = decision.get("candidate_metrics") or {}
+    selected_action = str(decision_metrics.get("selected_chip_action") or "")
+    selected_forecast = actions.get(selected_action, {}).get("raw_reservation_forecast")
+    selected_forecast_sha = (
+        str(selected_forecast.get("artifact_sha256") or "")
+        if isinstance(selected_forecast, Mapping) else None
+    )
+    if decision_metrics.get("raw_reservation_forecast_sha256") != selected_forecast_sha:
+        raise ChipAssessmentStoreError("arbiter forecast identity differs from the retained selected-action forecast")
+    if isinstance(selected_forecast, Mapping) and decision_metrics.get("raw_reservation_value") != selected_forecast.get(
+        "raw_value"
+    ):
+        raise ChipAssessmentStoreError("arbiter raw reservation value differs from its retained forecast")
     if decision.get("status") == cd.STATUS_PLAY_CHIP:
         action = str(decision.get("recommended_action") or "")
         evaluation = evaluated.get(action)

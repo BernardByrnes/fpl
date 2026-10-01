@@ -272,6 +272,25 @@ def test_bb_tc_evaluations_share_one_proposed_route_scenario_and_worlds():
     assert bb_eval.evidence["proposed_owned_ids"] == list(proposed)
     assert 3 in route.actual_owned_ids and 3 not in proposed
     assert 18 in proposed and 18 not in route.actual_owned_ids
+    expected_save_state = {
+        "event": 6,
+        "squad_ids": list(proposed),
+        "purchase_price_tenths": {
+            str(pid): int(player.purchase_price_tenths)
+            for pid, player in partial.actions[0]["transition"].next_event_state.by_id().items()
+        },
+        "bank_tenths": route.post_h1_bank_tenths,
+        "free_transfers": route.post_h1_free_transfers,
+        "event_start_free_transfers": route.post_h1_free_transfers,
+        "chip_state": [],
+        "source_decision_id": route.source_decision_id,
+        "generation_id": route.generation_id,
+        "route_id": route.route_id,
+        "route_input_sha256": route.route_input_sha256,
+    }
+    bb_save_state = bb_eval.evidence["save_policy"]["post_save_state_for_reservation"]
+    tc_save_state = tc_eval.evidence["save_policy"]["post_save_state_for_reservation"]
+    assert bb_save_state == tc_save_state == expected_save_state
     assert bb_eval.execution_permitted is False
     assert tc_eval.execution_permitted is True
 

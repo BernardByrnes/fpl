@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,8 @@ from fpl_brain import chip_assessment_store as store
 from fpl_brain import chip_assessment as assessment
 from fpl_brain import chip_decision as cd
 from fpl_brain import chip_reservation_calibration as calibration
+from fpl_brain import chip_reservation_forecast as forecast
+from fpl_brain import database
 from fpl_brain import free_hit_production as fhp
 from fpl_brain import outcome_ledger as ol
 from fpl_brain.chip_assessment import assemble_assessment_record
@@ -27,7 +30,13 @@ def _sha(payload):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_BB):
+_RAW_FORECAST_FIXTURES = {}
+
+
+def _causal_row(
+    index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_BB,
+    reservation_forecast_state: dict | None = None,
+):
     origin = datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=7 * index)
     label_time = origin + timedelta(days=2)
     origin_text = origin.isoformat().replace("+00:00", "Z")
@@ -43,6 +52,7 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
         "planning_event": event,
         "cutoff": origin_text,
         "data_snapshot_sha256": _sha({"snapshot": index}),
+        "predictive_code_snapshot_sha256": _sha({"predictive_code": index}),
         "certification_identity": "sha256:" + _sha({"certification": index}),
         "world_identity": "sha256:" + _sha({"world": index}),
     }
@@ -58,34 +68,148 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
         "6": "DEF", "7": "DEF", "8": "MID", "9": "MID", "10": "MID",
         "11": "MID", "12": "MID", "13": "FWD", "14": "FWD", "15": "FWD",
     }
-    common = {
-        "scenario_identity": f"scenario-{index}",
-        "world_identity": "sha256:" + _sha({"world": index}),
-        "proposed_squad_ids": list(range(1, 16)),
-        "lineup": lineup,
-        "player_positions": player_positions,
-        **{key: source[key] for key in (
-            "source_decision_id", "source_result_sha256", "source_artifact_sha256",
-            "generation_id", "cutoff", "data_snapshot_sha256", "certification_identity",
-        )},
-    }
+    save_squad = list(range(1, 16))
+    play_squad = list(range(1, 16))
+    play_lineup = lineup
+    play_positions = player_positions
+    if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
+        # FH/WC change the played squad.  Their causal pair is intentionally
+        # not forced through the same-squad BB/TC comparison contract.
+        play_squad[-1] = 16
+        play_lineup = {
+            **lineup,
+            "starter_ids": [1, 3, 4, 5, 8, 9, 10, 11, 13, 14, 16],
+        }
+        play_positions = {key: value for key, value in player_positions.items() if key != "15"}
+        play_positions["16"] = "FWD"
+
+    def arm_common(squad, arm_lineup, positions, role):
+        values = {
+            "scenario_identity": f"scenario-{index}",
+            "world_identity": "sha256:" + _sha({"world": index}),
+            "proposed_squad_ids": squad,
+            "lineup": arm_lineup,
+            "player_positions": positions,
+            "counterfactual_role": role,
+            "scoring_rule_version": calibration.OUTCOME_SCORING_RULE_VERSION,
+            **{key: source[key] for key in (
+                "source_decision_id", "source_result_sha256", "source_artifact_sha256",
+                "generation_id", "cutoff", "data_snapshot_sha256",
+                "predictive_code_snapshot_sha256", "certification_identity",
+            )},
+        }
+        if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
+            prices = {str(player_id): 50 for player_id in squad}
+            values["action_semantics"] = {
+                "role": role,
+                "transfer_state": {
+                    "squad_ids": squad,
+                    "bank_tenths": 70,
+                    "free_transfers": 3,
+                    "purchase_price_tenths": prices,
+                },
+            }
+            if action == cd.CHIP_ACTION_FH and role == "PLAY":
+                values["action_semantics"]["restore_at_h2"] = {
+                    "restore_event": event + 1,
+                    "permanent_squad_ids": save_squad,
+                    "restored_squad_ids": save_squad,
+                    "permanent_purchase_price_tenths": {str(pid): 50 for pid in save_squad},
+                    "restored_purchase_price_tenths": {str(pid): 50 for pid in save_squad},
+                    "permanent_bank_tenths": 70,
+                    "restored_bank_tenths": 70,
+                    "event_start_h1_free_transfers": 3,
+                    "restored_h2_free_transfers": 3,
+                }
+            elif action == cd.CHIP_ACTION_FH:
+                values["action_semantics"]["retains_chip_option"] = True
+            elif action == cd.CHIP_ACTION_WC and role == "PLAY":
+                values["action_semantics"].update({
+                    "wildcard_applied": True,
+                    "event_start_free_transfers": 3,
+                    "free_transfers_after": 3,
+                    "max_free_transfers": 5,
+                })
+            else:
+                values["action_semantics"].update({
+                    "wildcard_applied": False,
+                    "retains_chip_option": True,
+                })
+        return values
+
+    play_common = arm_common(play_squad, play_lineup, play_positions, "PLAY")
+    save_common = arm_common(save_squad, lineup, player_positions, "SAVE")
+    save_reservation_state = (
+        dict(save_common["action_semantics"]["transfer_state"])
+        if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}
+        else {"squad_ids": list(save_squad)}
+    )
+    forecast_state = dict(reservation_forecast_state or save_reservation_state)
+    save_common["reservation_state"] = save_reservation_state
+    play_common["reservation_state"] = (
+        dict(play_common["action_semantics"]["transfer_state"])
+        if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}
+        else dict(save_reservation_state)
+    )
     starters = set(lineup["starter_ids"])
     save_weights = {str(player_id): 1.0 for player_id in starters}
     save_weights[str(lineup["captain_id"])] += 1.0
     if action == cd.CHIP_ACTION_BB:
         play_weights = {str(player_id): 1.0 for player_id in range(1, 16)}
         play_weights[str(lineup["captain_id"])] += 1.0
-    else:
+    elif action == cd.CHIP_ACTION_TC:
         play_weights = dict(save_weights)
         play_weights[str(lineup["captain_id"])] += 1.0
+    else:
+        play_weights = {str(player_id): 1.0 for player_id in play_lineup["starter_ids"]}
+        play_weights[str(play_lineup["captain_id"])] += 1.0
     play_arm_payload = {
         "arm_id": f"play-{index}", "paired_value": 3.0,
-        "scoring_weights": play_weights, **common,
+        **play_common,
     }
     save_arm_payload = {
         "arm_id": f"save-{index}", "paired_value": 1.0,
-        "scoring_weights": save_weights, **common,
+        **save_common,
     }
+    forecast_source = {
+        key: source[key] for key in (
+            "source_decision_id", "source_result_sha256", "source_artifact_sha256",
+            "generation_id", "planning_event", "data_snapshot_sha256",
+            "predictive_code_snapshot_sha256", "certification_identity",
+        )
+    }
+    forecast_source["origin_cutoff"] = origin_text
+    forecast_refs = []
+    forecast_records = {}
+    for future_event in range(event + 1, event + 4):
+        reference = f"forecast-opportunity-{index}-{future_event}.json"
+        opportunity = forecast.build_event_opportunity_record(
+            action=action,
+            planning_event=event,
+            event=future_event,
+            origin_cutoff=origin_text,
+            made_at=forecast_time,
+            expected_incremental_points=10.0 if future_event == event + 1 else 0.0,
+            opportunity_model=f"fixture_{action.lower()}_future_opportunity_v1",
+            source_identity=forecast_source,
+            reservation_state=forecast_state,
+            world_identity=source["world_identity"],
+        )
+        forecast_refs.append(reference)
+        forecast_records[reference] = opportunity
+    forecast_artifact = forecast.build_reservation_forecast(
+        action=action,
+        planning_event=event,
+        origin_cutoff=origin_text,
+        made_at=forecast_time,
+        expiry_event=event + 3,
+        source_identity=forecast_source,
+        reservation_state=forecast_state,
+        opportunity_refs=forecast_refs,
+        evidence_verifier=forecast_records.__getitem__,
+    )
+    forecast_reference = f"forecast-{index}.json"
+    _RAW_FORECAST_FIXTURES[forecast_reference] = forecast_artifact
     evidence = {
         "schema": calibration.CAUSAL_EVIDENCE_SCHEMA,
         "policy": calibration.CAUSAL_EVIDENCE_POLICY,
@@ -95,22 +219,29 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
         "origin_cutoff": origin_text,
         "label_available_at": label_text,
         "source": source,
-        "forecast": {"value": 10.0, "made_at": forecast_time},
+        "forecast": {
+            "artifact_ref": forecast_reference,
+            "artifact_sha256": forecast_artifact["artifact_sha256"],
+            "retained_content_sha256": _sha(forecast_artifact),
+            "value": forecast_artifact["raw_value"],
+            "made_at": forecast_artifact["made_at"],
+        },
         "counterfactual_pair": {
             "play": {"arm_id": f"play-{index}", "artifact_ref": f"play-{index}.json",
                      "artifact_sha256": _sha(play_arm_payload),
-                     "artifact_payload": play_arm_payload, "scoring_weights": play_weights, **common},
+                     "artifact_payload": play_arm_payload, **play_common},
             "save": {"arm_id": f"save-{index}", "artifact_ref": f"save-{index}.json",
                      "artifact_sha256": _sha(save_arm_payload),
-                     "artifact_payload": save_arm_payload, "scoring_weights": save_weights, **common},
+                     "artifact_payload": save_arm_payload, **save_common},
         },
     }
     captures = []
-    for player_id in range(1, 16):
+    for player_id in range(1, 17):
         total_points = (
             realized_value
             if (action == cd.CHIP_ACTION_BB and player_id == 6)
             or (action == cd.CHIP_ACTION_TC and player_id == lineup["captain_id"])
+            or (action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC} and player_id == 16)
             else 0.0
         )
         minutes = 90.0
@@ -149,8 +280,8 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
         "action": evidence["action"],
         "planning_event": event,
         "origin_cutoff": origin_text,
-        "scenario_identity": common["scenario_identity"],
-        "world_identity": common["world_identity"],
+        "scenario_identity": play_common["scenario_identity"],
+        "world_identity": play_common["world_identity"],
         "play_arm_id": f"play-{index}",
         "play_artifact_sha256": _sha(play_arm_payload),
         "save_arm_id": f"save-{index}",
@@ -161,6 +292,7 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
         "generation_id": source["generation_id"],
         "cutoff": source["cutoff"],
         "data_snapshot_sha256": source["data_snapshot_sha256"],
+        "predictive_code_snapshot_sha256": source["predictive_code_snapshot_sha256"],
         "certification_identity": source["certification_identity"],
         "label_definition_version": calibration.OUTCOME_LABEL_DEFINITION,
         "scoring_rule_version": calibration.OUTCOME_SCORING_RULE_VERSION,
@@ -173,8 +305,9 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
         },
         "paired_results": {
             "play": {
-                "lineup": lineup,
-                "player_positions": player_positions,
+                "proposed_squad_ids": play_squad,
+                "lineup": play_lineup,
+                "player_positions": play_positions,
                 "scoring_weights": play_weights,
                 "observed_points": sum(
                     item["total_points"] * play_weights.get(str(item["player_id"]), 0.0)
@@ -182,6 +315,7 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
                 ),
             },
             "save": {
+                "proposed_squad_ids": save_squad,
                 "lineup": lineup,
                 "player_positions": player_positions,
                 "scoring_weights": save_weights,
@@ -219,6 +353,13 @@ def _causal_row(index: int, *, noise: float = 0.0, action: str = cd.CHIP_ACTION_
 
 def _store_causal_evidence(store_map, row, evidence):
     store_map[row["causal_evidence_ref"]] = evidence
+    for arm in evidence["counterfactual_pair"].values():
+        store_map[arm["artifact_ref"]] = arm["artifact_payload"]
+    forecast_meta = evidence["forecast"]
+    forecast_artifact = _RAW_FORECAST_FIXTURES[forecast_meta["artifact_ref"]]
+    store_map[forecast_meta["artifact_ref"]] = forecast_artifact
+    for opportunity in forecast_artifact["opportunities"]:
+        store_map[opportunity["artifact_ref"]] = opportunity["artifact_payload"]
     label = evidence["label"]
     store_map[label["outcome_record_ref"]] = label["outcome_record"]
 
@@ -230,9 +371,48 @@ def _causal_evidence_resolver(evidence, *, retained_outcome=None):
     def resolve(reference):
         if str(reference) == str(label["outcome_record_ref"]):
             return retained
+        for arm in evidence["counterfactual_pair"].values():
+            if str(reference) == str(arm["artifact_ref"]):
+                return arm["artifact_payload"]
+        forecast_meta = evidence["forecast"]
+        if str(reference) == str(forecast_meta["artifact_ref"]):
+            return _RAW_FORECAST_FIXTURES[forecast_meta["artifact_ref"]]
+        for artifact in _RAW_FORECAST_FIXTURES.values():
+            for opportunity in artifact["opportunities"]:
+                if str(reference) == str(opportunity["artifact_ref"]):
+                    return opportunity["artifact_payload"]
         return evidence
 
     return resolve
+
+
+def _official_outcome_connection(event, *, player_ids=range(1, 16), final=True, final_at="2025-01-03T00:00:00Z"):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    database.initialize_database(conn)
+    from datetime import datetime, timedelta
+
+    captured_at = (datetime.fromisoformat(final_at.replace("Z", "+00:00"))
+                   + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    conn.execute(
+        "INSERT INTO events(id, name, finished, data_checked, raw_json, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (int(event), f"GW{event}", 1 if final else 0, 1 if final else 0, "{}", final_at),
+    )
+    for player_id in player_ids:
+        ol.capture_observation(
+            conn,
+            grain=ol.GRAIN_PLAYER_EVENT,
+            event=int(event),
+            player_id=int(player_id),
+            fields={"minutes": 90, "total_points": 1},
+            source_name="player_gameweeks_final",
+            official_final_at=final_at,
+            observation_state=ol.OBSERVATION_FINAL if final else ol.OBSERVATION_PROVISIONAL,
+            source_identity=f"player_gameweeks:{event}",
+            captured_at=captured_at,
+        )
+    return conn
 
 
 def _context():
@@ -278,11 +458,16 @@ def test_calibration_requires_verified_paired_temporal_causal_evidence():
     reservation = calibration.VerifiedReservationCalibration.from_artifact(
         artifact, evidence_verifier=stored.__getitem__,
     )
+    runtime_forecast = _RAW_FORECAST_FIXTURES["forecast-4.json"]
     estimate = reservation.estimate(
         action=cd.CHIP_ACTION_BB,
         planning_event=5,
         expiry_event=8,
-        state={"raw_reservation_value": 10.0},
+        state={
+            "squad_ids": list(range(1, 16)),
+            "raw_reservation_value": 10.0,
+            "raw_reservation_forecast": runtime_forecast,
+        },
     )
     assert estimate.calibration_status == cd.CALIBRATION_CALIBRATED
     assert estimate.value == pytest.approx(15.0, abs=0.6)
@@ -377,16 +562,9 @@ def test_calibration_rejects_label_not_reproduced_by_retained_outcome_record():
 def test_rehashed_arbitrary_chip_weights_cannot_manufacture_calibration_labels():
     row, evidence = _causal_row(0)
     outcome = evidence["label"]["outcome_record"]
-    play = evidence["counterfactual_pair"]["play"]
-    forged_weights = dict(play["scoring_weights"])
-    forged_weights["6"] = 100.0
-    forged_payload = dict(play["artifact_payload"])
-    forged_payload["scoring_weights"] = forged_weights
-    play["scoring_weights"] = forged_weights
-    play["artifact_payload"] = forged_payload
-    play["artifact_sha256"] = _sha(forged_payload)
-    outcome["play_artifact_sha256"] = play["artifact_sha256"]
     result = outcome["paired_results"]["play"]
+    forged_weights = dict(result["scoring_weights"])
+    forged_weights["6"] = 100.0
     result["scoring_weights"] = forged_weights
     result["observed_points"] = sum(
         capture["total_points"] * forged_weights.get(str(capture["player_id"]), 0.0)
@@ -404,9 +582,49 @@ def test_rehashed_arbitrary_chip_weights_cannot_manufacture_calibration_labels()
         calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
 
-def test_calibration_fails_closed_for_actions_without_a_canonical_outcome_scorer():
+@pytest.mark.parametrize("action", [cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC])
+def test_calibration_scores_action_specific_fh_wc_arms_with_distinct_squads(action):
+    row, evidence = _causal_row(0, action=action)
+    play = evidence["counterfactual_pair"]["play"]
+    save = evidence["counterfactual_pair"]["save"]
+    assert play["proposed_squad_ids"] != save["proposed_squad_ids"]
+    assert play["world_identity"] == save["world_identity"]
+    assert calibration.validate_observation(
+        row, evidence_verifier=_causal_evidence_resolver(evidence),
+    ).realized_value == pytest.approx(row["realized_value"])
+
+
+def test_fh_reservation_scorer_rejects_broken_permanent_squad_restoration():
     row, evidence = _causal_row(0, action=cd.CHIP_ACTION_FH)
-    with pytest.raises(calibration.ReservationCalibrationError, match="no canonical reservation outcome scorer"):
+    play = evidence["counterfactual_pair"]["play"]
+    play["action_semantics"]["restore_at_h2"]["restored_squad_ids"] = [9000]
+    payload = dict(play["artifact_payload"])
+    payload["action_semantics"] = play["action_semantics"]
+    play["artifact_payload"] = payload
+    play["artifact_sha256"] = _sha(payload)
+    evidence["label"]["outcome_record"]["play_artifact_sha256"] = play["artifact_sha256"]
+    outcome = evidence["label"]["outcome_record"]
+    evidence["label"]["outcome_record_sha256"] = _sha(outcome)
+    evidence["label"]["outcome_record"] = outcome
+    row["causal_evidence_sha256"] = _sha(evidence)
+    with pytest.raises(calibration.ReservationCalibrationError, match="does not preserve permanent squad"):
+        calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
+
+
+def test_wc_reservation_scorer_rejects_inconsistent_event_start_ft_retention():
+    row, evidence = _causal_row(0, action=cd.CHIP_ACTION_WC)
+    play = evidence["counterfactual_pair"]["play"]
+    play["action_semantics"]["free_transfers_after"] = 1
+    payload = dict(play["artifact_payload"])
+    payload["action_semantics"] = play["action_semantics"]
+    play["artifact_payload"] = payload
+    play["artifact_sha256"] = _sha(payload)
+    evidence["label"]["outcome_record"]["play_artifact_sha256"] = play["artifact_sha256"]
+    outcome = evidence["label"]["outcome_record"]
+    evidence["label"]["outcome_record_sha256"] = _sha(outcome)
+    evidence["label"]["outcome_record"] = outcome
+    row["causal_evidence_sha256"] = _sha(evidence)
+    with pytest.raises(calibration.ReservationCalibrationError, match="free-transfer retention"):
         calibration.validate_observation(row, evidence_verifier=_causal_evidence_resolver(evidence))
 
 
@@ -539,6 +757,114 @@ def test_production_outcome_loader_verifies_append_only_official_captures(tmp_pa
     conn.close()
 
 
+def test_causal_finalizer_derives_and_retains_matured_outcome_from_official_ledger(tmp_path):
+    _row, evidence = _causal_row(0, action=cd.CHIP_ACTION_BB)
+    retained = {}
+    _store_causal_evidence(retained, _row, evidence)
+    evidence.pop("label")
+    positions = evidence["counterfactual_pair"]["play"]["player_positions"]
+    conn = _official_outcome_connection(2)
+    try:
+        result = calibration.finalize_causal_observation(
+            conn,
+            evidence,
+            realization_event=2,
+            evidence_root=tmp_path,
+            evidence_verifier=retained.__getitem__,
+            source_position_resolver=lambda _record: positions,
+        )
+        row = result["calibration_row"]
+        assert row["realized_value"] == 4.0
+        assert row["forecast_value"] == 10.0
+        assert result["outcome_record"]["available_at"] == "2025-01-03T00:05:00Z"
+        assert result["outcome_record"]["paired_results"]["play"]["scoring_weights"] != {}
+        assert result["outcome_record"]["paired_results"]["save"]["scoring_weights"] != {}
+        assert Path(result["outcome_path"]).is_file()
+        assert Path(result["causal_evidence_path"]).is_file()
+        calibration.verify_outcome_record_capture_sources(
+            conn,
+            result["outcome_record"],
+            source_position_resolver=lambda _record: positions,
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("final", "player_ids"),
+    [(True, range(1, 15)), (False, range(1, 16))],
+    ids=["missing-player", "nonfinal-captures"],
+)
+def test_causal_finalizer_refuses_missing_or_nonfinal_official_captures(tmp_path, final, player_ids):
+    _row, evidence = _causal_row(0, action=cd.CHIP_ACTION_BB)
+    retained = {}
+    _store_causal_evidence(retained, _row, evidence)
+    evidence.pop("label")
+    positions = evidence["counterfactual_pair"]["play"]["player_positions"]
+    conn = _official_outcome_connection(2, player_ids=player_ids, final=final)
+    try:
+        with pytest.raises(calibration.ReservationCalibrationError, match="official final player-gameweek capture is missing"):
+            calibration.finalize_causal_observation(
+                conn,
+                evidence,
+                realization_event=2,
+                evidence_root=tmp_path,
+                evidence_verifier=retained.__getitem__,
+                source_position_resolver=lambda _record: positions,
+            )
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        conn.close()
+
+
+def test_causal_finalizer_matures_the_origin_selected_event_only(tmp_path):
+    _row, evidence = _causal_row(0, action=cd.CHIP_ACTION_BB)
+    retained = {}
+    _store_causal_evidence(retained, _row, evidence)
+    evidence.pop("label")
+    positions = evidence["counterfactual_pair"]["play"]["player_positions"]
+    conn = _official_outcome_connection(3)
+    try:
+        with pytest.raises(calibration.ReservationCalibrationError, match="differs from the origin forecast's selected event"):
+            calibration.finalize_causal_observation(
+                conn,
+                evidence,
+                realization_event=3,
+                evidence_root=tmp_path,
+                evidence_verifier=retained.__getitem__,
+                source_position_resolver=lambda _record: positions,
+            )
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        conn.close()
+
+
+def test_causal_finalizer_refuses_forecast_bound_to_a_different_save_state(tmp_path):
+    _row, evidence = _causal_row(
+        0,
+        action=cd.CHIP_ACTION_BB,
+        reservation_forecast_state={"squad_ids": list(range(1, 16)), "bank_tenths": 999},
+    )
+    retained = {}
+    _store_causal_evidence(retained, _row, evidence)
+    evidence.pop("label")
+    positions = evidence["counterfactual_pair"]["play"]["player_positions"]
+    conn = _official_outcome_connection(2)
+    try:
+        with pytest.raises(calibration.ReservationCalibrationError, match="not bound to the retained SAVE arm state"):
+            calibration.finalize_causal_observation(
+                conn,
+                evidence,
+                realization_event=2,
+                evidence_root=tmp_path,
+                evidence_verifier=retained.__getitem__,
+                source_position_resolver=lambda _record: positions,
+            )
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        conn.close()
+
+
 def test_production_position_resolver_reads_the_bound_generation_snapshot(monkeypatch):
     _row, evidence = _causal_row(0)
     outcome = evidence["label"]["outcome_record"]
@@ -629,6 +955,7 @@ def test_calibration_does_not_override_an_evaluators_execution_permission():
         }],
         evaluations={cd.CHIP_ACTION_BB: evaluation},
         reservation=reservation,
+        reservation_forecasts={cd.CHIP_ACTION_BB: _RAW_FORECAST_FIXTURES["forecast-4.json"]},
         certification_valid=True,
         manager_state={"squad_ids": list(range(1, 16))},
     )

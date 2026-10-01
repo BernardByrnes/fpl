@@ -142,12 +142,19 @@ class ChipWorldInputs:
     world_seed: int
     world_identity: str
     code_snapshot_sha256: str | None = None
+    source_event: int | None = None
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> int:
         """Return the world count, raising ``ChipInputError`` on any gap."""
+
+        if self.source_event is not None and int(self.source_event) <= 0:
+            raise ChipInputError(
+                f"{DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE}: source event must be positive",
+                reasons=[DIAG_CHIP_WORLD_CONTRACT_INCOMPLETE],
+            )
 
         if int(self.worlds) <= 0:
             raise ChipInputError(
@@ -187,6 +194,7 @@ class ChipWorldInputs:
         world_seed: int,
         world_identity: str,
         code_snapshot_sha256: str | None = None,
+        source_event: int | None = None,
     ) -> "ChipWorldInputs":
         """Build the contract from a certified manager-world matrix verbatim."""
 
@@ -215,6 +223,7 @@ class ChipWorldInputs:
             world_seed=int(world_seed),
             world_identity=str(world_identity),
             code_snapshot_sha256=None if code_snapshot_sha256 is None else str(code_snapshot_sha256),
+            source_event=None if source_event is None else int(source_event),
         )
 
     def appeared(self, player_id: int) -> tuple[bool, ...]:
@@ -240,6 +249,7 @@ class ChipWorldInputs:
             "worlds": int(self.worlds),
             "planning_event": int(self.planning_event),
             "horizon_events": list(self.horizon_events),
+            "source_event": None if self.source_event is None else int(self.source_event),
         }
 
 
@@ -700,6 +710,7 @@ def decide_chip_action(
     chip_availability: Sequence[Mapping[str, Any]],
     evaluations: Mapping[str, ChipEvaluation] | None = None,
     reservation: ReservationValue | None = None,
+    reservation_forecasts: Mapping[str, Mapping[str, Any]] | None = None,
     certification_valid: bool = False,
     manager_state: Mapping[str, Any] | None = None,
     chips_already_played_for_event: Sequence[str] = (),
@@ -917,9 +928,9 @@ def decide_chip_action(
     # supplies one, its AUTHORITATIVE post-SAVE state (post-route squad, bank, FT,
     # chip availability).  This is how a chip whose decision turns on a projected
     # future state hands that state onward WITHOUT the evaluator ever calling the
-    # reservation itself -- the arbiter remains the single seam.  An evaluator
-    # that supplies no such state (notably Triple Captain) is unaffected: its
-    # payload is exactly what it always was.
+    # reservation itself -- the arbiter remains the single seam.  Route-bound
+    # BB/TC evaluations carry the verified post-H1 normal route state; standalone
+    # evaluator results without route context continue to use the input squad.
     reservation_state: dict[str, Any] = {"squad_ids": list(squad_ids)}
     supplied_state = (chosen.evidence.get("save_policy") or {}).get("post_save_state_for_reservation")
     if isinstance(supplied_state, Mapping):
@@ -927,9 +938,17 @@ def decide_chip_action(
     # A chip evaluator may carry a separately produced, point-in-time raw
     # reservation forecast. Pass it through to a verified calibration provider
     # when present; never derive or default one in the arbiter.
-    raw_reservation = chosen.candidate_metrics.get("raw_reservation_value")
-    if raw_reservation is not None:
-        reservation_state["raw_reservation_value"] = raw_reservation
+    forecast = dict(reservation_forecasts or {}).get(chosen.action)
+    if isinstance(forecast, Mapping):
+        reservation_state["raw_reservation_forecast"] = forecast
+        reservation_state["raw_reservation_value"] = forecast.get("raw_value")
+    else:
+        # Legacy custom ReservationValue implementations can continue to consume
+        # their own candidate metric; the verified production calibration
+        # provider independently requires a content-addressed forecast artifact.
+        raw_reservation = chosen.candidate_metrics.get("raw_reservation_value")
+        if raw_reservation is not None:
+            reservation_state["raw_reservation_value"] = raw_reservation
     estimate = (reservation or UncalibratedReservation()).estimate(
         action=chosen.action,
         planning_event=planning_event,
@@ -997,6 +1016,18 @@ def decide_chip_action(
         uncertainty=dict(chosen.uncertainty),
         candidate_metrics={
             **dict(chosen.candidate_metrics),
+            "selected_chip_action": chosen.action,
+            "raw_reservation_value": (
+                forecast.get("raw_value")
+                if isinstance(forecast, Mapping)
+                else chosen.candidate_metrics.get("raw_reservation_value")
+            ),
+            "raw_reservation_forecast_sha256": (
+                forecast.get("artifact_sha256") if isinstance(forecast, Mapping) else None
+            ),
+            "raw_reservation_forecast_coverage_status": (
+                forecast.get("coverage_status") if isinstance(forecast, Mapping) else None
+            ),
             "reservation_value": estimate.value,
             "reservation_terminal_value": estimate.terminal_value,
             "reservation_weeks_to_expiry": estimate.weeks_to_expiry,

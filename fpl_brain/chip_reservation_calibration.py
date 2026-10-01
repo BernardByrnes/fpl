@@ -12,23 +12,28 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import sqlite3
+import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import chip_decision as cd
+from . import chip_reservation_forecast as crf
 from . import manager_lineup as ml
 from . import outcome_ledger as ol
 
 CALIBRATION_SCHEMA = "fpl_brain.chip_reservation_calibration.v1"
-CAUSAL_EVIDENCE_SCHEMA = "fpl_brain.chip_reservation_causal_evidence.v2"
-CAUSAL_OUTCOME_RECORD_SCHEMA = "fpl_brain.chip_reservation_outcome_record.v2"
+CAUSAL_EVIDENCE_SCHEMA = "fpl_brain.chip_reservation_causal_evidence.v3"
+CAUSAL_OUTCOME_RECORD_SCHEMA = "fpl_brain.chip_reservation_outcome_record.v3"
 OUTCOME_CAPTURE_SET_SCHEMA = "fpl_brain.outcome_ledger_capture_set.v1"
-OUTCOME_LABEL_DEFINITION = "CANONICAL_BB_TC_PLAY_MINUS_SAVE_EVENT_POINTS_V2"
-OUTCOME_SCORING_RULE_VERSION = "manager_lineup_and_bb_tc_realized_scores_v1"
-CALIBRATION_VERSION = "chip_reservation_walkforward_v3.0.0"
-CAUSAL_EVIDENCE_POLICY = "SAME_SCENARIO_PAIRED_PLAY_SAVE_TEMPORAL_LABELS_v2"
+OUTCOME_LABEL_DEFINITION = "CANONICAL_CHIP_PLAY_MINUS_SAVE_EVENT_POINTS_V3"
+OUTCOME_SCORING_RULE_VERSION = "manager_lineup_and_action_specific_chip_scores_v2"
+CALIBRATION_VERSION = "chip_reservation_walkforward_v4.0.0"
+CAUSAL_EVIDENCE_POLICY = "SAME_SOURCE_WORLD_ACTION_SPECIFIC_PLAY_SAVE_TEMPORAL_LABELS_v3"
 
 # These criteria are fixed in code before labels are evaluated. A caller cannot
 # loosen them in a record after seeing the results.
@@ -41,6 +46,8 @@ MIN_90_INTERVAL_COVERAGE = 0.80
 DIAG_CALIBRATION_EVIDENCE_INVALID = "CHIP_RESERVATION_CAUSAL_EVIDENCE_INVALID"
 DIAG_CALIBRATION_INSUFFICIENT = "CHIP_RESERVATION_CALIBRATION_INSUFFICIENT_CAUSAL_EVIDENCE"
 DIAG_CALIBRATION_NOT_VALIDATED = "CHIP_RESERVATION_CALIBRATION_NOT_VALIDATED"
+DIAG_RESERVATION_FORECAST_REQUIRED = "CHIP_RESERVATION_RAW_FORECAST_REQUIRED"
+DIAG_RESERVATION_FORECAST_INCOMPLETE = "CHIP_RESERVATION_FORECAST_COVERAGE_INCOMPLETE"
 
 
 class ReservationCalibrationError(ValueError):
@@ -75,6 +82,13 @@ def _canonical_sha256(payload: Any) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _canonical_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False, default=str,
+    ).encode("utf-8")
+
+
 def _is_sha256(value: Any) -> bool:
     text = str(value or "")
     if text.startswith("sha256:"):
@@ -90,14 +104,12 @@ def _canonical_scoring_weights(
     player_points: Mapping[int, float],
     player_minutes: Mapping[int, float],
 ) -> dict[str, float]:
-    """Rebuild realized BB/TC point weights from the retained FPL policy.
+    """Rebuild realized chip point weights from each retained FPL arm policy.
 
     Caller-provided weights are data to verify, never the scoring authority.
-    FH/WC need action-specific squad and transfer-state scorers; until those are
-    implemented, they cannot contribute calibration labels.
     """
 
-    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+    if action not in cd.PLAYABLE_CHIP_ACTIONS:
         raise ReservationCalibrationError(
             f"{action} has no canonical reservation outcome scorer"
         )
@@ -178,6 +190,105 @@ def _canonical_scoring_weights(
     return dict(sorted(weights.items(), key=lambda item: int(item[0])))
 
 
+def _verify_forecast_matches_save_state(
+    forecast: Mapping[str, Any], save_arm: Mapping[str, Any],
+) -> None:
+    state = save_arm.get("reservation_state")
+    forecast_state = forecast.get("reservation_state")
+    if not isinstance(state, Mapping) or not state:
+        raise ReservationCalibrationError("SAVE arm omits its exact reservation state")
+    if not isinstance(forecast_state, Mapping) or dict(forecast_state) != dict(state):
+        raise ReservationCalibrationError("raw reservation forecast is not bound to the retained SAVE arm state")
+
+
+def _verify_action_pair_policies(
+    action: str,
+    play: Mapping[str, Any],
+    save: Mapping[str, Any],
+    *,
+    planning_event: int,
+) -> None:
+    """Apply the comparison contract specific to each chip's counterfactual.
+
+    BB/TC compare the same explicit proposed squad and lineup. FH/WC change
+    squad and/or lineup by definition, so those pairs instead bind each legal
+    policy to its own explicit transfer state and chip transition semantics.
+    """
+
+    if action in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        for name in ("proposed_squad_ids", "lineup", "player_positions"):
+            if play.get(name) != save.get(name) or play.get(name) in (None, "", [], {}):
+                raise ReservationCalibrationError(f"PLAY and SAVE do not share the same {name}")
+        return
+
+    for arm_name, arm, expected_role in (
+        ("PLAY", play, "PLAY"), ("SAVE", save, "SAVE"),
+    ):
+        if arm.get("counterfactual_role") != expected_role:
+            raise ReservationCalibrationError(f"{action} {arm_name} arm has the wrong counterfactual role")
+        semantics = arm.get("action_semantics")
+        state = semantics.get("transfer_state") if isinstance(semantics, Mapping) else None
+        if not isinstance(semantics, Mapping) or not isinstance(state, Mapping):
+            raise ReservationCalibrationError(f"{action} {arm_name} arm omits explicit transfer-state semantics")
+        if semantics.get("role") != expected_role:
+            raise ReservationCalibrationError(f"{action} {arm_name} action semantics disagree with its arm role")
+        try:
+            state_squad = tuple(int(value) for value in state["squad_ids"])
+            prices = {int(key): int(value) for key, value in state["purchase_price_tenths"].items()}
+            bank = int(state["bank_tenths"])
+            free_transfers = int(state["free_transfers"])
+        except (KeyError, TypeError, ValueError, AttributeError) as failure:
+            raise ReservationCalibrationError(
+                f"{action} {arm_name} transfer state is incomplete: {failure}"
+            ) from failure
+        if (
+            len(state_squad) != ml.SQUAD_SIZE
+            or len(set(state_squad)) != ml.SQUAD_SIZE
+            or bank < 0
+            or free_transfers < 0
+            or set(prices) != set(state_squad)
+            or tuple(sorted(state_squad)) != tuple(sorted(int(value) for value in arm.get("proposed_squad_ids", ())))
+        ):
+            raise ReservationCalibrationError(
+                f"{action} {arm_name} transfer state does not bind its complete 15-player policy"
+            )
+
+    play_semantics = play["action_semantics"]
+    save_semantics = save["action_semantics"]
+    if action == cd.CHIP_ACTION_FH:
+        restoration = play_semantics.get("restore_at_h2")
+        if not isinstance(restoration, Mapping):
+            raise ReservationCalibrationError("FH PLAY omits its permanent-state restoration record")
+        equality_pairs = (
+            ("permanent_squad_ids", "restored_squad_ids"),
+            ("permanent_purchase_price_tenths", "restored_purchase_price_tenths"),
+            ("permanent_bank_tenths", "restored_bank_tenths"),
+            ("event_start_h1_free_transfers", "restored_h2_free_transfers"),
+        )
+        if any(restoration.get(left) != restoration.get(right) for left, right in equality_pairs):
+            raise ReservationCalibrationError("FH PLAY does not preserve permanent squad, bank, basis and event-start FT")
+        if int(restoration.get("restore_event", -1)) <= int(planning_event):
+            raise ReservationCalibrationError("FH permanent-state restoration is not after the PLAY event")
+        if save_semantics.get("retains_chip_option") is not True:
+            raise ReservationCalibrationError("FH SAVE arm does not retain the Free Hit option")
+    elif action == cd.CHIP_ACTION_WC:
+        if play_semantics.get("wildcard_applied") is not True:
+            raise ReservationCalibrationError("WC PLAY arm does not declare the Wildcard transfer action")
+        if save_semantics.get("wildcard_applied") is not False or save_semantics.get("retains_chip_option") is not True:
+            raise ReservationCalibrationError("WC SAVE arm does not preserve the Wildcard option")
+        try:
+            event_start_ft = int(play_semantics["event_start_free_transfers"])
+            free_transfers_after = int(play_semantics["free_transfers_after"])
+            max_free_transfers = int(play_semantics["max_free_transfers"])
+        except (KeyError, TypeError, ValueError) as failure:
+            raise ReservationCalibrationError("WC PLAY omits explicit event-start FT transition semantics") from failure
+        if (
+            event_start_ft < 0 or max_free_transfers < 1
+            or free_transfers_after != min(event_start_ft, max_free_transfers)
+        ):
+            raise ReservationCalibrationError("WC PLAY free-transfer retention does not follow the declared rule")
+
+
 def _verify_outcome_record(
     outcome_record: Mapping[str, Any],
     *,
@@ -215,7 +326,7 @@ def _verify_outcome_record(
     for name in (
         "source_decision_id", "source_result_sha256", "source_artifact_sha256",
         "generation_id", "planning_event", "cutoff", "data_snapshot_sha256",
-        "certification_identity", "world_identity",
+        "predictive_code_snapshot_sha256", "certification_identity", "world_identity",
     ):
         if str(outcome_record.get(name) or "") != str(source_identity.get(name) or ""):
             raise ReservationCalibrationError(f"retained outcome record is not bound to source {name}")
@@ -290,21 +401,12 @@ def _verify_outcome_record(
     scores: dict[str, float] = {}
     for arm_name, arm in (("play", play), ("save", save)):
         result = paired_results.get(arm_name)
-        weights = arm.get("scoring_weights")
-        payload = arm.get("artifact_payload")
-        payload_weights = payload.get("scoring_weights") if isinstance(payload, Mapping) else None
         result_weights = result.get("scoring_weights") if isinstance(result, Mapping) else None
         if (
             not isinstance(result, Mapping)
-            or not isinstance(weights, Mapping)
-            or not weights
-            or not isinstance(payload, Mapping)
-            or not isinstance(payload_weights, Mapping)
             or not isinstance(result_weights, Mapping)
-            or dict(payload_weights) != dict(weights)
-            or dict(result_weights) != dict(weights)
         ):
-            raise ReservationCalibrationError(f"{arm_name.upper()} score is not bound to its retained arm scorer")
+            raise ReservationCalibrationError(f"{arm_name.upper()} outcome omits its reconstructed scoring weights")
         if (
             result.get("lineup") != arm.get("lineup")
             or result.get("player_positions") != arm.get("player_positions")
@@ -320,7 +422,7 @@ def _verify_outcome_record(
             player_minutes={int(key): value for key, value in player_minutes.items()},
         )
         normalized_weights: dict[str, float] = {}
-        for raw_player_id, raw_weight in weights.items():
+        for raw_player_id, raw_weight in result_weights.items():
             try:
                 player_id = str(int(raw_player_id))
             except (TypeError, ValueError) as failure:
@@ -452,8 +554,11 @@ def verify_outcome_record_capture_sources(
         raise ReservationCalibrationError("outcome record has malformed paired PLAY/SAVE results")
     play_positions = play_result.get("player_positions")
     save_positions = save_result.get("player_positions")
-    if not isinstance(play_positions, Mapping) or dict(play_positions) != dict(save_positions or {}):
-        raise ReservationCalibrationError("paired outcome scoring does not use one retained source position map")
+    if not isinstance(play_positions, Mapping) or not isinstance(save_positions, Mapping):
+        raise ReservationCalibrationError("paired outcome scoring omits an arm's source position map")
+    action = str(outcome_record.get("action") or "")
+    if action in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC} and dict(play_positions) != dict(save_positions):
+        raise ReservationCalibrationError("BB/TC paired scoring does not use one retained source position map")
     if source_position_resolver is not None:
         try:
             expected_positions = source_position_resolver(outcome_record)
@@ -465,13 +570,472 @@ def verify_outcome_record_capture_sources(
             raise ReservationCalibrationError("source generation position resolver returned no mapping")
         try:
             normalized_expected = {str(int(key)): str(value) for key, value in expected_positions.items()}
+            normalized_source = {str(int(key)): str(value) for key, value in expected_positions.items()}
             normalized_play = {str(int(key)): str(value) for key, value in play_positions.items()}
+            normalized_save = {str(int(key)): str(value) for key, value in save_positions.items()}
         except (TypeError, ValueError) as failure:
             raise ReservationCalibrationError("paired outcome contains an invalid source position map") from failure
-        if normalized_play != normalized_expected:
+        for arm_name, result, normalized in (
+            ("PLAY", play_result, normalized_play), ("SAVE", save_result, normalized_save),
+        ):
+            try:
+                policy_ids = {str(int(value)) for value in result["proposed_squad_ids"]}
+            except (KeyError, TypeError, ValueError) as failure:
+                raise ReservationCalibrationError(
+                    f"{arm_name} paired outcome omits its proposed squad ids"
+                ) from failure
+            if set(normalized) != policy_ids or normalized != {
+                player_id: position for player_id, position in normalized_source.items()
+                if player_id in policy_ids
+            }:
+                raise ReservationCalibrationError(
+                    f"{arm_name} paired outcome source positions differ from the pinned generation snapshot"
+                )
+
+
+def _retain_content_addressed_json(root: Path, filename: str, payload: Mapping[str, Any]) -> str:
+    """Retain one canonical JSON artifact without replacing an existing name."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / filename
+    encoded = _canonical_bytes(payload)
+    if target.exists():
+        if target.read_bytes() != encoded:
+            raise ReservationCalibrationError(f"content-addressed artifact path already has different bytes: {target}")
+        return str(target)
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(prefix=target.name + ".tmp-", dir=str(root))
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if target.read_bytes() != encoded:
+                raise ReservationCalibrationError(
+                    f"content-addressed artifact path already has different bytes: {target}"
+                )
+        except OSError as failure:
             raise ReservationCalibrationError(
-                "paired outcome source positions differ from the pinned generation snapshot"
+                f"atomic no-replace artifact publication failed: {failure}"
+            ) from failure
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return str(target)
+
+
+def retain_causal_origin_observation(
+    *,
+    observation_id: str,
+    forecast_artifact: Mapping[str, Any],
+    evidence_root: str | Path,
+    evidence_verifier: Callable[[str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Retain the selected future event's evaluated PLAY/SAVE origin evidence.
+
+    This freezes the action-specific paired policies chosen by the point-in-time
+    forecast. It does not create realized labels; those are added later from
+    official final outcome captures.
+    """
+
+    if not str(observation_id or "").strip() or evidence_verifier is None:
+        raise ReservationCalibrationError("causal origin needs an observation id and retained-artifact verifier")
+    forecast = json.loads(_canonical_bytes(forecast_artifact).decode("utf-8"))
+    if not isinstance(forecast, dict):
+        raise ReservationCalibrationError("origin reservation forecast is not an object")
+    action = str(forecast.get("action") or "")
+    planning_event = int(forecast.get("planning_event") or -1)
+    origin = _utc(forecast.get("origin_cutoff"), name="origin_cutoff")
+    source_identity = forecast.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        raise ReservationCalibrationError("origin reservation forecast omits source identity")
+    try:
+        crf.verify_reservation_forecast(
+            forecast,
+            expected={
+                "action": action,
+                "planning_event": planning_event,
+                "origin_cutoff": origin.isoformat().replace("+00:00", "Z"),
+            },
+            evidence_verifier=evidence_verifier,
+        )
+    except Exception as failure:
+        raise ReservationCalibrationError(f"origin reservation forecast did not verify: {failure}") from failure
+    if (
+        not forecast.get("coverage_complete")
+        or forecast.get("raw_value") is None
+        or forecast.get("selected_event") is None
+    ):
+        raise ReservationCalibrationError("origin reservation forecast is incomplete or has no selected event")
+
+    root = Path(evidence_root)
+    local_records: dict[str, Mapping[str, Any]] = {}
+    manifest = forecast.get("opportunities")
+    if not isinstance(manifest, list) or not manifest:
+        raise ReservationCalibrationError("origin reservation forecast has no retained event records")
+    for item in manifest:
+        payload = item.get("artifact_payload") if isinstance(item, Mapping) else None
+        if not isinstance(payload, Mapping):
+            raise ReservationCalibrationError("origin forecast event record is malformed")
+        receipt = crf.retain_event_opportunity_record(payload, root)
+        reference = Path(receipt["path"]).name
+        local_records[reference] = dict(payload)
+        item["artifact_ref"] = reference
+    body = dict(forecast)
+    body.pop("artifact_sha256", None)
+    forecast["artifact_sha256"] = crf.canonical_sha256(body)
+    try:
+        crf.verify_reservation_forecast(
+            forecast,
+            expected={},
+            evidence_verifier=local_records.__getitem__,
+        )
+    except Exception as failure:
+        raise ReservationCalibrationError(f"self-contained origin forecast did not verify: {failure}") from failure
+    forecast_receipt = crf.retain_reservation_forecast(forecast, root)
+    forecast_reference = Path(forecast_receipt["path"]).name
+
+    selected_event = int(forecast["selected_event"])
+    selected_row = next((
+        item["artifact_payload"] for item in forecast["opportunities"]
+        if int(item["artifact_payload"]["event"]) == selected_event
+    ), None)
+    if not isinstance(selected_row, Mapping):
+        raise ReservationCalibrationError("selected future event is absent from the forecast manifest")
+    outcome_arms = selected_row.get("outcome_arms")
+    if not isinstance(outcome_arms, Mapping) or set(outcome_arms) != {"play", "save"}:
+        raise ReservationCalibrationError("selected event has no retained evaluator PLAY/SAVE policies")
+    play_payload, save_payload = outcome_arms.get("play"), outcome_arms.get("save")
+    if not isinstance(play_payload, Mapping) or not isinstance(save_payload, Mapping):
+        raise ReservationCalibrationError("selected event PLAY/SAVE policies are malformed")
+    _verify_action_pair_policies(action, play_payload, save_payload, planning_event=planning_event)
+    _verify_forecast_matches_save_state(forecast, save_payload)
+    world_identity = str(selected_row.get("world_identity") or "")
+    if not world_identity or str(play_payload.get("world_identity")) != world_identity:
+        raise ReservationCalibrationError("selected future arms are not bound to the forecast's certified world")
+
+    source = {
+        **dict(source_identity),
+        "cutoff": origin.isoformat().replace("+00:00", "Z"),
+        "world_identity": world_identity,
+    }
+    pair: dict[str, dict[str, Any]] = {}
+    for role, payload in (("play", play_payload), ("save", save_payload)):
+        artifact_payload = dict(payload)
+        digest = _canonical_sha256(artifact_payload)
+        reference = f"chip-causal-arm-{digest}.json"
+        _retain_content_addressed_json(root, reference, artifact_payload)
+        pair[role] = {
+            "arm_id": str(artifact_payload.get("arm_id") or ""),
+            "artifact_ref": reference,
+            "artifact_sha256": digest,
+            "artifact_payload": artifact_payload,
+            **artifact_payload,
+        }
+    evidence: dict[str, Any] = {
+        "schema": CAUSAL_EVIDENCE_SCHEMA,
+        "policy": CAUSAL_EVIDENCE_POLICY,
+        "observation_id": str(observation_id),
+        "action": action,
+        "planning_event": planning_event,
+        "origin_cutoff": origin.isoformat().replace("+00:00", "Z"),
+        "source": source,
+        "forecast": {
+            "artifact_ref": forecast_reference,
+            "artifact_sha256": str(forecast["artifact_sha256"]),
+            "retained_content_sha256": _canonical_sha256(forecast),
+            "value": forecast.get("raw_value"),
+            "made_at": forecast.get("made_at"),
+        },
+        "counterfactual_pair": pair,
+        "label": None,
+    }
+    evidence_digest = _canonical_sha256(evidence)
+    evidence_reference = f"chip-causal-evidence-{evidence_digest}.json"
+    evidence_path = _retain_content_addressed_json(root, evidence_reference, evidence)
+    return {
+        "observation_id": str(observation_id),
+        "causal_evidence_ref": evidence_reference,
+        "causal_evidence_sha256": evidence_digest,
+        "causal_evidence_path": evidence_path,
+        "forecast_ref": forecast_reference,
+        "forecast_sha256": str(forecast["artifact_sha256"]),
+        "selected_event": selected_event,
+        "causal_evidence": evidence,
+    }
+
+
+def finalize_causal_observation(
+    conn: sqlite3.Connection,
+    origin_evidence: Mapping[str, Any],
+    *,
+    realization_event: int,
+    evidence_root: str | Path,
+    evidence_verifier: Callable[[str], Mapping[str, Any]],
+    source_position_resolver: Callable[[Mapping[str, Any]], Mapping[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Build and retain a matured label from official final player-event captures.
+
+    The input contains only the point-in-time source, raw forecast and retained
+    PLAY/SAVE policies. Realized weights are created here from the later official
+    minutes and scores, never required in the origin artifacts. The returned
+    calibration row points to immutable content-addressed evidence and outcome
+    records. Incomplete raw-forecast coverage cannot be finalized for fitting.
+    """
+
+    if evidence_verifier is None:
+        raise ReservationCalibrationError("a retained origin-artifact verifier is required")
+    evidence = json.loads(_canonical_bytes(origin_evidence).decode("utf-8"))
+    if not isinstance(evidence, dict) or evidence.get("schema") != CAUSAL_EVIDENCE_SCHEMA:
+        raise ReservationCalibrationError("origin evidence has an unsupported causal-evidence schema")
+    if evidence.get("policy") != CAUSAL_EVIDENCE_POLICY:
+        raise ReservationCalibrationError("origin evidence does not use the declared causal policy")
+    if evidence.get("label") is not None:
+        raise ReservationCalibrationError("origin evidence already has an outcome label")
+    action = str(evidence.get("action") or "")
+    planning_event = int(evidence.get("planning_event") or -1)
+    realization_event = int(realization_event)
+    if action not in cd.PLAYABLE_CHIP_ACTIONS or realization_event <= planning_event:
+        raise ReservationCalibrationError("causal outcome action or realization event is invalid")
+    origin = _utc(evidence.get("origin_cutoff"), name="origin_cutoff")
+    source = evidence.get("source")
+    pair = evidence.get("counterfactual_pair")
+    if not isinstance(source, Mapping) or not isinstance(pair, Mapping):
+        raise ReservationCalibrationError("origin evidence omits its source identity or paired arms")
+    play, save = pair.get("play"), pair.get("save")
+    if not isinstance(play, Mapping) or not isinstance(save, Mapping):
+        raise ReservationCalibrationError("origin evidence must retain both PLAY and SAVE arms")
+    _verify_action_pair_policies(action, play, save, planning_event=planning_event)
+    for arm_name, arm in (("PLAY", play), ("SAVE", save)):
+        payload = arm.get("artifact_payload")
+        if not isinstance(payload, Mapping) or _canonical_sha256(payload) != str(arm.get("artifact_sha256") or ""):
+            raise ReservationCalibrationError(f"{arm_name} origin arm artifact digest does not verify")
+        try:
+            retained_arm = evidence_verifier(str(arm.get("artifact_ref") or ""))
+        except Exception as failure:
+            raise ReservationCalibrationError(f"retained {arm_name} origin arm is unavailable: {failure}") from failure
+        if not isinstance(retained_arm, Mapping) or dict(retained_arm) != dict(payload):
+            raise ReservationCalibrationError(f"retained {arm_name} origin arm differs from its manifest")
+    forecast_meta = evidence.get("forecast")
+    if not isinstance(forecast_meta, Mapping):
+        raise ReservationCalibrationError("origin evidence has no retained raw reservation forecast")
+    try:
+        raw_forecast = evidence_verifier(str(forecast_meta.get("artifact_ref") or ""))
+    except Exception as failure:
+        raise ReservationCalibrationError(f"retained raw reservation forecast is unavailable: {failure}") from failure
+    if not isinstance(raw_forecast, Mapping):
+        raise ReservationCalibrationError("retained raw reservation forecast is not an object")
+    expected_source = {
+        "source_decision_id": source.get("source_decision_id"),
+        "source_result_sha256": source.get("source_result_sha256"),
+        "source_artifact_sha256": source.get("source_artifact_sha256"),
+        "generation_id": source.get("generation_id"),
+        "planning_event": planning_event,
+        "origin_cutoff": origin.isoformat().replace("+00:00", "Z"),
+        "data_snapshot_sha256": source.get("data_snapshot_sha256"),
+        "predictive_code_snapshot_sha256": source.get("predictive_code_snapshot_sha256"),
+        "certification_identity": source.get("certification_identity"),
+    }
+    try:
+        crf.verify_reservation_forecast(
+            raw_forecast,
+            expected={
+                "action": action,
+                "planning_event": planning_event,
+                "origin_cutoff": origin.isoformat().replace("+00:00", "Z"),
+                "source_identity": expected_source,
+            },
+            evidence_verifier=evidence_verifier,
+        )
+    except Exception as failure:
+        raise ReservationCalibrationError(f"raw reservation forecast is not valid at its origin: {failure}") from failure
+    _verify_forecast_matches_save_state(raw_forecast, save)
+    expiry_event = raw_forecast.get("expiry_event")
+    raw_value = raw_forecast.get("raw_value")
+    if (
+        not raw_forecast.get("coverage_complete")
+        or expiry_event is None
+        or raw_value is None
+        or int(expiry_event) <= planning_event
+    ):
+        raise ReservationCalibrationError(
+            "raw reservation forecast has unknown expiry or incomplete event coverage; it cannot train calibration"
+        )
+    if int(raw_forecast.get("selected_event") or -1) != realization_event:
+        raise ReservationCalibrationError(
+            "realized outcome event differs from the origin forecast's selected event"
+        )
+    weeks_to_expiry = int(expiry_event) - planning_event
+
+    policy_ids: set[int] = set()
+    for arm in (play, save):
+        try:
+            policy_ids.update(int(value) for value in arm["proposed_squad_ids"])
+        except (KeyError, TypeError, ValueError) as failure:
+            raise ReservationCalibrationError("paired origin arm omits its proposed squad") from failure
+    by_player: dict[int, list[Mapping[str, Any]]] = {}
+    for capture in ol.observation_captures(
+        conn, grain=ol.GRAIN_PLAYER_EVENT, event=realization_event,
+    ):
+        if int(capture.get("player_id") or -1) in policy_ids:
+            by_player.setdefault(int(capture["player_id"]), []).append(capture)
+    captures: list[dict[str, Any]] = []
+    player_points: dict[int, float] = {}
+    player_minutes: dict[int, float] = {}
+    capture_times: list[datetime] = []
+    for player_id in sorted(policy_ids):
+        official_final = [
+            row for row in by_player.get(player_id, ())
+            if row.get("grain") == ol.GRAIN_PLAYER_EVENT
+            and row.get("fixture_id") is None
+            and row.get("observation_state") == ol.OBSERVATION_FINAL
+            and row.get("source_name") == "player_gameweeks_final"
+            and row.get("source_identity") == f"player_gameweeks:{realization_event}"
+        ]
+        selected = ol.select_capture(official_final)
+        if selected is None:
+            raise ReservationCalibrationError(
+                f"official final player-gameweek capture is missing for player {player_id}"
             )
+        payload = selected.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ReservationCalibrationError(f"official player capture payload is invalid for player {player_id}")
+        points = _number(payload.get("total_points"), name=f"player {player_id} total_points")
+        minutes = _number(payload.get("minutes"), name=f"player {player_id} minutes")
+        if minutes < 0.0:
+            raise ReservationCalibrationError(f"official minutes are negative for player {player_id}")
+        official_final_at = _utc(selected.get("official_final_at"), name="official_final_at")
+        captured_at = _utc(selected.get("captured_at"), name="captured_at")
+        if captured_at < official_final_at:
+            raise ReservationCalibrationError("official outcome capture predates official finality")
+        player_points[player_id] = points
+        player_minutes[player_id] = minutes
+        capture_times.append(captured_at)
+        captures.append({
+            "capture_digest": str(selected.get("capture_digest") or ""),
+            "grain": ol.GRAIN_PLAYER_EVENT,
+            "event": realization_event,
+            "player_id": player_id,
+            "fixture_id": None,
+            "observation_state": ol.OBSERVATION_FINAL,
+            "official_final_at": official_final_at.isoformat().replace("+00:00", "Z"),
+            "captured_at": captured_at.isoformat().replace("+00:00", "Z"),
+            "source_name": str(selected.get("source_name") or ""),
+            "source_identity": str(selected.get("source_identity") or ""),
+            "total_points": points,
+            "minutes": minutes,
+        })
+    available_at = max(capture_times).isoformat().replace("+00:00", "Z")
+    paired_results: dict[str, dict[str, Any]] = {}
+    for arm_name, arm in (("play", play), ("save", save)):
+        scoring_weights = _canonical_scoring_weights(
+            action=action,
+            arm_name=arm_name,
+            arm=arm,
+            player_points=player_points,
+            player_minutes=player_minutes,
+        )
+        observed = sum(player_points[int(player_id)] * weight
+                       for player_id, weight in scoring_weights.items())
+        paired_results[arm_name] = {
+            "proposed_squad_ids": [int(value) for value in arm["proposed_squad_ids"]],
+            "lineup": dict(arm["lineup"]),
+            "player_positions": dict(arm["player_positions"]),
+            "scoring_weights": scoring_weights,
+            "observed_points": observed,
+        }
+    realized = paired_results["play"]["observed_points"] - paired_results["save"]["observed_points"]
+    outcome_record: dict[str, Any] = {
+        "schema": CAUSAL_OUTCOME_RECORD_SCHEMA,
+        "record_id": str(uuid.uuid4()),
+        "observation_id": str(evidence.get("observation_id") or ""),
+        "action": action,
+        "planning_event": planning_event,
+        "origin_cutoff": origin.isoformat().replace("+00:00", "Z"),
+        "scenario_identity": str(play.get("scenario_identity") or ""),
+        "world_identity": str(play.get("world_identity") or ""),
+        "play_arm_id": str(play.get("arm_id") or ""),
+        "play_artifact_sha256": str(play.get("artifact_sha256") or ""),
+        "save_arm_id": str(save.get("arm_id") or ""),
+        "save_artifact_sha256": str(save.get("artifact_sha256") or ""),
+        "source_decision_id": str(source.get("source_decision_id") or ""),
+        "source_result_sha256": str(source.get("source_result_sha256") or ""),
+        "source_artifact_sha256": str(source.get("source_artifact_sha256") or ""),
+        "generation_id": str(source.get("generation_id") or ""),
+        "cutoff": origin.isoformat().replace("+00:00", "Z"),
+        "data_snapshot_sha256": str(source.get("data_snapshot_sha256") or ""),
+        "predictive_code_snapshot_sha256": str(source.get("predictive_code_snapshot_sha256") or ""),
+        "certification_identity": str(source.get("certification_identity") or ""),
+        "label_definition_version": OUTCOME_LABEL_DEFINITION,
+        "scoring_rule_version": OUTCOME_SCORING_RULE_VERSION,
+        "realization_event": realization_event,
+        "available_at": available_at,
+        "source": {
+            "schema": OUTCOME_CAPTURE_SET_SCHEMA,
+            "available_at": available_at,
+            "captures": captures,
+        },
+        "paired_results": paired_results,
+        "observed_points": realized,
+    }
+    verify_outcome_record_capture_sources(conn, outcome_record, source_position_resolver=source_position_resolver)
+    outcome_digest = _canonical_sha256(outcome_record)
+    outcome_reference = f"chip-outcome-{outcome_digest}.json"
+    final_evidence = dict(evidence)
+    final_evidence["label_available_at"] = available_at
+    final_evidence["label"] = {
+        "kind": "OBSERVED_FUTURE_OUTCOME",
+        "outcome_record_ref": outcome_reference,
+        "outcome_record": outcome_record,
+        "outcome_record_sha256": outcome_digest,
+        "realized_reservation_value": realized,
+        "available_at": available_at,
+    }
+    evidence_digest = _canonical_sha256(final_evidence)
+    evidence_reference = f"chip-causal-evidence-{evidence_digest}.json"
+    calibration_row = {
+        "observation_id": str(evidence.get("observation_id") or ""),
+        "action": action,
+        "planning_event": planning_event,
+        "weeks_to_expiry": weeks_to_expiry,
+        "origin_cutoff": origin.isoformat().replace("+00:00", "Z"),
+        "forecast_made_at": str(raw_forecast.get("made_at") or ""),
+        "forecast_value": _number(raw_value, name="raw reservation forecast"),
+        "label_available_at": available_at,
+        "realized_value": realized,
+        "causal_evidence_ref": evidence_reference,
+        "causal_evidence_sha256": evidence_digest,
+    }
+    local_artifacts = {
+        evidence_reference: final_evidence,
+        outcome_reference: outcome_record,
+    }
+
+    def resolve(reference: str) -> Mapping[str, Any]:
+        if str(reference) in local_artifacts:
+            return local_artifacts[str(reference)]
+        return evidence_verifier(str(reference))
+
+    validate_observation(calibration_row, evidence_verifier=resolve)
+    root = Path(evidence_root)
+    outcome_path = _retain_content_addressed_json(root, outcome_reference, outcome_record)
+    evidence_path = _retain_content_addressed_json(root, evidence_reference, final_evidence)
+    return {
+        "calibration_row": calibration_row,
+        "outcome_record": outcome_record,
+        "causal_evidence": final_evidence,
+        "outcome_path": outcome_path,
+        "causal_evidence_path": evidence_path,
+        "outcome_sha256": outcome_digest,
+        "causal_evidence_sha256": evidence_digest,
+    }
 
 
 def expiry_bucket(weeks_to_expiry: int | None) -> str:
@@ -509,6 +1073,7 @@ def _verify_pair(
     row: Mapping[str, Any],
     *,
     retained_outcome_record: Mapping[str, Any],
+    evidence_verifier: Callable[[str], Mapping[str, Any]],
 ) -> None:
     if evidence.get("schema") != CAUSAL_EVIDENCE_SCHEMA:
         raise ReservationCalibrationError("causal evidence has an unsupported schema")
@@ -525,12 +1090,12 @@ def _verify_pair(
     required_source = (
         "source_decision_id", "source_result_sha256", "source_artifact_sha256",
         "generation_id", "planning_event", "cutoff", "data_snapshot_sha256",
-        "certification_identity", "world_identity",
+        "predictive_code_snapshot_sha256", "certification_identity", "world_identity",
     )
     if any(not str(source.get(name) or "").strip() for name in required_source):
         raise ReservationCalibrationError("causal evidence has incomplete source decision/generation identity")
     for name in ("source_result_sha256", "source_artifact_sha256", "data_snapshot_sha256",
-                 "certification_identity", "world_identity"):
+                 "predictive_code_snapshot_sha256", "certification_identity", "world_identity"):
         if not _is_sha256(source.get(name)):
             raise ReservationCalibrationError(f"causal evidence source {name} is not a SHA-256 identity")
     if (
@@ -541,15 +1106,18 @@ def _verify_pair(
     play, save = pair.get("play"), pair.get("save")
     if not isinstance(play, Mapping) or not isinstance(save, Mapping):
         raise ReservationCalibrationError("causal evidence must retain both PLAY and SAVE arms")
-    paired_fields = (
-        "scenario_identity", "world_identity", "proposed_squad_ids", "lineup", "player_positions",
-    )
+    action = str(row.get("action") or "")
+    paired_fields = ("scenario_identity", "world_identity")
     for name in paired_fields:
         if play.get(name) != save.get(name) or play.get(name) in (None, "", [], {}):
             raise ReservationCalibrationError(f"PLAY and SAVE do not share the same {name}")
+    _verify_action_pair_policies(
+        action, play, save, planning_event=int(row.get("planning_event") or -1),
+    )
     source_arm_fields = (
         "source_decision_id", "source_result_sha256", "source_artifact_sha256",
-        "generation_id", "cutoff", "data_snapshot_sha256", "certification_identity",
+        "generation_id", "cutoff", "data_snapshot_sha256", "predictive_code_snapshot_sha256",
+        "certification_identity",
     )
     for arm_name, arm in (("PLAY", play), ("SAVE", save)):
         for name in source_arm_fields:
@@ -568,13 +1136,27 @@ def _verify_pair(
             arm.get("artifact_sha256")
         ):
             raise ReservationCalibrationError(f"{arm_name} arm artifact content digest does not verify")
-        for name in (*paired_fields, *source_arm_fields, "arm_id"):
+        try:
+            retained_arm = evidence_verifier(str(arm.get("artifact_ref") or ""))
+        except Exception as failure:
+            raise ReservationCalibrationError(
+                f"retained {arm_name} arm artifact did not verify: {failure}"
+            ) from failure
+        if not isinstance(retained_arm, Mapping) or dict(retained_arm) != dict(artifact_payload):
+            raise ReservationCalibrationError(
+                f"retained {arm_name} arm artifact differs from the causal evidence manifest"
+            )
+        for name in (
+            *paired_fields, *source_arm_fields, "arm_id", "proposed_squad_ids", "lineup",
+            "player_positions", "counterfactual_role", "action_semantics", "scoring_rule_version",
+        ):
             if artifact_payload.get(name) != arm.get(name):
                 raise ReservationCalibrationError(f"{arm_name} arm artifact disagrees on {name}")
-        if not isinstance(arm.get("scoring_weights"), Mapping):
-            raise ReservationCalibrationError(f"{arm_name} arm has no retained outcome scoring weights")
-        if dict(artifact_payload.get("scoring_weights") or {}) != dict(arm.get("scoring_weights") or {}):
-            raise ReservationCalibrationError(f"{arm_name} arm scoring weights differ from its retained artifact")
+        if (
+            arm.get("scoring_rule_version") != OUTCOME_SCORING_RULE_VERSION
+            or artifact_payload.get("scoring_rule_version") != OUTCOME_SCORING_RULE_VERSION
+        ):
+            raise ReservationCalibrationError(f"{arm_name} arm does not bind the canonical outcome scorer")
         _number(artifact_payload.get("paired_value"), name=f"{arm_name} paired value")
     if str(play.get("arm_id")) == str(save.get("arm_id")):
         raise ReservationCalibrationError("PLAY and SAVE must be separately retained counterfactual arms")
@@ -655,19 +1237,85 @@ def validate_observation(
         ) from failure
     if not isinstance(retained_outcome_record, Mapping):
         raise ReservationCalibrationError("retained outcome record is not a JSON object")
-    _verify_pair(evidence, row, retained_outcome_record=retained_outcome_record)
-    forecast = evidence.get("forecast")
-    if not isinstance(forecast, Mapping):
-        raise ReservationCalibrationError("causal evidence has no retained origin forecast")
-    if (
-        _number(forecast.get("value"), name="evidence forecast")
-        != _number(row.get("forecast_value"), name="forecast value")
-        or str(forecast.get("made_at")) != str(row.get("forecast_made_at"))
-    ):
-        raise ReservationCalibrationError("causal evidence forecast differs from the supplied row")
+    _verify_pair(
+        evidence, row, retained_outcome_record=retained_outcome_record,
+        evidence_verifier=evidence_verifier,
+    )
     weeks = row.get("weeks_to_expiry")
     if weeks is None or int(weeks) < 0:
         raise ReservationCalibrationError("weeks_to_expiry must be an explicit non-negative integer")
+    forecast = evidence.get("forecast")
+    if not isinstance(forecast, Mapping):
+        raise ReservationCalibrationError("causal evidence has no retained raw reservation forecast")
+    forecast_reference = str(forecast.get("artifact_ref") or "")
+    if not forecast_reference:
+        raise ReservationCalibrationError("causal evidence has no raw forecast artifact reference")
+    try:
+        forecast_artifact = evidence_verifier(forecast_reference)
+    except Exception as failure:
+        raise ReservationCalibrationError(f"retained raw reservation forecast did not verify: {failure}") from failure
+    if not isinstance(forecast_artifact, Mapping):
+        raise ReservationCalibrationError("retained raw reservation forecast is not an object")
+    if (
+        not _is_sha256(forecast.get("retained_content_sha256"))
+        or _canonical_sha256(forecast_artifact) != str(forecast.get("retained_content_sha256"))
+        or str(forecast_artifact.get("artifact_sha256") or "")
+        != str(forecast.get("artifact_sha256") or "")
+    ):
+        raise ReservationCalibrationError("retained raw reservation forecast digest does not verify")
+    source = evidence.get("source")
+    expected_forecast_source = {
+        "source_decision_id": source.get("source_decision_id"),
+        "source_result_sha256": source.get("source_result_sha256"),
+        "source_artifact_sha256": source.get("source_artifact_sha256"),
+        "generation_id": source.get("generation_id"),
+        "planning_event": int(row.get("planning_event")),
+        "origin_cutoff": str(row.get("origin_cutoff")),
+        "data_snapshot_sha256": source.get("data_snapshot_sha256"),
+        "predictive_code_snapshot_sha256": source.get("predictive_code_snapshot_sha256"),
+        "certification_identity": source.get("certification_identity"),
+    }
+    try:
+        crf.verify_reservation_forecast(
+            forecast_artifact,
+            expected={
+                "action": action,
+                "planning_event": int(row.get("planning_event")),
+                "origin_cutoff": str(row.get("origin_cutoff")),
+                "made_at": str(row.get("forecast_made_at")),
+                "expiry_event": int(row.get("planning_event")) + int(weeks),
+                "source_identity": expected_forecast_source,
+            },
+            evidence_verifier=evidence_verifier,
+        )
+    except Exception as failure:
+        raise ReservationCalibrationError(f"retained raw reservation forecast is invalid: {failure}") from failure
+    pair = evidence.get("counterfactual_pair")
+    save_arm = pair.get("save") if isinstance(pair, Mapping) else None
+    if not isinstance(save_arm, Mapping):
+        raise ReservationCalibrationError("causal evidence omits the retained SAVE arm")
+    _verify_forecast_matches_save_state(forecast_artifact, save_arm)
+    outcome_record = label.get("outcome_record") if isinstance(label, Mapping) else None
+    selected_event = forecast_artifact.get("selected_event")
+    if (
+        not isinstance(outcome_record, Mapping)
+        or int(outcome_record.get("realization_event") or -1) != int(selected_event or -2)
+    ):
+        raise ReservationCalibrationError(
+            "matured outcome event differs from the origin forecast's selected event"
+        )
+    if (
+        not forecast_artifact.get("coverage_complete")
+        or forecast_artifact.get("raw_value") is None
+        or _number(forecast_artifact.get("raw_value"), name="raw forecast value")
+        != _number(row.get("forecast_value"), name="forecast value")
+        or _number(forecast.get("value"), name="evidence forecast value")
+        != _number(row.get("forecast_value"), name="forecast value")
+        or str(forecast.get("made_at")) != str(row.get("forecast_made_at"))
+    ):
+        raise ReservationCalibrationError(
+            "raw reservation forecast is incomplete or differs from the supplied calibration row"
+        )
     return VerifiedOpportunity(
         observation_id=observation_id,
         action=action,
@@ -887,6 +1535,8 @@ class VerifiedReservationCalibration:
     """ReservationValue backed by the module's verified immutable artifact."""
 
     artifact: Mapping[str, Any]
+    evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None
+    forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None
 
     @classmethod
     def from_artifact(
@@ -894,6 +1544,7 @@ class VerifiedReservationCalibration:
         artifact: Mapping[str, Any],
         *,
         evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+        forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> "VerifiedReservationCalibration":
         body = dict(artifact)
         identity = str(body.pop("identity_sha256", ""))
@@ -944,7 +1595,11 @@ class VerifiedReservationCalibration:
             raise ReservationCalibrationError(
                 "calibration status or model does not reproduce from retained causal evidence and locked criteria"
             )
-        return cls(artifact=dict(artifact))
+        return cls(
+            artifact=dict(artifact),
+            evidence_verifier=evidence_verifier,
+            forecast_evidence_verifier=forecast_evidence_verifier or evidence_verifier,
+        )
 
     def estimate(self, *, action: str, planning_event: int, expiry_event: int | None,
                  state: Mapping[str, Any]) -> cd.ReservationEstimate:
@@ -957,13 +1612,48 @@ class VerifiedReservationCalibration:
                 reason_codes=(DIAG_CALIBRATION_INSUFFICIENT,),
                 conditional_on=("action", "weeks_to_expiry_bucket"),
             )
-        raw = state.get("raw_reservation_value")
+        raw_forecast = state.get("raw_reservation_forecast")
+        if not isinstance(raw_forecast, Mapping):
+            return cd.ReservationEstimate(
+                value=None, calibration_status=cd.CALIBRATION_UNCALIBRATED,
+                terminal_value=0.0, weeks_to_expiry=weeks,
+                reason_codes=(DIAG_RESERVATION_FORECAST_REQUIRED,),
+                conditional_on=("action", "weeks_to_expiry_bucket"),
+            )
+        try:
+            forecast_verifier = self.forecast_evidence_verifier or self.evidence_verifier
+            if forecast_verifier is None:
+                raise crf.ReservationForecastError("retained event-opportunity verifier is required")
+            verified_forecast = crf.VerifiedReservationForecast(artifact=raw_forecast)
+            verified_forecast.validate_for_reservation(
+                action=action,
+                planning_event=int(planning_event),
+                expiry_event=expiry_event,
+                state=state,
+                evidence_verifier=forecast_verifier,
+            )
+        except Exception:
+            return cd.ReservationEstimate(
+                value=None, calibration_status=cd.CALIBRATION_UNCALIBRATED,
+                terminal_value=0.0, weeks_to_expiry=weeks,
+                reason_codes=(crf.FORECAST_IDENTITY_INVALID,),
+                conditional_on=("action", "weeks_to_expiry_bucket", "verified_raw_forecast"),
+            )
+        raw = verified_forecast.raw_value
         if raw is None:
             return cd.ReservationEstimate(
                 value=None, calibration_status=cd.CALIBRATION_UNCALIBRATED,
                 terminal_value=0.0, weeks_to_expiry=weeks,
-                reason_codes=(DIAG_CALIBRATION_INSUFFICIENT,),
-                conditional_on=("action", "weeks_to_expiry_bucket"),
+                reason_codes=(DIAG_RESERVATION_FORECAST_INCOMPLETE,),
+                conditional_on=("action", "weeks_to_expiry_bucket", "verified_raw_forecast"),
+            )
+        declared_raw = state.get("raw_reservation_value")
+        if declared_raw is not None and _number(declared_raw, name="raw reservation value") != raw:
+            return cd.ReservationEstimate(
+                value=None, calibration_status=cd.CALIBRATION_UNCALIBRATED,
+                terminal_value=0.0, weeks_to_expiry=weeks,
+                reason_codes=(crf.FORECAST_IDENTITY_INVALID,),
+                conditional_on=("action", "weeks_to_expiry_bucket", "verified_raw_forecast"),
             )
         value = max(0.0, _number(raw, name="raw reservation value") + float(model["bias_correction"]))
         return cd.ReservationEstimate(

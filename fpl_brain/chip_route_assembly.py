@@ -431,6 +431,41 @@ def build_bb_tc_evaluations(
         certification_identity=route.certification_identity,
         data_snapshot_sha256=route.data_snapshot_sha256,
     )
+    first_transition = route.partial.actions[0]["transition"]
+    post_save_state = getattr(first_transition, "next_event_state", None)
+    if post_save_state is None:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: verified route has no canonical post-H1 SAVE state"
+        )
+    post_save_ids = tuple(sorted(int(pid) for pid in post_save_state.by_id()))
+    if (
+        post_save_ids != tuple(sorted(int(pid) for pid in route.proposed_owned_ids))
+        or int(post_save_state.bank_tenths) != int(route.post_h1_bank_tenths)
+        or int(post_save_state.free_transfers) != int(route.post_h1_free_transfers)
+        or int(post_save_state.event) != int(route.planning_event) + 1
+    ):
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: post-H1 SAVE state differs from the verified proposed route"
+        )
+    post_save_reservation_state = {
+        "event": int(post_save_state.event),
+        "squad_ids": list(post_save_ids),
+        "purchase_price_tenths": {
+            str(int(player.player_id)): int(player.purchase_price_tenths)
+            for player in post_save_state.players
+        },
+        "bank_tenths": int(post_save_state.bank_tenths),
+        "free_transfers": int(post_save_state.free_transfers),
+        "event_start_free_transfers": (
+            None if post_save_state.event_start_free_transfers is None
+            else int(post_save_state.event_start_free_transfers)
+        ),
+        "chip_state": list(post_save_state.chip_state),
+        "source_decision_id": route.source_decision_id,
+        "generation_id": route.generation_id,
+        "route_id": route.route_id,
+        "route_input_sha256": route.route_input_sha256,
+    }
     bb_evaluation = bb.evaluate_bench_boost(bb.BenchBoostRequest(
         worlds=worlds,
         horizon_binding=binding,
@@ -477,6 +512,10 @@ def build_bb_tc_evaluations(
         "certification_identity": route.certification_identity,
         "planning_event": route.planning_event,
         "horizon_events": list(route.events),
+        "save_policy": {
+            "objective": "RETAIN_CHIP_AFTER_THE_VERIFIED_NORMAL_H1_ROUTE",
+            "post_save_state_for_reservation": post_save_reservation_state,
+        },
     }
     from dataclasses import replace
 
@@ -490,22 +529,28 @@ def build_bb_tc_evaluations(
     }
 
 
-def chip_worlds_from_h1_matrix(
+def chip_worlds_from_event_matrix(
     matrix: Mapping[str, Any],
     *,
     route: VerifiedNormalRoute,
     generation: Any,
     config: ro.OptimizerConfig,
     official_player_ids: Sequence[int],
+    event: int,
 ) -> Any:
-    """Bind the certified H1 matrix to the unchanged four-event chip contract."""
+    """Bind one certified event matrix to the normal four-event source identity."""
 
     from . import chip_decision as cd
 
     player_ids = tuple(sorted(int(pid) for pid in official_player_ids))
+    event = int(event)
+    if event not in route.events:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: event GW{event} is outside the certified normal horizon"
+        )
     expected_key = ro.world_cache_key(
-        event=int(route.planning_event), generation_id=str(generation.generation_id),
-        runs=generation.runs_for(int(route.planning_event)), config=config, union_ids=player_ids,
+        event=event, generation_id=str(generation.generation_id),
+        runs=generation.runs_for(event), config=config, union_ids=player_ids,
     )
     if str(matrix.get(ro.MANAGER_MATRIX_IDENTITY_KEY) or "") != expected_key:
         raise ChipRouteAssemblyError(
@@ -523,9 +568,10 @@ def chip_worlds_from_h1_matrix(
             f"{ROUTE_RECONSTRUCTION_INVALID}: H1 chip worlds have incomplete generation identity"
         )
     world_identity = analytics.canonical_hash({
-        "schema": "fpl_brain.chip_h1_world_identity.v1",
+        "schema": "fpl_brain.chip_event_world_identity.v1",
         "cache_key": expected_key,
         "generation_id": generation.generation_id,
+        "source_event": event,
         "planning_event": int(route.planning_event),
         "horizon_events": list(route.events),
         "cutoff": str(generation.cutoff),
@@ -544,6 +590,7 @@ def chip_worlds_from_h1_matrix(
             world_seed=int(config.seed),
             world_identity=world_identity,
             code_snapshot_sha256=source_code,
+            source_event=event,
         )
     except Exception as failure:
         raise ChipRouteAssemblyError(
@@ -551,6 +598,26 @@ def chip_worlds_from_h1_matrix(
         ) from failure
     worlds.validate()
     return worlds
+
+
+def chip_worlds_from_h1_matrix(
+    matrix: Mapping[str, Any],
+    *,
+    route: VerifiedNormalRoute,
+    generation: Any,
+    config: ro.OptimizerConfig,
+    official_player_ids: Sequence[int],
+) -> Any:
+    """Bind the H1 matrix to the unchanged four-event chip contract."""
+
+    return chip_worlds_from_event_matrix(
+        matrix,
+        route=route,
+        generation=generation,
+        config=config,
+        official_player_ids=official_player_ids,
+        event=int(route.planning_event),
+    )
 
 
 def load_certified_h1_chip_worlds(
@@ -602,3 +669,251 @@ def load_certified_h1_chip_worlds(
             f"{ROUTE_RECONSTRUCTION_INVALID}: canonical H1 world assembly refused: "
             f"{type(failure).__name__}: {failure}"
         ) from failure
+
+
+def load_certified_event_chip_worlds(
+    conn: sqlite3.Connection,
+    route: VerifiedNormalRoute,
+    *,
+    event: int,
+    cache_dir: str | Path | None = None,
+) -> Any:
+    """Load one event matrix from the exact verified normal generation."""
+
+    event = int(event)
+    try:
+        generation = gs.load_generation(conn, route.generation_id)
+        report = gs.verify_generation(conn, generation.generation_id)
+        if not report.get("verified") or generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW:
+            raise ValueError("normal four-event generation did not verify")
+        if tuple(int(value) for value in generation.events) != route.events or event not in route.events:
+            raise ValueError("event or route does not match the certified normal generation")
+        record = gs.load_engine_decision_record(conn, route.source_decision_id)
+        artifact = json.loads(Path(str(record["decision_artifact_ref"])).read_text(encoding="utf-8"))
+        raw_config = dict((artifact.get("search") or {}).get("config") or {})
+        allowed = {field.name for field in fields(ro.OptimizerConfig)}
+        raw_config["events"] = route.events
+        config = ro.OptimizerConfig(**{key: value for key, value in raw_config.items() if key in allowed})
+        source_conn = gs._open_generation_snapshot(generation)
+        try:
+            from .chip_wildcard import pool_binding_from_store
+
+            pool = pool_binding_from_store(source_conn)
+            official_ids = tuple(sorted(int(pid) for pid in pool.eligible_ids))
+            if not official_ids:
+                raise ValueError("pinned official player pool is empty")
+        finally:
+            source_conn.close()
+        matrix, _details = ro.build_event_worlds(
+            conn,
+            generation,
+            event,
+            official_ids,
+            config,
+            cache_dir=None if cache_dir is None else Path(cache_dir),
+        )
+        return chip_worlds_from_event_matrix(
+            matrix,
+            route=route,
+            generation=generation,
+            config=config,
+            official_player_ids=official_ids,
+            event=event,
+        )
+    except ChipRouteAssemblyError:
+        raise
+    except Exception as failure:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: certified event world assembly refused: "
+            f"{type(failure).__name__}: {failure}"
+        ) from failure
+
+
+def build_future_event_chip_opportunity(
+    conn: sqlite3.Connection,
+    route: VerifiedNormalRoute,
+    *,
+    action: str,
+    event: int,
+    reservation_state: Mapping[str, Any],
+    made_at: str,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Produce one future BB/TC opportunity from the normal certified route.
+
+    Event worlds and the future route lineup are resolved from the same verified
+    four-event generation and decision. FH/WC use different squad/route models
+    and remain unavailable through this producer.
+    """
+
+    from . import chip_decision as cd
+    from . import chip_reservation_forecast as crf
+    from . import candidate_universe as cu
+
+    event = int(event)
+    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: {action} has no future-event production evaluator"
+        )
+    if event <= int(route.planning_event) or event not in route.events:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: forecast event {event} is not a future event in the certified route"
+        )
+    try:
+        generation = gs.load_generation(conn, route.generation_id)
+        report = gs.verify_generation(conn, generation.generation_id)
+        if not report.get("verified") or generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW:
+            raise ValueError("normal four-event generation did not verify")
+        decision_record = gs.load_engine_decision_record(conn, route.source_decision_id)
+        artifact = json.loads(Path(str(decision_record["decision_artifact_ref"])).read_text(encoding="utf-8"))
+        route_record = (((artifact.get("finalist_refinement") or {}).get("route_table") or {})
+                        .get("routes") or {}).get(str(route.route_id))
+        if not isinstance(route_record, Mapping):
+            raise ValueError("selected normal route is absent from the verified decision artifact")
+        policy = _policy_from_route(route_record, event=event)
+        route_action = next((
+            row for row in route.partial.actions if int(row.get("event", -1)) == event
+        ), None)
+        if not isinstance(route_action, Mapping):
+            raise ValueError("verified normal route has no replayed state for the future event")
+        transition = route_action.get("transition")
+        event_state = getattr(transition, "next_event_state", None)
+        if event_state is None:
+            raise ValueError("verified normal route has no canonical post-transfer event state")
+        squad_ids = set(int(pid) for pid in event_state.by_id())
+        if squad_ids != set(ml.policy_player_ids(policy)):
+            raise ValueError("future route lineup does not match its replayed 15-player squad")
+        source_conn = gs._open_generation_snapshot(generation)
+        try:
+            pool = cu.load_pool(source_conn)
+        finally:
+            source_conn.close()
+        positions = {
+            int(pid): str(pool[int(pid)]["position"])
+            for pid in squad_ids
+            if int(pid) in pool and pool[int(pid)].get("position")
+        }
+        if set(positions) != squad_ids:
+            raise ValueError("future route squad has missing pinned player positions")
+        worlds = load_certified_event_chip_worlds(
+            conn, route, event=event, cache_dir=cache_dir,
+        )
+        binding = cd.ChipHorizonBinding(
+            planning_event=int(route.planning_event),
+            horizon_events=tuple(route.events),
+            certification_identity=str(route.certification_identity),
+            data_snapshot_sha256=str(route.data_snapshot_sha256),
+        )
+        source_identity = {
+            "source_decision_id": route.source_decision_id,
+            "source_result_sha256": route.source_result_sha256,
+            "source_artifact_sha256": route.source_artifact_sha256,
+            "generation_id": route.generation_id,
+            "planning_event": int(route.planning_event),
+            "origin_cutoff": str(route.cutoff),
+            "data_snapshot_sha256": str(route.data_snapshot_sha256),
+            "predictive_code_snapshot_sha256": str(generation.manifest.get("code_snapshot_sha256") or ""),
+            "certification_identity": str(route.certification_identity),
+        }
+        return crf.build_evaluated_event_opportunity_record(
+            action=action,
+            event=event,
+            worlds=worlds,
+            horizon_binding=binding,
+            policy=policy,
+            positions=positions,
+            source_identity=source_identity,
+            reservation_state=reservation_state,
+            made_at=made_at,
+        )
+    except ChipRouteAssemblyError:
+        raise
+    except Exception as failure:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: future {action} opportunity refused: "
+            f"{type(failure).__name__}: {failure}"
+        ) from failure
+
+
+def build_bb_tc_reservation_forecast(
+    conn: sqlite3.Connection,
+    route: VerifiedNormalRoute,
+    *,
+    action: str,
+    expiry_event: int | None,
+    reservation_state: Mapping[str, Any],
+    made_at: str,
+    evidence_root: str | Path,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Retain the route-backed BB/TC future forecast through known coverage.
+
+    The normal generation contributes only its verified future events. If a
+    known chip expiry extends beyond that coverage, the returned artifact stays
+    incomplete with an unknown numeric value.
+    """
+
+    from . import chip_decision as cd
+    from . import chip_reservation_forecast as crf
+
+    if action not in {cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC}:
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: {action} has no production future-reservation route"
+        )
+    root = Path(evidence_root)
+    root.mkdir(parents=True, exist_ok=True)
+    opportunity_refs: list[str] = []
+    local_records: dict[str, Mapping[str, Any]] = {}
+    for event in route.events[1:]:
+        if expiry_event is not None and int(event) > int(expiry_event):
+            break
+        opportunity = build_future_event_chip_opportunity(
+            conn,
+            route,
+            action=action,
+            event=int(event),
+            reservation_state=reservation_state,
+            made_at=made_at,
+            cache_dir=cache_dir,
+        )
+        receipt = crf.retain_event_opportunity_record(opportunity, root)
+        reference = Path(receipt["path"]).name
+        opportunity_refs.append(reference)
+        local_records[reference] = opportunity
+    if not opportunity_refs and int(expiry_event or -1) != int(route.planning_event):
+        raise ChipRouteAssemblyError(
+            f"{ROUTE_RECONSTRUCTION_INVALID}: no certified future event is available for the reservation forecast"
+        )
+    source_identity = {
+        "source_decision_id": route.source_decision_id,
+        "source_result_sha256": route.source_result_sha256,
+        "source_artifact_sha256": route.source_artifact_sha256,
+        "generation_id": route.generation_id,
+        "planning_event": int(route.planning_event),
+        "origin_cutoff": str(route.cutoff),
+        "data_snapshot_sha256": str(route.data_snapshot_sha256),
+        "predictive_code_snapshot_sha256": str(
+            gs.load_generation(conn, route.generation_id).manifest.get("code_snapshot_sha256") or ""
+        ),
+        "certification_identity": str(route.certification_identity),
+    }
+    forecast = crf.build_reservation_forecast(
+        action=action,
+        planning_event=int(route.planning_event),
+        origin_cutoff=str(route.cutoff),
+        made_at=made_at,
+        expiry_event=None if expiry_event is None else int(expiry_event),
+        source_identity=source_identity,
+        reservation_state=reservation_state,
+        opportunity_refs=opportunity_refs,
+        evidence_verifier=local_records.__getitem__,
+    )
+    receipt = crf.retain_reservation_forecast(forecast, root)
+    return {
+        "artifact": forecast,
+        "path": receipt["path"],
+        "artifact_sha256": receipt["artifact_sha256"],
+        "opportunity_refs": opportunity_refs,
+        "coverage_status": forecast["coverage_status"],
+        "raw_value": forecast["raw_value"],
+    }

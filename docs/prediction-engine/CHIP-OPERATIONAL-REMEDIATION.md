@@ -7,9 +7,9 @@ for a complete four-chip assessment. It does not change the frozen V1 branch,
 rewrite retained assessments, run an FPL account action, merge the candidate, or
 start PE-11.
 
-The worktree started at frozen commit
-`1c5b8348a463261cb70f626b4637dfa118b36e63` (tree
-`d31da0a127b16993ad49fe6e9c9aa5ee82911b7f`) on
+The worktree started at accepted remediation milestone commit
+`3411ad27a315f686e04d75661a03f88705188d42` (tree
+`eb2d1d9e21496cf0afcdf05f545a67181b6ddc82`) on
 `codex/chip-operational-remediation`. Candidate SHA and validation results are
 tracked against the exact code commit in the acceptance report; this document
 describes the implementation and its operational prerequisites.
@@ -33,6 +33,37 @@ fresh snapshot and generation are made. No confirmation has been backdated.
 
 Focused evidence: `test_historical_run1_missing_event_start_ft_stays_blocked_after_later_observation`
 and `test_production_preflight_rejects_missing_or_late_event_start_confirmation`.
+
+### Confirmation form for a future operational run
+
+Team ID `241392` was supplied by the manager. The attached screenshot visibly
+shows GW6, a 15/15 squad, £0.7m bank, 3 free transfers, and Play controls for
+Wildcard and Free Hit. Its capture time is unknown, so these screenshot values
+are unconfirmed observations and must be re-confirmed before they can enter a
+new snapshot. The screenshot shows only part of the squad and does not establish
+chip expiry or the saved event-start FT value. It is not evidence for a current
+production run.
+
+The local database's latest manager-state observation for this team is GW4 at
+`2026-09-14T08:13:41Z`; it has no GW6 squad. That observation is stale and is not
+prefilled below. Player IDs for any confirmed names must be resolved through the
+supported authoritative FPL source, with source and observation time retained.
+
+| Field | Value to confirm for the fresh run | Source/status |
+| --- | --- | --- |
+| Team ID | `241392` | Manager supplied; identity only |
+| Current planning gameweek | GW6? | Screenshot; capture time unknown, confirm |
+| Permanent 15-player squad | Names for all 15 players: **confirm** | Screenshot is partial; resolve names to IDs from the authoritative source |
+| Bank | £0.7m? | Screenshot; capture time unknown, confirm |
+| Free transfers remaining | 3? | Screenshot; capture time unknown, confirm |
+| Event-start free transfers | **confirm separately** | Unknown; never infer from current FT remaining |
+| Chip availability and expiry | **confirm each chip and expiry** | Screenshot controls alone do not establish expiry |
+| Confirmation captured at | Record the actual time of the manager's response | Fill only when confirmation occurs; never prefill or backdate |
+
+“Event-start free transfers” means the free-transfer bank entering that gameweek,
+before any transfers are made in that gameweek. It is distinct from the number
+of free transfers remaining after transfers. The manager has said fresh facts
+will be provided later; development uses labeled fixtures until then.
 
 ## Wildcard value horizon
 
@@ -100,8 +131,10 @@ are ready.
 ## Calibration and evaluator execution gates
 
 Reservation calibration now accepts only retained, content-addressed causal
-evidence containing separate PLAY/SAVE arms for the same proposed squad,
-lineup, scenario and worlds, plus a matured future outcome. Each outcome is a
+evidence containing separate PLAY/SAVE arms for the same scenario and worlds,
+plus a matured future outcome. BB/TC require the same proposed squad and lineup;
+FH/WC use separate legal arms with explicit action and transfer-state semantics.
+Each outcome is a
 versioned paired record bound to the observation, chip action, planning origin,
 scenario, world, source decision/generation, and both arm IDs and artifact
 digests. The outcome scorer is versioned and derives arm weights from the
@@ -110,9 +143,15 @@ minutes, and captured event points. It uses the normal lineup engine's legal
 autosubs and captain/vice fallback, scores all appearing players for Bench
 Boost, and applies the extra captain copy for Triple Captain. Caller-supplied
 weights are checked against those reconstructed weights; changing a weight and
-rehashing the artifacts cannot change the label. Wildcard and Free Hit remain
-ineligible for reservation calibration until their action-specific outcome
-scorers are implemented.
+rehashing the artifacts cannot change the label. The canonical matured-outcome
+scorer supports BB, TC, FH and WC. `finalize_causal_observation` derives
+PLAY/SAVE weights only after later official final captures are present in the
+append-only ledger; it retains the outcome and evidence as immutable
+content-addressed artifacts. Focused tests exercise finalization from official
+ledger captures, different FH/WC arm squads, and refusal of missing or nonfinal
+captures. The origin writer freezes the paired policies belonging to the
+forecast's selected future event, and maturation refuses a different event or
+a forecast tied to another SAVE state.
 
 Every capture must be event-grain, officially final, and carry the declared
 official player-gameweek provenance, including minutes and total points. At
@@ -131,16 +170,32 @@ self-hashed `CALIBRATED` label alone is rejected.
 The local read-only inventory found zero `outcome_observations` and zero
 `calibration_records`; the available `player_gameweeks` are point outcomes,
 not paired chip reservation trials. Synthetic fixtures test the calibration
-implementation only. There is not enough retained causal evidence to create a
-production calibration, and no current chip evaluator supplies a raw future
-reservation forecast. Reservation therefore remains uncalibrated and cannot
-support a production `PLAY_CHIP` endorsement.
+implementation only. The reservation-forecast artifact contract verifies
+per-event point-in-time expected-opportunity records bound to a certified
+source and exact SAVE state. A route-backed BB/TC producer now evaluates each
+future event available in the verified normal four-event generation and
+retains the event's paired scoring policies. Both current BB/TC assessments
+and their future reservation forecasts bind the same verified proposed route;
+the SAVE identity includes the post-H1 squad, acquisition-price basis, bank,
+free transfers, chip state and route identity. Per-event PLAY/SAVE scoring
+policies use the same proposed squad, lineup and certified worlds. If known
+expiry extends past the four-event coverage, the forecast remains incomplete
+with no numeric value. FH/WC's
+current arm builders do not yet produce future-event opportunity policies, so
+their reservation forecasts remain unavailable through this producer. The
+production assessor can consume retained forecasts, and the CLI accepts their
+verified artifact directory. Fixture forecasts are not evidence of a live
+forecast. There is not enough retained causal evidence to create a production
+calibration, and no production forecast currently has complete coverage to
+expiry. Reservation therefore remains uncalibrated and cannot support a
+production `PLAY_CHIP` endorsement.
 
 The evaluator gates remain independent: BB is review-only, TC retains its
 existing permitted gate, and FH/WC are review-only. Reservation calibration
 cannot override an evaluator whose `execution_permitted` is false. It also
-cannot supply the missing raw forecast. The gate behavior is covered by the
-focused remediation test and the existing BB, FH and WC review-only tests.
+cannot supply the missing production raw forecast. The gate behavior is covered
+by the focused remediation test and the existing BB, FH and WC review-only
+tests.
 
 ## Assessment retention and remaining dependencies
 
@@ -161,15 +216,20 @@ and
 No operational run has been used to discover missing prerequisites. The
 outstanding operational facts are:
 
-1. A manager-confirmed event-start FT, current FT, bank and squad captured
-   before a new snapshot and its cutoff.
+1. Manager confirmation of the current planning GW, permanent squad, bank,
+   current FT, event-start FT, and chip availability/expiry, captured before a
+   new snapshot and its cutoff. Team `241392` is known; the screenshot's visible
+   GW6/£0.7m/3 FT values remain unconfirmed because its capture time is unknown.
 2. A normal four-event certified generation/decision and canonical FH
    certification matching that same snapshot.
 3. One consistent 6–10 event Wildcard product with all required event runs at
    that same cutoff, snapshot, execution UUID and code identity.
-4. Validated retained paired chip causal outcomes and a point-in-time raw
-   reservation forecast before any reservation-calibrated recommendation can
-   be supported.
+4. Certified event forecasts with complete coverage to each chip's known
+   expiry. BB/TC are supported within the normal four-event product; FH/WC
+   future-event producers and any events beyond available certified coverage
+   remain implementation/data gates.
+5. Validated retained paired chip causal outcomes before any
+   reservation-calibrated recommendation can be supported.
 
 The validation report must distinguish fixture-backed implementation from
 operational evidence, preserve the historical Run #1 refusals and the two
