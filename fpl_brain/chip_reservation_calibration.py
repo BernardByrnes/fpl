@@ -1716,6 +1716,8 @@ class VerifiedOpportunity:
     evidence_sha256: str
     source_decision_id: str | None = None
     evaluator_version: str | None = None
+    evaluator_value_definition: str | None = None
+    evaluator_interval_value_definition: str | None = None
     evaluator_forecast_value: float | None = None
     evaluator_interval_low: float | None = None
     evaluator_interval_high: float | None = None
@@ -1998,11 +2000,19 @@ def validate_observation(
         raise ReservationCalibrationError("forecast does not retain one selected evaluator opportunity")
     evaluator_identity = selected_opportunities[0].get("evaluator_identity")
     evaluator_version = None
+    evaluator_value_definition = None
+    evaluator_interval_value_definition = None
     evaluator_value = evaluator_low = evaluator_high = None
     if evaluator_identity is not None:
         if not isinstance(evaluator_identity, Mapping):
             raise ReservationCalibrationError("selected evaluator identity is malformed")
         evaluator_version = str(evaluator_identity.get("evaluator_version") or "").strip() or None
+        evaluator_value_definition = (
+            str(evaluator_identity.get("opportunity_value_definition") or "").strip() or None
+        )
+        evaluator_interval_value_definition = (
+            str(evaluator_identity.get("uncertainty_value_definition") or "").strip() or None
+        )
         if evaluator_version is not None:
             evaluator_value = _number(
                 evaluator_identity.get("expected_incremental_points"),
@@ -2035,6 +2045,8 @@ def validate_observation(
         evidence_sha256=expected_digest,
         source_decision_id=str(source.get("source_decision_id") or "") or None,
         evaluator_version=evaluator_version,
+        evaluator_value_definition=evaluator_value_definition,
+        evaluator_interval_value_definition=evaluator_interval_value_definition,
         evaluator_forecast_value=evaluator_value,
         evaluator_interval_low=evaluator_low,
         evaluator_interval_high=evaluator_high,

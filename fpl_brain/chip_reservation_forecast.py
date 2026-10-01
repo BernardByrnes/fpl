@@ -844,6 +844,8 @@ def build_evaluated_event_opportunity_record(
             "event": event,
             "expected_incremental_points": expected_value,
             "uncertainty": dict(evaluation.uncertainty),
+            "opportunity_value_definition": "ONE_EVENT_MEAN_POINTS",
+            "uncertainty_value_definition": "ONE_EVENT_MEAN_POINTS",
             "decision_horizon_events": list(horizon_binding.horizon_events),
             "world_identity": str(worlds.world_identity),
             "source_identity": dict(source_identity),

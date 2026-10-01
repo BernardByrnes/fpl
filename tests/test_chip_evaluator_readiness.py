@@ -27,8 +27,8 @@ def _fixture_rows(action: str = cd.CHIP_ACTION_BB, evaluator_version: str = "bb-
             "evaluator_version": evaluator_version,
             "evaluator_forecast_value": 5.0,
             "realized_value": 5.0,
-            "interval_low": -1.0,
-            "interval_high": 1.0,
+            "interval_low": 4.0,
+            "interval_high": 6.0,
             "causal_evidence_ref": f"fixture-evidence-{index}",
             "causal_evidence_sha256": f"{index:064x}",
         }
@@ -133,6 +133,8 @@ def _install_fixture_causal_validator(monkeypatch):
             evaluator_forecast_value=float(raw["evaluator_forecast_value"]),
             evaluator_interval_low=float(raw["interval_low"]),
             evaluator_interval_high=float(raw["interval_high"]),
+            evaluator_value_definition=raw.get("opportunity_value_definition"),
+            evaluator_interval_value_definition=raw.get("uncertainty_value_definition"),
             source_decision_id=str(raw["source_decision_id"]),
             planning_event=int(raw["planning_event"]),
             origin_cutoff=parse("origin_cutoff"),
@@ -156,8 +158,10 @@ def _production_shaped_fixture_rows(action: str, evaluator_version: str, *, coun
             "evaluator_version": evaluator_version,
             "evaluator_forecast_value": 5.0,
             "realized_value": 5.0,
-            "interval_low": -1.0,
-            "interval_high": 1.0,
+            "interval_low": 4.0,
+            "interval_high": 6.0,
+            "opportunity_value_definition": readiness.ACTION_VALUE_DEFINITIONS[action],
+            "uncertainty_value_definition": readiness.ACTION_VALUE_DEFINITIONS[action],
             "causal_evidence_ref": f"simulated-causal-pair-{index}",
             "causal_evidence_sha256": f"{index + 1:064x}",
         }
@@ -230,6 +234,37 @@ def test_fixture_causal_readiness_permits_only_its_matching_action_gate(monkeypa
     assert permitted.execution_permitted is True
     assert permitted.calibration_status == cd.CALIBRATION_CALIBRATED
     assert "CHIP_EVALUATOR_READINESS_VERIFIED" in permitted.reason_codes
+
+
+def test_interval_coverage_uses_absolute_production_bounds_and_refuses_old_fh_units(monkeypatch):
+    rows = _production_shaped_fixture_rows(cd.CHIP_ACTION_BB, "bb-fixture-v1")
+    for row in rows:
+        row["evaluator_forecast_value"] = 1.0
+        row["realized_value"] = 1.9
+        row["interval_low"] = 0.8
+        row["interval_high"] = 1.2
+    outside = readiness.build_fixture_readiness(
+        rows,
+        action=cd.CHIP_ACTION_BB,
+        evaluator_version="bb-fixture-v1",
+    )
+    assert outside["metrics"]["interval_coverage"] == 0.0
+    assert outside["status"] == readiness.READINESS_FAILED
+
+    _install_fixture_causal_validator(monkeypatch)
+    fh_version = "fh-fixture-v1"
+    old_unit_rows = _production_shaped_fixture_rows(cd.CHIP_ACTION_FH, fh_version)
+    for row in old_unit_rows:
+        row.pop("uncertainty_value_definition")
+    old_units = readiness.build_evaluator_readiness(
+        old_unit_rows,
+        action=cd.CHIP_ACTION_FH,
+        evaluator_version=fh_version,
+        evidence_verifier=lambda _reference: {"verified": True},
+        evaluation_cutoff="2026-03-01T00:00:00Z",
+    )
+    assert old_units["status"] == readiness.READINESS_INVALID
+    assert old_units["execution_permitted"] is False
 
 
 @pytest.mark.parametrize("action", [cd.CHIP_ACTION_BB, cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC])

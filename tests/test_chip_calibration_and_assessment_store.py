@@ -229,7 +229,14 @@ def _causal_row(
                 "expected_incremental_points": (
                     selected_evaluator_value if future_event == event + 1 else 0.0
                 ),
-                "uncertainty": {"paired_interval_low": -2.0, "paired_interval_high": 2.0},
+                "uncertainty": {
+                    "paired_interval_low": selected_evaluator_value - 2.0,
+                    "paired_interval_high": selected_evaluator_value + 2.0,
+                },
+                **({
+                    "opportunity_value_definition": readiness.ACTION_VALUE_DEFINITIONS[action],
+                    "uncertainty_value_definition": readiness.ACTION_VALUE_DEFINITIONS[action],
+                } if action in readiness.ACTION_VALUE_DEFINITIONS else {}),
                 "world_identity": source["world_identity"],
             },
         )

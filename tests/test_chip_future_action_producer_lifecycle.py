@@ -461,6 +461,26 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
             assert opportunity["action"] == action
             assert opportunity["event"] == event
             assert opportunity["source_identity"] == SOURCE
+            if action == cd.CHIP_ACTION_FH:
+                evaluator_identity = opportunity["evaluator_identity"]
+                assert evaluator_identity["opportunity_value_definition"] == "FOUR_EVENT_NORMALIZED_MEAN_POINTS"
+                assert evaluator_identity["uncertainty_value_definition"] == "FOUR_EVENT_NORMALIZED_MEAN_POINTS"
+                assert evaluator_identity["expected_incremental_points"] == pytest.approx(
+                    evaluator_identity["mean_four_event_uplift"] / cd.CHIP_HORIZON_LENGTH,
+                )
+                raw_uncertainty = evaluator_identity["four_event_uncertainty"]
+                scaled_uncertainty = evaluator_identity["uncertainty"]
+                for field in (
+                    "paired_interval_low", "paired_interval_high",
+                    "paired_quantile_05", "paired_quantile_50", "paired_quantile_95",
+                ):
+                    assert scaled_uncertainty[field] == pytest.approx(
+                        raw_uncertainty[field] / cd.CHIP_HORIZON_LENGTH,
+                    )
+            elif action == cd.CHIP_ACTION_WC:
+                assert opportunity["evaluator_identity"]["opportunity_value_definition"] == (
+                    "WEIGHTED_WC_HORIZON_MEAN_POINTS"
+                )
             assert set(opportunity["outcome_arms"]) == {"play", "save"}
             play_arm = opportunity["outcome_arms"]["play"]
             save_arm = opportunity["outcome_arms"]["save"]

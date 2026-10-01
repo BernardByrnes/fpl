@@ -11,9 +11,13 @@ The accepted remediation milestone is commit
 `e960ca08d34802d519dc761289317b88227b9356` (tree
 `2d425f68cbd2a1e2d295d81eae66469480f6458d`) on
 `codex/chip-operational-remediation`. The work below forms a replacement
-candidate based on that milestone. It is not accepted until its focused gates,
-authoritative wrapper, exact-SHA CI and Sol review finish. Do not describe
-fixture evidence as production validation.
+candidate based on that milestone. Candidate
+`f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b` passed its wrapper and exact-SHA CI
+but Sol High returned `FIX_REQUIRED` for absolute-interval coverage and FH
+interval units. The current unpinned changes address those findings and are
+not accepted until focused gates, a replacement candidate's authoritative
+wrapper, exact-SHA CI and Sol review finish. Do not describe fixture evidence
+as production validation.
 
 ## Requirement-to-implementation matrix
 
@@ -21,7 +25,7 @@ fixture evidence as production validation.
 | --- | --- | --- | --- |
 | 1. FH/WC future opportunities | Existing canonical chip and maturation contracts | Dedicated FH/WC producers create action-specific PLAY/SAVE future-event opportunities, retain them at origin and feed maturation/calibration. The FH producer re-derives its decision authority from the verified origin CHIP_RESERVATION generation and compares all selected bundle contexts. Event 7/8 lifecycle fixtures assert policies, world/source identities, outcome maturation, FH permanent-state restoration and WC transfer-state semantics. | Fixtures are not a live production assessment. Fresh cutoff-consistent manager, generation and outcome inputs are still required. |
 | 2. Reservation through expiry | Normal decision remains FOUR_GW; WC value horizon remains separate at 6–10 events | A verified CHIP_RESERVATION product reuses the exact four-event prefix and binds continuation runs to the same cutoff, snapshot and predictive identity. BB/TC continuation carries the route terminal squad and bank with no transfers and a per-event ranked lineup. Future WC 6–10 event windows are certified only from the same origin product, with exact run IDs and dependency closures preserved; FH authority is loaded from that verified product. Origin-pinned bootstrap rules are digest-checked and retained. | A real product, bootstrap archive capture and each event opportunity must be available through confirmed expiry. Missing or unverifiable rules keep beyond-route coverage incomplete. No-transfer continuation is a forecast model, not observed future manager behavior. |
-| 3. Evaluator readiness | Existing execution-permission field is preserved | Action-specific readiness evidence can clear BB/FH/WC review-only gates only after retained prospective causal observations pass independent criteria. Before applying it, the current evaluation must also carry a finite value, allowlisted success reasons, the matching evaluator version, canonical horizon, certification/snapshot identities and a required snapshot-bound flag. The readiness artifact's evaluation cutoff must be at or before the current assessment cutoff; a later artifact cannot authorize an earlier assessment. Refused evaluations remain unchanged. An evaluation without permission stays unrankable and in `CHIP_REVIEW_REQUIRED` even if reservation calibration passes. Fixtures demonstrate permitted and refused paths. | No production readiness evidence exists. BB/FH/WC remain execution-blocked until compatible real evidence verifies. TC retains its established gate. |
+| 3. Evaluator readiness | Existing execution-permission field is preserved | Action-specific readiness uses absolute production interval endpoints and requires explicit action-specific units for both forecast and interval. FH's four-event route uplift and its interval/quantiles are normalized consistently to per-event value units; legacy FH evidence without the interval-unit declaration is refused. Readiness still requires retained prospective causal observations, finite value, allowlisted success reasons, matching evaluator version, canonical horizon, certification/snapshot identities and snapshot-bound evidence. A later readiness cutoff cannot authorize an earlier assessment. Refused evaluations remain unchanged and unrankable even if reservation calibration passes. Fixtures demonstrate permitted and refused paths. | No production readiness evidence exists. BB/FH/WC remain execution-blocked until compatible real evidence verifies. TC retains its established gate. |
 | 4. Arbiter ranking | Canonical action and reservation contracts remain in place | Each eligible candidate is compared after its reservation in shared units; an unknown reservation or blocked evaluator remains unrankable. Regression covers 10−9 versus 8−2 and chooses net 6. | Requires a calibrated reservation and readiness for every eligible executable candidate. |
 | 5. Forecast timestamps | Origin cutoff and outcome-availability safeguards remain enforced | Inputs must be as-of the origin cutoff; `made_at` records actual forecast issuance and may be later. Historical replay is excluded from evaluator-readiness evidence. | No forecasts or labels are backdated. Live validation still needs a fresh certified snapshot and later official final captures. |
 
@@ -33,11 +37,12 @@ FOUR_GW contract, separate WC value horizon, scenario identities and canonical
 Free Hit permanent-squad restoration checks. None of the historical evidence is
 rewritten.
 
-**Implemented in this candidate, awaiting acceptance:** FH/WC future-event
-production and the origin-to-maturation lifecycle; BB/TC certified expiry
-coverage and continuation; action-specific readiness; net-after-reservation
-ranking; and later-issued prospective forecast timestamps. The focused evidence
-and exact source paths are recorded below.
+**Implemented in the current unpinned replacement work, awaiting acceptance:**
+FH/WC future-event production and the origin-to-maturation lifecycle; BB/TC
+certified expiry coverage and continuation; action-specific readiness;
+net-after-reservation ranking; and later-issued prospective forecast
+timestamps. The Sol interval findings have focused corrections and tests, but
+the replacement candidate gates have not yet run.
 
 **Still unimplemented or not production-validated:** a real certified
 continuation generation and real future-event opportunity records through the
@@ -63,41 +68,29 @@ is still required before any `PLAY_CHIP` endorsement.
 
 ## Context-resume checklist
 
-- [x] Accepted base recorded as `e960ca0` / tree `2d425f68`.
-- [x] FH/WC event 7/8 producer-to-calibration fixtures completed.
-- [x] Certified CHIP_RESERVATION extension and BB/TC continuation contracts implemented with focused fixtures.
-- [x] Readiness pass/refusal fixtures, net-ranking regression and timestamp safeguards implemented.
-- [x] FH/WC selected-event producer → retained-origin → maturation → calibration fixtures cover event substitution and chip-specific state restoration.
-- [x] Reservation expiry fixtures cover WC-6/WC-10, unknown expiry and incomplete FH horizon; a no-rule-evidence continuation remains incomplete with null value.
-- [x] Pinned season-rule resolver selects only an accepted bootstrap capture at/before the origin cutoff, verifies raw archive bytes, and refuses a tampered archive.
-- [x] Readiness refuses to elevate a current action refusal even when its separate readiness artifact passes; permit/refuse paths remain fixture-only.
-- [x] Readiness application requires the current assessment cutoff and refuses a verified artifact whose evaluation cutoff is later, preventing temporal lookahead.
-- [x] Earlier contract-focused set passed: 127 tests in 45.64 seconds on 2026-10-01; includes readiness, FH/WC lifecycle, forecast, season-rule provenance, continuation and WC evaluator tests.
-- [x] Refreshed cross-contract set passed: 230 tests in 286.10 seconds, including PE-9 production decision, chip operational remediation, FH/WC, readiness and season-rule provenance.
-- [x] FH preflight refusal without origin-pinned season rules, BB continuation, and season-rule provenance follow-up passed: 10 tests in 0.93 seconds.
-- [x] Readiness permit/refuse and assessment-cutoff temporal-boundary tests passed: 15 tests in 0.61 seconds.
-- [x] Earlier five-gap focused integration bundle passed: 165 tests in 47.46 seconds before future-WC certification and FH continuation-authority revalidation were added.
-- [x] Future WC 6- and 10-event value windows certify from one origin continuation product without creating a future FOUR_GW decision pointer; an incomplete-expiry product refuses.
-- [x] Future FH authority is re-derived from the verified CHIP_RESERVATION product, exact event runs are asserted, and a gapped future FH horizon refuses.
-- [x] FH/WC lifecycle and future-WC certification focused integration passed: 5 tests in 16.57 seconds; FH substituted bundle-context refusal passed separately in the lifecycle bundle.
-- [x] Refreshed five-gap integration bundle passed after future-WC certification and FH authority-source verification: 189 tests in 56.49 seconds.
-- [x] First pinned candidate `d2cb8246653527cc9be86b30a879380e` wrapper completed in 77m 03s: 2701 passed, 31 skipped and 3 failed. The two exact accepted configuration-only failures were expected; `tests/test_bench_boost_adapter.py::test_N2_a_calibrated_reservation_may_endorse_but_the_evaluator_is_review_only` was the sole unexpected stale expectation.
-- [x] Corrected the old Bench Boost status expectation to preserve the independent readiness gate; its focused test and the readiness regression passed: 2 tests in 1.04 seconds.
-- [ ] Run the authoritative wrapper on the replacement candidate formed by this final test/documentation correction. The prior run took 77m 03s; the only accepted failures are the two exact configuration-only node IDs below.
-- [ ] Run exact-SHA CI and final Sol review; do not merge or begin PE-11.
-- [ ] Report production inputs, calibration and evaluator-readiness restrictions separately from code acceptance.
+- [x] Accepted base: `e960ca08d34802d519dc761289317b88227b9356` / tree `2d425f68cbd2a1e2d295d81eae66469480f6458d`.
+- [x] Five implementation paths have focused fixtures: FH/WC producer lifecycle, reservation continuation/expiry, readiness permit/refuse, net ranking, and later-issued forecasts.
+- [x] Candidate `f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b` wrapper: 2,702 passed, 31 skipped, two exact accepted configuration failures, zero unexpected; 4,502.54 seconds.
+- [x] Exact-SHA CI on `f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b`: unit job success; 2,684 passed, 49 skipped, same two accepted failures, zero unexpected; tests 3,345.12 seconds.
+- [x] Sol High returned `FIX_REQUIRED`: readiness coverage used forecast-relative instead of absolute bounds; FH intervals remained in four-event units.
+- [x] Corrected interval coverage, normalized FH interval/quantile endpoints, required explicit forecast and interval units, and added focused failure-path checks.
+- [x] Focused readiness, FH/WC lifecycle, forecast and calibration/retention tests passed: 68 passed in 15.00 seconds.
+- [x] Focused cross-contract bundle for chip expiry, ranking, scenarios, restoration, route/certification authority and PE-9 production decision passed: 390 passed in 407.82 seconds.
+- [x] Updated this requirement matrix and resume checklist to record the review finding, exact prior gate results, and current state.
+- [x] Focused gates and documentation are complete; this checklist is included in the replacement candidate commit.
+- [ ] Push/pin this exact commit on `feature/chip-operational-remediation-candidate` and run the remaining final gates.
+- [ ] Run the authoritative wrapper on that exact SHA; prior measured runtime was 4,502.54 seconds, with a full repeat allowed for failures.
+- [ ] Run exact-SHA CI; prior measured test runtime was 3,345.12 seconds, with a full repeat allowed for failures; then obtain Sol High review of that exact SHA.
+- [ ] Report code acceptance separately from missing manager facts, certified products, reservation calibration and evaluator-readiness evidence. No operational computation, merge or PE-11.
 
-Current resume point: this replacement candidate is one follow-up from
-`d2cb8246653527cc9be86b30a87938058bec380e` on
-`codex/chip-operational-remediation`, based ultimately on accepted milestone
-`e960ca08d34802d519dc761289317b88227b9356`. The wrapper-discovered stale test
-expectation is corrected: without evaluator readiness, a calibrated
-reservation remains `CHIP_REVIEW_REQUIRED` and unrankable. Its focused
-regressions pass. Next: run the authoritative wrapper on the exact replacement
-candidate, then exact-SHA CI and Sol review. Do not merge or begin PE-11.
-Keep production inputs, calibration and readiness evidence as separate
-prerequisites; do not merge or begin PE-11.
-
+Current resume point: the replacement candidate commit immediately follows
+`f92cf78c736b3d2fa3ae1b5b2628a7d3b5d2709b`, whose Sol review failed. Both
+focused sets passed (68 and 390 tests). FH mean, intervals and quantiles now
+use normalized per-event units in the evaluator identity; the original
+four-event uncertainty is retained separately for audit. Readiness checks
+absolute bounds and refuses FH evidence without the interval-unit declaration.
+Next: push this exact commit to the candidate ref, then run its authoritative
+wrapper, exact-SHA CI and Sol High review.
 ## Historical manager-state boundary
 
 Live Run #1 uses cutoff `2026-09-29T20:27:01Z`. Its retained
@@ -324,9 +317,14 @@ outcomes; none exist in the retained inventory. Reservation therefore remains
 uncalibrated and cannot support a production `PLAY_CHIP` endorsement.
 
 The candidate now reads action-specific evaluator-readiness artifacts built
-from independently revalidated prospective causal observations. Different
-criteria apply to BB, FH and WC, and the readiness artifact must match the
-action and evaluator version before its execution permission can be applied.
+from independently revalidated prospective causal observations. Interval
+coverage compares realized values directly with absolute low/high endpoints in
+the action's declared forecast-value units. FH forecast values and interval
+endpoints are normalized together from the four-event result, with original
+four-event uncertainty preserved separately for audit; old FH evidence
+without the interval-unit declaration is rejected for readiness.
+Different criteria apply to BB, FH and WC, and the readiness artifact must
+match the action and evaluator version before its execution permission can be applied.
 The artifact's evaluation cutoff must also be no later than the current
 assessment cutoff, preventing later matured evidence from enabling a historical
 assessment. Fixture tests demonstrate both permission and refusal for BB/FH/WC,

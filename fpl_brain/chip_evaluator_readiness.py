@@ -26,8 +26,9 @@ READINESS_INVALID = "CHIP_EVALUATOR_READINESS_INVALID"
 READINESS_CURRENT_EVALUATION_REFUSED = "CHIP_EVALUATOR_CURRENT_EVALUATION_REFUSED"
 
 # The minimum is the locked calibration validation sample size. Error tolerances
-# differ by the actual comparison: BB is one event, FH is the four-event route
-# delta, and WC is its independently certified 6-10 event weighted value.
+# differ by the action's comparison: BB uses one event, FH uses the four-event
+# route delta normalized to a per-event mean, and WC uses its independently
+# certified 6-10 event weighted value.
 ACTION_CRITERIA: dict[str, dict[str, float | int]] = {
     cd.CHIP_ACTION_BB: {
         "minimum_matured_origins": 30,
@@ -50,6 +51,12 @@ ACTION_CRITERIA: dict[str, dict[str, float | int]] = {
         "maximum_absolute_bias_points": 1.5,
         "minimum_interval_coverage": 0.80,
     },
+}
+
+ACTION_VALUE_DEFINITIONS = {
+    cd.CHIP_ACTION_BB: "ONE_EVENT_MEAN_POINTS",
+    cd.CHIP_ACTION_FH: "FOUR_EVENT_NORMALIZED_MEAN_POINTS",
+    cd.CHIP_ACTION_WC: "WEIGHTED_WC_HORIZON_MEAN_POINTS",
 }
 
 
@@ -120,6 +127,13 @@ def _sample_rows(
                 or not row.source_decision_id
             ):
                 raise EvaluatorReadinessError("observation lacks evaluator forecast, interval or source decision")
+            if (
+                row.evaluator_value_definition != ACTION_VALUE_DEFINITIONS[action]
+                or row.evaluator_interval_value_definition != ACTION_VALUE_DEFINITIONS[action]
+            ):
+                raise EvaluatorReadinessError(
+                    "observation evaluator forecast or interval uses a missing or incompatible value definition"
+                )
             origin_key = (row.planning_event, row.origin_cutoff.isoformat())
             if origin_key in origins:
                 raise EvaluatorReadinessError("duplicate planning origin is not independent readiness evidence")
@@ -167,9 +181,9 @@ def _evaluate_rows(
     coverage = (
         sum(
             1 for row in rows
-            if float(row["evaluator_forecast_value"]) + float(row["interval_low"])
+            if float(row["interval_low"])
             <= float(row["realized_value"])
-            <= float(row["evaluator_forecast_value"]) + float(row["interval_high"])
+            <= float(row["interval_high"])
         ) / len(rows)
         if rows else None
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import fields, replace
 from pathlib import Path
@@ -783,6 +784,25 @@ def build_future_free_hit_event_opportunity(
         "coverage_product_sha256": str(coverage_product["product_sha256"]),
     }
     expected = float(evaluation.mean_uplift) / fh.cd.CHIP_HORIZON_LENGTH
+    four_event_uncertainty = dict(evaluation.uncertainty)
+    normalized_uncertainty = dict(four_event_uncertainty)
+    for field in (
+        "paired_interval_low", "paired_interval_high",
+        "paired_quantile_05", "paired_quantile_50", "paired_quantile_95",
+    ):
+        try:
+            four_event_value = float(four_event_uncertainty[field])
+        except (KeyError, TypeError, ValueError, OverflowError) as failure:
+            raise FreeHitProductionError(
+                f"{FH_PRODUCTION_ARMS_INVALID}: FH evaluator uncertainty omits a finite {field}"
+            ) from failure
+        if not math.isfinite(four_event_value):
+            raise FreeHitProductionError(
+                f"{FH_PRODUCTION_ARMS_INVALID}: FH evaluator uncertainty has a non-finite {field}"
+            )
+        normalized_uncertainty[field] = round(
+            four_event_value / fh.cd.CHIP_HORIZON_LENGTH, 6,
+        )
     arms: dict[str, dict[str, Any]] = {
         "play": {
             "arm_id": f"fh-play-{crf.canonical_sha256([scenario_identity, 'PLAY'])[:16]}",
@@ -867,10 +887,12 @@ def build_future_free_hit_event_opportunity(
             "event": event,
             "expected_incremental_points": expected,
             "mean_four_event_uplift": float(evaluation.mean_uplift),
-            "uncertainty": dict(evaluation.uncertainty),
+            "uncertainty": normalized_uncertainty,
+            "four_event_uncertainty": four_event_uncertainty,
             "decision_horizon_events": list(request.horizon_events),
             "world_identity": world_identity,
             "source_identity": dict(source_identity),
             "opportunity_value_definition": "FOUR_EVENT_NORMALIZED_MEAN_POINTS",
+            "uncertainty_value_definition": "FOUR_EVENT_NORMALIZED_MEAN_POINTS",
         },
     )

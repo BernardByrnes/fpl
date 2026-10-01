@@ -811,6 +811,8 @@ def build_future_wildcard_event_opportunity(
             "action": cd.CHIP_ACTION_WC, "event": event,
             "expected_incremental_points": float(evaluation.mean_uplift),
             "uncertainty": dict(evaluation.uncertainty),
+            "opportunity_value_definition": "WEIGHTED_WC_HORIZON_MEAN_POINTS",
+            "uncertainty_value_definition": "WEIGHTED_WC_HORIZON_MEAN_POINTS",
             "decision_horizon_events": list(chip_events),
             "value_horizon_events": list(value_events),
             "world_identity": world_identity,
