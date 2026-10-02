@@ -1,0 +1,37 @@
+{
+  "source_artifact_sha256": "61c0f4858fdaaf247182f6b667f14f9258dfb2aa4ee6eb7e67be15cdf347f4a4",
+  "four_gw_certification_identity": "sha256:d39d02d3f244b35ea6e80397e4f1037572f35e733d761cb5cbb10d5358af6aae",
+  "planning_cutoff": "2026-09-17T13:46:43Z",
+  "certified_bundle_identity": {
+    "5": "sha256:c7674c351fdb135a3d74d492caea73492d8e865c4dc24826c96ffdca8431cbec",
+    "6": "sha256:18f81f14acf403efa33e6f357d173bb465a495fe927430819b48111927a6383e",
+    "7": "sha256:07159cfe957090f534eea2816a5a5548be7bb957ca7a228efc37611fdbc77714",
+    "8": "sha256:b3fac95f51b54ed37491901d3b0f49340ab4084613e4803c0d79e0bfec56ed0b"
+  },
+  "data_snapshot_sha256": "72ba668b8983718e73ca46847e347a70b6b549e3ae6901edbe897da753622e04",
+  "code_snapshot_sha256": "e2c1df67addfe0c54f262916599a8d17aa6d3002782a8ab8a08a2801cf9ceff4",
+  "certification_wiring": {
+    "entry_point": "scripts/certify_gw5_gw8.py",
+    "entry_point_sha256": "7ad4254ec4ba32f67e50dde181a728284335fc2ff37de996c6003a7bd1322c81",
+    "covered_source_files": [
+      "fpl_brain/analytics.py",
+      "fpl_brain/calibration.py",
+      "fpl_brain/database.py",
+      "fpl_brain/defcon_calibration.py",
+      "fpl_brain/historical_observations.py",
+      "fpl_brain/history_completeness.py",
+      "fpl_brain/joint_minutes.py",
+      "fpl_brain/minutes_coherence.py",
+      "fpl_brain/minutes_model.py",
+      "fpl_brain/monte_carlo.py",
+      "fpl_brain/player_rates.py",
+      "fpl_brain/repositories.py",
+      "fpl_brain/scoring_rules.py",
+      "fpl_brain/substitution_model.py",
+      "fpl_brain/team_model.py",
+      "fpl_brain/xpts.py",
+      "scripts/certify_gw5_gw8.py",
+      "scripts/freeze_predictions.py"
+    ]
+  }
+}

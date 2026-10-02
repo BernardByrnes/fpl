@@ -487,6 +487,31 @@ HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY = {
         "entry_point": "scripts/certify_gw5_gw8.py",
         "entry_point_sha256": "7ad4254ec4ba32f67e50dde181a728284335fc2ff37de996c6003a7bd1322c81",
         "code_snapshot_sha256": "e2c1df67addfe0c54f262916599a8d17aa6d3002782a8ab8a08a2801cf9ceff4",
+        # Freeze the exact pre-generic-runner source list from the retained GW5
+        # artifact. This historical certificate predates the shared production
+        # permission predicate's addition to today's SOURCE_SNAPSHOT_FILES.
+        # Deriving this list from the current set would rewrite the meaning of
+        # old evidence whenever current predictive identity coverage expands.
+        "covered_source_files": (
+            "fpl_brain/analytics.py",
+            "fpl_brain/calibration.py",
+            "fpl_brain/database.py",
+            "fpl_brain/defcon_calibration.py",
+            "fpl_brain/historical_observations.py",
+            "fpl_brain/history_completeness.py",
+            "fpl_brain/joint_minutes.py",
+            "fpl_brain/minutes_coherence.py",
+            "fpl_brain/minutes_model.py",
+            "fpl_brain/monte_carlo.py",
+            "fpl_brain/player_rates.py",
+            "fpl_brain/repositories.py",
+            "fpl_brain/scoring_rules.py",
+            "fpl_brain/substitution_model.py",
+            "fpl_brain/team_model.py",
+            "fpl_brain/xpts.py",
+            "scripts/certify_gw5_gw8.py",
+            "scripts/freeze_predictions.py",
+        ),
     },
 }
 
@@ -618,27 +643,22 @@ def _certification_wiring_is_trusted(payload: Mapping[str, Any], wiring: Any) ->
     runner name.
     """
 
-    from . import analytics
-
     if not isinstance(wiring, Mapping):
         return False
-    covered = list(wiring.get("covered_source_files") or [])
+    raw_covered = wiring.get("covered_source_files")
+    if not isinstance(raw_covered, list):
+        return False
+    covered = raw_covered
     declared_identity = str(payload.get("four_gw_certification_identity") or "")
     historical = HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY.get(declared_identity)
     if historical is not None:
         if certification_identity_of(payload) != declared_identity:
             return False
-        expected_covered = list(analytics.SOURCE_SNAPSHOT_FILES)
-        try:
-            current_entry_index = expected_covered.index(CERTIFIER_ENTRY_POINT)
-        except ValueError:
-            return False
-        expected_covered[current_entry_index] = historical["entry_point"]
         return (
             wiring.get("entry_point") == historical["entry_point"]
             and wiring.get("entry_point_sha256") == historical["entry_point_sha256"]
             and payload.get("code_snapshot_sha256") == historical["code_snapshot_sha256"]
-            and covered == expected_covered
+            and tuple(covered) == historical["covered_source_files"]
         )
 
     return (

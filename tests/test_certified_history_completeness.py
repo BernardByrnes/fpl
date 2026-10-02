@@ -951,6 +951,89 @@ def test_F4_historical_wiring_allowlist_still_requires_its_self_consistent_ident
     assert fg.DIAG_CERTIFICATION_WIRING_IDENTITY_MISSING in str(failure.value)
 
 
+def _retained_gw5_identity_fixture() -> dict:
+    """Identity-bearing fields copied from the digest-verified retained artifact."""
+
+    path = Path(__file__).parent / "fixtures" / "gw5_historical_identity_inputs.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_F4b_retained_gw5_identity_fixture_recomputes_and_matches_exact_descriptor():
+    fixture = _retained_gw5_identity_fixture()
+    identity, descriptor = next(iter(fg.HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY.items()))
+    assert fixture["source_artifact_sha256"] == (
+        "61c0f4858fdaaf247182f6b667f14f9258dfb2aa4ee6eb7e67be15cdf347f4a4"
+    )
+    assert fixture["four_gw_certification_identity"] == identity
+    assert fg.certification_identity_of(fixture) == identity
+    assert fixture["certification_wiring"] == {
+        "entry_point": descriptor["entry_point"],
+        "entry_point_sha256": descriptor["entry_point_sha256"],
+        "covered_source_files": list(descriptor["covered_source_files"]),
+    }
+    assert fixture["code_snapshot_sha256"] == descriptor["code_snapshot_sha256"]
+    assert fg._certification_wiring_is_trusted(
+        fixture, fixture["certification_wiring"]
+    )
+
+
+def test_F4c_historical_wiring_is_independent_of_the_current_fingerprint_list(monkeypatch):
+    fixture = _retained_gw5_identity_fixture()
+    current_files = tuple(analytics.SOURCE_SNAPSHOT_FILES)
+    assert "fpl_brain/four_gw_decision.py" in current_files
+    monkeypatch.setattr(
+        analytics,
+        "SOURCE_SNAPSHOT_FILES",
+        current_files + ("fpl_brain/later_added_predictive_source.py",),
+    )
+    assert fg._certification_wiring_is_trusted(
+        fixture, fixture["certification_wiring"]
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "added", "altered", "wrong_type"])
+def test_F4d_historical_wiring_refuses_nonexact_covered_file_lists(mutation):
+    fixture = _retained_gw5_identity_fixture()
+    wiring = copy.deepcopy(fixture["certification_wiring"])
+    covered = wiring["covered_source_files"]
+    if mutation == "missing":
+        covered.pop()
+    elif mutation == "added":
+        covered.append("fpl_brain/four_gw_decision.py")
+    elif mutation == "wrong_type":
+        wiring["covered_source_files"] = {name: True for name in covered}
+    else:
+        covered[0] = "fpl_brain/forged_analytics.py"
+    assert not fg._certification_wiring_is_trusted(fixture, wiring)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("entry_point_sha256", "0" * 64),
+        ("code_snapshot_sha256", "0" * 64),
+    ],
+)
+def test_F4e_historical_wiring_refuses_wrong_producer_or_snapshot(field, replacement):
+    fixture = _retained_gw5_identity_fixture()
+    if field == "entry_point_sha256":
+        fixture["certification_wiring"][field] = replacement
+    else:
+        fixture[field] = replacement
+    assert not fg._certification_wiring_is_trusted(
+        fixture, fixture["certification_wiring"]
+    )
+
+
+def test_F4f_copying_recognized_identity_to_inconsistent_content_is_refused():
+    fixture = _retained_gw5_identity_fixture()
+    fixture["data_snapshot_sha256"] = "0" * 64
+    assert fixture["four_gw_certification_identity"] != fg.certification_identity_of(fixture)
+    assert not fg._certification_wiring_is_trusted(
+        fixture, fixture["certification_wiring"]
+    )
+
+
 def test_G_runner_gate_refuses_a_new_artifact_missing_the_audit(tmp_path):
     """The runner has ONE predictive-world entry, and it is the validating one.
 
