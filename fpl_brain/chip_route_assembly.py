@@ -1302,11 +1302,12 @@ def build_bb_tc_reservation_forecast(
                 continuation_rules_evidence if int(event) > int(route.events[-1]) else None
             ),
         )
-        receipt = crf.retain_event_opportunity_record(opportunity, root)
+        receipt = crf.retain_event_opportunity_record(opportunity, root, store_conn=conn)
         reference = Path(receipt["path"]).name
         opportunity_refs.append(reference)
         local_records[reference] = opportunity
     forecast = crf.build_reservation_forecast(
+        store_conn=conn,
         action=action,
         planning_event=int(route.planning_event),
         origin_cutoff=str(route.cutoff),
@@ -1319,7 +1320,7 @@ def build_bb_tc_reservation_forecast(
         input_as_of=str(route.cutoff),
         coverage_product=coverage_product,
     )
-    receipt = crf.retain_reservation_forecast(forecast, root)
+    receipt = crf.retain_reservation_forecast(forecast, root, store_conn=conn)
     return {
         "artifact": forecast,
         "path": receipt["path"],

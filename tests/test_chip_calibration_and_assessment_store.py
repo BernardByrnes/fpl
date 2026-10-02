@@ -24,6 +24,56 @@ from fpl_brain.chip_assessment import assemble_assessment_record
 from scripts import run_chip_assessment
 
 
+# These legacy calibration fixtures deliberately use synthetic generation IDs.
+# Their purpose is the calibration/readiness math, not production permission.
+# Keep their nested forecast checks explicitly structural; real production
+# authority is exercised without patches in test_production_search_permission.py.
+_SYNTHETIC_STORE_CONN = sqlite3.connect(":memory:")
+
+
+@pytest.fixture(autouse=True)
+def _scope_synthetic_calibration_fixtures_to_structural_verification(monkeypatch):
+    def structural_opportunity(record, **kwargs):
+        kwargs.pop("store_conn", None)
+        return forecast.inspect_event_opportunity_structure(record, **kwargs)
+
+    monkeypatch.setattr(forecast, "_verify_event_opportunity", structural_opportunity)
+
+    def store_context(function):
+        def wrapped(*args, **kwargs):
+            kwargs.setdefault("store_conn", _SYNTHETIC_STORE_CONN)
+            return function(*args, **kwargs)
+        return wrapped
+
+    for module, names in (
+        (forecast, (
+            "build_reservation_forecast", "verify_reservation_forecast",
+            "retain_reservation_forecast", "retain_event_opportunity_record",
+        )),
+        (calibration, (
+            "retain_causal_origin_observation", "finalize_causal_observation",
+            "validate_observation", "evaluate_reservation_calibration",
+        )),
+        (readiness, (
+            "build_evaluator_readiness", "verify_evaluator_readiness", "apply_verified_readiness",
+        )),
+    ):
+        for name in names:
+            monkeypatch.setattr(module, name, store_context(getattr(module, name)))
+
+    original_from_artifact = calibration.VerifiedReservationCalibration.from_artifact.__func__
+
+    def from_artifact(cls, artifact, **kwargs):
+        kwargs.setdefault("store_conn", _SYNTHETIC_STORE_CONN)
+        return original_from_artifact(cls, artifact, **kwargs)
+
+    monkeypatch.setattr(
+        calibration.VerifiedReservationCalibration,
+        "from_artifact",
+        classmethod(from_artifact),
+    )
+
+
 def _sha(payload):
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False, default=str,

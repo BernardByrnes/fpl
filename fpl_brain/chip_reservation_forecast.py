@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import sqlite3
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -895,7 +896,7 @@ def _attach_search_permission_evaluation(
     return body
 
 
-def _verify_event_opportunity(
+def inspect_event_opportunity_structure(
     record: Mapping[str, Any],
     *,
     action: str,
@@ -903,7 +904,13 @@ def _verify_event_opportunity(
     origin_cutoff: str,
     source_identity: Mapping[str, Any],
     reservation_state: Mapping[str, Any] | None,
-) -> None:
+) -> dict[str, Any]:
+    """Check only an opportunity's self-contained shape and byte identities.
+
+    This is for diagnostics and historical inspection. It does not load the
+    origin generation, reproduce causal evidence, audit history, or establish
+    permission for a production search.
+    """
     if record.get("schema") != EVENT_OPPORTUNITY_SCHEMA:
         raise ReservationForecastError("retained event opportunity has an unsupported schema")
     body = dict(record)
@@ -1039,9 +1046,67 @@ def _verify_event_opportunity(
             rebuilt = _attach_search_permission_evaluation(rebuilt, permission_evaluation)
         if dict(rebuilt) != dict(record):
             raise ReservationForecastError("event opportunity outcome-arm manifest does not reproduce")
+    return {
+        "structural_integrity_verified": True,
+        "production_permission_verified": False,
+        "verification_scope": "STRUCTURAL_ONLY",
+    }
 
 
-def build_reservation_forecast(
+def _verify_event_opportunity(
+    record: Mapping[str, Any],
+    *,
+    store_conn: sqlite3.Connection,
+    action: str,
+    planning_event: int,
+    origin_cutoff: str,
+    source_identity: Mapping[str, Any],
+    reservation_state: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Verify shape and independently reproduce an opportunity's permission."""
+
+    inspect_event_opportunity_structure(
+        record,
+        action=action,
+        planning_event=planning_event,
+        origin_cutoff=origin_cutoff,
+        source_identity=source_identity,
+        reservation_state=reservation_state,
+    )
+    permission_marker = record.get("search_permission_evidence_schema")
+    permission_evaluation = record.get("search_permission_evaluation")
+    if (
+        permission_marker != "fpl_brain.chip_opportunity_permission.v1"
+        or not isinstance(permission_evaluation, Mapping)
+    ):
+        raise ReservationForecastError(
+            "production event opportunity is missing its required search-permission evidence"
+        )
+    from . import search_permission as sp
+
+    try:
+        expected = sp.verify_recorded_opportunity_evaluation(
+            store_conn,
+            source_identity=source_identity,
+            evaluation=permission_evaluation,
+        )
+    except Exception as failure:
+        raise ReservationForecastError(
+            f"event opportunity search-permission evidence did not reproduce: {failure}"
+        ) from failure
+    if dict(permission_evaluation) != expected:
+        raise ReservationForecastError(
+            "event opportunity search-permission evidence differs from authoritative origin evidence"
+        )
+    return {
+        "structural_integrity_verified": True,
+        "production_permission_verified": True,
+        "verification_scope": "AUTHORITATIVE_ORIGIN_PERMISSION",
+        "evaluation_sha256": expected.get("evaluation_sha256"),
+    }
+
+
+def _build_reservation_forecast(
     *,
     action: str,
     planning_event: int,
@@ -1056,6 +1121,7 @@ def build_reservation_forecast(
     forecast_mode: str = FORECAST_MODE_PROSPECTIVE,
     coverage_product: Mapping[str, Any] | None = None,
     value_units: str = FORECAST_VALUE_UNITS,
+    _opportunity_verifier: Callable[..., Any],
 ) -> dict[str, Any]:
     """Create a raw forecast from separately retained, verified event forecasts.
 
@@ -1099,7 +1165,7 @@ def build_reservation_forecast(
             raise ReservationForecastError(f"retained event opportunity did not verify: {failure}") from failure
         if not isinstance(record, Mapping):
             raise ReservationForecastError("retained event opportunity is not an object")
-        _verify_event_opportunity(
+        _opportunity_verifier(
             record,
             action=action,
             planning_event=planning_event,
@@ -1210,11 +1276,89 @@ def build_reservation_forecast(
     return body
 
 
-def verify_reservation_forecast(
+def build_reservation_forecast(
+    *,
+    store_conn: sqlite3.Connection,
+    action: str,
+    planning_event: int,
+    origin_cutoff: str,
+    made_at: str,
+    expiry_event: int | None,
+    source_identity: Mapping[str, Any],
+    reservation_state: Mapping[str, Any],
+    opportunity_refs: Sequence[str],
+    evidence_verifier: Callable[[str], Mapping[str, Any]],
+    input_as_of: str | None = None,
+    forecast_mode: str = FORECAST_MODE_PROSPECTIVE,
+    coverage_product: Mapping[str, Any] | None = None,
+    value_units: str = FORECAST_VALUE_UNITS,
+) -> dict[str, Any]:
+    """Build a production forecast after re-verifying each origin in the store."""
+
+    if not isinstance(store_conn, sqlite3.Connection):
+        raise ReservationForecastError("an authoritative generation-store connection is required")
+    return _build_reservation_forecast(
+        action=action,
+        planning_event=planning_event,
+        origin_cutoff=origin_cutoff,
+        made_at=made_at,
+        expiry_event=expiry_event,
+        source_identity=source_identity,
+        reservation_state=reservation_state,
+        opportunity_refs=opportunity_refs,
+        evidence_verifier=evidence_verifier,
+        input_as_of=input_as_of,
+        forecast_mode=forecast_mode,
+        coverage_product=coverage_product,
+        value_units=value_units,
+        _opportunity_verifier=lambda record, **kwargs: _verify_event_opportunity(
+            record, store_conn=store_conn, **kwargs
+        ),
+    )
+
+
+def build_structural_reservation_forecast(
+    *,
+    action: str,
+    planning_event: int,
+    origin_cutoff: str,
+    made_at: str,
+    expiry_event: int | None,
+    source_identity: Mapping[str, Any],
+    reservation_state: Mapping[str, Any],
+    opportunity_refs: Sequence[str],
+    evidence_verifier: Callable[[str], Mapping[str, Any]],
+    input_as_of: str | None = None,
+    forecast_mode: str = FORECAST_MODE_PROSPECTIVE,
+    coverage_product: Mapping[str, Any] | None = None,
+    value_units: str = FORECAST_VALUE_UNITS,
+) -> dict[str, Any]:
+    """Build a structurally checked diagnostic forecast without production authority."""
+
+    return _build_reservation_forecast(
+        action=action,
+        planning_event=planning_event,
+        origin_cutoff=origin_cutoff,
+        made_at=made_at,
+        expiry_event=expiry_event,
+        source_identity=source_identity,
+        reservation_state=reservation_state,
+        opportunity_refs=opportunity_refs,
+        evidence_verifier=evidence_verifier,
+        input_as_of=input_as_of,
+        forecast_mode=forecast_mode,
+        coverage_product=coverage_product,
+        value_units=value_units,
+        _opportunity_verifier=inspect_event_opportunity_structure,
+    )
+
+
+def _verify_reservation_forecast(
     forecast: Mapping[str, Any],
     *,
     expected: Mapping[str, Any],
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
+    _opportunity_verifier: Callable[..., Any],
 ) -> dict[str, Any]:
     """Verify content, nested sources, forecast timing and assessment binding."""
 
@@ -1281,7 +1425,7 @@ def verify_reservation_forecast(
                 raise ReservationForecastError(f"retained event opportunity did not re-verify: {failure}") from failure
             if not isinstance(retained, Mapping) or _canonical_bytes(retained) != _canonical_bytes(payload):
                 raise ReservationForecastError("retained event opportunity differs from the forecast manifest")
-        _verify_event_opportunity(
+        _opportunity_verifier(
             payload,
             action=action,
             planning_event=planning_event,
@@ -1399,6 +1543,49 @@ def verify_reservation_forecast(
     return {"verified": True, "artifact_sha256": identity, "raw_value": forecast.get("raw_value")}
 
 
+def verify_reservation_forecast(
+    forecast: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    store_conn: sqlite3.Connection,
+    evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Verify a production forecast and every opportunity against its origin store."""
+
+    if not isinstance(store_conn, sqlite3.Connection):
+        raise ReservationForecastError("an authoritative generation-store connection is required")
+    report = _verify_reservation_forecast(
+        forecast,
+        expected=expected,
+        evidence_verifier=evidence_verifier,
+        _opportunity_verifier=lambda record, **kwargs: _verify_event_opportunity(
+            record, store_conn=store_conn, **kwargs
+        ),
+    )
+    return {**report, "production_permission_verified": True}
+
+
+def inspect_reservation_forecast_structure(
+    forecast: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Inspect forecast bytes and semantics without granting production authority."""
+
+    report = _verify_reservation_forecast(
+        forecast,
+        expected=expected,
+        evidence_verifier=evidence_verifier,
+        _opportunity_verifier=inspect_event_opportunity_structure,
+    )
+    return {
+        **report,
+        "production_permission_verified": False,
+        "verification_scope": "STRUCTURAL_ONLY",
+    }
+
+
 @dataclass(frozen=True)
 class VerifiedReservationForecast:
     artifact: Mapping[str, Any]
@@ -1414,6 +1601,7 @@ class VerifiedReservationForecast:
 
     def validate_for_reservation(
         self, *, action: str, planning_event: int, expiry_event: int | None, state: Mapping[str, Any],
+        store_conn: sqlite3.Connection,
         evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         verify_reservation_forecast(
@@ -1423,6 +1611,7 @@ class VerifiedReservationForecast:
                 "planning_event": int(planning_event),
                 "expiry_event": None if expiry_event is None else int(expiry_event),
             },
+            store_conn=store_conn,
             evidence_verifier=evidence_verifier,
         )
         forecast_state = self.artifact.get("reservation_state")
@@ -1434,10 +1623,15 @@ class VerifiedReservationForecast:
             raise ReservationForecastError("reservation forecast does not match the arbiter SAVE state")
 
 
-def retain_reservation_forecast(forecast: Mapping[str, Any], root: str | Path) -> dict[str, str]:
+def retain_reservation_forecast(
+    forecast: Mapping[str, Any],
+    root: str | Path,
+    *,
+    store_conn: sqlite3.Connection,
+) -> dict[str, str]:
     """Atomically retain one forecast with no replacement or final-path stream."""
 
-    verify_reservation_forecast(forecast, expected={})
+    verify_reservation_forecast(forecast, expected={}, store_conn=store_conn)
     payload = _canonical_bytes(forecast)
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
@@ -1468,11 +1662,17 @@ def retain_reservation_forecast(forecast: Mapping[str, Any], root: str | Path) -
     return {"path": str(target), "artifact_sha256": str(forecast["artifact_sha256"])}
 
 
-def retain_event_opportunity_record(record: Mapping[str, Any], root: str | Path) -> dict[str, str]:
+def retain_event_opportunity_record(
+    record: Mapping[str, Any],
+    root: str | Path,
+    *,
+    store_conn: sqlite3.Connection,
+) -> dict[str, str]:
     """Atomically retain one certified event opportunity without replacement."""
 
     _verify_event_opportunity(
         record,
+        store_conn=store_conn,
         action=str(record.get("action") or ""),
         planning_event=int(record.get("planning_event") or -1),
         origin_cutoff=str(record.get("origin_cutoff") or ""),

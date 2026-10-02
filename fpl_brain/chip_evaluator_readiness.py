@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import math
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
@@ -91,6 +92,7 @@ def _sample_rows(
     action: str,
     evaluator_version: str,
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    store_conn: sqlite3.Connection,
     evaluation_cutoff: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if action not in ACTION_CRITERIA:
@@ -98,6 +100,8 @@ def _sample_rows(
     cutoff = _time(evaluation_cutoff, name="evaluation_cutoff")
     if evidence_verifier is None:
         raise EvaluatorReadinessError("a retained causal-evidence verifier is required")
+    if not isinstance(store_conn, sqlite3.Connection):
+        raise EvaluatorReadinessError("authoritative generation-store access is required")
     rows: list[dict[str, Any]] = []
     rejected: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -106,7 +110,11 @@ def _sample_rows(
     for raw in observations:
         observation_id = str(raw.get("observation_id") or "")
         try:
-            row = crc.validate_observation(raw, evidence_verifier=evidence_verifier)
+            row = crc.validate_observation(
+                raw,
+                evidence_verifier=evidence_verifier,
+                store_conn=store_conn,
+            )
             if observation_id in seen:
                 raise EvaluatorReadinessError("duplicate observation id")
             seen.add(observation_id)
@@ -236,6 +244,7 @@ def build_evaluator_readiness(
     action: str,
     evaluator_version: str,
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    store_conn: sqlite3.Connection,
     evaluation_cutoff: str,
 ) -> dict[str, Any]:
     """Validate the causal observations and produce an action-specific gate."""
@@ -245,6 +254,7 @@ def build_evaluator_readiness(
         action=action,
         evaluator_version=evaluator_version,
         evidence_verifier=evidence_verifier,
+        store_conn=store_conn,
         evaluation_cutoff=evaluation_cutoff,
     )
     artifact = _evaluate_rows(
@@ -267,6 +277,7 @@ def verify_evaluator_readiness(
     action: str,
     evaluator_version: str,
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    store_conn: sqlite3.Connection,
 ) -> dict[str, Any]:
     """Rebuild the readiness claim from verified evidence and locked criteria."""
 
@@ -296,6 +307,7 @@ def verify_evaluator_readiness(
         action=action,
         evaluator_version=evaluator_version,
         evidence_verifier=evidence_verifier,
+        store_conn=store_conn,
         evaluation_cutoff=str(body.get("evaluation_cutoff") or ""),
     )
     if reproduced != dict(artifact):
@@ -314,6 +326,7 @@ def apply_verified_readiness(
     *,
     current_cutoff: str,
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    store_conn: sqlite3.Connection,
 ) -> tuple[cd.ChipEvaluation, dict[str, Any]]:
     """Apply independently verified readiness without touching evaluator math."""
 
@@ -323,6 +336,7 @@ def apply_verified_readiness(
         action=evaluation.action,
         evaluator_version=evaluation.evaluator_version,
         evidence_verifier=evidence_verifier,
+        store_conn=store_conn,
     )
     if not verification["execution_permitted"]:
         return evaluation, {

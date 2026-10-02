@@ -180,6 +180,7 @@ def _four_gw_manager_packet(canonical_state: dict, **state_overrides) -> dict:
 def _four_gw_certified_manager_world(
     path: Path, *, bank: int = 7, free_transfers: int = 0,
     event_start_free_transfers: int | None = None,
+    completed_history_placeholder: bool = False,
 ):
     """Create a four-event generation whose pinned snapshot has real manager state."""
 
@@ -188,6 +189,24 @@ def _four_gw_certified_manager_world(
     conn = connect_database(path)
     gf.base_world(conn)
     four_gw_fixtures._seed_regression_manager(conn, entry_id=241392, event=4)
+    if completed_history_placeholder:
+        # A genuinely completed pre-origin event with a scheduled placeholder row.
+        # The generation remains structurally certifiable, while the independent
+        # production permission audit must refuse to search from its snapshot.
+        gf.add_event(conn, 3)
+        gf.add_fixture(conn, 31, 3, 1, 2)
+        conn.execute(
+            "UPDATE events SET finished=1, data_checked=1 WHERE id=3"
+        )
+        conn.execute(
+            "UPDATE fixtures SET finished=1, started=1, kickoff_time=? WHERE id=31",
+            ("2026-09-10T14:00:00Z",),
+        )
+        conn.execute(
+            "INSERT INTO player_gameweeks"
+            "(player_id,event,fixture_id,minutes,source,raw_json,updated_at)"
+            " VALUES (1,3,31,NULL,'fixture_schedule','{}','2026-09-10T14:00:00Z')"
+        )
     repo.upsert_manual_manager_state(
         conn,
         241392,

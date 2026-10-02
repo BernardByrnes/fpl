@@ -410,6 +410,14 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
         "require_search_permission",
         lambda _conn, _generation_id, **_kwargs: gf.fixture_search_permission_evaluation(SOURCE),
     )
+    # This is an explicitly synthetic lifecycle fixture. Keep downstream
+    # calibration semantics testable without claiming its fake generation is a
+    # production authority; the real store re-derivation is covered separately.
+    def structural_opportunity(record, **kwargs):
+        kwargs.pop("store_conn", None)
+        return forecast.inspect_event_opportunity_structure(record, **kwargs)
+
+    monkeypatch.setattr(forecast, "_verify_event_opportunity", structural_opportunity)
 
     expiry = FUTURE_EVENT + 1
     product = _coverage_product(
@@ -546,13 +554,16 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
                 assert play_arm["action_semantics"]["wildcard_applied"] is True
                 assert save_arm["action_semantics"]["wildcard_applied"] is False
                 assert save_arm["action_semantics"]["retains_chip_option"] is True
-            receipt = forecast.retain_event_opportunity_record(opportunity, evidence_root)
+            receipt = forecast.retain_event_opportunity_record(
+                opportunity, evidence_root, store_conn=conn,
+            )
             reference = Path(receipt["path"]).name
             retained[reference] = opportunity
             opportunities[event] = opportunity
             reservation_state = save_state
 
         forecast_artifact = forecast.build_reservation_forecast(
+            store_conn=conn,
             action=action,
             planning_event=ORIGIN_EVENT,
             origin_cutoff=CUTOFF,
@@ -572,6 +583,7 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
             forecast_artifact=forecast_artifact,
             evidence_root=evidence_root,
             evidence_verifier=retained.__getitem__,
+            store_conn=conn,
         )
 
         def evidence_verifier(reference):
@@ -591,6 +603,7 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
                 realization_event=FUTURE_EVENT,
                 evidence_root=evidence_root,
                 evidence_verifier=evidence_verifier,
+                store_conn=conn,
                 source_position_resolver=lambda _record: source_positions,
             )
         matured = calibration.finalize_causal_observation(
@@ -599,14 +612,18 @@ def test_future_action_producer_retention_maturation_and_calibration_path(
             realization_event=expiry,
             evidence_root=evidence_root,
             evidence_verifier=evidence_verifier,
+            store_conn=conn,
             source_position_resolver=lambda _record: source_positions,
         )
         row = matured["calibration_row"]
-        verified = calibration.validate_observation(row, evidence_verifier=evidence_verifier)
+        verified = calibration.validate_observation(
+            row, evidence_verifier=evidence_verifier, store_conn=conn,
+        )
         assert verified.action == action
         result = calibration.evaluate_reservation_calibration(
             [row],
             evidence_verifier=evidence_verifier,
+            store_conn=conn,
             evaluation_cutoff="2026-12-31T00:00:00Z",
         )
         assert result["status"] == cd.CALIBRATION_UNCALIBRATED

@@ -1245,6 +1245,7 @@ def retain_causal_origin_observation(
     observation_id: str,
     forecast_artifact: Mapping[str, Any],
     evidence_root: str | Path,
+    store_conn: sqlite3.Connection,
     evidence_verifier: Callable[[str], Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Retain the selected future event's evaluated PLAY/SAVE origin evidence.
@@ -1268,6 +1269,7 @@ def retain_causal_origin_observation(
     try:
         crf.verify_reservation_forecast(
             forecast,
+            store_conn=store_conn,
             expected={
                 "action": action,
                 "planning_event": planning_event,
@@ -1293,7 +1295,7 @@ def retain_causal_origin_observation(
         payload = item.get("artifact_payload") if isinstance(item, Mapping) else None
         if not isinstance(payload, Mapping):
             raise ReservationCalibrationError("origin forecast event record is malformed")
-        receipt = crf.retain_event_opportunity_record(payload, root)
+        receipt = crf.retain_event_opportunity_record(payload, root, store_conn=store_conn)
         reference = Path(receipt["path"]).name
         local_records[reference] = dict(payload)
         item["artifact_ref"] = reference
@@ -1303,12 +1305,15 @@ def retain_causal_origin_observation(
     try:
         crf.verify_reservation_forecast(
             forecast,
+            store_conn=store_conn,
             expected={},
             evidence_verifier=local_records.__getitem__,
         )
     except Exception as failure:
         raise ReservationCalibrationError(f"self-contained origin forecast did not verify: {failure}") from failure
-    forecast_receipt = crf.retain_reservation_forecast(forecast, root)
+    forecast_receipt = crf.retain_reservation_forecast(
+        forecast, root, store_conn=store_conn,
+    )
     forecast_reference = Path(forecast_receipt["path"]).name
 
     selected_event = int(forecast["selected_event"])
@@ -1387,6 +1392,7 @@ def finalize_causal_observation(
     conn: sqlite3.Connection,
     origin_evidence: Mapping[str, Any],
     *,
+    store_conn: sqlite3.Connection,
     realization_event: int,
     evidence_root: str | Path,
     evidence_verifier: Callable[[str], Mapping[str, Any]],
@@ -1457,6 +1463,7 @@ def finalize_causal_observation(
     try:
         crf.verify_reservation_forecast(
             raw_forecast,
+            store_conn=store_conn,
             expected={
                 "action": action,
                 "planning_event": planning_event,
@@ -1682,7 +1689,11 @@ def finalize_causal_observation(
             return local_artifacts[str(reference)]
         return evidence_verifier(str(reference))
 
-    validate_observation(calibration_row, evidence_verifier=resolve)
+    validate_observation(
+        calibration_row,
+        evidence_verifier=resolve,
+        store_conn=store_conn,
+    )
     root = Path(evidence_root)
     outcome_path = _retain_content_addressed_json(root, outcome_reference, outcome_record)
     evidence_path = _retain_content_addressed_json(root, evidence_reference, final_evidence)
@@ -1861,7 +1872,10 @@ def _verify_pair(
 
 
 def validate_observation(
-    row: Mapping[str, Any], *, evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    row: Mapping[str, Any],
+    *,
+    evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    store_conn: sqlite3.Connection,
 ) -> VerifiedOpportunity:
     """Load and verify one point-in-time forecast/outcome pair.
 
@@ -1872,6 +1886,8 @@ def validate_observation(
 
     if evidence_verifier is None:
         raise ReservationCalibrationError("a retained causal-evidence verifier is required")
+    if not isinstance(store_conn, sqlite3.Connection):
+        raise ReservationCalibrationError("authoritative generation-store access is required")
     observation_id = str(row.get("observation_id") or "")
     action = str(row.get("action") or "")
     if not observation_id or action not in cd.PLAYABLE_CHIP_ACTIONS:
@@ -1948,6 +1964,7 @@ def validate_observation(
     try:
         crf.verify_reservation_forecast(
             forecast_artifact,
+            store_conn=store_conn,
             expected={
                 "action": action,
                 "planning_event": int(row.get("planning_event")),
@@ -2141,6 +2158,7 @@ def evaluate_reservation_calibration(
     observations: Sequence[Mapping[str, Any]],
     *,
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+    store_conn: sqlite3.Connection,
     evaluation_cutoff: str,
 ) -> dict[str, Any]:
     """Evaluate a pre-registered, expanding-window reservation calibration.
@@ -2156,7 +2174,11 @@ def evaluate_reservation_calibration(
     seen: set[str] = set()
     for raw in observations:
         try:
-            row = validate_observation(raw, evidence_verifier=evidence_verifier)
+            row = validate_observation(
+                raw,
+                evidence_verifier=evidence_verifier,
+                store_conn=store_conn,
+            )
             if row.observation_id in seen:
                 raise ReservationCalibrationError("duplicate observation_id")
             seen.add(row.observation_id)
@@ -2275,6 +2297,7 @@ class VerifiedReservationCalibration:
     artifact: Mapping[str, Any]
     evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None
     forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None
+    store_conn: sqlite3.Connection | None = None
 
     @classmethod
     def from_artifact(
@@ -2282,8 +2305,11 @@ class VerifiedReservationCalibration:
         artifact: Mapping[str, Any],
         *,
         evidence_verifier: Callable[[str], Mapping[str, Any]] | None,
+        store_conn: sqlite3.Connection,
         forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> "VerifiedReservationCalibration":
+        if not isinstance(store_conn, sqlite3.Connection):
+            raise ReservationCalibrationError("authoritative generation-store access is required")
         body = dict(artifact)
         identity = str(body.pop("identity_sha256", ""))
         if body.get("schema") != CALIBRATION_SCHEMA or body.get("version") != CALIBRATION_VERSION:
@@ -2322,6 +2348,7 @@ class VerifiedReservationCalibration:
             reproduced = evaluate_reservation_calibration(
                 rows,
                 evidence_verifier=evidence_verifier,
+                store_conn=store_conn,
                 evaluation_cutoff=str(body["evaluation_cutoff"]),
             )
         except Exception as failure:
@@ -2338,6 +2365,7 @@ class VerifiedReservationCalibration:
             artifact=dict(artifact),
             evidence_verifier=evidence_verifier,
             forecast_evidence_verifier=forecast_evidence_verifier or evidence_verifier,
+            store_conn=store_conn,
         )
 
     def estimate(self, *, action: str, planning_event: int, expiry_event: int | None,
@@ -2369,6 +2397,7 @@ class VerifiedReservationCalibration:
                 planning_event=int(planning_event),
                 expiry_event=expiry_event,
                 state=state,
+                store_conn=self.store_conn,  # type: ignore[arg-type]
                 evidence_verifier=forecast_verifier,
             )
         except Exception:

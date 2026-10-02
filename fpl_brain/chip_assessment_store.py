@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -86,7 +87,12 @@ def _plain(value: Any) -> Any:
     return str(value)
 
 
-def _validate_context(record: Mapping[str, Any]) -> None:
+def _validate_context(
+    record: Mapping[str, Any],
+    *,
+    store_conn: sqlite3.Connection | None = None,
+    structural_only: bool = False,
+) -> None:
     context = record.get("context")
     if not isinstance(context, Mapping):
         raise ChipAssessmentStoreError("assessment context is missing")
@@ -196,17 +202,29 @@ def _validate_context(record: Mapping[str, Any]) -> None:
                 }
                 try:
                     expiry_map = context.get("chip_expiry_events")
-                    crf.verify_reservation_forecast(
-                        raw_forecast,
-                        expected={
-                            "action": action,
-                            "planning_event": event,
-                            "origin_cutoff": str(context["cutoff"]),
-                            **({"expiry_event": expiry_map[action]}
-                               if isinstance(expiry_map, Mapping) and action in expiry_map else {}),
-                            "source_identity": source_identity,
-                        },
-                    )
+                    expected_forecast = {
+                        "action": action,
+                        "planning_event": event,
+                        "origin_cutoff": str(context["cutoff"]),
+                        **({"expiry_event": expiry_map[action]}
+                           if isinstance(expiry_map, Mapping) and action in expiry_map else {}),
+                        "source_identity": source_identity,
+                    }
+                    if structural_only:
+                        crf.inspect_reservation_forecast_structure(
+                            raw_forecast,
+                            expected=expected_forecast,
+                        )
+                    else:
+                        if not isinstance(store_conn, sqlite3.Connection):
+                            raise ChipAssessmentStoreError(
+                                "authoritative generation-store access is required for a retained reservation forecast"
+                            )
+                        crf.verify_reservation_forecast(
+                            raw_forecast,
+                            expected=expected_forecast,
+                            store_conn=store_conn,
+                        )
                 except Exception as failure:
                     raise ChipAssessmentStoreError(
                         f"{action} raw reservation forecast is invalid: {failure}"
@@ -397,6 +415,7 @@ def build_assessment_record(
     manager_state: Mapping[str, Any],
     chip_results: Mapping[str, Mapping[str, Any]],
     decision: Any,
+    store_conn: sqlite3.Connection | None = None,
     created_at: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
@@ -413,12 +432,17 @@ def build_assessment_record(
         "decision": _plain(decision),
         "retention": {"immutable": True, "per_run": True},
     }
-    _validate_context(body)
+    _validate_context(body, store_conn=store_conn)
     body["record_sha256"] = _digest(body)
     return body
 
 
-def retain_assessment(record: Mapping[str, Any], root: str | Path) -> dict[str, str]:
+def retain_assessment(
+    record: Mapping[str, Any],
+    root: str | Path,
+    *,
+    store_conn: sqlite3.Connection | None = None,
+) -> dict[str, str]:
     """Publish one assessment with atomic no-replace semantics.
 
     Temporary staging is protected by ``finally``. If the filesystem cannot
@@ -429,7 +453,7 @@ def retain_assessment(record: Mapping[str, Any], root: str | Path) -> dict[str, 
     value = _plain(record)
     if not isinstance(value, dict) or value.get("schema") != ASSESSMENT_SCHEMA:
         raise ChipAssessmentStoreError("refusing to retain an unknown assessment record")
-    _validate_context(value)
+    _validate_context(value, store_conn=store_conn)
     expected = str(value.pop("record_sha256", ""))
     if expected != _digest(value):
         raise ChipAssessmentStoreError("assessment record digest does not verify before retention")
@@ -467,7 +491,12 @@ def retain_assessment(record: Mapping[str, Any], root: str | Path) -> dict[str, 
     }
 
 
-def verify_assessment(path: str | Path) -> dict[str, Any]:
+def _read_assessment(
+    path: str | Path,
+    *,
+    store_conn: sqlite3.Connection | None,
+    structural_only: bool,
+) -> dict[str, Any]:
     """Verify bytes, internal digest, context bindings and per-chip contracts."""
 
     target = Path(path)
@@ -483,11 +512,23 @@ def verify_assessment(path: str | Path) -> dict[str, Any]:
     if len(identity) != 64 or identity != _digest(body):
         raise ChipAssessmentStoreError(f"{ASSESSMENT_INVALID}: internal record digest differs")
     try:
-        _validate_context(record)
+        _validate_context(record, store_conn=store_conn, structural_only=structural_only)
     except Exception as failure:
         raise ChipAssessmentStoreError(f"{ASSESSMENT_INVALID}: {failure}") from failure
+    reservation_forecast_present = any(
+        isinstance(item, Mapping) and item.get("raw_reservation_forecast") is not None
+        for item in record["chip_results"].values()
+    )
+    permission_verified = bool(reservation_forecast_present and not structural_only)
     return {
         "verified": True,
+        "structural_integrity_verified": True,
+        "reservation_permission_evidence_verified": permission_verified,
+        "verification_scope": (
+            "STRUCTURAL_ONLY" if structural_only
+            else "AUTHORITATIVE_FORECASTS" if reservation_forecast_present
+            else "ASSESSMENT_INTEGRITY_ONLY"
+        ),
         "path": str(target),
         "run_id": str(record.get("run_id") or ""),
         "record_sha256": identity,
@@ -496,3 +537,19 @@ def verify_assessment(path: str | Path) -> dict[str, Any]:
         "generation_id": str(record["context"]["generation_id"]),
         "chip_actions": sorted(record["chip_results"]),
     }
+
+
+def verify_assessment(
+    path: str | Path,
+    *,
+    store_conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """Verify a retained assessment; nested forecasts require the authoritative store."""
+
+    return _read_assessment(path, store_conn=store_conn, structural_only=False)
+
+
+def inspect_assessment_structure(path: str | Path) -> dict[str, Any]:
+    """Inspect a retained assessment without establishing production permission."""
+
+    return _read_assessment(path, store_conn=None, structural_only=True)

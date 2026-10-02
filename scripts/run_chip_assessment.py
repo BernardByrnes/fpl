@@ -276,8 +276,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             evaluator_readiness_artifacts=evaluator_readiness_artifacts,
             evaluator_readiness_evidence_verifier=evaluator_readiness_evidence_verifier,
         )
-        receipt = chip_assessment_store.retain_assessment(record, args.evidence_dir)
-        verified = chip_assessment_store.verify_assessment(receipt["path"])
+        receipt = chip_assessment_store.retain_assessment(
+            record, args.evidence_dir, store_conn=conn,
+        )
+        verified = chip_assessment_store.verify_assessment(
+            receipt["path"], store_conn=conn,
+        )
         print(json.dumps({"receipt": receipt, "verification": verified}, sort_keys=True))
         return 0
     except chip_assessment.ChipAssessmentPreflightError as failure:

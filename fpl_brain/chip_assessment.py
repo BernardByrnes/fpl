@@ -86,6 +86,7 @@ def assemble_assessment_record(
     extra_evidence: Mapping[str, Mapping[str, Any]] | None = None,
     reservation: Any | None = None,
     reservation_forecasts: Mapping[str, Mapping[str, Any]] | None = None,
+    store_conn: sqlite3.Connection | None = None,
     reservation_forecast_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
     evaluator_readiness_artifacts: Mapping[str, Mapping[str, Any]] | None = None,
     evaluator_readiness_evidence_verifier: Callable[[str], Mapping[str, Any]] | None = None,
@@ -116,6 +117,7 @@ def assemble_assessment_record(
                     None,
                     current_cutoff=str(context["cutoff"]),
                     evidence_verifier=evaluator_readiness_evidence_verifier,
+                    store_conn=store_conn,
                 )
             except Exception as failure:
                 raise ChipAssessmentPreflightError(
@@ -146,6 +148,11 @@ def assemble_assessment_record(
         raise ChipAssessmentPreflightError(
             f"{crf.FORECAST_IDENTITY_INVALID}: a retained event-opportunity verifier is required"
         )
+    if reservation_forecasts and not isinstance(store_conn, sqlite3.Connection):
+        raise ChipAssessmentPreflightError(
+            f"{crf.FORECAST_IDENTITY_INVALID}: authoritative generation-store access is required "
+            "to verify reservation forecasts"
+        )
     for action, artifact in dict(reservation_forecasts or {}).items():
         row = by_action.get(str(action))
         if action not in cd.PLAYABLE_CHIP_ACTIONS or row is None or not bool(row.get("eligible")):
@@ -174,6 +181,7 @@ def assemble_assessment_record(
                     "expiry_event": None if expiry_event is None else int(expiry_event),
                     "source_identity": source_identity,
                 },
+                store_conn=store_conn,
                 evidence_verifier=reservation_forecast_evidence_verifier,
             )
         except Exception as failure:
@@ -252,6 +260,7 @@ def assemble_assessment_record(
         manager_state=manager_state,
         chip_results=chip_results,
         decision=decision,
+        store_conn=store_conn,
     )
 
 
@@ -570,6 +579,7 @@ def run_production_chip_assessment(
                 reservation = VerifiedReservationCalibration.from_artifact(
                     reservation_calibration_artifact,
                     evidence_verifier=reservation_calibration_evidence_verifier,
+                    store_conn=conn,
                     forecast_evidence_verifier=reservation_forecast_evidence_verifier,
                 )
             except Exception as failure:
@@ -623,6 +633,7 @@ def run_production_chip_assessment(
             extra_evidence=extras,
             reservation=reservation,
             reservation_forecasts=reservation_forecasts,
+            store_conn=conn,
             reservation_forecast_evidence_verifier=reservation_forecast_evidence_verifier,
             evaluator_readiness_artifacts=evaluator_readiness_artifacts,
             evaluator_readiness_evidence_verifier=evaluator_readiness_evidence_verifier,

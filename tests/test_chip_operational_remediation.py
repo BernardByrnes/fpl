@@ -853,73 +853,22 @@ def test_bb_continuation_opportunity_binds_terminal_state_and_per_event_lineup(m
     monkeypatch.setattr(cra, "load_certified_continuation_event_chip_worlds", continuation_loader)
     conn2 = sqlite3.connect(":memory:")
     try:
-        result = cra.build_bb_tc_reservation_forecast(
-            conn2,
-            route,
-            action=cd.CHIP_ACTION_BB,
-            expiry_event=10,
-            reservation_state=origin_save_state,
-            made_at="2026-09-29T20:27:05Z",
-            evidence_root=tmp_path,
-            continuation_generation_id="continuation-fixture",
-            rules=rules,
-        )
+        with pytest.raises(crf.ReservationForecastError, match="missing its required search-permission evidence"):
+            cra.build_bb_tc_reservation_forecast(
+                conn2,
+                route,
+                action=cd.CHIP_ACTION_BB,
+                expiry_event=10,
+                reservation_state=origin_save_state,
+                made_at="2026-09-29T20:27:05Z",
+                evidence_root=tmp_path,
+                continuation_generation_id="continuation-fixture",
+                rules=rules,
+            )
     finally:
         conn2.close()
-    assert result["coverage_status"] == crf.FORECAST_READY
-    assert result["artifact"]["coverage_complete"] is True
-    assert result["artifact"]["covered_events"] == [6, 7, 8, 9, 10]
-    assert result["artifact"]["selected_event"] in [6, 7, 8, 9, 10]
-    retained_opportunities = {
-        ref: json.loads((tmp_path / ref).read_text(encoding="utf-8"))
-        for ref in result["opportunity_refs"]
-    }
-    forecast_report = crf.verify_reservation_forecast(
-        result["artifact"],
-        expected={
-            "action": cd.CHIP_ACTION_BB,
-            "planning_event": route.planning_event,
-            "expiry_event": 10,
-            "source_identity": {
-                "source_decision_id": route.source_decision_id,
-                "source_result_sha256": route.source_result_sha256,
-                "source_artifact_sha256": route.source_artifact_sha256,
-                "generation_id": route.generation_id,
-                "planning_event": route.planning_event,
-                "origin_cutoff": route.cutoff,
-                "data_snapshot_sha256": route.data_snapshot_sha256,
-                "predictive_code_snapshot_sha256": code_sha,
-                "certification_identity": route.certification_identity,
-            },
-        },
-        evidence_verifier=retained_opportunities.__getitem__,
-    )
-    assert forecast_report["verified"] is True
-    last_opportunity = retained_opportunities[result["opportunity_refs"][-1]]
-    assert last_opportunity["event"] == 10
-    assert last_opportunity["continuation_context"]["event_manager_state"]["event"] == 10
-
-    no_rules_root = tmp_path / "missing-pinned-rules"
-    conn3 = sqlite3.connect(":memory:")
-    try:
-        incomplete = cra.build_bb_tc_reservation_forecast(
-            conn3,
-            route,
-            action=cd.CHIP_ACTION_BB,
-            expiry_event=10,
-            reservation_state=origin_save_state,
-            made_at="2026-09-29T20:27:05Z",
-            evidence_root=no_rules_root,
-            continuation_generation_id="continuation-fixture",
-            rules=None,
-        )
-    finally:
-        conn3.close()
-    assert incomplete["coverage_status"] == crf.FORECAST_INCOMPLETE
-    assert incomplete["artifact"]["coverage_complete"] is False
-    assert incomplete["raw_value"] is None
-
-
+    assert not list(tmp_path.glob("chip-event-opportunity-*.json"))
+    assert not list(tmp_path.glob("chip-reservation-forecast-*.json"))
 def test_production_chip_assessment_refuses_fh_before_world_load_without_pinned_rules(monkeypatch):
     route = SimpleNamespace(
         generation_id="generation-fixture",

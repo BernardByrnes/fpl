@@ -258,6 +258,79 @@ def verify_recorded_evaluation(
     return dict(record_binding) == decision_record_binding(expected)
 
 
+def verify_recorded_opportunity_evaluation(
+    conn: sqlite3.Connection,
+    *,
+    source_identity: Mapping[str, Any],
+    evaluation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Re-derive an opportunity's permission from its retained normal generation.
+
+    The opportunity JSON and its evidence-loader callback are never authority.
+    This function loads the named generation from the store, requires the normal
+    four-event product, recomputes its canonical certification identity, and
+    calls the shared permission gate against that generation's pinned snapshot.
+    """
+
+    from . import generation_store as gs
+
+    if not isinstance(source_identity, Mapping) or not isinstance(evaluation, Mapping):
+        raise SearchPermissionRefused(["opportunity permission source/evaluation is not an object"])
+    generation_id = str(source_identity.get("generation_id") or "")
+    try:
+        generation = gs.load_generation(conn, generation_id)
+        if generation.horizon_kind != gs.HORIZON_KIND_FOUR_GW:
+            raise ValueError("opportunity origin is not a normal FOUR_GW generation")
+        expected_events = tuple(range(int(generation.planning_event), int(generation.planning_event) + 4))
+        if tuple(int(event) for event in generation.events) != expected_events:
+            raise ValueError("opportunity origin does not retain the normal four-event horizon")
+        expected = require_search_permission(
+            conn,
+            generation_id,
+            expected_origin_planning_event=int(source_identity.get("planning_event")),
+            expected_origin_cutoff=str(source_identity.get("origin_cutoff") or ""),
+            expected_snapshot_sha256=str(source_identity.get("data_snapshot_sha256") or ""),
+        )
+        per_event = generation.manifest.get("per_event") or {}
+        bundle_identities = {
+            str(int(event)): str((per_event.get(str(int(event))) or {}).get("bundle_identity") or "")
+            for event in generation.events
+        }
+        if not all(bundle_identities.values()):
+            raise ValueError("origin generation omits one or more certified bundle identities")
+        certification_identity = gs._certification_identity_for_bundles(
+            cutoff=str(generation.cutoff),
+            bundle_identities=bundle_identities,
+            snapshot_sha256=str(generation.snapshot.get("sha256") or ""),
+        )
+    except Exception as failure:
+        if isinstance(failure, SearchPermissionRefused):
+            raise
+        raise SearchPermissionRefused(
+            [f"opportunity origin could not be independently verified: {type(failure).__name__}: {failure}"]
+        ) from failure
+
+    authoritative_origin = expected.get("origin") or {}
+    source_matches = (
+        source_identity.get("generation_id") == authoritative_origin.get("generation_id")
+        and int(source_identity.get("planning_event") or -1) == authoritative_origin.get("planning_event")
+        and str(source_identity.get("origin_cutoff") or "") == authoritative_origin.get("cutoff")
+        and source_identity.get("data_snapshot_sha256") == authoritative_origin.get("data_snapshot_sha256")
+        and source_identity.get("predictive_code_snapshot_sha256")
+        == authoritative_origin.get("predictive_code_snapshot_sha256")
+        and source_identity.get("certification_identity") == certification_identity
+    )
+    if not source_matches:
+        raise SearchPermissionRefused(
+            ["opportunity source identity differs from the independently verified origin generation"]
+        )
+    if dict(evaluation) != expected:
+        raise SearchPermissionRefused(
+            ["retained opportunity permission evaluation differs from the authoritative derivation"]
+        )
+    return expected
+
+
 __all__ = [
     "PRODUCTION_SEARCH_PERMISSION_DENIED",
     "SEARCH_PERMISSION_BINDING_SCHEMA",
@@ -267,4 +340,5 @@ __all__ = [
     "evaluation_digest",
     "require_search_permission",
     "verify_recorded_evaluation",
+    "verify_recorded_opportunity_evaluation",
 ]

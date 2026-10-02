@@ -112,7 +112,7 @@ def _build(records, *, expiry_event, product_last=None):
             product_last=product_last,
         )
     )
-    return forecast.build_reservation_forecast(
+    return forecast.build_structural_reservation_forecast(
         action=cd.CHIP_ACTION_TC,
         planning_event=6,
         origin_cutoff="2026-10-01T08:00:00Z",
@@ -135,7 +135,7 @@ def test_raw_forecast_is_content_addressed_and_uses_only_origin_expected_values(
     assert artifact["selected_event"] == 8
     assert artifact["artifact_sha256"] == _sha({key: value for key, value in artifact.items()
                                                 if key != "artifact_sha256"})
-    result = forecast.verify_reservation_forecast(
+    result = forecast.inspect_reservation_forecast_structure(
         artifact,
         expected={
             "action": cd.CHIP_ACTION_TC,
@@ -148,9 +148,15 @@ def test_raw_forecast_is_content_addressed_and_uses_only_origin_expected_values(
     )
     assert result["verified"] is True
     verified = forecast.VerifiedReservationForecast(artifact)
-    verified.validate_for_reservation(
-        action=cd.CHIP_ACTION_TC, planning_event=6, expiry_event=8, state=state,
-    )
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(forecast.ReservationForecastError):
+            verified.validate_for_reservation(
+                action=cd.CHIP_ACTION_TC, planning_event=6, expiry_event=8, state=state,
+                store_conn=conn,
+            )
+    finally:
+        conn.close()
 
 
 def test_complete_nonpositive_forecast_still_binds_earliest_best_event_for_maturation():
@@ -173,11 +179,14 @@ def test_complete_nonpositive_forecast_still_binds_earliest_best_event_for_matur
     artifact = _build(records, expiry_event=8)
     assert artifact["raw_value"] == 0.0
     assert artifact["selected_event"] == 8
-    forecast.verify_reservation_forecast(artifact, expected={})
+    forecast.inspect_reservation_forecast_structure(artifact, expected={})
 
 
 @pytest.mark.parametrize("action", [cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC])
-def test_certified_evaluator_builds_and_retains_future_event_causal_origin(action, tmp_path, monkeypatch):
+def test_fixture_evaluator_builds_structurally_valid_future_event_arms(action, monkeypatch):
+    # This test isolates the evaluator's counterfactual output shape with explicit
+    # fixture permission. Authoritative permission is exercised on a real stored
+    # generation in test_production_search_permission.py.
     source = _source()
     monkeypatch.setattr(
         sp,
@@ -252,36 +261,16 @@ def test_certified_evaluator_builds_and_retains_future_event_causal_origin(actio
         assert play_policy["vice_captain_id"] == expected.candidate_metrics["vice_captain_id"]
     else:
         assert play_policy == policy.as_dict()
-    records = {"opportunity-7.json": event_record}
-    artifact = forecast.build_reservation_forecast(
+    report = forecast.inspect_event_opportunity_structure(
+        event_record,
         action=action,
         planning_event=6,
         origin_cutoff=source["origin_cutoff"],
-        made_at="2026-10-01T08:00:30Z",
-        input_as_of="2026-10-01T08:00:00Z",
-        expiry_event=7,
         source_identity=source,
         reservation_state=reservation_state,
-        opportunity_refs=tuple(records),
-        evidence_verifier=records.__getitem__,
-        coverage_product=_fixture_coverage_product(
-            source, action=action, expiry_event=7, product_last=7,
-        ),
     )
-    retained = calibration.retain_causal_origin_observation(
-        observation_id=f"{action.lower()}-origin-1",
-        forecast_artifact=artifact,
-        evidence_root=tmp_path,
-        evidence_verifier=records.__getitem__,
-    )
-    causal = retained["causal_evidence"]
-    assert retained["selected_event"] == 7
-    assert causal["label"] is None
-    assert causal["source"]["world_identity"] == world_identity
-    assert _sha(causal["counterfactual_pair"]["play"]["lineup"]) == _sha(play_policy)
-    assert _sha(causal["counterfactual_pair"]["save"]["lineup"]) == _sha(save_policy)
-    assert (tmp_path / retained["forecast_ref"]).is_file()
-    assert (tmp_path / retained["causal_evidence_ref"]).is_file()
+    assert report["verification_scope"] == "STRUCTURAL_ONLY"
+    assert event_record["outcome_arms"]["play"]["world_identity"] == world_identity
 
 
 @pytest.mark.parametrize("expiry_event", [9, None])
@@ -296,7 +285,7 @@ def test_short_or_unknown_coverage_remains_unknown_not_zero(expiry_event):
     assert artifact["coverage_status"] == forecast.FORECAST_INCOMPLETE
     assert artifact["raw_value"] is None
     assert artifact["reason_code"] == "CHIP_RESERVATION_FORECAST_COVERAGE_INCOMPLETE"
-    forecast.verify_reservation_forecast(artifact, expected={})
+    forecast.inspect_reservation_forecast_structure(artifact, expected={})
 
 
 def test_unknown_expiry_coverage_product_is_explicitly_incomplete_even_with_future_runs():
@@ -307,7 +296,7 @@ def test_unknown_expiry_coverage_product_is_explicitly_incomplete_even_with_futu
         expiry_event=None,
         product_last=12,
     )
-    artifact = forecast.build_reservation_forecast(
+    artifact = forecast.build_structural_reservation_forecast(
         action=cd.CHIP_ACTION_TC,
         planning_event=6,
         origin_cutoff="2026-10-01T08:00:00Z",
@@ -326,7 +315,7 @@ def test_unknown_expiry_coverage_product_is_explicitly_incomplete_even_with_futu
     assert artifact["coverage_complete"] is False
     assert artifact["raw_value"] is None
     assert artifact["reason_code"] == "CHIP_RESERVATION_FORECAST_COVERAGE_INCOMPLETE"
-    forecast.verify_reservation_forecast(artifact, expected={})
+    forecast.inspect_reservation_forecast_structure(artifact, expected={})
 
 
 def test_complete_prediction_product_with_missing_event_forecast_stays_unknown():
@@ -338,7 +327,7 @@ def test_complete_prediction_product_with_missing_event_forecast_stays_unknown()
         product_last=8,
     )
     source, state, records = _inputs(coverage_product_sha256=product["product_sha256"])
-    artifact = forecast.build_reservation_forecast(
+    artifact = forecast.build_structural_reservation_forecast(
         action=cd.CHIP_ACTION_TC,
         planning_event=6,
         origin_cutoff="2026-10-01T08:00:00Z",
@@ -355,7 +344,7 @@ def test_complete_prediction_product_with_missing_event_forecast_stays_unknown()
     assert artifact["coverage_complete"] is False
     assert artifact["coverage_status"] == forecast.FORECAST_INCOMPLETE
     assert artifact["raw_value"] is None
-    forecast.verify_reservation_forecast(artifact, expected={})
+    forecast.inspect_reservation_forecast_structure(artifact, expected={})
 
 
 def test_prospective_forecast_may_issue_after_cutoff_but_not_use_later_inputs():
@@ -375,7 +364,7 @@ def test_prospective_forecast_may_issue_after_cutoff_but_not_use_later_inputs():
     )
     assert prospective["input_as_of"] == "2026-10-01T08:00:00Z"
     assert prospective["made_at"] == "2026-10-01T08:00:01Z"
-    forecast._verify_event_opportunity(
+    forecast.inspect_event_opportunity_structure(
         prospective, action=cd.CHIP_ACTION_TC, planning_event=6,
         origin_cutoff=source["origin_cutoff"], source_identity=source,
         reservation_state=state,
@@ -409,9 +398,9 @@ def test_forecast_verification_detects_tampering_and_assessment_substitution():
     forged = json.loads(json.dumps(artifact))
     forged["raw_value"] = 0.0
     with pytest.raises(forecast.ReservationForecastError, match="content digest"):
-        forecast.verify_reservation_forecast(forged, expected={})
+        forecast.inspect_reservation_forecast_structure(forged, expected={})
     with pytest.raises(forecast.ReservationForecastError, match="assessment context"):
-        forecast.verify_reservation_forecast(
+        forecast.inspect_reservation_forecast_structure(
             artifact,
             expected={"source_identity": {**source, "generation_id": "other-generation"}},
         )
@@ -433,22 +422,26 @@ def test_forecast_verification_rejects_rehashed_semantic_substitution(field, val
     forged["artifact_sha256"] = _sha({key: item for key, item in forged.items()
                                       if key != "artifact_sha256"})
     with pytest.raises(forecast.ReservationForecastError, match=message):
-        forecast.verify_reservation_forecast(forged, expected={})
+        forecast.inspect_reservation_forecast_structure(forged, expected={})
 
 
 def test_forecast_retention_uses_immutable_digest_path(tmp_path):
     _, _, records = _inputs()
     artifact = _build(records, expiry_event=8)
-    receipt = forecast.retain_reservation_forecast(artifact, tmp_path)
-    assert receipt["artifact_sha256"] == artifact["artifact_sha256"]
-    retained = json.loads((tmp_path / Path(receipt["path"]).name).read_text(encoding="utf-8"))
-    assert retained == artifact
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(forecast.ReservationForecastError):
+            forecast.retain_reservation_forecast(artifact, tmp_path, store_conn=conn)
+    finally:
+        conn.close()
 
 
 def test_assessment_cli_discovers_one_content_addressed_action_forecast(tmp_path):
     _, _, records = _inputs()
     artifact = _build(records, expiry_event=8)
-    forecast.retain_reservation_forecast(artifact, tmp_path)
+    (tmp_path / f"chip-reservation-forecast-{artifact['artifact_sha256']}.json").write_text(
+        json.dumps(artifact, sort_keys=True), encoding="utf-8",
+    )
     conn = sqlite3.connect(":memory:")
     try:
         loaded, verifier = run_chip_assessment._load_reservation_forecast_inputs(tmp_path, conn)
@@ -463,8 +456,10 @@ def test_assessment_cli_refuses_ambiguous_content_addressed_forecasts(tmp_path):
     first = _build(records, expiry_event=8)
     partial = {"event-7": records["event-7"]}
     second = _build(partial, expiry_event=9, product_last=8)
-    forecast.retain_reservation_forecast(first, tmp_path)
-    forecast.retain_reservation_forecast(second, tmp_path)
+    for artifact in (first, second):
+        (tmp_path / f"chip-reservation-forecast-{artifact['artifact_sha256']}.json").write_text(
+            json.dumps(artifact, sort_keys=True), encoding="utf-8",
+        )
     conn = sqlite3.connect(":memory:")
     try:
         with pytest.raises(ValueError, match="multiple retained reservation forecasts found for TC"):
@@ -473,7 +468,7 @@ def test_assessment_cli_refuses_ambiguous_content_addressed_forecasts(tmp_path):
         conn.close()
 
 
-def test_production_assessment_retains_the_verified_raw_forecast_and_arbiter_binding(tmp_path):
+def test_production_assessment_refuses_structural_forecast_without_store_authority():
     source, state, opportunities = _inputs()
     artifact = _build(opportunities, expiry_event=8)
     context = {
@@ -493,12 +488,7 @@ def test_production_assessment_retains_the_verified_raw_forecast_and_arbiter_bin
         evaluator_version="fixture-tc",
         candidate_metrics={"mean_paired_uplift": 8.0},
         uncertainty={"paired_interval_low": 3.0, "paired_interval_high": 10.0},
-        evidence={
-            "planning_event": 6,
-            "horizon_events": list(context["horizon_events"]),
-            "certification_identity": context["certification_identity"],
-            "data_snapshot_sha256": context["data_snapshot_sha256"],
-        },
+        evidence={"planning_event": 6, "horizon_events": list(context["horizon_events"])},
     )
     availability = [{
         "name": cd.CHIP_ACTION_TO_OFFICIAL_NAME[cd.CHIP_ACTION_TC],
@@ -508,19 +498,12 @@ def test_production_assessment_retains_the_verified_raw_forecast_and_arbiter_bin
         "used": False,
         "expired": False,
     }]
-    retained = assessment.assemble_assessment_record(
-        context=context,
-        manager_state=state,
-        availability=availability,
-        evaluations={cd.CHIP_ACTION_TC: evaluation},
-        reservation_forecasts={cd.CHIP_ACTION_TC: artifact},
-        reservation_forecast_evidence_verifier=opportunities.__getitem__,
-    )
-    tc = retained["chip_results"][cd.CHIP_ACTION_TC]
-    assert tc["raw_reservation_forecast"]["artifact_sha256"] == artifact["artifact_sha256"]
-    metrics = retained["decision"]["candidate_metrics"]
-    assert metrics["selected_chip_action"] == cd.CHIP_ACTION_TC
-    assert metrics["raw_reservation_forecast_sha256"] == artifact["artifact_sha256"]
-    assert metrics["raw_reservation_value"] == 6.0
-    receipt = assessment_store.retain_assessment(retained, tmp_path)
-    assert assessment_store.verify_assessment(receipt["path"])["verified"] is True
+    with pytest.raises(assessment.ChipAssessmentPreflightError, match="authoritative generation-store access"):
+        assessment.assemble_assessment_record(
+            context=context,
+            manager_state=state,
+            availability=availability,
+            evaluations={cd.CHIP_ACTION_TC: evaluation},
+            reservation_forecasts={cd.CHIP_ACTION_TC: artifact},
+            reservation_forecast_evidence_verifier=opportunities.__getitem__,
+        )

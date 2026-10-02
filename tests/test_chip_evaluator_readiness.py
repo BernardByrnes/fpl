@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime
 from dataclasses import replace
 from types import SimpleNamespace
@@ -14,6 +15,24 @@ from fpl_brain import chip_evaluator_readiness as readiness
 from fpl_brain import chip_free_hit as fh
 from fpl_brain import chip_reservation_calibration as crc
 from fpl_brain import chip_wildcard as wc
+
+
+# This file tests action-specific readiness criteria using simulated causal
+# observations. It does not grant production authority; the real origin-store
+# permission checks are tested separately.
+_SIMULATED_STORE_CONN = sqlite3.connect(":memory:")
+
+
+@pytest.fixture(autouse=True)
+def _supply_store_context_for_simulated_readiness(monkeypatch):
+    for name in ("build_evaluator_readiness", "verify_evaluator_readiness", "apply_verified_readiness"):
+        original = getattr(readiness, name)
+
+        def wrapped(*args, __original=original, **kwargs):
+            kwargs.setdefault("store_conn", _SIMULATED_STORE_CONN)
+            return __original(*args, **kwargs)
+
+        monkeypatch.setattr(readiness, name, wrapped)
 
 
 def _fixture_rows(action: str = cd.CHIP_ACTION_BB, evaluator_version: str = "bb-fixture-v1"):
@@ -121,7 +140,7 @@ def test_failed_evaluator_readiness_is_independent_of_calibrated_reservation():
 def _install_fixture_causal_validator(monkeypatch):
     """Simulate the verified causal-ledger boundary; never production evidence."""
 
-    def validate(raw, *, evidence_verifier):
+    def validate(raw, *, evidence_verifier, store_conn=None):
         evidence_verifier(str(raw["causal_evidence_ref"]))
         parse = lambda name: datetime.fromisoformat(str(raw[name]).replace("Z", "+00:00"))
         return SimpleNamespace(
@@ -389,8 +408,10 @@ def test_historical_replay_cannot_establish_evaluator_readiness(monkeypatch):
     _install_fixture_causal_validator(monkeypatch)
     prospective_validator = crc.validate_observation
 
-    def historical_validator(raw, *, evidence_verifier):
-        row = prospective_validator(raw, evidence_verifier=evidence_verifier)
+    def historical_validator(raw, *, evidence_verifier, store_conn=None):
+        row = prospective_validator(
+            raw, evidence_verifier=evidence_verifier, store_conn=store_conn,
+        )
         return SimpleNamespace(**{**vars(row), "forecast_mode": "HISTORICAL_REPLAY"})
 
     monkeypatch.setattr(crc, "validate_observation", historical_validator)
