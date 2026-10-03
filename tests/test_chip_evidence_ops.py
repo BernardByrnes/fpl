@@ -283,7 +283,8 @@ def _identity(tmp_path: Path, db_path: Path) -> dict:
 def _raw_capture_set(tmp_path: Path, *, finished=True, data_checked=True,
                      fixture_finished=True, players=(1,), run_id=None,
                      observed_base="2026-10-01T10:10:00Z", run_started_at=None,
-                     run_finished_at=None, conflicting_archive_time=False):
+                     run_finished_at=None, conflicting_archive_time=False,
+                     extra_fixture_rows=()):
     db_path = tmp_path / "fpl.db"
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -338,6 +339,7 @@ def _raw_capture_set(tmp_path: Path, *, finished=True, data_checked=True,
         "finished": bool(fixture_finished), "finished_provisional": True,
         "team_h": 1, "team_a": 2,
     }]
+    fixture_payload.extend(dict(row) for row in extra_fixture_rows)
     live = {"elements": [
         {"id": player, "stats": {"minutes": 0, "total_points": 0}}
         for player in players
@@ -736,6 +738,48 @@ def test_official_outcome_archive_requires_event_and_fixture_finality(
         conn.close()
 
 
+def test_official_outcome_archive_rejects_unparseable_target_fixture_instead_of_dropping_it(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path,
+        extra_fixture_rows=({"event": 2, "started": False, "finished": False},),
+    )
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="fixture.*id|id.*fixture|malformed"):
+            ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_official_outcome_archive_rejects_duplicate_raw_target_fixture_identity(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path,
+        extra_fixture_rows=({
+            "id": 200, "event": 2, "started": False, "finished": False,
+            "finished_provisional": False, "team_h": 1, "team_a": 2,
+        },),
+    )
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="duplicate|repeat"):
+            ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_official_outcome_archive_preserves_explicit_null_event_schedule_rows(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path,
+        extra_fixture_rows=({
+            "id": 201, "event": None, "started": False, "finished": False,
+            "finished_provisional": False, "team_h": 1, "team_a": 2,
+        },),
+    )
+    try:
+        archive = ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+        assert [row.id for row in archive["parsed"]["fixtures"]] == [200]
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("options", "message"),
     [
@@ -835,6 +879,188 @@ def test_capture_retry_recovers_receipt_without_duplicate_rows_and_later_capture
         conn.close()
 
 
+def test_capture_retry_rejects_receipt_with_resealed_partial_required_player_set(tmp_path, monkeypatch):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "bb-partial-receipt", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt = ops.capture_outcome(conn, **kwargs)
+        path = ops._metadata_root(evidence_root) / f"capture-{receipt['operation_id']}.json"
+        source = json.loads(path.read_text(encoding="utf-8"))
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["required_player_ids"] = [1]
+        body["captures"] = [row for row in body["captures"] if int(row["player_id"]) == 1]
+        body["missing_player_ids"] = []
+        path.write_text(json.dumps(ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)), encoding="utf-8")
+
+        with pytest.raises(ops.ChipEvidenceError, match="player set|policy|required.*player"):
+            ops.capture_outcome(conn, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_operation_identity_separates_bb_and_tc_for_same_observation_source():
+    common = ("origin", "same-observation", 2, 7, "payload", "2026-10-01T10:00:00Z")
+    assert ops._capture_operation_id(*common, action="BB") != ops._capture_operation_id(*common, action="TC")
+
+
+def test_capture_retry_rejects_receipt_for_wrong_action(tmp_path, monkeypatch):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "TC", "observation_id": "same-bb-tc-observation", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt = ops.capture_outcome(conn, **kwargs)
+        assert receipt["action"] == "TC"
+        tc_path = ops._metadata_root(evidence_root) / f"capture-{receipt['operation_id']}.json"
+        source = json.loads(tc_path.read_text(encoding="utf-8"))
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["action"] = "BB"
+        tc_path.write_text(json.dumps(ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)), encoding="utf-8")
+        with pytest.raises(ops.ChipEvidenceError, match="action|operation|receipt"):
+            ops.capture_outcome(conn, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_retry_rejects_valid_receipt_copied_under_different_fetch_operation_key(
+    tmp_path, monkeypatch,
+):
+    from datetime import timedelta
+
+    conn, db_path, raw_root, run_a = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    base_kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "same-fetch-binding-observation", "realization_event": 2,
+        "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt_a = ops.capture_outcome(conn, **{**base_kwargs, "fetch_run_id": run_a})
+        observed_at = "2026-10-01T11:10:00Z"
+        observed = ops._parse_utc(observed_at, name="second fetch observation")
+        started_at = (observed + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        finished_at = (observed + timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
+        run_b = int(conn.execute(
+            "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?, 'success','test',2,?,?,?)",
+            (started_at, finished_at, json.dumps([
+                "bootstrap-static", "fixtures", "event/2/live",
+            ]), "[]", str(raw_root.resolve())),
+        ).lastrowid)
+        bootstrap = {
+            "events": [{"id": 2, "name": "GW2", "finished": True, "data_checked": True}],
+            "teams": [{"id": 1, "name": "Team"}],
+            "elements": [
+                {"id": player, "web_name": f"P{player}", "team": 1, "element_type": 3}
+                for player in (1, 2)
+            ],
+        }
+        fixtures = [{
+            "id": 200, "event": 2, "started": True, "finished": True,
+            "finished_provisional": True, "team_h": 1, "team_a": 2,
+        }]
+        live = {"elements": [
+            {"id": player, "stats": {"minutes": 0, "total_points": 0}}
+            for player in (1, 2)
+        ]}
+        for source, payload, source_event in (
+            ("bootstrap_static", bootstrap, None),
+            ("fixtures", fixtures, 2),
+            ("event_live_2", live, 2),
+        ):
+            raw_archive.archive_raw_capture(
+                raw_root, source=source, observed_at=observed_at,
+                body=json.dumps(payload, separators=(",", ":")).encode(),
+                event=source_event, run_id=run_b,
+            )
+        conn.commit()
+        archive_b = ops._official_event_archive(
+            conn, raw_root=raw_root, fetch_run_id=run_b, event=2,
+        )
+        operation_b = ops._capture_operation_id(
+            str(parent["origin_id"]), base_kwargs["observation_id"], 2, run_b,
+            str(archive_b["records"]["event_live"]["payload_sha256"]),
+            str(archive_b["available_at"]), action="BB",
+        )
+        requested_path = ops._metadata_root(evidence_root) / f"capture-{operation_b}.json"
+        retained_a_path = ops._metadata_root(evidence_root) / f"capture-{receipt_a['operation_id']}.json"
+        requested_path.write_bytes(retained_a_path.read_bytes())
+
+        with pytest.raises(ops.ChipEvidenceError, match="requested source operation"):
+            ops.capture_outcome(conn, **{**base_kwargs, "fetch_run_id": run_b})
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_retry_refuses_legacy_action_unbound_receipt_key_without_rewriting_it(
+    tmp_path, monkeypatch,
+):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "legacy-capture-observation", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt = ops.capture_outcome(conn, **kwargs)
+        source_path = ops._metadata_root(evidence_root) / f"capture-{receipt['operation_id']}.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        legacy_id = ops._sha256([
+            str(receipt["origin_id"]), str(receipt["observation_id"]), 2, run_id,
+            str(receipt["raw_sources"]["event_live"]["payload_sha256"]),
+            str(receipt["available_at"]),
+        ])
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["operation_id"] = legacy_id
+        legacy_receipt = ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)
+        legacy_path = ops._metadata_root(evidence_root) / f"capture-{legacy_id}.json"
+        legacy_bytes = json.dumps(legacy_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        legacy_path.write_bytes(legacy_bytes)
+
+        with pytest.raises(ops.ChipEvidenceError, match="legacy action-unbound.*unsupported"):
+            ops.capture_outcome(conn, **kwargs)
+        assert legacy_path.read_bytes() == legacy_bytes
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
 def test_partial_unreceipted_capture_refuses_instead_of_completing_from_a_subset(tmp_path, monkeypatch):
     conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
     evidence_root = tmp_path / "evidence"
@@ -882,7 +1108,7 @@ def _overlapping_capture_case(tmp_path, monkeypatch):
     identities = {}
 
     def load_forecast(_conn, *, identity, action, observation_id):
-        if dict(identity) != identities[observation_id] or action != "BB":
+        if dict(identity) != identities[observation_id] or action not in {"BB", "TC"}:
             raise ops.ChipEvidenceError("test forecast origin does not match its own retained identity")
         return ({}, None, None, {}, {}, parents[observation_id])
 
@@ -962,6 +1188,33 @@ def test_capture_outcome_reuses_verified_rows_from_overlapping_origin_same_final
         assert path_b.read_bytes() == json.dumps(receipt_b, ensure_ascii=False, allow_nan=False,
             sort_keys=True, separators=(",", ":")).encode("utf-8")
         assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 16
+    finally:
+        conn.close()
+
+
+def test_bb_and_tc_captures_with_same_observation_have_distinct_receipts_and_share_final_rows(
+    tmp_path, monkeypatch,
+):
+    conn, _db_path, _raw_root, _run_id, evidence_root, kwargs_for = _overlapping_capture_case(
+        tmp_path, monkeypatch,
+    )
+    kwargs_bb = kwargs_for(suffix="a", observation_id="shared-bb-tc-observation")
+    kwargs_tc = {**kwargs_bb, "action": "TC"}
+    try:
+        receipt_bb = ops.capture_outcome(conn, **kwargs_bb)
+        path_bb = ops._metadata_root(evidence_root) / f"capture-{receipt_bb['operation_id']}.json"
+        bytes_bb = path_bb.read_bytes()
+
+        receipt_tc = ops.capture_outcome(conn, **kwargs_tc)
+        path_tc = ops._metadata_root(evidence_root) / f"capture-{receipt_tc['operation_id']}.json"
+        assert receipt_bb["action"] == "BB"
+        assert receipt_tc["action"] == "TC"
+        assert receipt_bb["operation_id"] != receipt_tc["operation_id"]
+        assert path_bb.read_bytes() == bytes_bb
+        assert len(receipt_bb["captures"]) == len(receipt_tc["captures"]) == 15
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
+        assert ops.capture_outcome(conn, **kwargs_tc) == receipt_tc
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
     finally:
         conn.close()
 
@@ -1170,7 +1423,7 @@ def test_maturation_partial_or_ambiguous_artifacts_refuse_to_finalize_again(
     retained_parent = {
         "origin_id": "origin-fixture",
         "receipt": {"selected_event": 5, "expiry_event": 5},
-        "causal": {},
+        "causal": _forecast_parent(event=5, required=(1,))["causal"],
     }
     monkeypatch.setattr(ops, "_required_identity", lambda **_kwargs: identity)
     monkeypatch.setattr(
@@ -1372,6 +1625,14 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
             expiry_event=5,
             product_generation_id=continuation.generation_id,
         )
+        other_action = "TC" if action == "BB" else "BB"
+        other_coverage_product = crf.build_reservation_coverage_product(
+            conn,
+            action=other_action,
+            source_identity=ops._source_identity(route, loaded_generation),
+            expiry_event=5,
+            product_generation_id=continuation.generation_id,
+        )
         from datetime import timedelta
 
         current_state_at = ops._utc_now()
@@ -1399,7 +1660,12 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
             conn, route=route, generation=loaded_generation,
             coverage_product=coverage_product, expiry_event=5,
         )
+        other_requirements = ops._world_cache_requirements(
+            conn, route=route, generation=loaded_generation,
+            coverage_product=other_coverage_product, expiry_event=5,
+        )
         assert [row["event"] for row in requirements] == [5]
+        assert [row["cache_key"] for row in other_requirements] == [row["cache_key"] for row in requirements]
         requirement = requirements[0]
         player_ids = requirement["player_ids"]
         matrix = {
@@ -1563,6 +1829,25 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         retained_publication = ops._read_json(publication_path)
         pre_final_issued_at = retained_publication["issued_at"]
 
+        # The same verified origin may retain separate BB and TC forecasts at
+        # one observation key, plus a second TC observation for substitution
+        # regression coverage. All are issued while GW5 is still prospective.
+        alternate_same_observation = ops.forecast_origin(
+            conn, **identity, action=other_action, expiry_event=5,
+            observation_id=observation_id,
+            continuation_generation_id=continuation.generation_id,
+            cache_dir=cache_dir,
+        )
+        second_observation_id = f"{other_action.lower()}-fixture-observation-2"
+        alternate_second_observation = ops.forecast_origin(
+            conn, **identity, action=other_action, expiry_event=5,
+            observation_id=second_observation_id,
+            continuation_generation_id=continuation.generation_id,
+            cache_dir=cache_dir,
+        )
+        assert alternate_same_observation["action"] == other_action
+        assert alternate_second_observation["selected_event"] == 5
+
         # Official finality now exists. Recovery is allowed only from the
         # verified publication witness and must not call the forecast producer.
         final_at = ops._utc_now()
@@ -1673,6 +1958,26 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         assert capture["raw_observed_at"] == raw_observed_at
         assert capture["available_at"] == run_finished_at
         assert capture["captured_at"] == run_finished_at
+        alternate_capture = ops.capture_outcome(
+            conn,
+            **identity,
+            action=other_action,
+            observation_id=observation_id,
+            realization_event=5,
+            fetch_run_id=run_id,
+            raw_root=raw_root,
+        )
+        second_capture = ops.capture_outcome(
+            conn,
+            **identity,
+            action=other_action,
+            observation_id=second_observation_id,
+            realization_event=5,
+            fetch_run_id=run_id,
+            raw_root=raw_root,
+        )
+        assert alternate_capture["action"] == second_capture["action"] == other_action
+        assert alternate_capture["captures"] == capture["captures"]
 
         finalize_calls = []
         original_finalize = cal.finalize_causal_observation
@@ -1684,30 +1989,29 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         monkeypatch.setattr(cal, "finalize_causal_observation", count_finalization)
         key = ops._maturation_key(f"{action.lower()}-fixture-observation-1", 5)
         receipt_path = ops._metadata_root(identity["evidence_root"]) / f"maturation-{key}.json"
-        if action == "BB":
-            original_write = ops._write_new_json
-            failed_receipt = False
+        original_write = ops._write_new_json
+        failed_receipt = False
 
-            def fail_maturation_receipt_once(path, value):
-                nonlocal failed_receipt
-                if Path(path) == receipt_path and not failed_receipt:
-                    failed_receipt = True
-                    raise OSError("injected maturation-receipt publication failure")
-                return original_write(path, value)
+        def fail_maturation_receipt_once(path, value):
+            nonlocal failed_receipt
+            if Path(path) == receipt_path and not failed_receipt:
+                failed_receipt = True
+                raise OSError("injected maturation-receipt publication failure")
+            return original_write(path, value)
 
-            monkeypatch.setattr(ops, "_write_new_json", fail_maturation_receipt_once)
-            with pytest.raises(OSError, match="injected maturation-receipt"):
-                ops.mature_observation(
-                    conn,
-                    **identity,
-                    action=action,
-                    observation_id=f"{action.lower()}-fixture-observation-1",
-                    realization_event=5,
-                )
-            assert failed_receipt is True
-            assert len(finalize_calls) == 1
-            assert not receipt_path.exists()
-            monkeypatch.setattr(ops, "_write_new_json", original_write)
+        monkeypatch.setattr(ops, "_write_new_json", fail_maturation_receipt_once)
+        with pytest.raises(OSError, match="injected maturation-receipt"):
+            ops.mature_observation(
+                conn,
+                **identity,
+                action=action,
+                observation_id=f"{action.lower()}-fixture-observation-1",
+                realization_event=5,
+            )
+        assert failed_receipt is True
+        assert len(finalize_calls) == 1
+        assert not receipt_path.exists()
+        monkeypatch.setattr(ops, "_write_new_json", original_write)
 
         recovery_started_at = ops._parse_utc(ops._utc_now(), name="test maturation/recovery start")
         matured = ops.mature_observation(
@@ -1724,6 +2028,71 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         assert matured["calibration_row"]["label_available_at"] == run_finished_at
         assert ops._parse_utc(matured["receipt"]["matured_at"], name="matured_at") >= recovery_started_at
         assert matured["calibration_row"]["realized_value"] == 0.0
+        alternate_matured = ops.mature_observation(
+            conn,
+            **identity,
+            action=other_action,
+            observation_id=second_observation_id,
+            realization_event=5,
+        )
+        alternate_receipt_path = ops._metadata_root(identity["evidence_root"]) / (
+            f"maturation-{ops._maturation_key(second_observation_id, 5)}.json"
+        )
+        assert alternate_matured["receipt"]["observation_id"] == second_observation_id
+        assert alternate_matured["receipt"]["action"] == other_action
+        assert len(finalize_calls) == 2
+
+        def evidence_snapshot():
+            import hashlib
+
+            return {
+                str(path.relative_to(identity["evidence_root"])): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in Path(identity["evidence_root"]).rglob("*") if path.is_file()
+            }
+
+        artifacts_before_wrong_action = evidence_snapshot()
+        rows_before_wrong_action = conn.execute(
+            "SELECT COUNT(*) FROM outcome_observation_captures"
+        ).fetchone()[0]
+        # The deterministic receipt key omits action, so the existing receipt
+        # must be bound to the action explicitly requested by this caller.
+        with pytest.raises(ops.ChipEvidenceError, match="requested observation/action/event/origin/key"):
+            ops.mature_observation(
+                conn,
+                **identity,
+                action=other_action,
+                observation_id=observation_id,
+                realization_event=5,
+            )
+        assert len(finalize_calls) == 2
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == rows_before_wrong_action
+        assert evidence_snapshot() == artifacts_before_wrong_action
+
+        primary_receipt_bytes = receipt_path.read_bytes()
+        receipt_path.write_bytes(alternate_receipt_path.read_bytes())
+        artifacts_before_wrong_observation = evidence_snapshot()
+        rows_before_wrong_observation = conn.execute(
+            "SELECT COUNT(*) FROM outcome_observation_captures"
+        ).fetchone()[0]
+        try:
+            # A valid receipt for another observation cannot be substituted
+            # under this caller's canonical deterministic receipt path.
+            with pytest.raises(ops.ChipEvidenceError, match="requested observation/action/event/origin/key"):
+                ops.mature_observation(
+                    conn,
+                    **identity,
+                    action=action,
+                    observation_id=observation_id,
+                    realization_event=5,
+                )
+            assert evidence_snapshot() == artifacts_before_wrong_observation
+            assert len(finalize_calls) == 2
+            assert conn.execute(
+                "SELECT COUNT(*) FROM outcome_observation_captures"
+            ).fetchone()[0] == rows_before_wrong_observation
+        finally:
+            receipt_path.write_bytes(primary_receipt_bytes)
+
         retried = ops.mature_observation(
             conn,
             **identity,
@@ -1733,7 +2102,27 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         )
         assert retried["receipt"] == matured["receipt"]
         handoff = ops.load_verified_calibration_handoff(conn, **identity)
-        assert len(handoff) == 1
-        assert handoff[0]["observation_id"] == f"{action.lower()}-fixture-observation-1"
+        assert len(handoff) == 2
+        assert {row["observation_id"] for row in handoff} == {
+            f"{action.lower()}-fixture-observation-1", second_observation_id,
+        }
+        misplaced_path = ops._metadata_root(identity["evidence_root"]) / "maturation-wrong-name.json"
+        valid_alt_receipt_bytes = alternate_receipt_path.read_bytes()
+        misplaced_path.write_bytes(valid_alt_receipt_bytes)
+        artifacts_before_misnamed_handoff = evidence_snapshot()
+        rows_before_misnamed_handoff = conn.execute(
+            "SELECT COUNT(*) FROM outcome_observation_captures"
+        ).fetchone()[0]
+        try:
+            with pytest.raises(ops.ChipEvidenceError, match="filename does not match"):
+                ops.load_verified_calibration_handoff(conn, **identity)
+            assert evidence_snapshot() == artifacts_before_misnamed_handoff
+            assert conn.execute(
+                "SELECT COUNT(*) FROM outcome_observation_captures"
+            ).fetchone()[0] == rows_before_misnamed_handoff
+            assert len(finalize_calls) == 2
+        finally:
+            misplaced_path.unlink()
+        assert alternate_receipt_path.read_bytes() == valid_alt_receipt_bytes
     finally:
         conn.close()

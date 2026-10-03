@@ -2220,8 +2220,43 @@ def _official_event_archive(
     event_row = event_raw_rows[0]
     if event_row.get("finished") not in (True, 1) or event_row.get("data_checked") not in (True, 1):
         raise ChipEvidenceError("archived official bootstrap does not mark the target event finished and data-checked")
-    parsed_fixtures = parsers.parse_fixtures(fixture_payload if isinstance(fixture_payload, list) else [])
+    if not isinstance(fixture_payload, list) or not fixture_payload:
+        raise ChipEvidenceError("archived official fixtures are not a non-empty row list")
+    raw_target_fixture_ids: list[int] = []
+    seen_fixture_ids: set[int] = set()
+    for index, row in enumerate(fixture_payload):
+        if not isinstance(row, Mapping):
+            raise ChipEvidenceError(f"archived official fixture row {index} is malformed and cannot be classified")
+        fixture_id = row.get("id")
+        if type(fixture_id) is not int or fixture_id <= 0:
+            raise ChipEvidenceError(
+                f"archived official fixture row {index} has a missing or invalid id; fixture coverage is ambiguous"
+            )
+        if fixture_id in seen_fixture_ids:
+            raise ChipEvidenceError(f"archived official fixture rows repeat fixture id {fixture_id}")
+        seen_fixture_ids.add(fixture_id)
+        if "event" not in row:
+            raise ChipEvidenceError(
+                f"archived official fixture {fixture_id} has no event field and cannot be classified"
+            )
+        raw_event = row.get("event")
+        if raw_event is not None and (type(raw_event) is not int or raw_event <= 0):
+            raise ChipEvidenceError(f"archived official fixture {fixture_id} has an invalid event value")
+        if raw_event == int(event):
+            for flag_name in ("started", "finished"):
+                flag_value = row.get(flag_name)
+                if not (type(flag_value) is bool or type(flag_value) is int and flag_value in (0, 1)):
+                    raise ChipEvidenceError(
+                        f"archived target fixture {fixture_id} has a missing or invalid {flag_name} flag"
+                    )
+            raw_target_fixture_ids.append(fixture_id)
+    parsed_fixtures = parsers.parse_fixtures(fixture_payload)
     event_fixtures = [row for row in parsed_fixtures if row.event == int(event)]
+    parsed_target_fixture_ids = [int(row.id) for row in event_fixtures]
+    if parsed_target_fixture_ids != raw_target_fixture_ids:
+        raise ChipEvidenceError(
+            "parsed target-event fixture identities do not cover the validated raw official fixture rows"
+        )
     if not event_fixtures:
         raise ChipEvidenceError("archived official fixtures contain no fixtures for the target event")
     fixture_ids = [int(row.id) for row in event_fixtures]
@@ -2265,9 +2300,14 @@ def _capture_operation_id(
     fetch_run_id: int,
     payload_sha256: str,
     captured_at: str,
+    *,
+    action: str,
 ) -> str:
+    canonical_action = str(action).upper()
+    if canonical_action not in {"BB", "TC"}:
+        raise ChipEvidenceError("capture operation identity requires canonical BB or TC action")
     return _sha256([
-        str(origin_id), str(observation_id), int(event), int(fetch_run_id),
+        str(origin_id), canonical_action, str(observation_id), int(event), int(fetch_run_id),
         str(payload_sha256), str(captured_at),
     ])
 
@@ -2277,6 +2317,12 @@ def _verify_capture_receipt(
     receipt: Mapping[str, Any],
     *,
     expected_identity_sha256: str,
+    expected_origin_id: str,
+    expected_action: str,
+    expected_observation_id: str,
+    expected_realization_event: int,
+    expected_required_player_ids: Sequence[int],
+    expected_operation_id: str,
     evidence_root: str | Path,
 ) -> dict[str, Any]:
     from . import outcome_ledger as ol
@@ -2284,6 +2330,22 @@ def _verify_capture_receipt(
     _verify_seal(receipt, schema=CAPTURE_RECEIPT_SCHEMA)
     if str(receipt.get("identity_sha256") or "") != expected_identity_sha256:
         raise ChipEvidenceError("capture receipt is bound to another explicit origin identity")
+    if (
+        str(receipt.get("origin_id") or "") != str(expected_origin_id)
+        or str(receipt.get("action") or "") != str(expected_action)
+        or str(receipt.get("observation_id") or "") != str(expected_observation_id)
+        or int(receipt.get("realization_event") or -1) != int(expected_realization_event)
+    ):
+        raise ChipEvidenceError("capture receipt differs from the verified origin/action/observation/event request")
+    required_ids_value = receipt.get("required_player_ids")
+    expected_required_ids = [int(value) for value in expected_required_player_ids]
+    if (
+        not isinstance(required_ids_value, list)
+        or any(type(value) is not int for value in required_ids_value)
+        or required_ids_value != expected_required_ids
+    ):
+        raise ChipEvidenceError("capture receipt player set differs from its verified forecast policy")
+    required_ids = list(required_ids_value)
     archive = _official_event_archive(
         conn,
         raw_root=str(receipt.get("raw_root") or ""),
@@ -2304,9 +2366,21 @@ def _verify_capture_receipt(
         int(receipt.get("fetch_run_id") or -1),
         str(live_record.get("payload_sha256") or ""),
         str(archive.get("available_at") or ""),
+        action=str(expected_action),
     )
     if str(receipt.get("operation_id") or "") != operation_id:
+        legacy_operation_id = _sha256([
+            str(receipt.get("origin_id") or ""), str(receipt.get("observation_id") or ""),
+            int(receipt.get("realization_event") or -1), int(receipt.get("fetch_run_id") or -1),
+            str(live_record.get("payload_sha256") or ""), str(archive.get("available_at") or ""),
+        ])
+        if str(receipt.get("operation_id") or "") == legacy_operation_id:
+            raise ChipEvidenceError(
+                "legacy action-unbound capture receipt is preserved but unsupported for reuse or proof"
+            )
         raise ChipEvidenceError("capture receipt operation id does not reproduce from its source identity")
+    if operation_id != str(expected_operation_id):
+        raise ChipEvidenceError("capture receipt operation id differs from the explicit requested source operation")
     if (
         str(receipt.get("raw_observed_at") or "") != str(archive.get("observed_at") or "")
         or str(receipt.get("available_at") or "") != str(archive.get("available_at") or "")
@@ -2340,7 +2414,6 @@ def _verify_capture_receipt(
         if player_id in raw_by_player:
             raise ChipEvidenceError(f"archived event-live payload repeats player id {player_id}")
         raw_by_player[player_id] = item
-    required_ids = [int(value) for value in receipt.get("required_player_ids") or ()]
     expected_captures: dict[int, tuple[str, dict[str, Any]]] = {}
     for player_id in required_ids:
         raw_item = raw_by_player.get(player_id)
@@ -2505,6 +2578,16 @@ def _verified_shared_capture_digests(
             conn,
             candidate,
             expected_identity_sha256=_sha256(origin_identity),
+            expected_origin_id=origin_id,
+            expected_action=action,
+            expected_observation_id=observation_id,
+            expected_realization_event=int(event),
+            expected_required_player_ids=policy_player_ids,
+            expected_operation_id=_capture_operation_id(
+                origin_id, observation_id, int(event), int(fetch_run_id),
+                str(expected_live.get("payload_sha256") or ""), str(archive.get("available_at") or ""),
+                action=action,
+            ),
             evidence_root=evidence_root,
         )
         candidate_live = (candidate.get("raw_sources") or {}).get("event_live") or {}
@@ -2595,13 +2678,29 @@ def capture_outcome(
     operation_id = _capture_operation_id(
         parent["origin_id"], observation_id, int(realization_event), int(fetch_run_id),
         str(live_record["payload_sha256"]), archive["available_at"],
+        action=action,
     )
     receipt_path = _metadata_root(evidence_root) / f"capture-{operation_id}.json"
+    legacy_operation_id = _sha256([
+        str(parent["origin_id"]), str(observation_id), int(realization_event), int(fetch_run_id),
+        str(live_record["payload_sha256"]), str(archive["available_at"]),
+    ])
+    legacy_receipt_path = _metadata_root(evidence_root) / f"capture-{legacy_operation_id}.json"
+    legacy_intent_path = _metadata_root(evidence_root) / f"capture-intent-{legacy_operation_id}.json"
     with _operation_lock(evidence_root, f"capture-{operation_id}"):
+        if legacy_receipt_path.exists() or legacy_intent_path.exists():
+            raise ChipEvidenceError(
+                "legacy action-unbound capture artifact is preserved but unsupported for retry, reuse or proof"
+            )
         if receipt_path.exists():
             existing = _read_json(receipt_path)
             _verify_capture_receipt(
                 conn, existing, expected_identity_sha256=_sha256(identity),
+                expected_origin_id=str(parent["origin_id"]), expected_action=action,
+                expected_observation_id=str(observation_id),
+                expected_realization_event=int(realization_event),
+                expected_required_player_ids=required_players,
+                expected_operation_id=operation_id,
                 evidence_root=evidence_root,
             )
             return existing
@@ -2718,6 +2817,11 @@ def capture_outcome(
                     conn,
                     receipt,
                     expected_identity_sha256=_sha256(identity),
+                    expected_origin_id=str(parent["origin_id"]), expected_action=action,
+                    expected_observation_id=str(observation_id),
+                    expected_realization_event=int(realization_event),
+                    expected_required_player_ids=required_players,
+                    expected_operation_id=operation_id,
                     evidence_root=evidence_root,
                 )
 
@@ -2745,7 +2849,12 @@ def capture_outcome(
 
         _write_new_json(receipt_path, receipt)
         _verify_capture_receipt(
-            conn, receipt, expected_identity_sha256=_sha256(identity), evidence_root=evidence_root,
+            conn, receipt, expected_identity_sha256=_sha256(identity),
+            expected_origin_id=str(parent["origin_id"]), expected_action=action,
+            expected_observation_id=str(observation_id),
+            expected_realization_event=int(realization_event),
+            expected_required_player_ids=required_players, expected_operation_id=operation_id,
+            evidence_root=evidence_root,
         )
         return receipt
 
@@ -2796,6 +2905,7 @@ def _verified_capture_receipts_for_observation(
     observation_id: str,
     action: str,
     event: int,
+    required_player_ids: Sequence[int],
 ) -> list[dict[str, Any]]:
     receipts: list[dict[str, Any]] = []
     for path in _metadata_root(evidence_root).glob("capture-*.json"):
@@ -2809,8 +2919,25 @@ def _verified_capture_receipts_for_observation(
             or str(value.get("origin_id") or "") != str(origin_id)
         ):
             continue
+        if path.name != f"capture-{str(value.get('operation_id') or '')}.json":
+            raise ChipEvidenceError("capture receipt filename does not bind its retained operation id")
+        source_archive = _official_event_archive(
+            conn, raw_root=str(value.get("raw_root") or ""),
+            fetch_run_id=int(value.get("fetch_run_id") or -1), event=int(event),
+        )
+        source_live = source_archive["records"]["event_live"]
+        expected_operation_id = _capture_operation_id(
+            str(origin_id), str(observation_id), int(event), int(value.get("fetch_run_id") or -1),
+            str(source_live.get("payload_sha256") or ""), str(source_archive.get("available_at") or ""),
+            action=str(action),
+        )
         _verify_capture_receipt(
-            conn, value, expected_identity_sha256=identity_sha256, evidence_root=evidence_root,
+            conn, value, expected_identity_sha256=identity_sha256,
+            expected_origin_id=origin_id, expected_action=action,
+            expected_observation_id=observation_id,
+            expected_realization_event=int(event),
+            expected_required_player_ids=required_player_ids, evidence_root=evidence_root,
+            expected_operation_id=expected_operation_id,
         )
         receipts.append(value)
     if not receipts:
@@ -2909,28 +3036,53 @@ def _verify_maturation_receipt(
     evidence_root: str | Path,
     identity: Mapping[str, Any],
     source_positions: Mapping[int, str],
+    expected_observation_id: str,
+    expected_action: str,
+    expected_realization_event: int,
+    expected_origin_id: str,
+    expected_receipt_key: str,
 ) -> dict[str, Any]:
     _verify_seal(receipt, schema=MATURATION_RECEIPT_SCHEMA)
-    observation_id = str(receipt.get("observation_id") or "")
-    event = int(receipt.get("realization_event") or -1)
+    expected_observation_id = str(expected_observation_id)
+    expected_action = str(expected_action)
+    expected_realization_event = int(expected_realization_event)
+    expected_receipt_key = str(expected_receipt_key)
+    if expected_action not in {"BB", "TC"}:
+        raise ChipEvidenceError("maturation verification requires the caller's canonical BB or TC action")
+    canonical_receipt_key = _maturation_key(expected_observation_id, expected_realization_event)
+    if expected_receipt_key != canonical_receipt_key:
+        raise ChipEvidenceError("requested maturation receipt key does not reproduce from its explicit request")
     if (
-        str(receipt.get("receipt_key") or "") != _maturation_key(observation_id, event)
+        str(receipt.get("receipt_key") or "") != expected_receipt_key
+        or str(receipt.get("observation_id") or "") != expected_observation_id
+        or str(receipt.get("action") or "") != expected_action
+        or type(receipt.get("realization_event")) is not int
+        or int(receipt.get("realization_event")) != expected_realization_event
+        or str(receipt.get("origin_id") or "") != str(expected_origin_id)
         or str(receipt.get("identity_sha256") or "") != _sha256(identity)
         or dict(receipt.get("identity") or {}) != dict(identity)
     ):
-        raise ChipEvidenceError("maturation receipt key or explicit source identity does not verify")
+        raise ChipEvidenceError(
+            "maturation receipt differs from the caller's requested observation/action/event/origin/key"
+        )
+    observation_id = expected_observation_id
+    event = expected_realization_event
     _retained, _generation, _decision, _route, _state, parent = _load_forecast_origin(
-        conn, identity=identity, action=str(receipt.get("action") or ""),
+        conn, identity=identity, action=expected_action,
         observation_id=observation_id,
     )
-    if int(parent["receipt"].get("selected_event") or -1) != event:
+    if (
+        str(parent.get("origin_id") or "") != str(expected_origin_id)
+        or int(parent["receipt"].get("selected_event") or -1) != event
+    ):
         raise ChipEvidenceError("maturation receipt event differs from its selected forecast event")
     evidence_path, evidence_value = _flat_artifact(evidence_root, receipt.get("causal_evidence_ref"))
     outcome_path, outcome_value = _flat_artifact(evidence_root, receipt.get("outcome_ref"))
     capture_receipts = _verified_capture_receipts_for_observation(
         conn, evidence_root=evidence_root, identity_sha256=_sha256(identity),
         origin_id=str(parent["origin_id"]), observation_id=observation_id,
-        action=str(receipt.get("action") or ""), event=event,
+        action=expected_action, event=event,
+        required_player_ids=_required_players_for_event(parent["causal"], event),
     )
     pair = _validate_maturation_artifact_pair(
         conn,
@@ -2941,7 +3093,7 @@ def _verify_maturation_receipt(
         outcome_value=outcome_value,
         causal_origin=parent["causal"],
         observation_id=observation_id,
-        action=str(receipt.get("action") or ""),
+        action=expected_action,
         event=event,
         expiry_event=int(parent["receipt"].get("expiry_event") or -1),
         source_positions=source_positions,
@@ -2999,6 +3151,7 @@ def mature_observation(
             conn, evidence_root=evidence_root, identity_sha256=_sha256(identity),
             origin_id=parent["origin_id"], observation_id=observation_id,
             action=action, event=int(realization_event),
+            required_player_ids=_required_players_for_event(parent["causal"], int(realization_event)),
         )
         snapshot_conn = gs._open_generation_snapshot(generation)
         try:
@@ -3015,6 +3168,9 @@ def mature_observation(
             verified = _verify_maturation_receipt(
                 conn, receipt, evidence_root=evidence_root, identity=identity,
                 source_positions=source_positions,
+                expected_observation_id=str(observation_id), expected_action=action,
+                expected_realization_event=int(realization_event),
+                expected_origin_id=str(parent["origin_id"]), expected_receipt_key=receipt_key,
             )
             return {"receipt": receipt, "calibration_row": verified["calibration_row"]}
 
@@ -3121,6 +3277,9 @@ def mature_observation(
         _verify_maturation_receipt(
             conn, receipt, evidence_root=evidence_root, identity=identity,
             source_positions=source_positions,
+            expected_observation_id=str(observation_id), expected_action=action,
+            expected_realization_event=int(realization_event),
+            expected_origin_id=str(parent["origin_id"]), expected_receipt_key=receipt_key,
         )
         return {"receipt": receipt, "calibration_row": calibration_row}
 
@@ -3176,9 +3335,29 @@ def load_verified_calibration_handoff(
             continue
         if dict(receipt_identity) != identity:
             raise ChipEvidenceError("maturation receipt for this origin is bound to a different database/evidence root")
+        observation_id = str(receipt.get("observation_id") or "")
+        action = str(receipt.get("action") or "")
+        event_value = receipt.get("realization_event")
+        if not observation_id or action not in {"BB", "TC"} or type(event_value) is not int:
+            raise ChipEvidenceError("maturation receipt omits a canonical observation/action/event identity")
+        event = int(event_value)
+        receipt_key = _maturation_key(observation_id, event)
+        if path.name != f"maturation-{receipt_key}.json":
+            raise ChipEvidenceError("maturation receipt filename does not match its deterministic observation/event key")
+        _retained, _generation, _decision, _route, _state, canonical_parent = _load_forecast_origin(
+            conn, identity=identity, action=action, observation_id=observation_id,
+        )
+        if (
+            str(canonical_parent.get("origin_id") or "") != origin_id
+            or int(canonical_parent["receipt"].get("selected_event") or -1) != event
+        ):
+            raise ChipEvidenceError("maturation receipt does not bind the retained canonical forecast event")
         verified = _verify_maturation_receipt(
             conn, receipt, evidence_root=evidence_root, identity=identity,
             source_positions=source_positions,
+            expected_observation_id=observation_id, expected_action=action,
+            expected_realization_event=event, expected_origin_id=origin_id,
+            expected_receipt_key=receipt_key,
         )
         row = verified["calibration_row"]
         observation_id = str(row.get("observation_id") or "")
