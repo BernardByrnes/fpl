@@ -45,6 +45,7 @@ DIAG_NON_PRODUCTION_WORLDS_FORBIDDEN = "NON_PRODUCTION_WORLDS_FORBIDDEN"
 
 #: A certified load was attempted without a loadable certified generation.
 DIAG_CERTIFIED_GENERATION_REQUIRED = "CERTIFIED_GENERATION_REQUIRED"
+DIAG_CERTIFIED_WORLD_CACHE_REQUIRED = "CERTIFIED_WORLD_CACHE_REQUIRED"
 
 
 @dataclass(frozen=True)
@@ -894,6 +895,7 @@ def world_cache_key(*, event, generation_id=None, runs=None, config, union_ids, 
 
 def _load_event_worlds(conn, generation, event, union_ids, config, *,
                        cache_dir: Path | None = None,
+                       allow_materialization: bool = True,
                        non_production_worlds: "NonProductionWorlds | None" = None):
     """The certified load itself: one event's world matrix, or a refusal.
 
@@ -1001,9 +1003,28 @@ def _load_event_worlds(conn, generation, event, union_ids, config, *,
                 return matrix, {"source": "cache", "key": key,
                                 "generation_id": generation.generation_id,
                                 **cache_evidence}
-            # A MISS is recorded in the load's own evidence, never swallowed: the
-            # rebuild below is the answer, and ``info["cache"]`` says why the cache
-            # could not supply it (amendment 2 section 12).
+        else:
+            cache_evidence = {"cache": {"status": "MISS_ABSENT", "cache_key": key}}
+        if not allow_materialization:
+            status = str(cache_evidence.get("cache", {}).get("status") or "MISS_UNREADABLE")
+            raise cb.CertificationRefused(
+                DIAG_CERTIFIED_WORLD_CACHE_REQUIRED,
+                [
+                    f"event {int(event)}: required certified cache {key} is unavailable at the "
+                    f"loader boundary ({status}); materialization is disabled, so no worlds were built"
+                ],
+            )
+        # With the existing default policy, a MISS is recorded and rebuilt from
+        # the certified run ids.  The explicit cache-only policy above refuses
+        # here, before fixture loading, simulation, or cache publication.
+    elif not allow_materialization:
+        raise cb.CertificationRefused(
+            DIAG_CERTIFIED_WORLD_CACHE_REQUIRED,
+            [
+                f"event {int(event)}: cache-only certified loading requires an explicit cache directory; "
+                "materialization is disabled, so no worlds were built"
+            ],
+        )
     fixtures = monte_carlo.load_fixture_inputs(
         conn, event=int(event), xpts_run_id=int(runs["xpts_v1"]),
         minutes_run_id=int(runs["minutes_v1"]), team_run_id=int(runs["team_strength_v1"]),
@@ -1099,6 +1120,7 @@ def build_event_worlds(
     config,
     *,
     cache_dir: Path | None = None,
+    allow_materialization: bool = True,
     non_production_worlds: "NonProductionWorlds | None" = None,
     **descriptors: Any,
 ):
@@ -1112,6 +1134,7 @@ def build_event_worlds(
     refuse_predictive_descriptors(descriptors, caller="build_event_worlds")
     return _load_event_worlds(
         conn, generation, event, union_ids, config, cache_dir=cache_dir,
+        allow_materialization=allow_materialization,
         non_production_worlds=non_production_worlds,
     )
 

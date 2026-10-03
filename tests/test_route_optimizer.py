@@ -12,6 +12,7 @@ from fpl_brain import candidate_universe as cu
 from fpl_brain import certified_bundle as cb
 from fpl_brain import route_comparator as rc
 from fpl_brain import route_optimizer as ro
+from fpl_brain import chip_evidence_ops as chip_evidence
 from fpl_brain import route_stability as rs
 import hashlib
 from fpl_brain import transfer_state as ts
@@ -702,6 +703,107 @@ def test_world_cache_hit_and_key_sensitivity(tmp_path):
         event=4, generation_id="sha256:" + "0" * 64, runs=runs, config=config, union_ids=union,
     )
     assert other_generation_key != key  # a different certified generation IS a different world
+
+
+def test_cache_only_certified_world_load_refuses_direct_miss_before_simulation(tmp_path, monkeypatch):
+    from fpl_brain import monte_carlo
+
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
+    union = list(SQUAD_IDS)
+    config = _config(events=(4,), search_draws=2, policy_selection_worlds=2)
+    cache_dir = tmp_path / "empty-cache"
+    monkeypatch.setattr(monte_carlo, "load_fixture_inputs", lambda *_args, **_kwargs: pytest.fail("fixture load must not start"))
+    monkeypatch.setattr(monte_carlo, "simulate", lambda *_args, **_kwargs: pytest.fail("simulation must not start"))
+    try:
+        with pytest.raises(cb.CertificationRefused, match=ro.DIAG_CERTIFIED_WORLD_CACHE_REQUIRED):
+            ro.build_event_worlds(
+                conn, generation, 4, union, config,
+                cache_dir=cache_dir, allow_materialization=False,
+            )
+        assert not cache_dir.exists()
+    finally:
+        conn.close()
+
+
+def test_cache_disappearing_after_preflight_is_refused_at_loader_boundary(tmp_path, monkeypatch):
+    from fpl_brain import monte_carlo
+
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
+    union = list(SQUAD_IDS)
+    config = _config(events=(4,), search_draws=2, policy_selection_worlds=2)
+    runs = generation.runs_for(4)
+    key = ro.world_cache_key(
+        event=4, generation_id=generation.generation_id, runs=runs,
+        config=config, union_ids=union,
+    )
+    cache_dir = tmp_path / "race-cache"
+    cache_dir.mkdir()
+    cache_path = cache_dir / f"{key}.json"
+    cache_path.write_text(json.dumps(_cache_payload(union)), encoding="utf-8")
+    preflight = chip_evidence._preflight_world_cache([{
+        "event": 4, "cache_key": key, "player_ids": union,
+        "worlds": 2, "seed": config.seed,
+    }], cache_dir=cache_dir)
+    assert preflight[0]["hit"] is True
+    cache_path.unlink()
+    monkeypatch.setattr(monte_carlo, "load_fixture_inputs", lambda *_args, **_kwargs: pytest.fail("fixture load must not start"))
+    monkeypatch.setattr(monte_carlo, "simulate", lambda *_args, **_kwargs: pytest.fail("simulation must not start"))
+    try:
+        with pytest.raises(cb.CertificationRefused, match="loader boundary"):
+            ro.build_event_worlds(
+                conn, generation, 4, union, config,
+                cache_dir=cache_dir, allow_materialization=False,
+            )
+        assert not cache_path.exists()
+    finally:
+        conn.close()
+
+
+def test_default_certified_world_loader_still_materializes_missing_cache_on_fixture(tmp_path, monkeypatch):
+    from fpl_brain import manager_worlds, monte_carlo
+
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
+    union = list(SQUAD_IDS)
+    config = _config(events=(4,), search_draws=2, policy_selection_worlds=2)
+    calls = {"simulate": 0}
+    monkeypatch.setattr(monte_carlo, "load_fixture_inputs", lambda *_args, **_kwargs: [])
+
+    def simulate(_fixtures, _config, *, capture_player_ids):
+        calls["simulate"] += 1
+        return {"world_matrix": {
+            "worlds": 2,
+            "player_ids": list(capture_player_ids),
+            "core": {pid: [1.0, 2.0] for pid in capture_player_ids},
+            "minutes": {pid: [90.0, 90.0] for pid in capture_player_ids},
+        }}
+
+    monkeypatch.setattr(monte_carlo, "simulate", simulate)
+    monkeypatch.setattr(
+        manager_worlds, "with_expected_bonus",
+        lambda matrix, _bonus: {**matrix, "expected_bonus": {pid: 0.0 for pid in matrix["player_ids"]}},
+    )
+    monkeypatch.setattr(
+        manager_worlds, "expected_bonus_by_player",
+        lambda _conn, **_kwargs: {pid: 0.0 for pid in union},
+    )
+    monkeypatch.setattr(
+        manager_worlds, "with_role_actionability",
+        lambda matrix, _roles: {**matrix, "role_actionability": {pid: False for pid in matrix["player_ids"]}},
+    )
+    monkeypatch.setattr(
+        manager_worlds, "role_actionability_by_player",
+        lambda _conn, **_kwargs: {pid: False for pid in union},
+    )
+    cache_dir = tmp_path / "default-cache"
+    try:
+        _matrix, info = ro.build_event_worlds(
+            conn, generation, 4, union, config, cache_dir=cache_dir,
+        )
+        assert info["source"] == "generated"
+        assert calls["simulate"] == 1
+        assert (cache_dir / f"{info['key']}.json").is_file()
+    finally:
+        conn.close()
 
 
 def test_no_new_predictive_runs_no_db_write_no_threshold_change():

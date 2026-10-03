@@ -678,6 +678,7 @@ def load_certified_event_chip_worlds(
     *,
     event: int,
     cache_dir: str | Path | None = None,
+    allow_materialization: bool = True,
 ) -> Any:
     """Load one event matrix from the exact verified normal generation."""
 
@@ -712,6 +713,7 @@ def load_certified_event_chip_worlds(
             official_ids,
             config,
             cache_dir=None if cache_dir is None else Path(cache_dir),
+            allow_materialization=bool(allow_materialization),
         )
         return chip_worlds_from_event_matrix(
             matrix,
@@ -739,6 +741,7 @@ def load_certified_continuation_event_chip_worlds(
     expiry_event: int,
     coverage_product: Mapping[str, Any],
     cache_dir: str | Path | None = None,
+    allow_materialization: bool = True,
 ) -> tuple[Any, Mapping[int, Any], Any]:
     """Load one post-route event from the verified origin-pinned continuation.
 
@@ -838,6 +841,7 @@ def load_certified_continuation_event_chip_worlds(
             official_ids,
             config,
             cache_dir=None if cache_dir is None else Path(cache_dir),
+            allow_materialization=bool(allow_materialization),
         )
         bundle_identity = str(
             ((continuation.manifest.get("per_event") or {}).get(str(event)) or {}).get("bundle_identity") or ""
@@ -902,6 +906,7 @@ def build_future_event_chip_opportunity(
     reservation_state: Mapping[str, Any],
     made_at: str,
     cache_dir: str | Path | None = None,
+    allow_materialization: bool = True,
     coverage_product: Mapping[str, Any] | None = None,
     rules: Any | None = None,
     rules_evidence: Mapping[str, Any] | None = None,
@@ -992,6 +997,7 @@ def build_future_event_chip_opportunity(
                 raise ValueError("future route squad has missing pinned player positions")
             worlds = load_certified_event_chip_worlds(
                 conn, route, event=event, cache_dir=cache_dir,
+                allow_materialization=allow_materialization,
             )
         else:
             if coverage_product is None:
@@ -1020,6 +1026,7 @@ def build_future_event_chip_opportunity(
                 expiry_event=int(expiry_event),
                 coverage_product=coverage_product,
                 cache_dir=cache_dir,
+                allow_materialization=allow_materialization,
             )
             event_state = _no_transfer_continuation_state(route, event=event, rules=rules)
             squad_ids = {int(pid) for pid in event_state.by_id()}
@@ -1188,6 +1195,7 @@ def build_bb_tc_reservation_forecast(
     made_at: str,
     evidence_root: str | Path,
     cache_dir: str | Path | None = None,
+    allow_materialization: bool = True,
     continuation_generation_id: str | None = None,
     rules: Any | None = None,
 ) -> dict[str, Any]:
@@ -1296,6 +1304,7 @@ def build_bb_tc_reservation_forecast(
             reservation_state=reservation_state,
             made_at=made_at,
             cache_dir=cache_dir,
+            allow_materialization=allow_materialization,
             coverage_product=coverage_product,
             rules=continuation_rules if int(event) > int(route.events[-1]) else None,
             rules_evidence=(
