@@ -460,7 +460,7 @@ def base_skeleton_stats(skeletons: Sequence[tuple], positions: Mapping[int, str]
         count = group["count"]
         mean_core = tuple(group["core_sum"][position] / count for position in range(len(player_ids)))
         appeared = tuple(bool(mask >> position & 1) for position in range(len(player_ids)))
-        mask_items.append((count / worlds, appeared, mean_core))
+        mask_items.append((mask, count / worlds, appeared, mean_core))
 
     stats: list[dict[str, Any]] = []
     for starter_ids, bench_gk, order in skeletons:
@@ -472,15 +472,18 @@ def base_skeleton_stats(skeletons: Sequence[tuple], positions: Mapping[int, str]
         starter_gk_idx = next(i for i in starter_idx if codes[i] == 3)
         # The appearance bits this skeleton's autosub decision can depend on.
         watch = starter_out_idx + bench_idx + (starter_gk_idx, gk_idx)
-        choice_cache: dict[tuple, tuple] = {}
+        watch_mask = 0
+        for i in watch:
+            watch_mask |= 1 << i
+        choice_cache: dict[int, tuple] = {}
         weighted_base = 0.0
         any_autosub = 0.0
         autosub_points = 0.0
         autosub_count = 0.0
         gk_used = 0.0
         slot_used = [0.0, 0.0, 0.0]
-        for weight, appeared, mean_core in mask_items:
-            key = tuple(appeared[i] for i in watch)
+        for mask, weight, appeared, mean_core in mask_items:
+            key = mask & watch_mask
             decision = choice_cache.get(key)
             if decision is None:
                 _MATRIX_MEMO_STATS["entrant_cache_misses"] += 1
