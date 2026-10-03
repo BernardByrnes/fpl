@@ -751,6 +751,26 @@ def _forecast_operation_id(origin_id: str, action: str, observation_id: str) -> 
     return _sha256([str(origin_id), str(action), str(observation_id)])
 
 
+def _verify_forecast_request_binding(
+    intent: Mapping[str, Any],
+    publication: Mapping[str, Any],
+    *,
+    expected_intent: Mapping[str, Any],
+) -> None:
+    """Require a retry request to match the immutable issued operation."""
+
+    _verify_seal(intent, schema=FORECAST_INTENT_SCHEMA)
+    _verify_seal(publication, schema=FORECAST_PUBLICATION_SCHEMA)
+    if any(intent.get(key) != value for key, value in expected_intent.items()):
+        raise ChipEvidenceError("forecast retry differs from the immutable operation intent")
+    expected_publication = {
+        **dict(expected_intent),
+        "intent_sha256": _sha256(intent),
+    }
+    if any(publication.get(key) != value for key, value in expected_publication.items()):
+        raise ChipEvidenceError("forecast publication receipt differs from its immutable intent")
+
+
 def _fpl_flag(value: Any) -> int | None:
     if isinstance(value, bool):
         return int(value)
@@ -1614,13 +1634,6 @@ def forecast_origin(
         retained, generation, _decision, route, state, _permission = _revalidate_registered_origin(
             conn, identity=identity,
         )
-        existing_receipt_path = _metadata_root(evidence_root) / f"forecast-{operation_id}.json"
-        if existing_receipt_path.exists():
-            _retained, _generation, _decision, _route, _state, parent = _load_forecast_origin(
-                conn, identity=identity, action=action, observation_id=observation_id,
-            )
-            return parent["receipt"]
-
         origin = retained["origin"]
         action_key = "BB" if action == cd.CHIP_ACTION_BB else "TC"
         chip_state = origin.get("chip_eligibility", {}).get(action_key) or {}
@@ -1629,6 +1642,31 @@ def forecast_origin(
         pinned_expiry = int(chip_state.get("expiry_event") or -1)
         if int(expiry_event) != pinned_expiry or pinned_expiry <= int(planning_event):
             raise ChipEvidenceError("requested expiry differs from pinned chip state or has no future opportunity")
+
+        intent_path = _metadata_root(evidence_root) / f"forecast-intent-{operation_id}.json"
+        publication_path = _metadata_root(evidence_root) / f"forecast-publication-{operation_id}.json"
+        expected_intent = {
+            "operation_id": operation_id,
+            "identity_sha256": _sha256(identity),
+            "origin_id": origin_id,
+            "observation_id": str(observation_id),
+            "action": action,
+            "expiry_event": pinned_expiry,
+            "continuation_generation_id": continuation_generation_id,
+            "cache_dir": str(cache_path),
+            "materialize_worlds": bool(materialize_worlds),
+        }
+        existing_receipt_path = _metadata_root(evidence_root) / f"forecast-{operation_id}.json"
+        if existing_receipt_path.exists():
+            _retained, _generation, _decision, _route, _state, parent = _load_forecast_origin(
+                conn, identity=identity, action=action, observation_id=observation_id,
+            )
+            intent = _read_json(intent_path)
+            publication = _read_json(publication_path)
+            _verify_forecast_request_binding(
+                intent, publication, expected_intent=expected_intent,
+            )
+            return parent["receipt"]
 
         source_identity = _source_identity(route, generation)
         coverage_product = None
@@ -1660,19 +1698,6 @@ def forecast_origin(
         )
         if forecast_events != list(range(int(planning_event) + 1, pinned_expiry + 1)):
             raise ChipEvidenceError("verified forecast products do not provide contiguous future-event coverage")
-        intent_path = _metadata_root(evidence_root) / f"forecast-intent-{operation_id}.json"
-        publication_path = _metadata_root(evidence_root) / f"forecast-publication-{operation_id}.json"
-        expected_intent = {
-            "operation_id": operation_id,
-            "identity_sha256": _sha256(identity),
-            "origin_id": origin_id,
-            "observation_id": str(observation_id),
-            "action": action,
-            "expiry_event": pinned_expiry,
-            "continuation_generation_id": continuation_generation_id,
-            "cache_dir": str(cache_path),
-            "materialize_worlds": bool(materialize_worlds),
-        }
         intent_exists = intent_path.exists()
         if (
             not intent_exists
@@ -1684,9 +1709,6 @@ def forecast_origin(
             )
         if intent_exists:
             intent = _read_json(intent_path)
-            _verify_seal(intent, schema=FORECAST_INTENT_SCHEMA)
-            if any(intent.get(key) != value for key, value in expected_intent.items()):
-                raise ChipEvidenceError("forecast retry differs from the immutable operation intent")
             calculation_started_at = str(intent.get("calculation_started_at") or "")
             _parse_utc(calculation_started_at, name="forecast calculation_started_at")
             if not publication_path.exists():
@@ -1695,13 +1717,9 @@ def forecast_origin(
                     "do not reuse its start time—retry with a new observation id"
                 )
             publication = _read_json(publication_path)
-            _verify_seal(publication, schema=FORECAST_PUBLICATION_SCHEMA)
-            expected_publication = {
-                **expected_intent,
-                "intent_sha256": _sha256(intent),
-            }
-            if any(publication.get(key) != value for key, value in expected_publication.items()):
-                raise ChipEvidenceError("forecast publication receipt differs from its immutable intent")
+            _verify_forecast_request_binding(
+                intent, publication, expected_intent=expected_intent,
+            )
             issued_at = str(publication.get("issued_at") or "")
             _parse_utc(issued_at, name="forecast issued_at")
             _verify_prospective_state_sequence(
@@ -2272,6 +2290,12 @@ def _verify_capture_receipt(
         fetch_run_id=int(receipt.get("fetch_run_id") or -1),
         event=int(receipt.get("realization_event") or -1),
     )
+    realization_event = int(receipt.get("realization_event") or -1)
+    if (
+        receipt.get("source_name") != "player_gameweeks_final"
+        or receipt.get("source_identity") != f"player_gameweeks:{realization_event}"
+    ):
+        raise ChipEvidenceError("capture receipt does not identify the canonical final event-grain source")
     live_record = archive["records"]["event_live"]
     operation_id = _capture_operation_id(
         str(receipt.get("origin_id") or ""),
@@ -2377,6 +2401,7 @@ def _verify_capture_receipt(
             or stored.get("source_identity") != f"player_gameweeks:{int(receipt['realization_event'])}"
             or int(stored.get("event") or -1) != int(receipt["realization_event"])
             or int(stored.get("player_id") or -1) != player_id
+            or int(stored.get("fetch_run_id") or -1) != int(receipt.get("fetch_run_id") or -2)
             or payload != expected_capture[1]
             or str(stored.get("captured_at")) != str(item.get("captured_at"))
             or str(stored.get("source_payload_sha256")) != str(archive["records"]["event_live"]["payload_sha256"])
@@ -2384,6 +2409,119 @@ def _verify_capture_receipt(
         ):
             raise ChipEvidenceError("retained outcome row is not bound to the verified final event-live archive")
     return archive
+
+
+def _verified_shared_capture_digests(
+    conn: sqlite3.Connection,
+    requested_digests: set[str],
+    *,
+    event: int,
+    fetch_run_id: int,
+    identity: Mapping[str, Any],
+    archive: Mapping[str, Any],
+    raw_root: str | Path,
+    evidence_root: str | Path,
+) -> set[str]:
+    """Return requested rows covered by complete receipts from this exact source."""
+
+    if not requested_digests:
+        return set()
+    metadata_root = _metadata_root(evidence_root)
+    expected_root = str(Path(raw_root).expanduser().resolve())
+    expected_live = archive["records"]["event_live"]
+    source_fields = (
+        "capture_id", "source", "observed_at", "payload_sha256", "relative_path", "run_id", "event",
+    )
+    proven: set[str] = set()
+    for receipt_path in sorted(metadata_root.glob("capture-*.json")):
+        if receipt_path.name.startswith("capture-intent-"):
+            continue
+        try:
+            candidate = _read_json(receipt_path)
+        except (OSError, ChipEvidenceError, ValueError):
+            # An unreadable artifact supplies no proof; any rows that need it
+            # will still fail the complete-set check below.
+            continue
+        if not isinstance(candidate, Mapping):
+            continue
+        try:
+            candidate_event = int(candidate.get("realization_event") or -1)
+            candidate_run_id = int(candidate.get("fetch_run_id") or -1)
+        except (TypeError, ValueError):
+            continue
+        if candidate_event != int(event) or candidate_run_id != int(fetch_run_id):
+            continue
+
+        operation_id = str(candidate.get("operation_id") or "")
+        if not operation_id or receipt_path.name != f"capture-{operation_id}.json":
+            raise ChipEvidenceError("matching capture receipt filename does not bind its operation id")
+
+        origin_id = str(candidate.get("origin_id") or "")
+        if not origin_id:
+            raise ChipEvidenceError("matching capture receipt omits its own registered origin")
+        origin_receipt = _read_json(metadata_root / f"origin-{origin_id}.json")
+        _verify_seal(origin_receipt, schema=ORIGIN_SCHEMA)
+        origin_ref = str(origin_receipt.get("origin_ref") or "")
+        if not origin_ref or Path(origin_ref).name != origin_ref:
+            raise ChipEvidenceError("matching capture receipt origin reference is unsafe")
+        origin_artifact = _read_json(_root(evidence_root) / origin_ref)
+        origin_identity = origin_artifact.get("identity")
+        if not isinstance(origin_identity, Mapping):
+            raise ChipEvidenceError("matching capture receipt origin omits its explicit identity")
+        _verify_origin_binding(
+            origin_receipt,
+            origin_artifact,
+            origin_id=origin_id,
+            expected_identity=origin_identity,
+        )
+        origin_identity = dict(origin_identity)
+        if (
+            _sha256(origin_identity) != str(candidate.get("identity_sha256") or "")
+            or str(origin_identity.get("database_path") or "") != str(identity.get("database_path") or "")
+            or str(origin_identity.get("evidence_root") or "") != str(identity.get("evidence_root") or "")
+            or _sha256(_origin_key(origin_identity)) != origin_id
+        ):
+            raise ChipEvidenceError("matching capture receipt differs from its registered origin identity")
+
+        action = str(candidate.get("action") or "")
+        observation_id = str(candidate.get("observation_id") or "")
+        _retained, _generation, _decision, _route, _state, candidate_parent = _load_forecast_origin(
+            conn,
+            identity=origin_identity,
+            action=action,
+            observation_id=observation_id,
+        )
+        forecast_receipt = candidate_parent["receipt"]
+        if int(forecast_receipt.get("selected_event") or -1) != int(event):
+            raise ChipEvidenceError("matching capture receipt event differs from its verified forecast")
+        policy_player_ids = _required_players_for_event(candidate_parent["causal"], int(event))
+        if [int(value) for value in candidate.get("required_player_ids") or ()] != policy_player_ids:
+            raise ChipEvidenceError("capture receipt player set differs from its verified forecast policy")
+
+        # Validate against the candidate receipt's own origin identity. Shared
+        # event-grain rows are reusable; binding A's receipt to B's identity
+        # would incorrectly reject them.
+        verified_archive = _verify_capture_receipt(
+            conn,
+            candidate,
+            expected_identity_sha256=_sha256(origin_identity),
+            evidence_root=evidence_root,
+        )
+        candidate_live = (candidate.get("raw_sources") or {}).get("event_live") or {}
+        verified_live = verified_archive["records"]["event_live"]
+        if (
+            str(candidate.get("raw_root") or "") != expected_root
+            or str(candidate.get("available_at") or "") != str(archive.get("available_at") or "")
+            or str(candidate.get("raw_observed_at") or "") != str(archive.get("observed_at") or "")
+            or any(candidate_live.get(key) != expected_live.get(key) for key in source_fields)
+            or any(verified_live.get(key) != expected_live.get(key) for key in source_fields)
+        ):
+            raise ChipEvidenceError("matching capture receipt does not bind the exact requested fetch/source/availability")
+        for row in candidate.get("captures") or ():
+            digest = str(row.get("capture_digest") or "")
+            if digest in requested_digests:
+                proven.add(digest)
+    return proven
 
 
 def capture_outcome(
@@ -2488,7 +2626,8 @@ def capture_outcome(
             "payload_sha256": str(live_record["payload_sha256"]),
             "captured_at": archive["available_at"],
         })
-        if intent_path.exists():
+        intent_existed = intent_path.exists()
+        if intent_existed:
             previous = _read_json(intent_path)
             _verify_seal(previous, schema=CAPTURE_INTENT_SCHEMA)
             if previous != intent:
@@ -2517,42 +2656,6 @@ def capture_outcome(
             rows_to_capture.append({"player_id": player_id, "fields": fields, "payload": payload,
                                     "capture_digest": digest})
         expected_digests = {str(row["capture_digest"]) for row in rows_to_capture}
-        present = {
-            str(row["capture_digest"])
-            for row in ol.observation_captures(
-                conn, grain=ol.GRAIN_PLAYER_EVENT, event=int(realization_event),
-            )
-            if str(row.get("capture_digest") or "") in expected_digests
-        }
-        if present and present != expected_digests:
-            raise ChipEvidenceError("partial committed event capture exists without a verifiable complete receipt")
-        inserted_rows: list[dict[str, Any]] = []
-        if not present and rows_to_capture:
-            with database.write_transaction(conn):
-                for row in rows_to_capture:
-                    result = ol.capture_observation(
-                        conn,
-                        grain=ol.GRAIN_PLAYER_EVENT,
-                        event=int(realization_event),
-                        player_id=int(row["player_id"]),
-                        fields=row["fields"],
-                        source_name="player_gameweeks_final",
-                        official_final_at=archive["official_final_at"],
-                        observation_state=ol.OBSERVATION_FINAL,
-                        source_identity=f"player_gameweeks:{int(realization_event)}",
-                        source_payload_sha256=str(live_record["payload_sha256"]),
-                        fetch_run_id=int(fetch_run_id),
-                        archive_capture_id=str(live_record["capture_id"]),
-                        captured_at=archive["available_at"],
-                        backfill=False,
-                    )
-                    if result.capture_digest != row["capture_digest"] or result.observation_state != ol.OBSERVATION_FINAL:
-                        raise ChipEvidenceError("outcome ledger did not retain the expected official FINAL event row")
-                    inserted_rows.append({
-                        "player_id": int(row["player_id"]),
-                        "capture_digest": str(result.capture_digest),
-                        "captured_at": archive["available_at"],
-                    })
         capture_rows = [
             {"player_id": int(row["player_id"]), "capture_digest": str(row["capture_digest"]),
              "captured_at": archive["available_at"]}
@@ -2580,6 +2683,66 @@ def capture_outcome(
             "captures": capture_rows,
             "unavailable_players_remain_missing": True,
         })
+
+        # Keep the shared-row provenance read, exact-source check, and append
+        # under one SQLite writer lock. A concurrent origin cannot turn a
+        # previously empty preflight into acceptance of an unproven subset.
+        with database.write_transaction(conn):
+            present = {
+                str(row["capture_digest"])
+                for row in ol.observation_captures(
+                    conn, grain=ol.GRAIN_PLAYER_EVENT, event=int(realization_event),
+                )
+                if str(row.get("capture_digest") or "") in expected_digests
+            }
+            proven_shared = _verified_shared_capture_digests(
+                conn,
+                present,
+                event=int(realization_event),
+                fetch_run_id=int(fetch_run_id),
+                identity=identity,
+                archive=archive,
+                raw_root=raw_root,
+                evidence_root=evidence_root,
+            )
+            unproven_present = present - proven_shared
+            if unproven_present:
+                if present != expected_digests or not intent_existed:
+                    raise ChipEvidenceError(
+                        "partial committed event capture exists without a verifiable complete receipt"
+                    )
+                # All exact-request rows may have committed before publication
+                # failed. The pre-existing immutable intent plus this synthetic
+                # candidate receipt proves those rows from the current archive.
+                _verify_capture_receipt(
+                    conn,
+                    receipt,
+                    expected_identity_sha256=_sha256(identity),
+                    evidence_root=evidence_root,
+                )
+
+            for row in rows_to_capture:
+                if str(row["capture_digest"]) in present:
+                    continue
+                result = ol.capture_observation(
+                    conn,
+                    grain=ol.GRAIN_PLAYER_EVENT,
+                    event=int(realization_event),
+                    player_id=int(row["player_id"]),
+                    fields=row["fields"],
+                    source_name="player_gameweeks_final",
+                    official_final_at=archive["official_final_at"],
+                    observation_state=ol.OBSERVATION_FINAL,
+                    source_identity=f"player_gameweeks:{int(realization_event)}",
+                    source_payload_sha256=str(live_record["payload_sha256"]),
+                    fetch_run_id=int(fetch_run_id),
+                    archive_capture_id=str(live_record["capture_id"]),
+                    captured_at=archive["available_at"],
+                    backfill=False,
+                )
+                if result.capture_digest != row["capture_digest"] or result.observation_state != ol.OBSERVATION_FINAL:
+                    raise ChipEvidenceError("outcome ledger did not retain the expected official FINAL event row")
+
         _write_new_json(receipt_path, receipt)
         _verify_capture_receipt(
             conn, receipt, expected_identity_sha256=_sha256(identity), evidence_root=evidence_root,
