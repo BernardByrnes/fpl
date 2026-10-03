@@ -10,6 +10,262 @@ from fpl_brain import chip_evidence_ops as ops
 from fpl_brain import database, outcome_ledger as ol, raw_archive, route_optimizer as ro
 
 
+def _prospective_state_fixture(*, event_flags=(0, 0), fixture_flags=(0, 0, 0),
+                               kickoff_offset_days=30, fixture_updated_at=None):
+    from datetime import timedelta
+
+    from fpl_brain import repositories as repo
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    database.initialize_database(conn)
+    now = ops._utc_now()
+    checked = ops._parse_utc(now, name="test source time")
+    kickoff = None if kickoff_offset_days is None else (
+        checked + timedelta(days=kickoff_offset_days)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    conn.execute(
+        "INSERT INTO events(id,name,finished,data_checked,raw_json,updated_at) VALUES(5,'GW5',?,?, '{}',?)",
+        (event_flags[0], event_flags[1], now),
+    )
+    conn.execute(
+        "INSERT INTO fixtures(id,event,kickoff_time,team_h,team_a,started,finished,finished_provisional,"
+        "raw_json,updated_at) VALUES(50,5,?,1,2,?,?,?,'{}',?)",
+        (kickoff, *fixture_flags, fixture_updated_at or now),
+    )
+    conn.commit()
+    return conn
+
+
+def _retain_official_prospective_state(
+    conn, *, event, cutoff, kickoff_time, raw_root, reversed_fetch_interval=False,
+    fetch_status="success",
+):
+    """Seed an exact successful archived observation before the pinned cutoff."""
+
+    from datetime import timedelta
+
+    cutoff_at = ops._parse_utc(cutoff, name="test pinned cutoff")
+    observed_at = (cutoff_at - timedelta(minutes=15)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    finished_at = (cutoff_at - timedelta(minutes=14)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    started_at = (
+        cutoff_at - timedelta(minutes=13) if reversed_fetch_interval
+        else cutoff_at - timedelta(minutes=14, seconds=30)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    if reversed_fetch_interval:
+        finished_at = (cutoff_at - timedelta(minutes=14)).isoformat(
+            timespec="microseconds",
+        ).replace("+00:00", "Z")
+    raw_path = Path(raw_root).resolve()
+    raw_path.mkdir(parents=True, exist_ok=True)
+    cursor = conn.execute(
+        "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+        "endpoints_failed,raw_dir) VALUES(?,?,?,'fetch_fpl',?,?,?,?)",
+        (started_at, finished_at, str(fetch_status), int(event),
+         json.dumps(["bootstrap-static", "fixtures"]),
+         json.dumps([] if fetch_status == "success" else [{"endpoint": "event/4/live", "error": "test partial"}]),
+         str(raw_path)),
+    )
+    run_id = int(cursor.lastrowid)
+    conn.execute(
+        "UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=?",
+        (observed_at, int(event)),
+    )
+    fixture_rows = [dict(row) for row in conn.execute(
+        "SELECT id,event,team_h,team_a,kickoff_time FROM fixtures WHERE event=? ORDER BY id",
+        (int(event),),
+    ).fetchall()]
+    assert fixture_rows
+    conn.execute(
+        "UPDATE fixtures SET started=0,finished=0,finished_provisional=0,kickoff_time=?,updated_at=? "
+        "WHERE event=?",
+        (kickoff_time, observed_at, int(event)),
+    )
+    conn.commit()
+    fixture_payload = [{
+        "id": int(row["id"]),
+        "event": int(event),
+        "kickoff_time": kickoff_time,
+        "team_h": int(row["team_h"]),
+        "team_a": int(row["team_a"]),
+        "started": False,
+        "finished": False,
+        "finished_provisional": False,
+    } for row in fixture_rows]
+    bootstrap_payload = {
+        "events": [{"id": int(event), "name": f"GW{event}", "finished": False, "data_checked": False}],
+        "teams": [{"id": 1, "name": "One"}, {"id": 2, "name": "Two"}],
+        "elements": [],
+    }
+    for source, payload, source_event in (
+        ("bootstrap_static", bootstrap_payload, None),
+        ("fixtures", fixture_payload, None),
+    ):
+        raw_archive.archive_raw_capture(
+            raw_path,
+            source=source,
+            observed_at=observed_at,
+            body=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            event=source_event,
+            run_id=run_id,
+        )
+    return observed_at, fixture_payload, started_at
+
+
+def test_prospective_gate_rejects_reversed_successful_fetch_interval(tmp_path):
+    from datetime import timedelta
+
+    conn = _prospective_state_fixture()
+    try:
+        kickoff = (
+            ops._parse_utc(ops._utc_now(), name="current test time") + timedelta(days=30)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        _retain_official_prospective_state(
+            conn,
+            event=5,
+            cutoff="2026-09-19T11:00:00Z",
+            kickoff_time=kickoff,
+            raw_root=tmp_path / "reversed-state-raw",
+            reversed_fetch_interval=True,
+        )
+        with pytest.raises(ops.ChipEvidenceError, match="fetch interval is reversed"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_requires_matching_intact_official_state_archives():
+    conn = _prospective_state_fixture()
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="bootstrap_static source provenance is missing"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_accepts_verified_endpoint_captures_from_completed_partial_fetch(tmp_path):
+    from datetime import timedelta
+
+    conn = _prospective_state_fixture()
+    try:
+        kickoff = (
+            ops._parse_utc(ops._utc_now(), name="current test time") + timedelta(days=30)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        _retain_official_prospective_state(
+            conn,
+            event=5,
+            cutoff="2026-09-19T11:00:00Z",
+            kickoff_time=kickoff,
+            raw_root=tmp_path / "partial-state-raw",
+            fetch_status="partial",
+        )
+        check = ops._prospective_event_state_check(
+            conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+        )
+        assert check["source_provenance"]["event"]["fetch_status"] == "partial"
+        assert check["source_provenance"]["fixtures"]["fetch_status"] == "partial"
+        assert ops._parse_utc(
+            check["source_provenance"]["event"]["observed_at"], name="raw observation",
+        ) < ops._parse_utc(
+            check["source_provenance"]["event"]["fetch_started_at"], name="fetch start",
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("event_flags", "fixture_flags", "state"),
+    [
+        ((0, 0), (1, 0, 0), "IN_PROGRESS"),
+        ((0, 0), (0, 1, 1), "PROVISIONAL"),
+        ((1, 1), (0, 0, 0), "FINAL"),
+    ],
+)
+def test_prospective_gate_rejects_non_scheduled_event_states(event_flags, fixture_flags, state):
+    from fpl_brain import planning
+
+    conn = _prospective_state_fixture(event_flags=event_flags, fixture_flags=fixture_flags)
+    try:
+        assert planning.event_data_state(conn, 5)[0] == state
+        with pytest.raises(ops.ChipEvidenceError, match="only a verified scheduled event"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_rejects_inconsistent_event_or_provisional_fixture_flags():
+    conn = _prospective_state_fixture(event_flags=(0, 1), fixture_flags=(0, 0, 0))
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="event flags are not explicitly"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+    conn = _prospective_state_fixture(event_flags=(0, 0), fixture_flags=(0, 0, 1))
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="marked provisional"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("case", ["unknown_event", "unknown_kickoff", "kickoff_passed", "future_fixture_state"])
+def test_prospective_gate_refuses_unverifiable_fixture_timing(case):
+    if case == "unknown_event":
+        conn = _prospective_state_fixture()
+        conn.execute("DELETE FROM events WHERE id=5")
+    elif case == "unknown_kickoff":
+        conn = _prospective_state_fixture(kickoff_offset_days=None)
+    elif case == "kickoff_passed":
+        conn = _prospective_state_fixture(kickoff_offset_days=-1)
+    else:
+        conn = _prospective_state_fixture(fixture_updated_at="2099-09-18T11:00:00Z")
+    try:
+        if case == "unknown_event":
+            match = "no official event row"
+        elif case == "unknown_kickoff":
+            match = "unknown kickoff"
+        elif case == "kickoff_passed":
+            match = "kickoff has passed"
+        else:
+            match = "source timestamp is later than the state check"
+        with pytest.raises(ops.ChipEvidenceError, match=match):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_rejects_existing_event_grain_outcome_capture():
+    conn = _prospective_state_fixture()
+    try:
+        payload = {"event": 5, "player_id": 99, "points": 0}
+        conn.execute(
+            "INSERT INTO outcome_observation_captures(capture_digest,grain,event,player_id,captured_at,created_at,"
+            "observation_state,source_name,payload_json) VALUES(?,? ,5,99,?,?, 'PROVISIONAL',?,?)",
+            (ops._sha256(payload), ol.GRAIN_PLAYER_EVENT, ops._utc_now(), ops._utc_now(),
+             "player_gameweeks_final", json.dumps(payload)),
+        )
+        conn.commit()
+        with pytest.raises(ops.ChipEvidenceError, match="event-grain outcome capture"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
 def _identity(tmp_path: Path, db_path: Path) -> dict:
     db_path.touch(exist_ok=True)
     return {
@@ -712,6 +968,29 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
             expiry_event=5,
             product_generation_id=continuation.generation_id,
         )
+        from datetime import timedelta
+
+        current_state_at = ops._utc_now()
+        future_kickoff = (
+            ops._parse_utc(current_state_at, name="fixture source refresh") + timedelta(days=30)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        source_observed_at, _fixture_payload, source_started_at = _retain_official_prospective_state(
+            conn,
+            event=5,
+            cutoff=generation.cutoff,
+            kickoff_time=future_kickoff,
+            raw_root=tmp_path / "state-raw",
+        )
+        assert ops._parse_utc(source_observed_at, name="test source observation") < ops._parse_utc(
+            generation.cutoff, name="test origin cutoff",
+        )
+        assert ops._parse_utc(source_observed_at, name="test source observation") < ops._parse_utc(
+            source_started_at, name="test fetch start",
+        )
+        target_fixture_rows = [dict(row) for row in conn.execute(
+            "SELECT id,event,kickoff_time,team_h,team_a FROM fixtures WHERE event=5 ORDER BY id"
+        ).fetchall()]
+        assert target_fixture_rows
         requirements = ops._world_cache_requirements(
             conn, route=route, generation=loaded_generation,
             coverage_product=coverage_product, expiry_event=5,
@@ -744,30 +1023,170 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
             json.dumps(cache_entry), encoding="utf-8",
         )
 
-        forecast_receipt = ops.forecast_origin(
-            conn,
-            **identity,
-            action=action,
-            expiry_event=5,
-            observation_id=f"{action.lower()}-fixture-observation-1",
-            continuation_generation_id=continuation.generation_id,
-            cache_dir=cache_dir,
+        # A completed member fixture can leave event_data_state=SCHEDULED while
+        # other fixtures have not started. The stricter prospective gate must
+        # refuse before cache inspection/scoring or operation artifacts.
+        partial_fixture_id = max(int(row["id"]) for row in target_fixture_rows) + 1000
+        fresh_partial_at = ops._utc_now()
+        conn.execute(
+            "INSERT INTO fixtures(id,event,kickoff_time,team_h,team_a,started,finished,finished_provisional,"
+            "raw_json,updated_at) VALUES(?,5,?,?,?,0,0,0,'{}',?)",
+            (partial_fixture_id, future_kickoff, target_fixture_rows[0]["team_h"],
+             target_fixture_rows[0]["team_a"], fresh_partial_at),
         )
-        assert forecast_receipt["selected_event"] == 5
-        assert forecast_receipt["materialized_worlds"] is False
-        assert forecast_receipt["issued_at"] >= forecast_receipt["calculation_started_at"]
+        conn.execute(
+            "UPDATE fixtures SET started=0,finished=1,finished_provisional=1,updated_at=? WHERE event=5 AND id=?",
+            (fresh_partial_at, int(target_fixture_rows[0]["id"])),
+        )
+        conn.execute("UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=5", (fresh_partial_at,))
+        conn.commit()
+        from fpl_brain import planning
 
-        # Simulate a later official-final fetch only in this temporary test DB and raw archive.
+        assert planning.event_data_state(conn, 5)[0] == planning.EVENT_STATE_SCHEDULED
+        partial_observation = f"{action.lower()}-partial-start-state"
+        partial_operation = ops._forecast_operation_id(origin_id, action, partial_observation)
+        with monkeypatch.context() as guard:
+            guard.setattr(ops, "_world_cache_requirements", lambda *_a, **_k: pytest.fail(
+                "cache requirement work must not begin for an already-played fixture"
+            ))
+            guard.setattr(ops, "_preflight_world_cache", lambda *_a, **_k: pytest.fail(
+                "cache probing must not begin for an already-played fixture"
+            ))
+            guard.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_a, **_k: pytest.fail(
+                "forecast evaluator must not run for an already-played fixture"
+            ))
+            with pytest.raises(ops.ChipEvidenceError, match="started or finished"):
+                ops.forecast_origin(
+                    conn, **identity, action=action, expiry_event=5,
+                    observation_id=partial_observation,
+                    continuation_generation_id=continuation.generation_id,
+                    cache_dir=cache_dir,
+                )
+        assert not (ops._metadata_root(identity["evidence_root"]) /
+                    f"forecast-intent-{partial_operation}.json").exists()
+        assert not (ops._metadata_root(identity["evidence_root"]) /
+                    f"forecast-publication-{partial_operation}.json").exists()
+        conn.execute("DELETE FROM fixtures WHERE id=?", (partial_fixture_id,))
+        conn.execute(
+            "UPDATE fixtures SET started=0,finished=0,finished_provisional=0,kickoff_time=?,updated_at=? "
+            "WHERE event=5",
+            (future_kickoff, source_observed_at),
+        )
+        conn.execute(
+            "UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=5",
+            (source_observed_at,),
+        )
+        conn.commit()
+
+        # A fixture starting while the evaluator runs invalidates the new
+        # issuance. The immutable intent/calculation may remain, but no
+        # prospective publication or causal observation may be retained.
+        start_during_observation = f"{action.lower()}-started-during-calculation"
+        start_during_operation = ops._forecast_operation_id(origin_id, action, start_during_observation)
+        original_builder = cra.build_bb_tc_reservation_forecast
+        started_during_build = False
+
+        def start_fixture_during_build(*args, **kwargs):
+            nonlocal started_during_build
+            generated = original_builder(*args, **kwargs)
+            started_during_build = True
+            started_at = ops._utc_now()
+            conn.execute(
+                "UPDATE fixtures SET started=1,updated_at=? WHERE event=5 AND id=?",
+                (started_at, int(target_fixture_rows[0]["id"])),
+            )
+            conn.commit()
+            return generated
+
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", start_fixture_during_build)
+        with pytest.raises(ops.ChipEvidenceError, match="IN_PROGRESS|started or finished"):
+            ops.forecast_origin(
+                conn, **identity, action=action, expiry_event=5,
+                observation_id=start_during_observation,
+                continuation_generation_id=continuation.generation_id,
+                cache_dir=cache_dir,
+            )
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", original_builder)
+        assert started_during_build
+        start_during_publication = ops._metadata_root(identity["evidence_root"]) / \
+            f"forecast-publication-{start_during_operation}.json"
+        assert not start_during_publication.exists()
+        assert not any(
+            str(ops._read_json(path).get("observation_id") or "") == start_during_observation
+            for path in Path(identity["evidence_root"]).glob("chip-causal-evidence-*.json")
+        )
+        conn.execute(
+            "UPDATE fixtures SET started=0,finished=0,finished_provisional=0,kickoff_time=?,updated_at=? "
+            "WHERE event=5",
+            (future_kickoff, source_observed_at),
+        )
+        conn.execute(
+            "UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=5",
+            (source_observed_at,),
+        )
+        conn.commit()
+
+        # Simulate a lost acknowledgement after the immutable publication was
+        # committed. Later finality must not invalidate that earlier valid issue
+        # or cause a rescore during recovery.
+        observation_id = f"{action.lower()}-fixture-observation-1"
+        forecast_operation = ops._forecast_operation_id(origin_id, action, observation_id)
+        publication_path = ops._metadata_root(identity["evidence_root"]) / \
+            f"forecast-publication-{forecast_operation}.json"
+        original_write = ops._write_new_json
+        publication_written_then_failed = False
+
+        def lose_publication_ack(path, value):
+            nonlocal publication_written_then_failed
+            digest = original_write(path, value)
+            if Path(path) == publication_path and not publication_written_then_failed:
+                publication_written_then_failed = True
+                raise OSError("injected lost forecast-publication acknowledgement")
+            return digest
+
+        monkeypatch.setattr(ops, "_write_new_json", lose_publication_ack)
+        with pytest.raises(OSError, match="lost forecast-publication"):
+            ops.forecast_origin(
+                conn, **identity, action=action, expiry_event=5,
+                observation_id=observation_id,
+                continuation_generation_id=continuation.generation_id,
+                cache_dir=cache_dir,
+            )
+        monkeypatch.setattr(ops, "_write_new_json", original_write)
+        assert publication_written_then_failed and publication_path.is_file()
+        assert not (ops._metadata_root(identity["evidence_root"]) /
+                    f"forecast-{forecast_operation}.json").exists()
+        retained_publication = ops._read_json(publication_path)
+        pre_final_issued_at = retained_publication["issued_at"]
+
+        # Official finality now exists. Recovery is allowed only from the
+        # verified publication witness and must not call the forecast producer.
         final_at = ops._utc_now()
         conn.execute("UPDATE events SET finished=1,data_checked=1,updated_at=? WHERE id=5", (final_at,))
         conn.execute(
-            "UPDATE fixtures SET started=1,finished=1,finished_provisional=1,updated_at=? WHERE id=42",
+            "UPDATE fixtures SET started=1,finished=1,finished_provisional=1,updated_at=? WHERE event=5",
             (final_at,),
         )
         conn.commit()
-        raw_root = tmp_path / "raw"
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_a, **_k: pytest.fail(
+            "publication recovery must not rescore"
+        ))
+        forecast_receipt = ops.forecast_origin(
+            conn, **identity, action=action, expiry_event=5,
+            observation_id=observation_id,
+            continuation_generation_id=continuation.generation_id,
+            cache_dir=cache_dir,
+        )
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", original_builder)
+        assert forecast_receipt["selected_event"] == 5
+        assert forecast_receipt["materialized_worlds"] is False
+        assert forecast_receipt["issued_at"] == pre_final_issued_at
+        assert forecast_receipt["issued_at"] >= forecast_receipt["calculation_started_at"]
+
+        # Retain final raw official source evidence in the temporary test DB.
         import datetime as dt
 
+        raw_root = tmp_path / "raw"
         base = ops._parse_utc(final_at, name="fixture final timestamp")
         raw_observed_at = base.isoformat(timespec="microseconds").replace("+00:00", "Z")
         run_started_at = (base + dt.timedelta(seconds=1)).isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -789,9 +1208,9 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
             } for pid in route.proposed_owned_ids],
         }
         fixtures = [{
-            "id": 42, "event": 5, "started": True, "finished": True,
-            "finished_provisional": True, "team_h": 1, "team_a": 2,
-        }]
+            **row, "event": 5, "started": True, "finished": True,
+            "finished_provisional": True,
+        } for row in target_fixture_rows]
         live = {"elements": [{"id": pid, "stats": {"minutes": 0, "total_points": 0}}
                               for pid in route.proposed_owned_ids]}
         for source, observed_at, payload, event_id in (
@@ -859,6 +1278,7 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
             assert not receipt_path.exists()
             monkeypatch.setattr(ops, "_write_new_json", original_write)
 
+        recovery_started_at = ops._parse_utc(ops._utc_now(), name="test maturation/recovery start")
         matured = ops.mature_observation(
             conn,
             **identity,
@@ -870,6 +1290,8 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         assert receipt_path.is_file()
         assert len(list(Path(identity["evidence_root"]).glob("chip-outcome-*.json"))) == 1
         assert matured["receipt"]["receipt_key"] == key
+        assert matured["calibration_row"]["label_available_at"] == run_finished_at
+        assert ops._parse_utc(matured["receipt"]["matured_at"], name="matured_at") >= recovery_started_at
         assert matured["calibration_row"]["realized_value"] == 0.0
         retried = ops.mature_observation(
             conn,

@@ -29,8 +29,9 @@ FORECAST_RECEIPT_SCHEMA = "fpl_brain.chip_evidence_forecast_receipt.v1"
 CAPTURE_RECEIPT_SCHEMA = "fpl_brain.chip_evidence_capture_receipt.v1"
 MATURATION_RECEIPT_SCHEMA = "fpl_brain.chip_evidence_maturation_receipt.v1"
 HANDOFF_SCHEMA = "fpl_brain.chip_evidence_calibration_handoff.v1"
-FORECAST_INTENT_SCHEMA = "fpl_brain.chip_evidence_forecast_intent.v1"
-FORECAST_PUBLICATION_SCHEMA = "fpl_brain.chip_evidence_forecast_publication.v1"
+FORECAST_INTENT_SCHEMA = "fpl_brain.chip_evidence_forecast_intent.v2"
+FORECAST_PUBLICATION_SCHEMA = "fpl_brain.chip_evidence_forecast_publication.v2"
+FORECAST_STATE_CHECK_SCHEMA = "fpl_brain.chip_evidence_forecast_state_check.v1"
 CAPTURE_INTENT_SCHEMA = "fpl_brain.chip_evidence_capture_intent.v1"
 RECEIPT_DIRNAME = ".chip-evidence"
 _LOCK_TIMEOUT_SECONDS = 10.0
@@ -750,6 +751,598 @@ def _forecast_operation_id(origin_id: str, action: str, observation_id: str) -> 
     return _sha256([str(origin_id), str(action), str(observation_id)])
 
 
+def _fpl_flag(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int) and value in (0, 1):
+        return value
+    return None
+
+
+def _verified_state_source_capture(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    endpoint: str,
+    updated_at: str,
+    checked_at: str,
+) -> tuple[dict[str, Any], Any]:
+    """Read one exact official source capture matching a DB row's provenance."""
+
+    from . import raw_archive
+
+    observed = _parse_utc(updated_at, name=f"{source} database updated_at")
+    checked = _parse_utc(checked_at, name="prospective state checked_at")
+    candidates: list[tuple[dict[str, Any], Any]] = []
+    for run in conn.execute(
+        "SELECT id,status,started_at,finished_at,endpoints_ok,endpoints_failed,raw_dir FROM fetch_runs "
+        "WHERE status IN ('success','partial') AND finished_at IS NOT NULL ORDER BY id"
+    ).fetchall():
+        try:
+            started_at = _parse_utc(run["started_at"], name="official source fetch started_at")
+            finished_at = _parse_utc(run["finished_at"], name="official source fetch finished_at")
+            endpoints_ok = json.loads(str(run["endpoints_ok"] or "[]"))
+            endpoints_failed = json.loads(str(run["endpoints_failed"] or "[]"))
+        except (ChipEvidenceError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        failed_names = {
+            str(item.get("endpoint") or "")
+            for item in endpoints_failed
+            if isinstance(item, Mapping)
+        } if isinstance(endpoints_failed, list) else set()
+        raw_dir = str(run["raw_dir"] or "").strip()
+        if (
+            not isinstance(endpoints_ok, list)
+            or endpoint not in endpoints_ok
+            or endpoint in failed_names
+            or not raw_dir
+            or finished_at < observed
+            or finished_at > checked
+        ):
+            continue
+        root = Path(raw_dir).expanduser().resolve()
+        if not root.is_dir():
+            continue
+        try:
+            records = raw_archive.load_manifest(root)
+        except (OSError, ValueError, raw_archive.RawArchiveError):
+            continue
+        matches = [
+            item for item in records
+            if int(item.get("run_id") or -1) == int(run["id"])
+            and str(item.get("source") or "") == source
+            and _parse_utc(item.get("observed_at"), name=f"{source} archive observed_at") == observed
+        ]
+        if len(matches) != 1:
+            continue
+        if finished_at < started_at:
+            raise ChipEvidenceError("official source fetch interval is reversed")
+        if finished_at < observed or not raw_archive.verify_archived_blob(root, matches[0]):
+            continue
+        record = matches[0]
+        try:
+            payload = json.loads((root / raw_archive.ARCHIVE_DIRNAME / str(record["relative_path"])).read_text(
+                encoding="utf-8"
+            ))
+        except (OSError, ValueError, KeyError):
+            continue
+        provenance = {
+            "source": source,
+            "endpoint": endpoint,
+            "fetch_run_id": int(run["id"]),
+            "fetch_status": str(run["status"]),
+            "fetch_started_at": str(run["started_at"]),
+            "raw_dir": str(root),
+            "capture_id": str(record.get("capture_id") or ""),
+            "observed_at": str(record.get("observed_at") or ""),
+            "relative_path": str(record.get("relative_path") or ""),
+            "fetch_finished_at": str(run["finished_at"]),
+            "payload_sha256": str(record.get("payload_sha256") or ""),
+        }
+        candidates.append((provenance, payload))
+    if len(candidates) != 1:
+        raise ChipEvidenceError(
+            f"{source} source provenance is missing, ambiguous, stale, or not backed by one intact "
+            "successful official fetch capture"
+        )
+    return candidates[0]
+
+
+def _verify_event_payload(payload: Any, event_row: Mapping[str, Any], *, event: int) -> None:
+    rows = payload.get("events") if isinstance(payload, Mapping) else None
+    matches = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            if int(row.get("id")) == int(event):
+                matches.append(row)
+        except (TypeError, ValueError):
+            continue
+    if len(matches) != 1:
+        raise ChipEvidenceError(f"official bootstrap archive does not uniquely contain GW{event}")
+    source = matches[0]
+    if (
+        _fpl_flag(source.get("finished")) != int(event_row["finished"])
+        or _fpl_flag(source.get("data_checked")) != int(event_row["data_checked"])
+    ):
+        raise ChipEvidenceError(f"GW{event} database event state differs from its official archive")
+
+
+def _verify_fixture_payload(payload: Any, fixtures: Sequence[Mapping[str, Any]], *, event: int) -> None:
+    if not isinstance(payload, list):
+        raise ChipEvidenceError("official fixtures archive is not a fixture list")
+    source_rows = [
+        row for row in payload
+        if isinstance(row, Mapping) and row.get("event") is not None
+        and int(row.get("event")) == int(event)
+    ]
+    try:
+        by_id = {int(row["id"]): row for row in source_rows}
+    except (KeyError, TypeError, ValueError):
+        raise ChipEvidenceError(f"official fixtures archive has invalid GW{event} fixture IDs")
+    expected_ids = {int(row["id"]) for row in fixtures}
+    if len(source_rows) != len(by_id) or set(by_id) != expected_ids:
+        raise ChipEvidenceError(f"official fixtures archive does not match the stored GW{event} fixture set")
+    for fixture in fixtures:
+        raw = by_id[int(fixture["id"])]
+        kickoff = _parse_utc(raw.get("kickoff_time"), name=f"official GW{event} kickoff_time")
+        if (
+            int(raw.get("team_h") or 0) != int(fixture["team_h"])
+            or int(raw.get("team_a") or 0) != int(fixture["team_a"])
+            or kickoff != _parse_utc(fixture["kickoff_time"], name=f"GW{event} kickoff_time")
+            or _fpl_flag(raw.get("started")) != int(fixture["started"])
+            or _fpl_flag(raw.get("finished")) != int(fixture["finished"])
+            or _fpl_flag(raw.get("finished_provisional")) != _fpl_flag(fixture.get("finished_provisional"))
+        ):
+            raise ChipEvidenceError(
+                f"GW{event} fixture {fixture['id']} database state differs from its official archive"
+            )
+
+
+def _verify_state_source_witness(
+    witness: Mapping[str, Any],
+    *,
+    expected_source: str,
+    expected_endpoint: str,
+    checked_at: datetime,
+    expected_observed_at: str,
+) -> Any:
+    from . import raw_archive
+
+    if (
+        witness.get("source") != expected_source
+        or witness.get("endpoint") != expected_endpoint
+        or witness.get("fetch_status") not in {"success", "partial"}
+        or not str(witness.get("capture_id") or "")
+        or len(str(witness.get("payload_sha256") or "")) != 64
+        or not str(witness.get("raw_dir") or "")
+        or not str(witness.get("relative_path") or "")
+    ):
+        raise ChipEvidenceError("official state source witness is incomplete or has the wrong endpoint identity")
+    observed = _parse_utc(witness.get("observed_at"), name=f"{expected_source} observed_at")
+    expected_observed = _parse_utc(expected_observed_at, name=f"{expected_source} database updated_at")
+    started = _parse_utc(witness.get("fetch_started_at"), name="official source fetch started_at")
+    finished = _parse_utc(witness.get("fetch_finished_at"), name="official source fetch finished_at")
+    if finished < started:
+        raise ChipEvidenceError("official source fetch interval is reversed")
+    if observed != expected_observed or finished < observed or finished > checked_at:
+        raise ChipEvidenceError("official state source witness has inconsistent or unavailable timing")
+    try:
+        run_id = int(witness.get("fetch_run_id"))
+        root = Path(str(witness["raw_dir"])).expanduser().resolve()
+        archive_root = (root / raw_archive.ARCHIVE_DIRNAME).resolve()
+        blob = (archive_root / str(witness["relative_path"])).resolve()
+        if not blob.is_relative_to(archive_root):
+            raise ChipEvidenceError("official state source witness escapes the raw archive root")
+        records = raw_archive.load_manifest(root)
+        expected_capture_id = raw_archive.capture_id(
+            expected_source,
+            str(witness["observed_at"]),
+            str(witness["payload_sha256"]),
+        )
+        if expected_capture_id != str(witness["capture_id"]):
+            raise ChipEvidenceError("official state source witness capture identity does not reproduce")
+        matches = [
+            item for item in records
+            if str(item.get("capture_id") or "") == str(witness["capture_id"])
+            and int(item.get("run_id") or -1) == run_id
+            and str(item.get("source") or "") == expected_source
+            and str(item.get("observed_at") or "") == str(witness["observed_at"])
+            and str(item.get("payload_sha256") or "") == str(witness["payload_sha256"])
+            and str(item.get("relative_path") or "") == str(witness["relative_path"])
+        ]
+    except ChipEvidenceError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError) as failure:
+        raise ChipEvidenceError("official state source witness cannot be re-read") from failure
+    if len(matches) != 1 or not raw_archive.verify_archived_blob(root, matches[0]):
+        raise ChipEvidenceError("official state source witness archive/digest no longer verifies")
+    try:
+        return json.loads(blob.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as failure:
+        raise ChipEvidenceError("official state source witness payload is unreadable") from failure
+
+
+def _prospective_event_state_check(
+    conn: sqlite3.Connection,
+    *,
+    event: int,
+    cutoff: str,
+    stage: str,
+) -> dict[str, Any]:
+    """Prove one target event is still safely prospective from live source state.
+
+    Official event/fixture flags are authoritative for match state. Their row
+    timestamps must match intact archived official captures from a completed
+    successful/partial fetch; those captures may predate the origin cutoff.
+    A known future kickoff is timing evidence that an unstarted flag is not
+    stale, never a completion marker. Event-grain captures and canonical
+    completed performances also make a prospective issue ineligible.
+    """
+
+    from . import outcome_ledger as ol, planning, repositories as repo
+
+    target = int(event)
+    if target <= 0 or stage not in {"preflight", "calculation_start", "issuance"}:
+        raise ChipEvidenceError("prospective state check has an invalid event or stage")
+    event_row = next((row for row in repo.event_rows(conn) if int(row["id"]) == target), None)
+    if event_row is None:
+        raise ChipEvidenceError(f"GW{target} has no official event row; prospectivity cannot be verified")
+    event_state, _basis = planning.event_data_state(conn, target)
+    if event_state != planning.EVENT_STATE_SCHEDULED:
+        raise ChipEvidenceError(
+            f"GW{target} is {event_state}; only a verified scheduled event can receive a prospective forecast"
+        )
+    if event_row.get("finished") != 0 or event_row.get("data_checked") != 0:
+        raise ChipEvidenceError(
+            f"GW{target} event flags are not explicitly unfinished and unchecked"
+        )
+
+    _parse_utc(cutoff, name="origin cutoff")
+    fixtures = [dict(row) for row in conn.execute(
+        "SELECT id,event,kickoff_time,team_h,team_a,started,finished,finished_provisional,updated_at "
+        "FROM fixtures WHERE event=? ORDER BY id",
+        (target,),
+    ).fetchall()]
+    if not fixtures:
+        raise ChipEvidenceError(f"GW{target} has no known fixtures; prospectivity cannot be verified")
+    fixture_ids: set[int] = set()
+    for row in fixtures:
+        fixture_id = int(row.get("id") or 0)
+        if fixture_id <= 0 or fixture_id in fixture_ids or int(row.get("event") or -1) != target:
+            raise ChipEvidenceError(f"GW{target} has invalid or duplicate fixture identity")
+        fixture_ids.add(fixture_id)
+        if row.get("started") != 0 or row.get("finished") != 0:
+            raise ChipEvidenceError(
+                f"GW{target} fixture {fixture_id} has started or finished; refusing prospective forecast"
+            )
+        if row.get("finished_provisional") == 1:
+            raise ChipEvidenceError(
+                f"GW{target} fixture {fixture_id} is marked provisional; refusing prospective forecast"
+            )
+        team_h, team_a = row.get("team_h"), row.get("team_a")
+        if team_h is None or team_a is None or int(team_h) <= 0 or int(team_a) <= 0 or int(team_h) == int(team_a):
+            raise ChipEvidenceError(
+                f"GW{target} fixture {fixture_id} lacks a verifiable scheduled team pairing"
+            )
+        kickoff = row.get("kickoff_time")
+        try:
+            kickoff_at = _parse_utc(kickoff, name=f"GW{target} fixture {fixture_id} kickoff_time")
+        except ChipEvidenceError as failure:
+            raise ChipEvidenceError(
+                f"GW{target} fixture {fixture_id} has unknown kickoff; prospectivity cannot be verified"
+            ) from failure
+        updated_at = row.get("updated_at")
+        try:
+            updated = _parse_utc(updated_at, name=f"GW{target} fixture {fixture_id} updated_at")
+        except ChipEvidenceError as failure:
+            raise ChipEvidenceError(
+                f"GW{target} fixture {fixture_id} source state has no valid update time"
+            ) from failure
+        # Store normalized strings so independently captured states can be
+        # compared canonically even if the database used an equivalent offset.
+        row["kickoff_time"] = kickoff_at.isoformat().replace("+00:00", "Z")
+        row["updated_at"] = updated.isoformat().replace("+00:00", "Z")
+
+    event_updated_at = event_row.get("updated_at")
+    try:
+        event_updated = _parse_utc(event_updated_at, name=f"GW{target} event updated_at")
+    except ChipEvidenceError as failure:
+        raise ChipEvidenceError(f"GW{target} event source state has no valid update time") from failure
+    checked_at = _utc_now()
+    checked = _parse_utc(checked_at, name="prospective state checked_at")
+    if event_updated > checked:
+        raise ChipEvidenceError(f"GW{target} event source timestamp is later than the state check")
+    for row in fixtures:
+        updated = _parse_utc(row["updated_at"], name=f"GW{target} fixture updated_at")
+        kickoff = _parse_utc(row["kickoff_time"], name=f"GW{target} fixture kickoff_time")
+        if updated > checked:
+            raise ChipEvidenceError(
+                f"GW{target} fixture {row['id']} source timestamp is later than the state check"
+            )
+        if kickoff <= checked:
+            raise ChipEvidenceError(
+                f"GW{target} fixture {row['id']} kickoff has passed; its unstarted flag cannot prove prospectivity"
+            )
+
+    event_captures = ol.observation_captures(
+        conn, grain=ol.GRAIN_PLAYER_EVENT, event=target,
+    )
+    completed_rows = repo.completed_player_fixture_rows(conn, event=target)
+    if event_captures:
+        raise ChipEvidenceError(
+            f"GW{target} already has {len(event_captures)} event-grain outcome capture(s)"
+        )
+    if completed_rows:
+        raise ChipEvidenceError(
+            f"GW{target} already has {len(completed_rows)} completed player-fixture performance row(s)"
+        )
+
+    event_provenance, event_payload = _verified_state_source_capture(
+        conn,
+        source="bootstrap_static",
+        endpoint="bootstrap-static",
+        updated_at=str(event_row["updated_at"]),
+        checked_at=checked_at,
+    )
+    fixture_provenance, fixture_payload = _verified_state_source_capture(
+        conn,
+        source="fixtures",
+        endpoint="fixtures",
+        updated_at=str(fixtures[0]["updated_at"]),
+        checked_at=checked_at,
+    )
+    fixture_updated_times = {
+        _parse_utc(row["updated_at"], name=f"GW{target} fixture updated_at") for row in fixtures
+    }
+    if len(fixture_updated_times) != 1 or next(iter(fixture_updated_times)) != _parse_utc(
+        fixture_provenance["observed_at"], name="fixtures archive observed_at",
+    ):
+        raise ChipEvidenceError(f"GW{target} fixtures do not share one verified official observation")
+    if _parse_utc(event_provenance["observed_at"], name="bootstrap archive observed_at") != event_updated:
+        raise ChipEvidenceError(f"GW{target} event does not match its verified bootstrap observation")
+    _verify_event_payload(event_payload, event_row, event=target)
+    _verify_fixture_payload(fixture_payload, fixtures, event=target)
+
+    # Source-file verification can take time. Re-read the live authoritative
+    # flags afterward so a concurrent collector cannot start/finish a fixture
+    # during that work and leave the returned witness falsely prospective.
+    latest_event = conn.execute(
+        "SELECT id,finished,data_checked,updated_at FROM events WHERE id=?", (target,),
+    ).fetchone()
+    latest_fixtures = [dict(row) for row in conn.execute(
+        "SELECT id,event,kickoff_time,team_h,team_a,started,finished,finished_provisional,updated_at "
+        "FROM fixtures WHERE event=? ORDER BY id",
+        (target,),
+    ).fetchall()]
+    latest_state, _latest_basis = planning.event_data_state(conn, target)
+    if (
+        latest_event is None
+        or latest_state != planning.EVENT_STATE_SCHEDULED
+        or latest_event["finished"] != 0
+        or latest_event["data_checked"] != 0
+        or _parse_utc(latest_event["updated_at"], name=f"GW{target} event updated_at") != event_updated
+        or len(latest_fixtures) != len(fixtures)
+    ):
+        raise ChipEvidenceError(f"GW{target} official state changed while prospectivity was being verified")
+    for original, latest in zip(fixtures, latest_fixtures):
+        if (
+            int(latest.get("id") or -1) != int(original["id"])
+            or int(latest.get("event") or -1) != target
+            or latest.get("team_h") != original["team_h"]
+            or latest.get("team_a") != original["team_a"]
+            or latest.get("started") != 0
+            or latest.get("finished") != 0
+            or latest.get("finished_provisional") == 1
+            or _parse_utc(latest.get("kickoff_time"), name="latest fixture kickoff_time")
+            != _parse_utc(original["kickoff_time"], name="verified fixture kickoff_time")
+            or _parse_utc(latest.get("updated_at"), name="latest fixture updated_at")
+            != _parse_utc(original["updated_at"], name="verified fixture updated_at")
+        ):
+            raise ChipEvidenceError(f"GW{target} fixture state changed while prospectivity was being verified")
+    checked_at = _utc_now()
+    checked = _parse_utc(checked_at, name="prospective state checked_at")
+    if any(
+        _parse_utc(row["kickoff_time"], name=f"GW{target} fixture kickoff_time") <= checked
+        for row in fixtures
+    ):
+        raise ChipEvidenceError(f"GW{target} fixture kickoff passed during prospectivity verification")
+    if ol.observation_captures(conn, grain=ol.GRAIN_PLAYER_EVENT, event=target):
+        raise ChipEvidenceError(f"GW{target} acquired an event-grain outcome capture during verification")
+    if repo.completed_player_fixture_rows(conn, event=target):
+        raise ChipEvidenceError(f"GW{target} acquired completed player-fixture data during verification")
+
+    event_state_record = {
+        "id": target,
+        "finished": int(event_row["finished"]),
+        "data_checked": int(event_row["data_checked"]),
+        "updated_at": event_updated.isoformat().replace("+00:00", "Z"),
+    }
+    fixture_state_records = [{
+        "id": int(row["id"]),
+        "event": target,
+        "kickoff_time": str(row["kickoff_time"]),
+        "team_h": int(row["team_h"]),
+        "team_a": int(row["team_a"]),
+        "started": int(row["started"]),
+        "finished": int(row["finished"]),
+        "finished_provisional": row.get("finished_provisional"),
+        "updated_at": str(row["updated_at"]),
+    } for row in fixtures]
+    return _sealed(FORECAST_STATE_CHECK_SCHEMA, {
+        "event": target,
+        "stage": stage,
+        "checked_at": checked_at,
+        "origin_cutoff": str(cutoff),
+        "event_state": planning.EVENT_STATE_SCHEDULED,
+        "event_row": event_state_record,
+        "fixtures": fixture_state_records,
+        "source_provenance": {
+            "event": event_provenance,
+            "fixtures": fixture_provenance,
+        },
+        "event_capture_count": 0,
+        "completed_player_fixture_count": 0,
+    })
+
+
+def _collect_prospective_state_checks(
+    conn: sqlite3.Connection,
+    *,
+    events: Sequence[int],
+    cutoff: str,
+    stage: str,
+) -> list[dict[str, Any]]:
+    targets = [int(value) for value in events]
+    if not targets or len(set(targets)) != len(targets):
+        raise ChipEvidenceError("prospective state check requires unique target events")
+    return [
+        _prospective_event_state_check(conn, event=event, cutoff=cutoff, stage=stage)
+        for event in targets
+    ]
+
+
+def _verify_prospective_state_sequence(
+    *,
+    checks: Sequence[Sequence[Mapping[str, Any]]],
+    events: Sequence[int],
+    cutoff: str,
+    calculation_started_at: str,
+    issued_at: str | None = None,
+) -> None:
+    """Validate sealed prospectivity witnesses, including issue-state binding."""
+
+    if len(checks) != 3:
+        raise ChipEvidenceError("forecast is missing one or more prospectivity state checks")
+    expected_stages = ("preflight", "calculation_start", "issuance")
+    expected_events = [int(value) for value in events]
+    per_event: dict[int, list[Mapping[str, Any]]] = {event: [] for event in expected_events}
+    stage_times: list[list[datetime]] = []
+    _parse_utc(cutoff, name="origin cutoff")
+    for stage_checks, expected_stage in zip(checks, expected_stages):
+        if not isinstance(stage_checks, Sequence) or len(stage_checks) != len(expected_events):
+            raise ChipEvidenceError("forecast prospectivity stage does not cover every target event")
+        seen_events: set[int] = set()
+        times: list[datetime] = []
+        for check in stage_checks:
+            _verify_seal(check, schema=FORECAST_STATE_CHECK_SCHEMA)
+            if str(check.get("stage") or "") != expected_stage:
+                raise ChipEvidenceError("forecast prospectivity checks are missing or out of order")
+            event = int(check.get("event") or -1)
+            if event not in per_event or event in seen_events or check.get("event_state") != "SCHEDULED":
+                raise ChipEvidenceError("forecast prospectivity check does not bind a scheduled target event")
+            seen_events.add(event)
+            if int(check.get("event_capture_count", -1)) != 0 or int(
+                check.get("completed_player_fixture_count", -1)
+            ) != 0:
+                raise ChipEvidenceError("forecast prospectivity check includes outcome/performance evidence")
+            event_row = check.get("event_row")
+            fixtures = check.get("fixtures")
+            if (
+                not isinstance(event_row, Mapping)
+                or int(event_row.get("id") or -1) != event
+                or event_row.get("finished") != 0
+                or event_row.get("data_checked") != 0
+                or not isinstance(fixtures, list)
+                or not fixtures
+            ):
+                raise ChipEvidenceError("forecast prospectivity check has incomplete event/fixture state")
+            checked_at = _parse_utc(check.get("checked_at"), name="prospective state checked_at")
+            times.append(checked_at)
+            if str(check.get("origin_cutoff") or "") != str(cutoff):
+                raise ChipEvidenceError("forecast prospectivity check differs from the pinned origin cutoff")
+            for fixture in fixtures:
+                if (
+                    not isinstance(fixture, Mapping)
+                    or int(fixture.get("event") or -1) != event
+                    or int(fixture.get("started", -1)) != 0
+                    or int(fixture.get("finished", -1)) != 0
+                    or fixture.get("finished_provisional") == 1
+                    or int(fixture.get("team_h") or 0) <= 0
+                    or int(fixture.get("team_a") or 0) <= 0
+                    or int(fixture.get("team_h") or 0) == int(fixture.get("team_a") or 0)
+                ):
+                    raise ChipEvidenceError("forecast prospectivity check has a started/finished/unknown fixture")
+                kickoff = _parse_utc(
+                    fixture.get("kickoff_time"), name=f"GW{event} fixture kickoff_time",
+                )
+                fixture_updated = _parse_utc(
+                    fixture.get("updated_at"), name=f"GW{event} fixture updated_at",
+                )
+                if fixture_updated > checked_at or kickoff <= checked_at:
+                    raise ChipEvidenceError("forecast prospectivity check has future source time or non-future kickoff")
+            event_updated = _parse_utc(event_row.get("updated_at"), name=f"GW{event} event updated_at")
+            if event_updated > checked_at:
+                raise ChipEvidenceError("forecast prospectivity check has future event-state timing")
+            provenance = check.get("source_provenance")
+            if not isinstance(provenance, Mapping):
+                raise ChipEvidenceError("forecast prospectivity check omits official source provenance")
+            event_provenance = provenance.get("event")
+            fixture_provenance = provenance.get("fixtures")
+            if not isinstance(event_provenance, Mapping) or not isinstance(fixture_provenance, Mapping):
+                raise ChipEvidenceError("forecast prospectivity check has incomplete source provenance")
+            event_payload = _verify_state_source_witness(
+                event_provenance,
+                expected_source="bootstrap_static",
+                expected_endpoint="bootstrap-static",
+                checked_at=checked_at,
+                expected_observed_at=str(event_row.get("updated_at") or ""),
+            )
+            fixture_updated_values = {str(item.get("updated_at") or "") for item in fixtures}
+            if len(fixture_updated_values) != 1:
+                raise ChipEvidenceError("forecast prospectivity check has mixed fixture observation times")
+            fixtures_payload = _verify_state_source_witness(
+                fixture_provenance,
+                expected_source="fixtures",
+                expected_endpoint="fixtures",
+                checked_at=checked_at,
+                expected_observed_at=next(iter(fixture_updated_values)),
+            )
+            _verify_event_payload(event_payload, event_row, event=event)
+            _verify_fixture_payload(fixtures_payload, fixtures, event=event)
+            per_event[event].append(check)
+        if seen_events != set(expected_events):
+            raise ChipEvidenceError("forecast prospectivity stage has missing/duplicate target events")
+        stage_times.append(times)
+    if any(len(value) != 3 for value in per_event.values()):
+        raise ChipEvidenceError("forecast prospectivity checks do not cover each target event three times")
+    start_at = _parse_utc(calculation_started_at, name="forecast calculation_started_at")
+    if max(stage_times[0]) > min(stage_times[1]):
+        raise ChipEvidenceError("forecast prospectivity preflight and calculation-start checks overlap")
+    if max(stage_times[1]) > start_at:
+        raise ChipEvidenceError("forecast calculation starts before its final pre-calculation state check")
+    if issued_at is not None:
+        issue_at = _parse_utc(issued_at, name="forecast issued_at")
+        issuance_checks = [
+            _parse_utc(per_event[event][2]["checked_at"], name="issuance checked_at")
+            for event in expected_events
+        ]
+        if any(value > issue_at for value in issuance_checks):
+            raise ChipEvidenceError("forecast issue time precedes its final prospective state check")
+        if issue_at < start_at or max(stage_times[2]) < start_at:
+            raise ChipEvidenceError("forecast issuance precedes calculation start")
+        for event_checks in per_event.values():
+            for check in event_checks:
+                for fixture in check["fixtures"]:
+                    if _parse_utc(
+                        fixture["kickoff_time"], name="prospective fixture kickoff_time",
+                    ) <= issue_at:
+                        raise ChipEvidenceError(
+                            "forecast issue time is at or after a target fixture kickoff"
+                        )
+    # The exact fixture schedule and team binding must remain stable at each
+    # checked stage; status/timestamps may advance but cannot change identity.
+    for event, values in per_event.items():
+        fixture_bindings = [
+            [(int(fixture["id"]), int(fixture["team_h"]), int(fixture["team_a"]), str(fixture["kickoff_time"]))
+             for fixture in check["fixtures"]]
+            for check in values
+        ]
+        if fixture_bindings[0] != fixture_bindings[1] or fixture_bindings[1] != fixture_bindings[2]:
+            raise ChipEvidenceError(f"GW{event} fixture schedule changed during forecast calculation")
+
+
 def _read_forecast_receipt(evidence_root: str | Path, operation_id: str) -> dict[str, Any]:
     receipt = _read_json(_metadata_root(evidence_root) / f"forecast-{operation_id}.json")
     _verify_seal(receipt, schema=FORECAST_RECEIPT_SCHEMA)
@@ -986,7 +1579,6 @@ def forecast_origin(
     from . import chip_decision as cd
     from . import chip_reservation_forecast as crf
     from . import generation_store as gs
-    from . import planning
     from . import season_rules as sr
     from .chip_route_assembly import (
         _post_h1_save_reservation_state,
@@ -1081,13 +1673,6 @@ def forecast_origin(
             "cache_dir": str(cache_path),
             "materialize_worlds": bool(materialize_worlds),
         }
-        for event in forecast_events:
-            state_name, _basis = planning.event_data_state(conn, event)
-            if state_name == planning.EVENT_STATE_FINAL:
-                raise ChipEvidenceError(
-                    f"GW{event} is already officially final; refusing to issue a retrospective prospective forecast"
-                )
-
         intent_exists = intent_path.exists()
         if (
             not intent_exists
@@ -1119,6 +1704,17 @@ def forecast_origin(
                 raise ChipEvidenceError("forecast publication receipt differs from its immutable intent")
             issued_at = str(publication.get("issued_at") or "")
             _parse_utc(issued_at, name="forecast issued_at")
+            _verify_prospective_state_sequence(
+                checks=(
+                    intent.get("prospective_preflight") or (),
+                    intent.get("prospective_calculation_start") or (),
+                    publication.get("prospective_issuance") or (),
+                ),
+                events=forecast_events,
+                cutoff=str(cutoff),
+                calculation_started_at=calculation_started_at,
+                issued_at=issued_at,
+            )
             cache_report = publication.get("cache")
             if not isinstance(cache_report, list):
                 raise ChipEvidenceError("forecast publication receipt omits its verified cache report")
@@ -1139,6 +1735,9 @@ def forecast_origin(
                 raise ChipEvidenceError("completed source forecast differs from its publication receipt")
             materialized_worlds = bool(publication.get("materialized_worlds"))
         else:
+            prospective_preflight = _collect_prospective_state_checks(
+                conn, events=forecast_events, cutoff=str(cutoff), stage="preflight",
+            )
             prior_evidence = [
                 path for path in _root(evidence_root).glob("chip-causal-evidence-*.json")
                 if str(_read_json(path).get("observation_id") or "") == str(observation_id)
@@ -1158,12 +1757,6 @@ def forecast_origin(
                     "canonical world cache is incomplete; refusing before scoring/world construction: "
                     + ", ".join(f"GW{row['event']}={row['status']}" for row in misses)
                 )
-            calculation_started_at = _utc_now()
-            if _parse_utc(calculation_started_at, name="forecast calculation_started_at") < _parse_utc(
-                cutoff, name="origin cutoff",
-            ):
-                raise ChipEvidenceError("forecast calculation starts before the pinned input cutoff")
-
             season_artifact = _read_json(Path(str(
                 gs.load_engine_decision_record(conn, decision_id)["decision_artifact_ref"]
             )))
@@ -1185,9 +1778,25 @@ def forecast_origin(
                     raise ChipEvidenceError("origin-pinned season rules are unavailable for continuation scoring")
                 rules = pinned_rules.rules
 
+            prospective_calculation_start = _collect_prospective_state_checks(
+                conn, events=forecast_events, cutoff=str(cutoff), stage="calculation_start",
+            )
+            calculation_started_at = _utc_now()
+            if _parse_utc(calculation_started_at, name="forecast calculation_started_at") < _parse_utc(
+                cutoff, name="origin cutoff",
+            ):
+                raise ChipEvidenceError("forecast calculation starts before the pinned input cutoff")
+            if max(_parse_utc(row["checked_at"], name="calculation-start checked_at")
+                   for row in prospective_calculation_start) > _parse_utc(
+                       calculation_started_at, name="forecast calculation_started_at",
+                   ):
+                raise ChipEvidenceError("forecast calculation started before prospectivity recheck completed")
+
             intent = _sealed(FORECAST_INTENT_SCHEMA, {
                 **expected_intent,
                 "calculation_started_at": calculation_started_at,
+                "prospective_preflight": prospective_preflight,
+                "prospective_calculation_start": prospective_calculation_start,
             })
             _write_new_json(intent_path, intent)
             generated = build_bb_tc_reservation_forecast(
@@ -1205,22 +1814,9 @@ def forecast_origin(
             )
             if generated.get("coverage_status") != forecast.FORECAST_READY:
                 raise ChipEvidenceError("canonical forecast producer did not return complete through-expiry coverage")
-            for event in forecast_events:
-                state_name, _basis = planning.event_data_state(conn, event)
-                if state_name == planning.EVENT_STATE_FINAL:
-                    raise ChipEvidenceError(
-                        f"GW{event} became officially final during forecast calculation; "
-                        "the completed attempt is not a prospective origin"
-                    )
             calculation_path = Path(str(generated.get("path") or "")).expanduser().resolve()
             if calculation_path.parent != _root(evidence_root):
                 raise ChipEvidenceError("canonical producer forecast was not retained in the explicit flat evidence root")
-            issued_at = _utc_now()
-            _parse_utc(issued_at, name="forecast issued_at")
-            if _parse_utc(issued_at, name="forecast issued_at") < _parse_utc(
-                calculation_started_at, name="forecast calculation_started_at",
-            ):
-                raise ChipEvidenceError("forecast issuance precedes calculation completion")
             from . import chip_reservation_forecast as crf
 
             calculation_artifact = dict(generated.get("artifact") or {})
@@ -1251,11 +1847,27 @@ def forecast_origin(
                 },
                 evidence_verifier=lambda reference: _flat_artifact(evidence_root, reference)[1],
             )
+            prospective_issuance = _collect_prospective_state_checks(
+                conn, events=forecast_events, cutoff=str(cutoff), stage="issuance",
+            )
+            issued_at = _utc_now()
+            _verify_prospective_state_sequence(
+                checks=(
+                    intent["prospective_preflight"],
+                    intent["prospective_calculation_start"],
+                    prospective_issuance,
+                ),
+                events=forecast_events,
+                cutoff=str(cutoff),
+                calculation_started_at=calculation_started_at,
+                issued_at=issued_at,
+            )
             publication = _sealed(FORECAST_PUBLICATION_SCHEMA, {
                 **expected_intent,
                 "intent_sha256": _sha256(intent),
                 "calculation_started_at": calculation_started_at,
                 "issued_at": issued_at,
+                "prospective_issuance": prospective_issuance,
                 "source_forecast_ref": calculation_path.name,
                 "source_forecast_artifact_identity": str(calculation_artifact.get("artifact_sha256") or ""),
                 "source_forecast_content_sha256": crf.canonical_sha256(calculation_artifact),
@@ -1409,6 +2021,19 @@ def _load_forecast_origin(
         calculation_started_at, name="forecast calculation_started_at",
     ):
         raise ChipEvidenceError("forecast publication precedes calculation start")
+    expiry_event = int(receipt.get("expiry_event") or -1)
+    forecast_events = list(range(int(identity["planning_event"]) + 1, expiry_event + 1))
+    _verify_prospective_state_sequence(
+        checks=(
+            intent.get("prospective_preflight") or (),
+            intent.get("prospective_calculation_start") or (),
+            publication.get("prospective_issuance") or (),
+        ),
+        events=forecast_events,
+        cutoff=str(identity["cutoff"]),
+        calculation_started_at=calculation_started_at,
+        issued_at=issued_at,
+    )
     causal_path, causal, _forecast_path, raw_forecast = _load_causal_origin(
         identity["evidence_root"], observation_id=observation_id,
         action=action, origin_id=origin_id,
