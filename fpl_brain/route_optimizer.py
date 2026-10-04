@@ -1564,6 +1564,7 @@ def optimize(
     parallel_workers: int | None = None,
     parallel_matrix_cache: int | None = None,
     parallel_schedule_sink: dict | None = None,
+    allow_world_materialization: bool = True,
     **descriptors: Any,
 ) -> dict[str, Any]:
     """Bounded search, exact scoring, Pareto frontiers and coverage/rescue audits.
@@ -1593,6 +1594,8 @@ def optimize(
     from . import certified_bundle as cb
 
     refuse_predictive_descriptors(descriptors, caller="route_optimizer.optimize")
+    if type(allow_world_materialization) is not bool:
+        raise TypeError("allow_world_materialization must be an actual bool")
     config = config or OptimizerConfig()
     if search_n_override is not None:
         config = _with_n(config, int(search_n_override))
@@ -1608,6 +1611,14 @@ def optimize(
             [
                 "a certified generation names the certified run ids, and a non-production world "
                 "source was supplied beside it; a certified search never consumes injected worlds"
+            ],
+        )
+    if not allow_world_materialization and non_production_worlds is not None:
+        raise cb.CertificationRefused(
+            DIAG_CERTIFIED_WORLD_CACHE_REQUIRED,
+            [
+                "cache-only optimization requires a certified generation and its verified cache; "
+                "injected/non-production matrices or providers are not accepted"
             ],
         )
     rows = {int(row["player_id"]): row for row in universe["universe"]}
@@ -1655,6 +1666,7 @@ def optimize(
         else:
             matrix, info = build_event_worlds(
                 conn, generation, event, union, config, cache_dir=cache_dir,
+                allow_materialization=allow_world_materialization,
             )
         worlds_by_event[event] = matrix
         world_info[str(event)] = {**info, "worlds": int(matrix["worlds"]), "union_players": len(union)}

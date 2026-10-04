@@ -1,4 +1,4 @@
-"""Bounded operator workflow for prospective BB/TC evidence retention.
+"""Bounded operator workflow for prospective chip evidence retention.
 
 This module is an orchestration layer over the accepted generation, route,
 permission, forecast, outcome-ledger and calibration validators.  It does not
@@ -1569,10 +1569,11 @@ def _load_causal_origin(
         raise ChipEvidenceError("causal origin forecast artifact identity differs")
     if str(causal["forecast"].get("artifact_ref") or "") != forecast_path.name:
         raise ChipEvidenceError("causal origin raw forecast reference differs from its retained filename")
+    from . import chip_decision as cd
     if str(source.get("generation_id") or "") == "" or str(
         causal.get("action") or ""
-    ) not in {"BB", "TC"}:
-        raise ChipEvidenceError("causal origin is not a BB/TC source")
+    ) not in set(cd.PLAYABLE_CHIP_ACTIONS):
+        raise ChipEvidenceError("causal origin is not a supported playable-chip source")
     return causal_path, causal, forecast_path, forecast_value
 
 
@@ -1986,6 +1987,11 @@ def _load_forecast_origin(
         conn, identity=identity,
     )
     origin_id = _sha256(_origin_key(identity))
+    if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
+        from . import chip_horizon_evidence_ops as horizon_ops
+        horizon_ops._verify_horizon_origin(
+            identity["evidence_root"], origin_id=origin_id, identity=identity, action=action,
+        )
     operation_id = _forecast_operation_id(origin_id, action, observation_id)
     receipt_path = _metadata_root(identity["evidence_root"]) / f"forecast-{operation_id}.json"
     if not receipt_path.exists():
@@ -2083,6 +2089,24 @@ def _load_forecast_origin(
         },
         evidence_verifier=lambda reference: _flat_artifact(identity["evidence_root"], reference)[1],
     )
+    if action in {cd.CHIP_ACTION_FH, cd.CHIP_ACTION_WC}:
+        from . import chip_horizon_evidence_ops as horizon_ops
+
+        verified_receipt, verified_forecast = horizon_ops._forecast_receipt_from_publication(
+            conn,
+            identity=identity,
+            origin_id=origin_id,
+            operation_id=operation_id,
+            observation_id=observation_id,
+            action=action,
+            expiry_event=int(receipt.get("expiry_event") or -1),
+            publication=publication,
+            intent=intent,
+        )
+        if verified_receipt != receipt or verified_forecast != raw_forecast:
+            raise ChipEvidenceError(
+                "FH/WC common loader differs from its deterministic completed forecast publication"
+            )
     snapshot_causality = generation.manifest.get("search_permission_causality") or {}
     if (
         str(receipt.get("input_as_of") or "") != str(identity["cutoff"])
@@ -2108,29 +2132,119 @@ def _load_forecast_origin(
     }
 
 
-def _required_players_for_event(causal: Mapping[str, Any], event: int) -> list[int]:
+def _schedule_player_map(causal: Mapping[str, Any], action: str) -> dict[int, list[int]]:
+    """Return the exact per-event PLAY/SAVE player union from retained policies."""
+
     pair = causal.get("counterfactual_pair")
     if not isinstance(pair, Mapping):
         raise ChipEvidenceError("causal origin omits the PLAY/SAVE policy pair")
-    required: set[int] = set()
+    canonical_action = str(action).upper()
+    by_role: dict[str, dict[int, set[int]]] = {}
     for role in ("play", "save"):
         arm = pair.get(role)
         if not isinstance(arm, Mapping):
             raise ChipEvidenceError(f"causal origin omits its {role.upper()} policy")
         schedule = arm.get("valuation_schedule")
+        role_events: dict[int, set[int]] = {}
         if isinstance(schedule, Mapping):
-            rows = schedule.get("events") or ()
+            rows = schedule.get("events")
+            if not isinstance(rows, list) or not rows:
+                raise ChipEvidenceError(f"{role.upper()} valuation schedule has no event rows")
             for row in rows:
-                if int(row.get("event") or -1) == int(event):
-                    required.update(int(pid) for pid in row.get("proposed_squad_ids") or ())
-        elif int(arm.get("event") or -1) == int(event):
+                if not isinstance(row, Mapping) or type(row.get("event")) is not int:
+                    raise ChipEvidenceError(f"{role.upper()} valuation schedule has a malformed event row")
+                event = int(row["event"])
+                player_ids = row.get("proposed_squad_ids")
+                if event <= 0 or not isinstance(player_ids, list) or not player_ids:
+                    raise ChipEvidenceError(f"{role.upper()} schedule GW{event} has no verified proposed squad")
+                if event in role_events:
+                    raise ChipEvidenceError(f"{role.upper()} valuation schedule repeats GW{event}")
+                parsed_ids = [int(pid) for pid in player_ids]
+                if any(pid <= 0 for pid in parsed_ids) or len(parsed_ids) != len(set(parsed_ids)):
+                    raise ChipEvidenceError(f"{role.upper()} schedule GW{event} has invalid player identities")
+                role_events[event] = set(parsed_ids)
+        elif canonical_action in {"FH", "WC"}:
+            raise ChipEvidenceError(f"{canonical_action} causal policy omits its full valuation schedule")
+        elif type(arm.get("event")) is int and isinstance(arm.get("proposed_squad_ids"), list):
             # The accepted BB/TC causal arm schema binds the selected event
             # directly on each PLAY/SAVE arm; it does not duplicate that
             # event under causal.forecast.selected_event.
-            required.update(int(pid) for pid in arm.get("proposed_squad_ids") or ())
+            event = int(arm["event"])
+            player_ids = [int(pid) for pid in arm["proposed_squad_ids"]]
+            if event <= 0 or not player_ids or any(pid <= 0 for pid in player_ids):
+                raise ChipEvidenceError(f"{role.upper()} policy has invalid event/player identities")
+            role_events[event] = set(player_ids)
+        by_role[role] = role_events
+    if not by_role["play"] or set(by_role["play"]) != set(by_role["save"]):
+        raise ChipEvidenceError("PLAY and SAVE policies do not bind the same event schedule")
+    if canonical_action in {"FH", "WC"}:
+        play_events = list(by_role["play"])
+        save_events = list(by_role["save"])
+        if play_events != save_events or play_events != sorted(play_events):
+            raise ChipEvidenceError("FH/WC PLAY and SAVE schedules are not identical chronological event sequences")
+    result = {
+        event: sorted(by_role["play"][event] | by_role["save"][event])
+        for event in by_role["play"]
+    }
+    return result
+
+
+def _scheduled_event_ids(causal: Mapping[str, Any], action: str, *, selected_event: int) -> list[int]:
+    if str(action).upper() not in {"FH", "WC"}:
+        return [int(selected_event)]
+    events = list(_schedule_player_map(causal, action))
+    if not events or events[0] != int(selected_event):
+        raise ChipEvidenceError("selected forecast event is not the first event in its verified FH/WC schedule")
+    return events
+
+
+def _required_players_for_event(
+    causal: Mapping[str, Any], event: int, *, action: str | None = None,
+) -> list[int]:
+    selected_action = str(action or causal.get("action") or "").upper()
+    if selected_action in {"FH", "WC"}:
+        required = _schedule_player_map(causal, selected_action).get(int(event), [])
+    else:
+        # Preserve the accepted BB/TC extraction semantics exactly: the policies
+        # can bind the selected event directly or through their existing schedules.
+        pair = causal.get("counterfactual_pair")
+        if not isinstance(pair, Mapping):
+            raise ChipEvidenceError("causal origin omits the PLAY/SAVE policy pair")
+        required_set: set[int] = set()
+        for role in ("play", "save"):
+            arm = pair.get(role)
+            if not isinstance(arm, Mapping):
+                raise ChipEvidenceError(f"causal origin omits its {role.upper()} policy")
+            schedule = arm.get("valuation_schedule")
+            if isinstance(schedule, Mapping):
+                rows = schedule.get("events") or ()
+                for row in rows:
+                    if int(row.get("event") or -1) == int(event):
+                        required_set.update(int(pid) for pid in row.get("proposed_squad_ids") or ())
+            elif int(arm.get("event") or -1) == int(event):
+                required_set.update(int(pid) for pid in arm.get("proposed_squad_ids") or ())
+        required = sorted(required_set)
     if not required:
         raise ChipEvidenceError(f"the retained policies name no players for GW{int(event)}")
-    return sorted(required)
+    return list(required)
+
+
+def _require_capture_after_forecast(
+    forecast_receipt: Mapping[str, Any], archive: Mapping[str, Any], *, event: int,
+) -> None:
+    forecast_available = _parse_utc(
+        forecast_receipt.get("forecast_available_at"), name="verified forecast_available_at",
+    )
+    official_final = _parse_utc(archive.get("official_final_at"), name="official event finality time")
+    capture_available = _parse_utc(archive.get("available_at"), name="official capture available_at")
+    if official_final <= forecast_available:
+        raise ChipEvidenceError(
+            f"GW{int(event)} official finality is not strictly later than the retained forecast availability"
+        )
+    if capture_available <= forecast_available:
+        raise ChipEvidenceError(
+            f"GW{int(event)} official capture availability is not strictly later than the retained forecast availability"
+        )
 
 
 def _read_verified_archive_payload(raw_root: str | Path, record: Mapping[str, Any]) -> dict[str, Any]:
@@ -2304,8 +2418,8 @@ def _capture_operation_id(
     action: str,
 ) -> str:
     canonical_action = str(action).upper()
-    if canonical_action not in {"BB", "TC"}:
-        raise ChipEvidenceError("capture operation identity requires canonical BB or TC action")
+    if canonical_action not in {"BB", "TC", "FH", "WC"}:
+        raise ChipEvidenceError("capture operation identity requires a canonical BB/TC/FH/WC action")
     return _sha256([
         str(origin_id), canonical_action, str(observation_id), int(event), int(fetch_run_id),
         str(payload_sha256), str(captured_at),
@@ -2565,9 +2679,15 @@ def _verified_shared_capture_digests(
             observation_id=observation_id,
         )
         forecast_receipt = candidate_parent["receipt"]
-        if int(forecast_receipt.get("selected_event") or -1) != int(event):
-            raise ChipEvidenceError("matching capture receipt event differs from its verified forecast")
-        policy_player_ids = _required_players_for_event(candidate_parent["causal"], int(event))
+        allowed_events = _scheduled_event_ids(
+            candidate_parent["causal"], action,
+            selected_event=int(forecast_receipt.get("selected_event") or -1),
+        )
+        if int(event) not in allowed_events:
+            raise ChipEvidenceError("matching capture receipt event is outside its verified forecast schedule")
+        policy_player_ids = _required_players_for_event(
+            candidate_parent["causal"], int(event), action=action,
+        )
         if [int(value) for value in candidate.get("required_player_ids") or ()] != policy_player_ids:
             raise ChipEvidenceError("capture receipt player set differs from its verified forecast policy")
 
@@ -2628,11 +2748,11 @@ def capture_outcome(
 
     from . import database, outcome_ledger as ol, parsers
 
-    action_map = {"BB": "BB", "TC": "TC",
-                  "BENCH_BOOST": "BB", "TRIPLE_CAPTAIN": "TC"}
+    action_map = {"BB": "BB", "TC": "TC", "FH": "FH", "WC": "WC",
+                  "BENCH_BOOST": "BB", "TRIPLE_CAPTAIN": "TC", "FREE_HIT": "FH", "WILDCARD": "WC"}
     action = action_map.get(str(action).upper(), str(action))
-    if action not in {"BB", "TC"}:
-        raise ChipEvidenceError("outcome capture action must be BB or TC")
+    if action not in {"BB", "TC", "FH", "WC"}:
+        raise ChipEvidenceError("outcome capture action must be BB, TC, FH or WC")
     identity = _required_identity(
         db_path=db_path, entry_id=entry_id, generation_id=generation_id,
         decision_id=decision_id, route_id=route_id, planning_event=planning_event,
@@ -2641,12 +2761,22 @@ def capture_outcome(
     _retained, _generation, _decision, _route, _state, parent = _load_forecast_origin(
         conn, identity=identity, action=action, observation_id=observation_id,
     )
-    if int(realization_event) != int(parent["receipt"].get("selected_event") or -1):
-        raise ChipEvidenceError("realization event must equal the event selected by the retained forecast")
-    required_players = _required_players_for_event(parent["causal"], int(realization_event))
+    scheduled_events = _scheduled_event_ids(
+        parent["causal"], action,
+        selected_event=int(parent["receipt"].get("selected_event") or -1),
+    )
+    if int(realization_event) not in scheduled_events:
+        raise ChipEvidenceError("realization event is outside the retained PLAY/SAVE event schedule")
+    if action in {"BB", "TC"} and int(realization_event) != int(parent["receipt"].get("selected_event") or -1):
+        raise ChipEvidenceError("BB/TC realization event must equal the event selected by the retained forecast")
+    required_players = _required_players_for_event(
+        parent["causal"], int(realization_event), action=action,
+    )
     archive = _official_event_archive(
         conn, raw_root=raw_root, fetch_run_id=int(fetch_run_id), event=int(realization_event),
     )
+    if action in {"FH", "WC"}:
+        _require_capture_after_forecast(parent["receipt"], archive, event=int(realization_event))
     live_payload = archive["payloads"]["event_live"]
     raw_by_player: dict[int, Mapping[str, Any]] = {}
     for item in live_payload.get("elements") or ():
@@ -2847,6 +2977,8 @@ def capture_outcome(
                 if result.capture_digest != row["capture_digest"] or result.observation_state != ol.OBSERVATION_FINAL:
                     raise ChipEvidenceError("outcome ledger did not retain the expected official FINAL event row")
 
+        if action in {"FH", "WC"}:
+            _require_capture_after_forecast(parent["receipt"], archive, event=int(realization_event))
         _write_new_json(receipt_path, receipt)
         _verify_capture_receipt(
             conn, receipt, expected_identity_sha256=_sha256(identity),
@@ -2945,6 +3077,149 @@ def _verified_capture_receipts_for_observation(
     return receipts
 
 
+def _verified_horizon_capture_manifest(
+    conn: sqlite3.Connection,
+    *,
+    evidence_root: str | Path,
+    identity: Mapping[str, Any],
+    parent: Mapping[str, Any],
+    observation_id: str,
+    action: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Verify every scheduled event and the ledger-selected player rows for FH/WC."""
+
+    from . import outcome_ledger as ol
+
+    action = str(action).upper()
+    if action not in {"FH", "WC"}:
+        raise ChipEvidenceError("full-horizon capture verification requires FH or WC")
+    causal = parent.get("causal")
+    if not isinstance(causal, Mapping):
+        raise ChipEvidenceError("verified FH/WC forecast has no causal policy pair")
+    forecast_receipt = parent.get("receipt")
+    if not isinstance(forecast_receipt, Mapping):
+        raise ChipEvidenceError("verified FH/WC forecast has no sealed availability receipt")
+    selected_event = int(forecast_receipt.get("selected_event") or -1)
+    events = _scheduled_event_ids(causal, action, selected_event=selected_event)
+    receipt_by_event: dict[int, list[dict[str, Any]]] = {}
+    all_receipts: list[dict[str, Any]] = []
+    archive_by_operation: dict[str, dict[str, Any]] = {}
+    receipt_manifest: list[dict[str, Any]] = []
+    identity_sha256 = _sha256(identity)
+    origin_id = str(parent.get("origin_id") or "")
+    for event in events:
+        required_ids = _required_players_for_event(causal, event, action=action)
+        receipts = _verified_capture_receipts_for_observation(
+            conn,
+            evidence_root=evidence_root,
+            identity_sha256=identity_sha256,
+            origin_id=origin_id,
+            observation_id=observation_id,
+            action=action,
+            event=event,
+            required_player_ids=required_ids,
+        )
+        receipt_by_event[event] = receipts
+        all_receipts.extend(receipts)
+        for receipt in receipts:
+            operation_id = str(receipt.get("operation_id") or "")
+            archive = _official_event_archive(
+                conn,
+                raw_root=str(receipt.get("raw_root") or ""),
+                fetch_run_id=int(receipt.get("fetch_run_id") or -1),
+                event=event,
+            )
+            _require_capture_after_forecast(forecast_receipt, archive, event=event)
+            archive_by_operation[operation_id] = archive
+        event_receipts: list[dict[str, Any]] = []
+        for receipt in receipts:
+            operation_id = str(receipt.get("operation_id") or "")
+            receipt_ref = f"capture-{operation_id}.json"
+            receipt_path = _metadata_root(evidence_root) / receipt_ref
+            retained_receipt = _read_json(receipt_path)
+            if retained_receipt != receipt:
+                raise ChipEvidenceError("verified event capture receipt changed while building its manifest")
+            event_receipts.append({
+                "receipt_ref": receipt_ref,
+                "receipt_sha256": str(receipt.get("receipt_sha256") or ""),
+                "file_sha256": _file_sha256(receipt_path),
+                "operation_id": operation_id,
+                "fetch_run_id": int(receipt.get("fetch_run_id") or -1),
+                "required_player_ids": [int(value) for value in receipt.get("required_player_ids") or ()],
+                "captures": sorted(
+                    [
+                        {
+                            "player_id": int(item.get("player_id") or -1),
+                            "capture_digest": str(item.get("capture_digest") or ""),
+                        }
+                        for item in receipt.get("captures") or ()
+                    ],
+                    key=lambda item: (item["player_id"], item["capture_digest"]),
+                ),
+                "official_final_at": str(archive_by_operation[operation_id].get("official_final_at") or ""),
+                "available_at": str(archive_by_operation[operation_id].get("available_at") or ""),
+            })
+        event_receipts.sort(key=lambda row: (row["operation_id"], row["receipt_ref"]))
+        receipt_manifest.append({
+            "event": event,
+            "required_player_ids": required_ids,
+            "receipts": event_receipts,
+        })
+
+    selected_manifest: list[dict[str, Any]] = []
+    for event in events:
+        required_ids = _required_players_for_event(causal, event, action=action)
+        receipts = receipt_by_event[event]
+        for player_id in required_ids:
+            candidates = [
+                row for row in ol.observation_captures(
+                    conn, grain=ol.GRAIN_PLAYER_EVENT, event=event, player_id=player_id,
+                )
+                if row.get("observation_state") == ol.OBSERVATION_FINAL
+                and row.get("fixture_id") is None
+                and row.get("source_name") == "player_gameweeks_final"
+                and row.get("source_identity") == f"player_gameweeks:{event}"
+            ]
+            selected = ol.select_capture(candidates)
+            if selected is None:
+                raise ChipEvidenceError(
+                    f"verified final player-gameweek capture is missing for player {player_id} in GW{event}"
+                )
+            digest = str(selected.get("capture_digest") or "")
+            bindings = [
+                (receipt, row)
+                for receipt in receipts
+                for row in (receipt.get("captures") or ())
+                if int(row.get("player_id") or -1) == player_id
+                and str(row.get("capture_digest") or "") == digest
+            ]
+            if len(bindings) != 1:
+                raise ChipEvidenceError(
+                    f"current ledger-selected capture for player {player_id} in GW{event} "
+                    "is not uniquely bound to a verified observation receipt"
+                )
+            receipt, _capture_row = bindings[0]
+            operation_id = str(receipt.get("operation_id") or "")
+            archive = archive_by_operation.get(operation_id)
+            if archive is None:
+                raise ChipEvidenceError("selected capture receipt has no verified official archive")
+            # Recheck the actual selected row against the exact source receipt; this
+            # deliberately refuses a later plausible but unbound ledger append.
+            if str(selected.get("captured_at") or "") != str(receipt.get("available_at") or ""):
+                raise ChipEvidenceError("selected player capture time differs from its verified receipt")
+            selected_manifest.append({
+                "event": event,
+                "player_id": player_id,
+                "capture_digest": digest,
+                "operation_id": operation_id,
+                "official_final_at": str(archive.get("official_final_at") or ""),
+                "available_at": str(archive.get("available_at") or ""),
+            })
+    selected_manifest.sort(key=lambda row: (row["event"], row["player_id"]))
+    all_receipts.sort(key=lambda row: (int(row.get("realization_event") or -1), str(row.get("operation_id") or "")))
+    return all_receipts, receipt_manifest, selected_manifest
+
+
 def _validate_maturation_artifact_pair(
     conn: sqlite3.Connection,
     *,
@@ -2960,6 +3235,8 @@ def _validate_maturation_artifact_pair(
     expiry_event: int,
     source_positions: Mapping[int, str],
     capture_receipts: Sequence[Mapping[str, Any]],
+    capture_manifest: Sequence[Mapping[str, Any]] | None = None,
+    forecast_available_at: str | None = None,
 ) -> dict[str, Any]:
     """Verify a complete retained label/outcome pair before receipt publication."""
 
@@ -3008,6 +3285,19 @@ def _validate_maturation_artifact_pair(
     cal.validate_observation(
         calibration_row, evidence_verifier=verifier, store_conn=conn,
     )
+    if action in {"FH", "WC"}:
+        verified_available = _parse_utc(
+            forecast_available_at, name="verified FH/WC forecast_available_at",
+        )
+        raw_made_at = str((evidence_value.get("forecast") or {}).get("made_at") or "")
+        if (
+            str(calibration_row.get("forecast_made_at") or "") != raw_made_at
+            or _parse_utc(raw_made_at, name="raw FH/WC forecast_made_at") > verified_available
+        ):
+            raise ChipEvidenceError("FH/WC calibration row changed the retained raw forecast making time")
+        calibration_row["forecast_available_at"] = (
+            verified_available.isoformat().replace("+00:00", "Z")
+        )
     cal.verify_outcome_record_capture_sources(
         conn, outcome_value,
         source_position_resolver=lambda _record: {str(key): value for key, value in source_positions.items()},
@@ -3022,6 +3312,37 @@ def _validate_maturation_artifact_pair(
     }
     if not outcome_digests or not outcome_digests.issubset(retained_digests):
         raise ChipEvidenceError("matured outcome includes captures without verified exact-run archive receipts")
+    if action in {"FH", "WC"}:
+        # ``selected_event`` lives in the verified raw reservation forecast and
+        # receipt, not in the canonical retained causal-origin forecast block.
+        # The caller has already rebound this argument to that parent receipt.
+        expected_events = _scheduled_event_ids(causal_origin, action, selected_event=int(event))
+        actual_events = [int(value) for value in outcome_value.get("realization_events") or ()]
+        expected_capture_rows = {
+            (
+                int(item.get("event") or -1),
+                int(item.get("player_id") or -1),
+                str(item.get("capture_digest") or ""),
+            )
+            for item in (capture_manifest or ())
+        }
+        actual_capture_rows = {
+            (
+                int(item.get("event") or -1),
+                int(item.get("player_id") or -1),
+                str(item.get("capture_digest") or ""),
+            )
+            for item in (outcome_value.get("source") or {}).get("captures") or ()
+        }
+        if (
+            actual_events != expected_events
+            or not expected_capture_rows
+            or actual_capture_rows != expected_capture_rows
+        ):
+            raise ChipEvidenceError(
+                "matured FH/WC outcome event/player/digest set does not exactly reproduce "
+                "the verified per-event capture receipt manifest"
+            )
     return {
         "evidence_digest": evidence_digest,
         "outcome_digest": outcome_digest,
@@ -3047,8 +3368,8 @@ def _verify_maturation_receipt(
     expected_action = str(expected_action)
     expected_realization_event = int(expected_realization_event)
     expected_receipt_key = str(expected_receipt_key)
-    if expected_action not in {"BB", "TC"}:
-        raise ChipEvidenceError("maturation verification requires the caller's canonical BB or TC action")
+    if expected_action not in {"BB", "TC", "FH", "WC"}:
+        raise ChipEvidenceError("maturation verification requires a canonical BB/TC/FH/WC action")
     canonical_receipt_key = _maturation_key(expected_observation_id, expected_realization_event)
     if expected_receipt_key != canonical_receipt_key:
         raise ChipEvidenceError("requested maturation receipt key does not reproduce from its explicit request")
@@ -3078,12 +3399,35 @@ def _verify_maturation_receipt(
         raise ChipEvidenceError("maturation receipt event differs from its selected forecast event")
     evidence_path, evidence_value = _flat_artifact(evidence_root, receipt.get("causal_evidence_ref"))
     outcome_path, outcome_value = _flat_artifact(evidence_root, receipt.get("outcome_ref"))
-    capture_receipts = _verified_capture_receipts_for_observation(
-        conn, evidence_root=evidence_root, identity_sha256=_sha256(identity),
-        origin_id=str(parent["origin_id"]), observation_id=observation_id,
-        action=expected_action, event=event,
-        required_player_ids=_required_players_for_event(parent["causal"], event),
-    )
+    capture_manifest: list[dict[str, Any]] | None = None
+    capture_receipt_manifest: list[dict[str, Any]] | None = None
+    if expected_action in {"FH", "WC"}:
+        capture_receipts, capture_receipt_manifest, capture_manifest = _verified_horizon_capture_manifest(
+            conn, evidence_root=evidence_root, identity=identity, parent=parent,
+            observation_id=observation_id, action=expected_action,
+        )
+        expected_capture_operation_ids = sorted(
+            str(row.get("operation_id") or "") for row in capture_receipts
+        )
+        if (
+            str(receipt.get("forecast_available_at") or "")
+            != str(parent["receipt"].get("forecast_available_at") or "")
+            or str(receipt.get("forecast_made_at") or "")
+            != str(parent["forecast"].get("made_at") or "")
+            or receipt.get("capture_manifest") != capture_manifest
+            or receipt.get("capture_receipt_manifest") != capture_receipt_manifest
+            or receipt.get("capture_operation_ids") != expected_capture_operation_ids
+        ):
+            raise ChipEvidenceError(
+                "FH/WC maturation receipt does not preserve forecast timing and the verified capture manifest"
+            )
+    else:
+        capture_receipts = _verified_capture_receipts_for_observation(
+            conn, evidence_root=evidence_root, identity_sha256=_sha256(identity),
+            origin_id=str(parent["origin_id"]), observation_id=observation_id,
+            action=expected_action, event=event,
+            required_player_ids=_required_players_for_event(parent["causal"], event, action=expected_action),
+        )
     pair = _validate_maturation_artifact_pair(
         conn,
         evidence_root=evidence_root,
@@ -3098,6 +3442,11 @@ def _verify_maturation_receipt(
         expiry_event=int(parent["receipt"].get("expiry_event") or -1),
         source_positions=source_positions,
         capture_receipts=capture_receipts,
+        capture_manifest=capture_manifest,
+        forecast_available_at=(
+            str(parent["receipt"].get("forecast_available_at") or "")
+            if expected_action in {"FH", "WC"} else None
+        ),
     )
     if (
         str(receipt.get("causal_evidence_sha256") or "") != pair["evidence_digest"]
@@ -3123,17 +3472,20 @@ def mature_observation(
     realization_event: int,
     evidence_root: str | Path,
 ) -> dict[str, Any]:
-    """Finalize one selected future BB/TC outcome at event grain, idempotently."""
+    """Finalize one retained BB/TC event or the full FH/WC causal schedule."""
 
     from . import candidate_universe as cu
     from . import generation_store as gs
     from . import chip_reservation_calibration as cal
 
-    action_map = {"BB": "BB", "TC": "TC",
-                  "BENCH_BOOST": "BB", "TRIPLE_CAPTAIN": "TC"}
+    action_map = {
+        "BB": "BB", "TC": "TC", "FH": "FH", "WC": "WC",
+        "BENCH_BOOST": "BB", "TRIPLE_CAPTAIN": "TC",
+        "FREE_HIT": "FH", "WILDCARD": "WC",
+    }
     action = action_map.get(str(action).upper(), str(action))
-    if action not in {"BB", "TC"}:
-        raise ChipEvidenceError("maturation action must be BB or TC")
+    if action not in {"BB", "TC", "FH", "WC"}:
+        raise ChipEvidenceError("maturation action must be BB, TC, FH or WC")
     identity = _required_identity(
         db_path=db_path, entry_id=entry_id, generation_id=generation_id,
         decision_id=decision_id, route_id=route_id, planning_event=planning_event,
@@ -3145,14 +3497,28 @@ def mature_observation(
         retained, generation, _decision, route, _state, parent = _load_forecast_origin(
             conn, identity=identity, action=action, observation_id=observation_id,
         )
+        scheduled_events = _scheduled_event_ids(
+            parent["causal"], action,
+            selected_event=int(parent["receipt"].get("selected_event") or -1),
+        )
         if int(parent["receipt"].get("selected_event") or -1) != int(realization_event):
             raise ChipEvidenceError("realization event is not the event selected by the retained forecast")
-        capture_receipts = _verified_capture_receipts_for_observation(
-            conn, evidence_root=evidence_root, identity_sha256=_sha256(identity),
-            origin_id=parent["origin_id"], observation_id=observation_id,
-            action=action, event=int(realization_event),
-            required_player_ids=_required_players_for_event(parent["causal"], int(realization_event)),
-        )
+        capture_manifest: list[dict[str, Any]] | None = None
+        capture_receipt_manifest: list[dict[str, Any]] | None = None
+        if action in {"FH", "WC"}:
+            capture_receipts, capture_receipt_manifest, capture_manifest = _verified_horizon_capture_manifest(
+                conn, evidence_root=evidence_root, identity=identity, parent=parent,
+                observation_id=observation_id, action=action,
+            )
+        else:
+            capture_receipts = _verified_capture_receipts_for_observation(
+                conn, evidence_root=evidence_root, identity_sha256=_sha256(identity),
+                origin_id=parent["origin_id"], observation_id=observation_id,
+                action=action, event=int(realization_event),
+                required_player_ids=_required_players_for_event(
+                    parent["causal"], int(realization_event), action=action,
+                ),
+            )
         snapshot_conn = gs._open_generation_snapshot(generation)
         try:
             pinned_pool = cu.load_pool(snapshot_conn)
@@ -3253,11 +3619,16 @@ def mature_observation(
             expiry_event=int(parent["receipt"].get("expiry_event") or -1),
             source_positions=source_positions,
             capture_receipts=capture_receipts,
+            capture_manifest=capture_manifest,
+            forecast_available_at=(
+                str(parent["receipt"].get("forecast_available_at") or "")
+                if action in {"FH", "WC"} else None
+            ),
         )
         causal_digest = pair["evidence_digest"]
         outcome_digest = pair["outcome_digest"]
         calibration_row = pair["calibration_row"]
-        receipt = _sealed(MATURATION_RECEIPT_SCHEMA, {
+        receipt_body = {
             "receipt_key": receipt_key,
             "identity": identity,
             "identity_sha256": _sha256(identity),
@@ -3272,7 +3643,17 @@ def mature_observation(
             "calibration_row": calibration_row,
             "capture_operation_ids": sorted(str(row.get("operation_id") or "") for row in capture_receipts),
             "matured_at": _utc_now(),
-        })
+        }
+        if action in {"FH", "WC"}:
+            receipt_body.update({
+                "forecast_available_at": str(parent["receipt"].get("forecast_available_at") or ""),
+                # Preserve the raw forecast's original making time exactly; it
+                # is not rewritten to the later publication-availability time.
+                "forecast_made_at": str(parent["forecast"].get("made_at") or ""),
+                "capture_receipt_manifest": capture_receipt_manifest,
+                "capture_manifest": capture_manifest,
+            })
+        receipt = _sealed(MATURATION_RECEIPT_SCHEMA, receipt_body)
         _write_new_json(receipt_path, receipt)
         _verify_maturation_receipt(
             conn, receipt, evidence_root=evidence_root, identity=identity,

@@ -759,6 +759,114 @@ def test_cache_disappearing_after_preflight_is_refused_at_loader_boundary(tmp_pa
         conn.close()
 
 
+def test_optimize_cache_only_matches_default_result_on_real_certified_cache_hit(tmp_path, monkeypatch):
+    from fpl_brain import monte_carlo
+
+    universe, state, meta = _universe(events=(4,))
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
+    config = _config(
+        events=(4,), search_draws=2, policy_selection_worlds=2,
+        beam_width=4, exact_evaluation_budget=4,
+    )
+    pool = ro.build_search_pool(universe, [int(p.player_id) for p in state.players], config)
+    union = ro.union_player_ids(state, sorted(pool["pool_ids"]))
+    key = ro.world_cache_key(
+        event=4, generation_id=generation.generation_id,
+        runs=generation.runs_for(4), config=config, union_ids=union,
+    )
+    cache_dir = tmp_path / "certified-cache-hit"
+    cache_dir.mkdir()
+    (cache_dir / f"{key}.json").write_text(
+        json.dumps(_cache_payload(union, bonus=True)), encoding="utf-8",
+    )
+    monkeypatch.setattr(monte_carlo, "load_fixture_inputs", lambda *_a, **_k: pytest.fail("cache hit must not load fixtures"))
+    monkeypatch.setattr(monte_carlo, "simulate", lambda *_a, **_k: pytest.fail("cache hit must not simulate"))
+    try:
+        default = ro.optimize(
+            universe=universe, initial_state=state, scenario=_scenario((4,)),
+            player_meta=meta, generation=generation, conn=conn, config=config,
+            cache_dir=cache_dir,
+        )
+        cache_only = ro.optimize(
+            universe=universe, initial_state=state, scenario=_scenario((4,)),
+            player_meta=meta, generation=generation, conn=conn, config=config,
+            cache_dir=cache_dir, allow_world_materialization=False,
+        )
+        assert cache_only["routes"] == default["routes"]
+        assert cache_only["world_info"] == default["world_info"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("cache_state", ["absent", "corrupt", "unreadable", "no_directory"])
+def test_optimize_cache_only_refuses_before_fixture_load_or_simulation(
+    tmp_path, monkeypatch, cache_state,
+):
+    from fpl_brain import monte_carlo
+
+    universe, state, meta = _universe(events=(4,))
+    conn, generation = _certified_generation((4,), tmp_path=tmp_path)
+    config = _config(
+        events=(4,), search_draws=2, policy_selection_worlds=2,
+        beam_width=4, exact_evaluation_budget=4,
+    )
+    pool = ro.build_search_pool(universe, [int(p.player_id) for p in state.players], config)
+    union = ro.union_player_ids(state, sorted(pool["pool_ids"]))
+    key = ro.world_cache_key(
+        event=4, generation_id=generation.generation_id,
+        runs=generation.runs_for(4), config=config, union_ids=union,
+    )
+    cache_dir = None if cache_state == "no_directory" else tmp_path / f"cache-{cache_state}"
+    if cache_state in {"corrupt", "unreadable"}:
+        cache_dir.mkdir()
+        content = (
+            "{not-json"
+            if cache_state == "unreadable"
+            else json.dumps(_cache_payload(union, bonus=True, digest=False))
+        )
+        (cache_dir / f"{key}.json").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(monte_carlo, "load_fixture_inputs", lambda *_a, **_k: pytest.fail("cache-only refusal must precede fixture loading"))
+    monkeypatch.setattr(monte_carlo, "simulate", lambda *_a, **_k: pytest.fail("cache-only refusal must precede simulation"))
+    try:
+        with pytest.raises(cb.CertificationRefused, match=ro.DIAG_CERTIFIED_WORLD_CACHE_REQUIRED):
+            ro.optimize(
+                universe=universe, initial_state=state, scenario=_scenario((4,)),
+                player_meta=meta, generation=generation, conn=conn, config=config,
+                cache_dir=cache_dir, allow_world_materialization=False,
+            )
+        if cache_state == "absent":
+            assert not cache_dir.exists()
+        if cache_state in {"corrupt", "unreadable"}:
+            assert (cache_dir / f"{key}.json").exists()
+    finally:
+        conn.close()
+
+
+def test_optimize_cache_only_rejects_injected_provider_before_calling_it(tmp_path):
+    universe, state, meta = _universe(events=(4,))
+    calls = []
+    provider = lambda *_a, **_k: calls.append("called")
+    with pytest.raises(cb.CertificationRefused, match="injected/non-production"):
+        ro.optimize(
+            universe=universe, initial_state=state, scenario=_scenario((4,)),
+            player_meta=meta, config=_config(events=(4,), search_draws=2),
+            cache_dir=tmp_path, non_production_worlds=_np(provider),
+            allow_world_materialization=False,
+        )
+    assert calls == []
+
+
+def test_optimize_cache_policy_requires_an_actual_bool():
+    universe, state, meta = _universe(events=(4,))
+    with pytest.raises(TypeError, match="actual bool"):
+        ro.optimize(
+            universe=universe, initial_state=state, scenario=_scenario((4,)),
+            player_meta=meta, config=_config(events=(4,)),
+            non_production_worlds=_np(_provider((4,))),
+            allow_world_materialization=0,
+        )
+
+
 def test_default_certified_world_loader_still_materializes_missing_cache_on_fixture(tmp_path, monkeypatch):
     from fpl_brain import manager_worlds, monte_carlo
 

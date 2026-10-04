@@ -1,31 +1,29 @@
-# Prospective BB/TC evidence collection
+# Prospective chip evidence collection
 
-This is an operational collector for prospective Bench Boost (BB) and Triple Captain (TC) calibration evidence. It does not generate official facts, predictions, normal decisions, certified generations, or production chip decisions. FH/WC orchestration, calibration orchestration, readiness orchestration, dashboards, and convenience tooling are out of scope.
+This is a thin operator workflow for retaining prospective BB/TC/FH/WC forecasts and causally maturing later official outcomes. It is not a prediction collector, normal decision runner, certified-product builder, calibration engine, readiness service, production chip arbiter, or account-action tool. It makes no schema migration. The completed GW6 normal decision and hypothetical `route_041` BB/TC assessment remain closed milestones; neither is a prospective calibration origin, and the separately materialized hypothetical cache is not promoted or reused as production authority.
 
-The collector accepts explicit source identities only. It never resolves a latest generation, decision, route, fetch run, or evidence root. The completed GW6 normal decision and `route_041` hypothetical BB/TC assessment remain closed milestones; neither assessment is a prospective forecast, and the hypothetical assessment/cache cannot be relabelled as one or promoted to production authority. No planning event is declared eligible in advance: the accepted producer requires scored opportunity events to be later than the planning event, and each requested event must still be prospective when a properly bound forecast is issued. Eligibility therefore depends on the exact origin, pinned chip state, certified coverage, search permission, cache/scoring inputs, and official outcome availability passing their checks. The completed GW6 assessment does not establish those conditions either way.
+All source identities are explicit. The commands never choose a latest generation, decision, route, fetch run, or evidence root. They preserve actual issue/availability and capture times. Event-start free transfers are never inferred: a prospective origin requiring an event-start FT refuses if the exact value is unknown. The retained GW6 event-start FT remains unknown; a genuine historical confirmation would not create a forecast that was never issued before outcomes.
 
-Event-start free transfers remain unknown unless the manager provides a genuine confirmation of the number available at the start of the event before transfers. The collector does not infer, backdate, or fill that field.
+## First-origin prerequisites
 
-## Required origin evidence
+The first eligible prospective origin requires all of the following before the target outcomes happen:
 
-Before a first valid prospective origin can be registered and forecast:
+1. A freshly verified normal four-event generation, its verified decision, and the exact verified route. The entry, generation ID, decision ID, route ID, planning event, cutoff, database and evidence root are all supplied explicitly.
+2. Search permission for that exact normal generation, with its source decision/route and immutable pinned snapshot intact.
+3. The pinned snapshot proves exactly one unused, eligible action chip and its official window start/expiry. The action and expiry passed to the operator must agree. The action-specific FH/WC origin receipt records that eligibility beside the common immutable origin.
+4. A genuine, timely event-start free-transfer value where the future policy needs it. No post-event value, current value, route guess or backdated confirmation substitutes.
+5. A verified same-origin `CHIP_RESERVATION` continuation whose exact four-event normal-run prefix, cutoff, data snapshot and predictive-code identity match the origin. Its coverage must span every opportunity event through the pinned expiry and every required scoring horizon.
+6. For FH, each candidate event needs its four-event chip decision window. For WC, each candidate event additionally needs one explicit compatible `WILDCARD_VALUE` generation with a contiguous 6–10-event horizon. The value generations must share the continuation's same-origin per-event runs and dependency closures.
+7. Every required world cache entry must verify against the exact certified generation, event run IDs, full official player population, config/seed/draw count and semantic payload. A cache filename or file count is not evidence. The FH/WC CLI path is cache-only: it refuses missing matrices and does not offer a materialization switch.
+8. Every covered opportunity and valuation event must still be demonstrably unplayed at preflight, calculation start and issue. The accepted checks inspect official event/fixture state, existing performance/outcome evidence, source provenance and future kickoffs. Kickoff is a timing guard, never proof of completion. A started, finished, unknown, ambiguous or already-final event blocks a new prospective forecast.
 
-1. A freshly captured and verified normal four-event generation, a verified normal decision bound to it, and the exact verified route selected from that decision must exist. Record and pass all three IDs explicitly, together with the route ID, planning event, cutoff, database, entry ID, and evidence root.
-2. The accepted production-search permission check for that exact generation must pass. Registration repeats the generation, decision, route, manager-context, pinned snapshot, official chip-state, and permission checks.
-3. The pinned official bootstrap/manager snapshot must show exactly one eligible, unused BB or TC chip and its official expiry. The requested action and expiry must match that pinned state.
-4. A complete, certified, same-origin `CHIP_RESERVATION` generation must cover each event from planning-event + 1 through the chip expiry. It must retain the normal four-event generation as its exact run-ID prefix, and use the same planning event, cutoff, data snapshot, and predictive-code identity. The forecast producer requires this coverage product even when expiry falls inside the normal four-event window; without it, the accepted forecast builder cannot mark future coverage complete.
-5. Events beyond the normal route horizon additionally need verified origin-pinned season rules and the accepted no-transfer continuation model. Any unavailable rules, event bundle, or world matrix leaves the forecast incomplete; no value is imputed.
-6. Every required world matrix must bind the certified event run IDs, captured official player pool, configured seed/draw count, and semantic scoring/minutes/bonus/role blocks. A cache filename or file count alone is not proof.
-7. At fresh forecast preflight, immediately before scoring, and immediately before publication, every covered event must still classify as `SCHEDULED`, with `events.finished=0`, `events.data_checked=0`, at least one fully identified fixture, and every fixture explicitly `started=0` and `finished=0`. No event-grain outcome capture or canonical completed player-fixture performance may exist. Each fixture must have a known kickoff later than the completed issue time; kickoff is only a timing guard, never a completion signal. Null/unknown kickoff, a started/finished/provisional fixture, stale-at-issuance kickoff, or unavailable source provenance refuses.
-8. The live event row and target fixtures must match intact raw official captures from completed `success`/`partial` FPL fetch runs where that specific endpoint appears in `endpoints_ok` and not in `endpoints_failed`: event status from `bootstrap_static`/`bootstrap-static`, fixture schedule/state from `fixtures`/`fixtures`. Their `updated_at` timestamps must match the corresponding archive observation times and payload fields. These verified source captures may legitimately predate the origin cutoff; the collector applies no invented age threshold and does not require `updated_at >= cutoff`. The fetch interval must be ordered (`started_at <= finished_at`, with `finished_at` after the observed capture and before the check); the accepted collector may timestamp the shared raw capture slightly before the recorded run start. The future-kickoff and official-state checks are repeated at issue time so old unstarted flags cannot authorize a forecast after kickoff.
+The accepted code can certify `CHIP_RESERVATION` and WC value products when called under the existing execution writer-lease workflow, but this collector does not create those products. The first-origin operator blocker is therefore any missing same-origin continuation, WC value generation, or required cache. Prepare each separately through the accepted producer and lease procedure; the CLI refuses instead of silently generating predictions, rerunning a decision, building a generation or materializing worlds.
 
-The accepted code has a library producer for `CHIP_RESERVATION` certification (`generation_store.certify_chip_reservation_generation`) but no dedicated operator CLI to prepare that product. Therefore valid-origin collection cannot begin under the present operator workflow until that product is separately prepared through an approved execution/writer-lease procedure. The collector refuses rather than creating predictions, certifying a missing product, rerunning a decision, selecting latest data, or manufacturing a compatible-looking cache entry. Do not call the library function as an undocumented shortcut.
+The completed GW6 route cannot be calibration origin #1: no qualifying prospective forecast was retained before its outcomes. The earliest possible origin is the first later planning event for which a fresh normal capture and all prerequisites above are completed before any covered event begins. GW7 is only a candidate if its own deadline/outcome status still passes those point-in-time checks; otherwise the first later eligible event is the earliest candidate. This is not established by the old GW6 assessment or cache.
 
-The accepted GW6 generation/decision and hypothetical calculation do not remove this blocker. In particular, the hypothetical world cache is not promoted to production authority and must not be reused as a forecast cache unless the canonical cache key, full semantic content digest, official player population, seed, draw count, and source-run binding all reproduce for the prospective origin.
+## Commands
 
-## Commands and artifacts
-
-All four commands require the common explicit arguments:
+All commands share this explicit identity:
 
 ```text
 --db <existing-db> --entry-id <entry>
@@ -34,16 +32,23 @@ All four commands require the common explicit arguments:
 --origin-cutoff <ISO-8601-cutoff> --evidence-root <retained-root>
 ```
 
-Register the immutable origin after upstream requirements are verified:
+Register a prospective BB/TC origin or an FH/WC-specific eligible chip window:
 
 ```powershell
 python scripts/chip_evidence.py register-origin `
   --db <db> --entry-id <entry> --generation-id <generation> `
   --decision-id <decision> --route-id <route> --planning-event <event> `
   --origin-cutoff <cutoff> --evidence-root <evidence-root>
+
+python scripts/chip_evidence.py register-horizon-origin `
+  --db <db> --entry-id <entry> --generation-id <generation> `
+  --decision-id <decision> --route-id <route> --planning-event <event> `
+  --origin-cutoff <cutoff> --evidence-root <evidence-root> --action FH
 ```
 
-Retain one prospective BB or TC forecast, with an explicit same-origin coverage generation and cache directory:
+Use `--action WC` for the Wildcard. This registration also re-verifies/retains the common origin; it does not certify missing continuation products.
+
+Retain one forecast. BB/TC use `forecast`; FH/WC use `horizon-forecast`:
 
 ```powershell
 python scripts/chip_evidence.py forecast `
@@ -53,61 +58,68 @@ python scripts/chip_evidence.py forecast `
   --action BB --expiry-event <pinned-expiry> --observation-id <unique-id> `
   --continuation-generation-id <same-origin-chip-reservation-generation> `
   --cache-dir <origin-specific-cache-dir>
+
+python scripts/chip_evidence.py horizon-forecast `
+  --db <db> --entry-id <entry> --generation-id <generation> `
+  --decision-id <decision> --route-id <route> --planning-event <event> `
+  --origin-cutoff <cutoff> --evidence-root <evidence-root> `
+  --action WC --expiry-event <pinned-expiry> --observation-id <unique-id> `
+  --continuation-generation-id <same-origin-chip-reservation-generation> `
+  --cache-dir <origin-specific-cache-dir> --value-horizon-length 6 `
+  --value-generation <event-1>=<exact-value-generation-1> `
+  --value-generation <event-2>=<exact-value-generation-2>
 ```
 
-Replace `BB` with `TC` for a Triple Captain observation. Missing or invalid cache entries fail closed before scoring by default. `--materialize-worlds` is a separate explicit opt-in and is allowed only in `<evidence-root>/.chip-evidence/world-cache/<origin-id>`. It invokes the accepted canonical event-world builder for missing matrices and then scores the BB/TC opportunity; it is not a cache-only operation. Treat that as a potentially substantial CPU, memory, and disk task, authorize and schedule it separately, and record its measured duration. It does not create projection runs or a generation.
+For FH, use `--action FH` and omit `--value-horizon-length` and all `--value-generation` arguments. WC needs exactly one explicit value-generation ID for each opportunity event from planning event + 1 through expiry. The command recomputes and verifies an in-memory coverage product from the named continuation; it does not certify that generation. The horizon forecast is cache-only and cannot create worlds. BB/TC retain their existing separate opt-in `--materialize-worlds`, restricted to their origin-isolated cache path; that may require substantial CPU, memory and disk and must be separately authorized and timed.
 
-After official outcomes are final, use the exact successful FPL fetch-run ID and the raw-archive root named by that fetch run:
+After the forecast-selected outcome or full FH/WC schedule is officially final, capture each required event-grain outcome using the successful official run that archived it:
 
 ```powershell
 python scripts/chip_evidence.py capture-outcome `
   --db <db> --entry-id <entry> --generation-id <generation> `
   --decision-id <decision> --route-id <route> --planning-event <event> `
   --origin-cutoff <cutoff> --evidence-root <evidence-root> `
-  --action BB --observation-id <same-observation-id> `
-  --realization-event <forecast-selected-event> --fetch-run-id <successful-run-id> `
+  --action WC --observation-id <same-observation-id> `
+  --realization-event <scheduled-event> --fetch-run-id <successful-run-id> `
   --raw-root <that-run-raw-archive-root>
 ```
 
-Only after capture receipt verification, mature the same observation/event:
+Repeat `capture-outcome` once for every event in the verified FH/WC PLAY/SAVE schedule union, each with that event's final official fetch. BB/TC capture only the one selected event. Then mature the selected realization event (the forecast-selected event; for FH/WC it binds the completed multi-event causal schedule):
 
 ```powershell
 python scripts/chip_evidence.py mature `
   --db <db> --entry-id <entry> --generation-id <generation> `
   --decision-id <decision> --route-id <route> --planning-event <event> `
   --origin-cutoff <cutoff> --evidence-root <evidence-root> `
-  --action BB --observation-id <same-observation-id> `
+  --action WC --observation-id <same-observation-id> `
   --realization-event <forecast-selected-event>
 ```
 
-The official refresh itself must use the project's normal FPL workflow, for example `python scripts/fetch_fpl.py --config config.json --summaries all --live --gw <event>`. The collector does not invoke it. `capture-outcome` accepts no provisional result: it requires the exact successful fetch run, its three archived official endpoints (`bootstrap-static`, `fixtures`, `event/<E>/live`), shared archive observation time, successful run completion time, final/data-checked event, and all target-event fixtures finished. `finished_provisional=true` is not an independent veto after those official finality conditions pass. Raw archive observation time and fetch completion/availability time are retained separately; the conservative ledger `captured_at` is the successful fetch's `finished_at`.
+Use the same identity and observation ID across the forecast, captures and maturation. Replace `WC` with `FH`, `BB` or `TC` as appropriate. The supported official refresh is a separate operator action, for example `python scripts/fetch_fpl.py --config config.json --summaries all --live --gw <event>`; this collector never invokes it.
 
-The flat evidence root contains immutable content-addressed producer artifacts such as `chip-origin-<digest>.json`, `chip-event-opportunity-<digest>.json`, `chip-reservation-forecast-<digest>.json`, `chip-causal-evidence-<digest>.json`, paired arm files, and matured outcome files. `.chip-evidence/` contains sealed operation receipts/intents/publication records, locks, and the origin-specific world cache. Receipts name flat artifact filenames and include content/identity digests; filenames and digests are rechecked before reuse. Keep the whole root and referenced raw archives together. Do not move or edit individual files after issuance.
+## Evidence and timing
 
-The only logical database write in this workflow is `capture-outcome`, which appends event-grain rows to the existing append-only `outcome_observation_captures` table with `source_name=player_gameweeks_final` and `source_identity=player_gameweeks:<E>`. It performs no migration or collector refresh. Register, forecast, and mature use read-only, query-only database connections; they write their operation artifacts only to the explicit evidence root. Maturation validates/reuses the ledger captures and produces retained JSON artifacts; it does not update FPL facts or manager state.
+The forecast retains input cutoff, snapshot observation and availability, calculation start, issue and forecast-availability times, chip action/window/expiry, exact generation and run identities, cache/world identities, policies, evaluator version, uncertainty/diagnostic context and causal source. The actual `forecast_available_at` is distinct from raw `forecast_made_at`; FH/WC maturation carries both unchanged into its operator receipt/calibration row. The general canonical calibration validator/schema is not widened.
 
-## Timing, finality, and retry contract
+For every capture, use the exact successful `fetch_runs` ID and its raw archive root. The run must have exactly one archived bootstrap, fixtures and target `event/<E>/live` response with shared raw observation time, successful completion time, final/data-checked event and every target fixture `finished=true`. `finished_provisional=true` is not an independent veto after official event finality and all finished fixtures pass. Source provenance and hashes are checked before parsing. Capture availability and official finality must both be strictly later than the retained FH/WC forecast availability. Outcomes are event-grain `player_gameweeks:<E>` from `player_gameweeks_final`; missing players/fields remain missing, not zeros.
 
-- The origin receipt binds the explicit entry, normal generation, decision, route, planning event, cutoff, database path, and evidence root. Re-registration re-verifies that source rather than trusting a pointer.
-- Forecast evidence retains the exact input cutoff, snapshot consistency observation time, later snapshot-file availability time, calculation start, completed issue time, action/expiry, evaluator and world identities, policies, source provenance, and uncertainty/diagnostic context. The source snapshot is immutable and remains the point-in-time input.
-- A new prospective forecast is refused unless every event through expiry is demonstrably still scheduled and unplayed at preflight, calculation start, and issuance. `planning.event_data_state` is necessary but insufficient: each target fixture's explicit started/finished flags, event-grain outcome ledger, canonical completed-performance rows, future kickoff, and matching intact official source archives are checked as well. This catches a partially completed event that still classifies as `SCHEDULED`. Source observations can predate the pinned cutoff if their exact official archive and completed fetch-run provenance verify; missing or ambiguous provenance fails closed. Forecasts never learn from later outcomes.
-- A completed publication is recovered from its sealed intent/publication state witnesses and verified source archives without rechecking today's mutable event/fixture state and without rescoring. This preserves a valid prospective issue if official finality arrives after publication but before receipt recovery. An intent with no complete publication remains an ambiguous incomplete attempt and is not replayed; use a new observation ID after resolving it.
-- BB uses its paired route policy; TC retains the evaluator's independent selected PLAY/SAVE captain policy and deterministic selection procedure.
-- Outcome capture requires `fetch_runs.status='success'`, valid non-reversed `started_at`/`finished_at`, and exactly one bootstrap, fixture, and target event-live archive for that run. Their common raw `observed_at` may precede `started_at`; it must not postdate successful `finished_at`. `captured_at` is that run's completion/availability time, while the raw observation time remains in the receipt.
-- Fixture finality is checked against the archived raw fixture list before the forgiving shared parser is used: every row must be classifiable with a unique positive integer fixture ID and an explicit event value (integer or `null`); explicit `null` remains a valid unscheduled fixture. Parsed target-event fixture IDs must exactly match the validated raw target rows, and target `started`/`finished` flags must be explicit booleans or 0/1 integers. A malformed row cannot disappear and make an incomplete event look final. Event and fixture completion flags remain authoritative; `finished_provisional=true` alone is not a veto once the event is finished and data-checked and all target fixtures are finished.
-- Outcomes use event grain `player_gameweeks:<E>`, not fixture-grain substitutes. Missing players and unavailable fields remain missing and are listed in the capture receipt; they are never turned into zeros. Existing provisional captures remain distinct in the append-only ledger and cannot satisfy final maturation.
-- Capture operation identity includes the normalized `BB`/`TC` action as well as origin, observation, realization event, successful fetch, live-payload digest, and actual availability time. Every reused receipt is checked against the caller's explicit operation identity and the authoritative forecast's complete action-specific policy player set; a receipt's own claims are not their authority. Distinct origins or actions may share event-grain rows only when complete receipts in the same evidence root verify those rows against the exact same event, successful fetch, raw source/capture identity, payload hash, and actual availability time. Existing rows are checked again under the SQLite writer transaction before only missing rows are appended. A complete commit-before-receipt retry may recover from its matching immutable intent and the exact archived source; an unproven partial subset, mismatched or tampered receipt, or different fetch/availability refuses. A later fetch/observation has its actual later timestamps and a distinct operation identity.
-- Capture receipts/intents created before action was included in the operation key remain preserved and are not rewritten or migrated. Their action-unbound keys are unsupported for retry/reuse/proof by this version; if a matching legacy artifact exists, or such a receipt is needed to prove existing ledger rows, capture/maturation fails closed and requires separate evidence review.
-- The maturation receipt key is deterministically derived from `(observation_id, realization_event)`. A retry first verifies and returns the existing receipt against the caller's explicit observation, action, event, origin and key, and the canonical forecast for that request; a receipt's own claims do not authorize substitution. Handoff intake also requires the filename to match that key and rebinds it to the registered origin and canonical forecast before accepting it. If receipt publication failed after finalization, a retry may recover exactly one complete, mutually bound content-addressed causal-label/outcome pair, but only after revalidating it against the original causal source, selected event, official capture receipts, source positions, and calibration validator; it publishes the single deterministic receipt without calling the finalizer again. Its `matured_at` records the actual successful publication/recovery time; the original forecast issue and label-availability times remain unchanged. Partial pairs, duplicate/competing artifacts, or artifacts that do not bind the origin are refused. Identical maturation retries therefore cannot add duplicate handoff rows.
-- The calibration handoff contains only receipt-verified, unique matured observations. It is evidence for later separately authorized calibration, not calibration itself and not evaluator permission.
+FH/WC maturation requires receipts for the exact complete event schedule. It seals, for every event, the exact capture receipt references and receipt/file digests, operation/fetch IDs, required player union and per-receipt player capture digests; a separate selected-row manifest records which official receipt supplied each retained player outcome. A later plausible ledger row without a unique verified receipt binding cannot complete the label. Retries reverify the whole manifest and refuse extra, missing, replaced, tampered, provisional or unbound rows.
 
-## Weekly operator procedure and gates
+Capture receipts use deterministic operation identities that bind origin, action, observation, realization event, fetch run, live payload and actual availability. An identical retry reuses its verified receipt and appends no duplicate rows. A later source observation keeps its later times and is a different operation. Rows append through the existing `outcome_observation_captures` transaction; no FPL fact is updated or overwritten. Capture intents support only exact commit-before-receipt recovery; ambiguous partial state refuses. Pre-action-bound legacy capture artifacts remain preserved but cannot be reused or treated as proof.
 
-1. Separately authorize and complete the normal official data refresh, fresh normal four-event certification, and normal decision. Preserve their exact IDs and cutoff; do not run these as a side effect of evidence collection.
-2. Confirm the generation snapshot contains the intended official chip state and preserve unknown event-start FT as null unless there is a genuine timely confirmation.
-3. Prepare the exact same-origin `CHIP_RESERVATION` generation and complete opportunity coverage through the pinned expiry using its approved writer-lease workflow. This is the current operator blocker: no dedicated CLI exists in this checkout.
-4. Inspect exact cache requirements. If all required canonical entries verify, run `register-origin`, then `forecast` before any forecast event's outcomes. If entries are missing, stop or obtain separate authorization for `--materialize-worlds`; do not invent a cache identity or silently run the builder.
-5. After the normal official collector has a successful final fetch, verify its event, fixtures, endpoint archives, timestamps, run ID, and raw root. Run `capture-outcome` with those exact values.
-6. Run `mature` for the selected event. Confirm the deterministic maturation receipt and then read the verified handoff. Resolve partial files only by inspection and an explicit recovery decision; do not delete or rewrite valid historical evidence.
+The maturation receipt key is deterministically derived from `(observation_id, realization_event)`. Before finalizing, the collector checks and verifies any existing receipt. If publication failed after a complete immutable outcome/causal-evidence pair exists, a retry recovers and verifies that exact pair without calling the finalizer again. If artifacts exist without one verifiable receipt or complete mutually bound pair, it fails closed. Provisional and later-final captures stay distinct; only a verified final receipt can mature. These outputs are evidence for separately authorized future calibration, not calibration itself and not production PLAY/SAVE permission.
 
-Forecast calibration maturity and production evaluator permission are separate. A growing set of properly prospective, causally matured BB/TC pairs can later support a separately validated calibration process; it does not itself authorize PLAY/SAVE. No calibration, readiness orchestration, production assessment, FH/WC workflow, or account action is implemented here.
+## Storage and database access
+
+Producer JSON is kept as flat content-addressed files under the explicit evidence root; sealed intents, receipts, locks and publication records live below `.chip-evidence/`. Receipts name flat artifact files and bind their content digests, identity and operation keys. Keep the evidence root and referenced raw archives together; never edit or move individual files after issuance. FH/WC cache references remain evidence about this operation, not production authority.
+
+`register-origin`, `register-horizon-origin`, `forecast`, `horizon-forecast` and `mature` use read-only, query-only database connections. `capture-outcome` is the sole logical DB writer: it appends only official event-grain capture rows to the existing ledger under a SQLite writer transaction. No command migrates the schema, refreshes official data, edits manager state, or writes scouting/watchlist/decision records.
+
+## Weekly operator sequence and stop conditions
+
+1. Separately complete the normal official refresh, fresh normal four-event certification and normal decision; retain their exact IDs and cutoff.
+2. Verify timely event-start FT evidence and the pinned snapshot's unused chip window. Unknown FT stays unknown; stop if the canonical future state cannot be proven.
+3. Separately prepare the exact same-origin `CHIP_RESERVATION` generation and, for WC, every explicitly named `WILDCARD_VALUE` generation through expiry under the accepted execution writer-lease workflow. Confirm compatibility and cache readiness; this collector will not create missing products or worlds.
+4. Register the action-specific horizon origin. Run `horizon-forecast` before any opportunity/valuation event starts. A failed preflight, late event, missing generation, incompatible cache, unknown state or ambiguous source is a stop, not a reason to rerun a normal decision implicitly.
+5. After each required official event is final, refresh through the project's ordinary collector, verify the exact successful run and archive root, and issue one `capture-outcome` for each schedule event.
+6. Run `mature` for the forecast-selected event, then verify its deterministic receipt, sealed multi-event capture manifest and retained calibration audit row. `load_verified_calibration_handoff` remains BB/TC-only; FH/WC rows are not yet exposed to calibration intake, training or readiness. Any compatible FH/WC handoff is a separate future change/authorization. Keep calibration and production evaluator permission as separate gates.
