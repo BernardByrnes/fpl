@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import builtins
+from itertools import permutations
+
 from fpl_brain import manager_worlds as mw
 
 STAT_FIELDS = (
@@ -131,3 +134,84 @@ def test_integer_key_keeps_bench_order_goalkeeper_and_skeleton_cache_boundaries(
     assert actual[1]["bench_slot_1_used_probability"] == 0.5
     assert actual[1]["bench_slot_2_used_probability"] == 0.0
     assert actual[0]["expected_autosub_points_added"] != actual[1]["expected_autosub_points_added"]
+
+
+def test_starter_sum_reuse_is_exact_ordered_and_scoped_to_call_context(monkeypatch):
+    matrix = _matrix((
+        frozenset({20_010}),
+        frozenset({20_010, 20_003}),
+        frozenset({START_GK}),
+        frozenset({START_GK, BENCH_GK}),
+    ))
+    bench_orders = tuple(permutations(BENCH_ORDER_DEF_FIRST))
+    reversed_starters = tuple(reversed(STARTERS))
+    # Six bench permutations share one exact ordered XI. Reversing the XI tuple
+    # must start a new sum group; returning to the original tuple after that must
+    # compute again rather than reaching across the intervening context.
+    skeletons = (
+        [(STARTERS, BENCH_GK, order) for order in bench_orders]
+        + [(reversed_starters, BENCH_GK, order) for order in bench_orders]
+        + [(STARTERS, BENCH_GK, order) for order in bench_orders]
+    )
+    group_count = len(mw._appearance_groups(matrix)[2])
+    original_sum = builtins.sum
+    starter_sum_calls = 0
+
+    def counted_sum(values, *args, **kwargs):
+        nonlocal starter_sum_calls
+        frame = getattr(values, "gi_frame", None)
+        iterator = frame.f_locals.get(".0") if frame is not None else None
+        reduced = iterator.__reduce__() if iterator is not None else None
+        iterated_values = reduced[1][0] if reduced and reduced[1] else None
+        if isinstance(iterated_values, tuple) and len(iterated_values) == len(STARTERS):
+            starter_sum_calls += 1
+        return original_sum(values, *args, **kwargs)
+
+    _install_fresh_counters(monkeypatch)
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "sum", counted_sum)
+        expected = mw.base_skeleton_stats_reference(skeletons, POSITIONS, matrix)
+    assert starter_sum_calls == len(skeletons) * group_count
+
+    starter_sum_calls = 0
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "sum", counted_sum)
+        actual = mw.base_skeleton_stats(skeletons, POSITIONS, matrix)
+
+    _assert_exact_rows(actual, expected)
+    assert starter_sum_calls == 3 * group_count
+
+    # A different squad bench and different appearance-group context in a second
+    # call must not inherit any cached sums from the first call.
+    second_matrix = _matrix((frozenset({FILLERS[0]}), frozenset({START_GK}), frozenset()))
+    second_skeletons = [
+        (STARTERS, BENCH_GK, order)
+        for order in permutations(FILLERS[:3])
+    ]
+    second_group_count = len(mw._appearance_groups(second_matrix)[2])
+    second_starter_sum_calls = 0
+
+    def counted_second_sum(values, *args, **kwargs):
+        nonlocal second_starter_sum_calls
+        frame = getattr(values, "gi_frame", None)
+        iterator = frame.f_locals.get(".0") if frame is not None else None
+        reduced = iterator.__reduce__() if iterator is not None else None
+        iterated_values = reduced[1][0] if reduced and reduced[1] else None
+        if isinstance(iterated_values, tuple) and len(iterated_values) == len(STARTERS):
+            second_starter_sum_calls += 1
+        return original_sum(values, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "sum", counted_second_sum)
+        expected_second = mw.base_skeleton_stats_reference(
+            second_skeletons, POSITIONS, second_matrix
+        )
+    assert second_starter_sum_calls == len(second_skeletons) * second_group_count
+
+    second_starter_sum_calls = 0
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "sum", counted_second_sum)
+        actual_second = mw.base_skeleton_stats(second_skeletons, POSITIONS, second_matrix)
+
+    _assert_exact_rows(actual_second, expected_second)
+    assert second_starter_sum_calls == second_group_count
