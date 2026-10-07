@@ -460,11 +460,26 @@ def base_skeleton_stats(skeletons: Sequence[tuple], positions: Mapping[int, str]
         count = group["count"]
         mean_core = tuple(group["core_sum"][position] / count for position in range(len(player_ids)))
         appeared = tuple(bool(mask >> position & 1) for position in range(len(player_ids)))
-        mask_items.append((count / worlds, appeared, mean_core))
+        mask_items.append((mask, count / worlds, appeared, mean_core))
 
     stats: list[dict[str, Any]] = []
+    # The same ordered XI is emitted once for every outfield bench order. Reuse
+    # its exact per-appearance-group starter sum across those adjacent skeletons.
+    # This cache is deliberately local to this invocation: ``mask_items`` fixes
+    # the matrix/appearance-group context, and the exact ordered index tuple is
+    # the cache key. At most one group's 10,000-or-fewer sums is retained.
+    cached_starter_idx: tuple[int, ...] | None = None
+    cached_starter_sums: tuple[float, ...] = ()
     for starter_ids, bench_gk, order in skeletons:
         starter_idx = tuple(index[int(pid)] for pid in starter_ids)
+        if starter_idx != cached_starter_idx:
+            cached_starter_idx = starter_idx
+            # Keep the reference's built-in sum, generator, operands, and order
+            # unchanged so every reused value is bit-identical.
+            cached_starter_sums = tuple(
+                sum(mean_core[i] for i in starter_idx)
+                for _, _, _, mean_core in mask_items
+            )
         bench_idx = tuple(index[int(pid)] for pid in order)
         gk_idx = index[int(bench_gk)]
         starter_out_idx = tuple(i for i in starter_idx if codes[i] != 3)
@@ -472,15 +487,18 @@ def base_skeleton_stats(skeletons: Sequence[tuple], positions: Mapping[int, str]
         starter_gk_idx = next(i for i in starter_idx if codes[i] == 3)
         # The appearance bits this skeleton's autosub decision can depend on.
         watch = starter_out_idx + bench_idx + (starter_gk_idx, gk_idx)
-        choice_cache: dict[tuple, tuple] = {}
+        watch_mask = 0
+        for i in watch:
+            watch_mask |= 1 << i
+        choice_cache: dict[int, tuple] = {}
         weighted_base = 0.0
         any_autosub = 0.0
         autosub_points = 0.0
         autosub_count = 0.0
         gk_used = 0.0
         slot_used = [0.0, 0.0, 0.0]
-        for weight, appeared, mean_core in mask_items:
-            key = tuple(appeared[i] for i in watch)
+        for group_index, (mask, weight, appeared, mean_core) in enumerate(mask_items):
+            key = mask & watch_mask
             decision = choice_cache.get(key)
             if decision is None:
                 _MATRIX_MEMO_STATS["entrant_cache_misses"] += 1
@@ -516,7 +534,7 @@ def base_skeleton_stats(skeletons: Sequence[tuple], positions: Mapping[int, str]
             # it with a naive ``total += x`` loop changes the last ulp (measured:
             # ``sum([4.1]*11) == 45.099999999999994`` against a naive ``45.10000000000001``).
             # A bit-preserving fast path must therefore keep ``sum``.
-            base = sum(mean_core[i] for i in starter_idx)
+            base = cached_starter_sums[group_index]
             for i in entrant_idx:
                 base += mean_core[i]
             if gk_swap:

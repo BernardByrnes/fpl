@@ -330,6 +330,9 @@ def build_free_hit_request(
     certified: FreeHitCertifiedInputs,
     *,
     conn: sqlite3.Connection | None = None,
+    #: Read-only pinned data snapshot used for manager, pool and price authority.
+    #: ``conn`` remains the live evidence store used to load the certified runs.
+    manager_source_conn: sqlite3.Connection | None = None,
     #: The canonical certification artifact the decision is authorised by.  This
     #: is the ONE production source of decision authority.
     certification_path: str | Path | None = None,
@@ -382,14 +385,34 @@ def build_free_hit_request(
     # authority object at all, so "B agrees with B, therefore B is trusted" has no
     # production path.  Price retrieval below uses the CERTIFIED cutoff, so a later
     # caller cutoff can never pull post-cutoff prices into this decision.
-    if not str(certification_path or "").strip():
+    if conn is not None and generation is None:
+        try:
+            generation = gs.resolve_generation(conn, planning_event=int(manager.planning_event))
+        except Exception as failure:
+            raise FreeHitAdapterError(
+                f"{FH_CERTIFICATION_REQUIRED}: no canonical certified generation could be resolved: {failure}",
+                reasons=(FH_CERTIFICATION_REQUIRED,),
+            ) from failure
+    requested_events = tuple(int(value) for value in certified.horizon_binding.horizon_events)
+    use_continuation_authority = bool(
+        conn is not None
+        and generation is not None
+        and generation.horizon_kind == gs.HORIZON_KIND_CHIP_RESERVATION
+        and tuple(generation.events[:4]) != requested_events
+    )
+    if not str(certification_path or "").strip() and not use_continuation_authority:
         raise FreeHitAdapterError(
             f"{FH_CERTIFICATION_REQUIRED}: production Free Hit must load the canonical certification "
             "artifact; no caller-supplied decision authority is accepted",
             reasons=(FH_CERTIFICATION_REQUIRED,),
         )
     try:
-        authority = fh.load_decision_authority(certification_path)
+        if use_continuation_authority:
+            authority = fh.FreeHitDecisionAuthority.from_verified_continuation_generation(
+                conn, generation.generation_id, events=requested_events,
+            )
+        else:
+            authority = fh.load_decision_authority(certification_path)
     except fh.FreeHitAuthorityError as exc:
         raise FreeHitAdapterError(
             f"{FH_CERTIFICATION_REQUIRED}: the canonical certification could not be loaded: {exc}",
@@ -414,9 +437,10 @@ def build_free_hit_request(
         )
 
     if conn is not None:
+        source_conn = manager_source_conn or conn
         # The pool is the accepted generation from the store, and the supplied
         # binding must BE it: identity, digest and exact ids.
-        canonical_pool = resolve_pool_binding(conn)
+        canonical_pool = resolve_pool_binding(source_conn)
         pool_problems = _pool_disagreements(canonical_pool, certified.pool_binding)
         if pool_problems:
             raise FreeHitAdapterError(
@@ -425,7 +449,7 @@ def build_free_hit_request(
                 reasons=(FH_POOL_MISMATCH,),
             )
         canonical = free_hit_manager_state(
-            conn, int(manager.entry_id), int(manager.planning_event),
+            source_conn, int(manager.entry_id), int(manager.planning_event),
             decision_cutoff=certified_cutoff, as_of=as_of,
         )
         disagreements = _state_disagreements(canonical, manager)

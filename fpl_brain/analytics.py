@@ -95,6 +95,11 @@ SOURCE_SNAPSHOT_FILES = (
     # its versioned spec determines the DEFCON term in every xPts row, so a
     # change to it must change the certified code identity.
     "fpl_brain/defcon_calibration.py",
+    # The shared certification permission predicate decides whether a
+    # generation is eligible for a production search.  It is delegated to by
+    # the certifier entry point below, so its implementation bytes must be in
+    # the predictive source identity as well as the delegation wiring.
+    "fpl_brain/four_gw_decision.py",
     "fpl_brain/historical_observations.py",
     # The canonical point-in-time boundary selects which player-fixture
     # observations every historical model may read, so a change to it changes WHAT

@@ -54,9 +54,11 @@ PLAY vs SAVE
 ------------
 This evaluator reports the RAW H1 paired uplift.  It never calls the reservation:
 saving the chip is valued by the arbiter's reservation seam, exactly once.  It
-supplies no ``post_save_state_for_reservation``, because playing Bench Boost
-changes no squad, bank, free-transfer or chip state — so the arbiter's default
-payload is already the correct post-SAVE state (Triple Captain's shape).
+does not construct ``post_save_state_for_reservation`` by itself because it has
+no manager-route input.  The production route assembler supplies the verified
+normal route's post-H1 state, including its proposed squad, acquisition basis,
+bank, free transfers and route identity, so the reservation forecast is bound
+to the actual SAVE scenario even when H1 transfers changed the squad.
 
 REVIEW-ONLY
 -----------

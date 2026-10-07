@@ -8,8 +8,15 @@ bootstrap `game_settings` payload instead of being hardcoded everywhere.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import sqlite3
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
+
+from . import raw_archive
 
 REQUIRED_GAME_SETTINGS_KEYS = (
     "squad_squadsize",
@@ -40,6 +47,162 @@ def window_flag(events) -> str:
 
 class SeasonRulesError(ValueError):
     """Official game settings are missing or contradict required rule constants."""
+
+
+PINNED_RULES_EVIDENCE_SCHEMA = "fpl_brain.origin_pinned_season_rules.v1"
+
+
+@dataclass(frozen=True)
+class PinnedSeasonRules:
+    rules: "SeasonRules"
+    evidence: Mapping[str, Any]
+
+
+def _utc(value: Any, *, name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as failure:
+        raise SeasonRulesError(f"{name} is not an ISO timestamp") from failure
+    if parsed.tzinfo is None:
+        raise SeasonRulesError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_origin_pinned_season_rules(
+    conn: sqlite3.Connection,
+    *,
+    season: str,
+    cutoff: str,
+    data_snapshot_sha256: str,
+) -> PinnedSeasonRules:
+    """Resolve season rules from accepted official settings in a verified snapshot.
+
+    The connection must be the read-only database snapshot whose content digest
+    is ``data_snapshot_sha256``. The selected accepted bootstrap generation pins
+    a fetch run in that snapshot; its immutable bootstrap archive capture is
+    re-hashed before deriving rules. Historical rows without that retained
+    capture remain unavailable; they are never reconstructed from today's
+    defaults.
+    """
+
+    origin = _utc(cutoff, name="origin cutoff")
+    snapshot = str(data_snapshot_sha256 or "").removeprefix("sha256:")
+    if len(snapshot) != 64 or any(character not in "0123456789abcdef" for character in snapshot.lower()):
+        raise SeasonRulesError("origin data snapshot identity is not a SHA-256 digest")
+    try:
+        rows = conn.execute(
+            "SELECT bg.id, bg.fetch_run_id, bg.captured_at, fr.raw_dir "
+            "FROM bootstrap_generations AS bg LEFT JOIN fetch_runs AS fr "
+            "ON fr.id=bg.fetch_run_id WHERE bg.accepted=1 AND bg.fetch_run_id IS NOT NULL "
+            "ORDER BY bg.id DESC",
+        ).fetchall()
+    except sqlite3.OperationalError as failure:
+        raise SeasonRulesError("pinned snapshot has no accepted bootstrap provenance") from failure
+
+    candidates = []
+    for row in rows:
+        captured_at = _utc(row["captured_at"], name="bootstrap captured_at")
+        if captured_at <= origin:
+            candidates.append((captured_at, int(row["id"]), row))
+    if not candidates:
+        raise SeasonRulesError("pinned snapshot has no accepted bootstrap capture at or before the cutoff")
+    captured_at, generation_id, row = max(candidates, key=lambda item: (item[0], item[1]))
+    fetch_run_id = row["fetch_run_id"]
+    raw_dir = str(row["raw_dir"] or "").strip()
+    if not raw_dir:
+        raise SeasonRulesError("accepted bootstrap generation has no retained raw archive directory")
+    try:
+        captures = [
+            record for record in raw_archive.load_manifest(raw_dir)
+            if str(record.get("source") or "") == "bootstrap_static"
+            and str(record.get("run_id") or "") == str(fetch_run_id)
+            and _utc(record.get("observed_at"), name="bootstrap archive observed_at") == captured_at
+        ]
+    except Exception as failure:
+        raise SeasonRulesError(f"pinned bootstrap archive manifest is unavailable or malformed: {failure}") from failure
+    if len(captures) != 1:
+        raise SeasonRulesError("accepted bootstrap generation does not resolve to exactly one archived payload")
+    capture = captures[0]
+    if not raw_archive.verify_archived_blob(raw_dir, capture):
+        raise SeasonRulesError("pinned bootstrap archive payload digest does not verify")
+    try:
+        payload_path = Path(raw_dir) / raw_archive.ARCHIVE_DIRNAME / str(capture["relative_path"])
+        payload = json.loads(payload_path.read_bytes())
+    except (OSError, KeyError, TypeError, ValueError) as failure:
+        raise SeasonRulesError("pinned bootstrap archive payload is unreadable or malformed") from failure
+    if not isinstance(payload, Mapping):
+        raise SeasonRulesError("pinned bootstrap archive payload is not an object")
+    rules = season_rules_from_bootstrap(str(season), payload)
+    settings = payload["game_settings"]
+    settings_sha256 = _canonical_sha256(settings)
+    rules_payload = asdict(rules)
+    evidence = {
+        "schema": PINNED_RULES_EVIDENCE_SCHEMA,
+        "source": "ACCEPTED_BOOTSTRAP_CAPTURE_IN_ORIGIN_SNAPSHOT_ARCHIVE",
+        "season": str(season),
+        "bootstrap_generation_id": generation_id,
+        "fetch_run_id": int(fetch_run_id),
+        "captured_at": captured_at.isoformat().replace("+00:00", "Z"),
+        "origin_cutoff": str(cutoff),
+        "data_snapshot_sha256": snapshot,
+        "archive_capture_id": str(capture.get("capture_id") or ""),
+        "bootstrap_payload_sha256": str(capture.get("payload_sha256") or ""),
+        "archive_relative_path": str(capture.get("relative_path") or ""),
+        "game_settings_sha256": settings_sha256,
+        "season_rules": rules_payload,
+        "season_rules_sha256": _canonical_sha256(rules_payload),
+    }
+    return PinnedSeasonRules(rules=rules, evidence=evidence)
+
+
+def verify_pinned_season_rules_evidence(
+    evidence: Mapping[str, Any],
+    rules: "SeasonRules",
+    *,
+    cutoff: str,
+    data_snapshot_sha256: str,
+    allow_fixture: bool = False,
+) -> bool:
+    """Check the retained rules binding against the exact opportunity origin."""
+
+    rule_payload = asdict(rules)
+    source = evidence.get("source")
+    production_source = "ACCEPTED_BOOTSTRAP_CAPTURE_IN_ORIGIN_SNAPSHOT_ARCHIVE"
+    fixture_source = "EXPLICIT_FIXTURE_ONLY"
+    if evidence.get("schema") != PINNED_RULES_EVIDENCE_SCHEMA:
+        raise SeasonRulesError("season-rule evidence schema is unsupported")
+    if source != production_source and not (allow_fixture and source == fixture_source
+                                            and evidence.get("evidence_class") == "FIXTURE_ONLY"):
+        raise SeasonRulesError("season-rule evidence is not from a verified origin snapshot")
+    if (
+        evidence.get("season_rules") != rule_payload
+        or evidence.get("season_rules_sha256") != _canonical_sha256(rule_payload)
+        or str(evidence.get("origin_cutoff") or "") != str(cutoff)
+        or str(evidence.get("data_snapshot_sha256") or "").removeprefix("sha256:")
+        != str(data_snapshot_sha256 or "").removeprefix("sha256:")
+        or _utc(evidence.get("captured_at"), name="season-rule captured_at")
+        > _utc(cutoff, name="origin cutoff")
+    ):
+        raise SeasonRulesError("season-rule evidence differs from the origin rules, cutoff or data snapshot")
+    if source == production_source:
+        for name in ("bootstrap_generation_id", "fetch_run_id"):
+            if int(evidence.get(name) or 0) <= 0:
+                raise SeasonRulesError(f"season-rule evidence omits {name}")
+        for name in ("archive_capture_id", "archive_relative_path"):
+            if not str(evidence.get(name) or "").strip():
+                raise SeasonRulesError(f"season-rule evidence omits {name}")
+        for name in ("bootstrap_payload_sha256", "game_settings_sha256"):
+            value = str(evidence.get(name) or "").removeprefix("sha256:")
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value.lower()):
+                raise SeasonRulesError(f"season-rule evidence {name} is not a SHA-256 digest")
+    return True
 
 
 @dataclass(frozen=True)

@@ -184,6 +184,90 @@ class FreeHitDecisionAuthority:
         return []
 
     @classmethod
+    def from_verified_continuation_generation(
+        cls,
+        conn: Any,
+        generation_id: str,
+        *,
+        events: Sequence[int],
+    ) -> "FreeHitDecisionAuthority":
+        """Derive a future FH authority from a verified origin-pinned product.
+
+        The continuation generation is reloaded and independently verified in
+        the canonical store. Only a contiguous four-event window wholly inside
+        a ``CHIP_RESERVATION`` product may authorize the future FH request.
+        """
+
+        from . import generation_store as gs
+
+        try:
+            generation = gs.load_generation(conn, str(generation_id))
+            report = gs.verify_generation(conn, generation.generation_id)
+        except Exception as failure:
+            raise FreeHitAuthorityError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: continuation generation refused: {failure}",
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            ) from failure
+        selected = tuple(int(value) for value in events)
+        if (
+            not report.get("verified")
+            or generation.horizon_kind != gs.HORIZON_KIND_CHIP_RESERVATION
+            or len(selected) != 4
+            or selected != tuple(range(selected[0], selected[0] + 4))
+            or not set(selected).issubset(set(generation.events))
+        ):
+            raise FreeHitAuthorityError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: continuation product is not verified or does not cover the exact future FH window",
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        per_event = generation.manifest.get("per_event") or {}
+        bundle_map: dict[int, Mapping[str, Any]] = {}
+        bundle_ids: dict[int, str] = {}
+        for event in selected:
+            record = per_event.get(str(event)) or {}
+            identity = str(record.get("bundle_identity") or "")
+            if not identity:
+                raise FreeHitAuthorityError(
+                    f"{FH_DECISION_AUTHORITY_REQUIRED}: GW{event} continuation bundle has no identity",
+                    reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+                )
+            bundle_ids[event] = identity
+            bundle_map[event] = {
+                "cutoff": str(generation.cutoff),
+                "data_snapshot_sha256": str(generation.snapshot.get("sha256") or ""),
+                "code_snapshot_sha256": str(generation.manifest.get("code_snapshot_sha256") or ""),
+                "runs": generation.runs_for(event),
+                "model_versions": generation.model_versions_by_event.get(event) or {},
+                "planning_context_hash": str(record.get("planning_context_hash") or ""),
+            }
+        first = bundle_map[selected[0]]
+        models = first.get("model_versions") or {}
+        authority = cls(
+            planning_cutoff=str(generation.cutoff),
+            data_snapshot_sha256=str(generation.snapshot.get("sha256") or ""),
+            certification_identity=gs._certification_identity_for_bundles(
+                cutoff=str(generation.cutoff),
+                bundle_identities={str(event): identity for event, identity in bundle_ids.items()},
+                snapshot_sha256=str(generation.snapshot.get("sha256") or ""),
+            ),
+            certified_events=selected,
+            certified_bundle_identity=bundle_ids,
+            code_snapshot_sha256=str(generation.manifest.get("code_snapshot_sha256") or ""),
+            model_versions=tuple((str(key), str(value)) for key, value in sorted(models.items())),
+            planning_context_hash=str(first.get("planning_context_hash") or ""),
+            loaded_from=f"verified CHIP_RESERVATION generation {generation.generation_id}",
+            bundle_map=bundle_map,
+            artifact=generation.manifest,
+        )
+        problems = authority.problems()
+        if problems:
+            raise FreeHitAuthorityError(
+                f"{FH_DECISION_AUTHORITY_REQUIRED}: " + "; ".join(problems[:6]),
+                reasons=(FH_DECISION_AUTHORITY_REQUIRED,),
+            )
+        return authority
+
+    @classmethod
     def from_certification(
         cls, artifact: Mapping[str, Any], *, loaded_from: str = ""
     ) -> "FreeHitDecisionAuthority":

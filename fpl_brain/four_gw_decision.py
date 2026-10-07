@@ -99,6 +99,44 @@ HORIZON_FLAGS = (
 WILDCARD_EVALUATION_SUPPORTED = "WILDCARD_EVALUATION_SUPPORTED"
 
 
+def decide_search_permission(
+    *,
+    temporal_status: Any,
+    dependency_validation: Any,
+    horizon_status: Any,
+    data_snapshot_sha256: Any,
+    history_completeness: Mapping[str, Any],
+    snapshot_error: str | None = None,
+) -> tuple[bool, list[str]]:
+    """Derive search permission from canonical certification conditions.
+
+    Certification and production both call this shared predicate. Inputs must
+    come from canonical validators and the pinned-origin history audit; this
+    function does not accept a caller permission claim.
+    """
+
+    from . import history_completeness as hc
+
+    reasons: list[str] = []
+    if str(temporal_status).upper() != "CAUSAL":
+        reasons.append("temporal_status is not CAUSAL")
+    if str(dependency_validation).upper() != "COHERENT":
+        reasons.append("dependency_validation is not COHERENT")
+    if horizon_status != DECISION_HORIZON_COMPLETE:
+        reasons.append(f"horizon status is {horizon_status}")
+    if not data_snapshot_sha256:
+        reasons.append("no data snapshot identity")
+    if snapshot_error:
+        reasons.append(str(snapshot_error))
+    if not history_completeness.get("complete"):
+        blocker = hc.blocking_reason_token(history_completeness)
+        detail = history_completeness.get("reasons") or []
+        reasons.append(
+            blocker if not detail else f"{blocker} ({', '.join(str(item) for item in detail)})"
+        )
+    return (not reasons), reasons
+
+
 def sanitize_wildcard_screen(wildcard: Mapping[str, Any]) -> dict[str, Any]:
     """Strip any unverifiable actionable Wildcard claim from a passthrough block.
 
@@ -449,6 +487,31 @@ HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY = {
         "entry_point": "scripts/certify_gw5_gw8.py",
         "entry_point_sha256": "7ad4254ec4ba32f67e50dde181a728284335fc2ff37de996c6003a7bd1322c81",
         "code_snapshot_sha256": "e2c1df67addfe0c54f262916599a8d17aa6d3002782a8ab8a08a2801cf9ceff4",
+        # Freeze the exact pre-generic-runner source list from the retained GW5
+        # artifact. This historical certificate predates the shared production
+        # permission predicate's addition to today's SOURCE_SNAPSHOT_FILES.
+        # Deriving this list from the current set would rewrite the meaning of
+        # old evidence whenever current predictive identity coverage expands.
+        "covered_source_files": (
+            "fpl_brain/analytics.py",
+            "fpl_brain/calibration.py",
+            "fpl_brain/database.py",
+            "fpl_brain/defcon_calibration.py",
+            "fpl_brain/historical_observations.py",
+            "fpl_brain/history_completeness.py",
+            "fpl_brain/joint_minutes.py",
+            "fpl_brain/minutes_coherence.py",
+            "fpl_brain/minutes_model.py",
+            "fpl_brain/monte_carlo.py",
+            "fpl_brain/player_rates.py",
+            "fpl_brain/repositories.py",
+            "fpl_brain/scoring_rules.py",
+            "fpl_brain/substitution_model.py",
+            "fpl_brain/team_model.py",
+            "fpl_brain/xpts.py",
+            "scripts/certify_gw5_gw8.py",
+            "scripts/freeze_predictions.py",
+        ),
     },
 }
 
@@ -580,27 +643,22 @@ def _certification_wiring_is_trusted(payload: Mapping[str, Any], wiring: Any) ->
     runner name.
     """
 
-    from . import analytics
-
     if not isinstance(wiring, Mapping):
         return False
-    covered = list(wiring.get("covered_source_files") or [])
+    raw_covered = wiring.get("covered_source_files")
+    if not isinstance(raw_covered, list):
+        return False
+    covered = raw_covered
     declared_identity = str(payload.get("four_gw_certification_identity") or "")
     historical = HISTORICAL_CERTIFICATION_WIRING_BY_IDENTITY.get(declared_identity)
     if historical is not None:
         if certification_identity_of(payload) != declared_identity:
             return False
-        expected_covered = list(analytics.SOURCE_SNAPSHOT_FILES)
-        try:
-            current_entry_index = expected_covered.index(CERTIFIER_ENTRY_POINT)
-        except ValueError:
-            return False
-        expected_covered[current_entry_index] = historical["entry_point"]
         return (
             wiring.get("entry_point") == historical["entry_point"]
             and wiring.get("entry_point_sha256") == historical["entry_point_sha256"]
             and payload.get("code_snapshot_sha256") == historical["code_snapshot_sha256"]
-            and covered == expected_covered
+            and tuple(covered) == historical["covered_source_files"]
         )
 
     return (

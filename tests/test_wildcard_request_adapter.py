@@ -518,6 +518,34 @@ def test_adapter_P_production_happy_path_reaches_exact_evaluate():
     assert decision.candidate_metrics["mean_paired_uplift"] is not None or decision.reason_codes
 
 
+def test_adapter_production_manager_check_compares_scalar_bank_without_iterating(monkeypatch):
+    """The connected production seam must compare bank as an integer scalar."""
+
+    players = _pool()
+    owned = _legal_owned(players)
+    manager = _manager(players, owned)
+    certified = _certified(players)
+    binding = wc.pool_binding_from_generation(certified.generation)
+
+    monkeypatch.setattr(wc, "pool_binding_from_store", lambda _conn: binding)
+    monkeypatch.setattr(ad, "wildcard_manager_state", lambda *_args, **_kwargs: manager)
+
+    # The adapter should pass its manager equality check and then stop at the
+    # deliberately missing persisted PE-9 generation ids.  The former suffix
+    # dispatch attempted dict(bank_tenths) first and raised an incidental TypeError.
+    with pytest.raises(ad.WildcardAdapterError, match="production Wildcard requires persisted"):
+        ad.build_wildcard_request(
+            manager,
+            certified,
+            rules=RULES,
+            data_snapshot_sha256=SNAPSHOT,
+            conn=object(),
+            manager_source_conn=object(),
+            pool_binding=binding,
+            canonical_route=object(),
+        )
+
+
 def test_adapter_Q_no_caller_supplied_evaluation_result_exists():
     """There is no production argument representing caller-authoritative values."""
 

@@ -69,7 +69,7 @@ CAPTAIN, VICE = 25, 26
 
 
 def _seed(conn, *, prices: dict[int, int] | None = None, bank: int = 20, ft: int = 2,
-          with_generation: bool = True) -> None:
+          event_start_ft: int | None = -1, with_generation: bool = True) -> None:
     prices = prices if prices is not None else {pid: 50 for pid in UNIVERSE}
     with conn:
         repo.upsert_teams(conn, [TeamRecord(id=t, name=f"Team {t}") for t in sorted(set(CLUB.values()))])
@@ -142,7 +142,7 @@ def _seed(conn, *, prices: dict[int, int] | None = None, bank: int = 20, ft: int
         repo.upsert_manual_manager_state(
             conn, ENTRY, EVENT, int(ft), int(bank),
             source="user_confirmed_free_hit_test_state", captured_at=CAPTURED_AT,
-            event_start_free_transfers=int(ft),
+            event_start_free_transfers=(int(ft) if event_start_ft == -1 else event_start_ft),
         )
         # The runs this fixture's certification DECLARES must exist: a loader reads the
         # model version off the run's own row, so a database that names certified run
@@ -396,6 +396,48 @@ def test_a_post_cutoff_price_is_invisible_to_a_historical_replay(conn):
         repo.finish_fetch_run(conn, run, "success", current_event=EVENT)
     state = _state(conn)
     assert state.market_price_tenths[1] == 50, "a post-cutoff price leaked into the decision"
+
+
+def test_historical_run1_missing_event_start_ft_stays_blocked_after_later_observation(conn):
+    """FT remaining=3 and bank=7 do not fill historical event-start FT.
+
+    The later explicit value is excluded by the Run #1 cutoff.  Both production
+    chip adapters retain their exact historical refusal tokens.
+    """
+
+    from fpl_brain import wildcard_request_adapter as wc_adapter
+
+    historical_cutoff = "2026-09-29T20:27:01Z"
+    later_capture = "2026-09-29T20:27:02Z"
+    _seed(conn, bank=7, ft=3, event_start_ft=None)
+
+    before = repo.manager_planning_state(conn, ENTRY, EVENT, as_of=historical_cutoff)
+    assert before["free_transfers"] == 3
+    assert before["bank"] == 7
+    assert before["event_start_free_transfers"] is None
+    assert before["event_start_free_transfers_source"] == "data_gap"
+
+    repo.upsert_manual_manager_state(
+        conn, ENTRY, EVENT, 3, 7, source="later_user_confirmation",
+        captured_at=later_capture, event_start_free_transfers=2,
+    )
+    still_historical = repo.manager_planning_state(conn, ENTRY, EVENT, as_of=historical_cutoff)
+    assert still_historical["free_transfers"] == 3
+    assert still_historical["bank"] == 7
+    assert still_historical["event_start_free_transfers"] is None
+
+    with pytest.raises(ad.FreeHitAdapterError) as free_hit_failure:
+        ad.free_hit_manager_state(
+            conn, ENTRY, EVENT, decision_cutoff=historical_cutoff, as_of=historical_cutoff,
+        )
+    assert free_hit_failure.value.reasons == ("FREE_HIT_PRODUCTION_MANAGER_STATE_MISSING",)
+
+    with pytest.raises(wc_adapter.WildcardAdapterError) as wildcard_failure:
+        wc_adapter.wildcard_manager_state(
+            conn, ENTRY, EVENT, cutoff=historical_cutoff,
+            eligible_ids=UNIVERSE, as_of=historical_cutoff,
+        )
+    assert wildcard_failure.value.reasons == ["WILDCARD_PRODUCTION_MANAGER_STATE_MISSING"]
 
 
 def test_building_without_canonical_authority_refuses_by_default(conn):

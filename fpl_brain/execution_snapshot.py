@@ -34,7 +34,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .causality import CausalityError, _aware, assert_causal_cutoff
 from .utils import utc_now
@@ -48,6 +48,7 @@ DIAG_LIVE_SOURCE_DRIFT = "LIVE_SOURCE_DRIFT_DETECTED"
 
 SNAPSHOT_FILENAME = "execution_source_snapshot.db"
 SNAPSHOT_MANIFEST = "execution_source_snapshot.json"
+GENERATION_CAUSALITY_SCHEMA = "fpl_brain.generation_causality.v1"
 
 
 class SnapshotError(CausalityError):
@@ -284,10 +285,12 @@ def open_snapshot(snapshot: ExecutionSnapshot) -> sqlite3.Connection:
     return conn
 
 
-def load_snapshot_manifest(directory: str | Path) -> ExecutionSnapshot:
+def load_snapshot_manifest(
+    directory: str | Path, *, manifest_path: str | Path | None = None
+) -> ExecutionSnapshot:
     """Load a previously captured snapshot manifest, failing closed if absent."""
 
-    manifest = Path(directory) / SNAPSHOT_MANIFEST
+    manifest = Path(manifest_path) if manifest_path is not None else Path(directory) / SNAPSHOT_MANIFEST
     if not manifest.exists():
         raise SnapshotError(
             f"{DIAG_SNAPSHOT_MISSING}: no certification snapshot manifest at {manifest}"
@@ -312,6 +315,157 @@ def load_snapshot_manifest(directory: str | Path) -> ExecutionSnapshot:
         size_bytes=int(payload.get("data_snapshot_size_bytes") or 0),
         manifest_path=str(manifest),
     )
+
+
+def derive_generation_causality(
+    *,
+    snapshot_path: str | Path,
+    data_snapshot_sha256: str,
+    data_snapshot_size_bytes: int,
+    source_db_identity: Mapping[str, Any],
+    snapshot_manifest_path: str | Path | None,
+    execution_run_uuid: str,
+    origin_planning_event: int,
+    origin_cutoff: str,
+    execution_started_at: str,
+) -> dict[str, Any]:
+    """Derive and retain the origin snapshot's causal ordering from its evidence.
+
+    The generation manifest currently retains the snapshot bytes and execution UUID
+    but not the snapshot consistency instant or execution start.  This shared
+    derivation reads those instants from the canonical snapshot manifest, verifies
+    that manifest against the pinned snapshot identity, and reuses the existing
+    cutoff and causality validators.  It never consults the current wall clock.
+    """
+
+    from .causality import _aware, assert_causal_cutoff
+
+    path = Path(snapshot_path)
+    manifest_path = (
+        Path(snapshot_manifest_path)
+        if snapshot_manifest_path is not None
+        else path.parent / SNAPSHOT_MANIFEST
+    )
+    if not manifest_path.is_file():
+        raise SnapshotError(
+            f"{DIAG_SNAPSHOT_MISSING}: no retained snapshot timing manifest at {manifest_path}"
+        )
+    try:
+        raw_bytes = manifest_path.read_bytes()
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as failure:
+        raise SnapshotError(
+            f"{DIAG_SNAPSHOT_MISSING}: retained snapshot timing manifest is unreadable: {failure}"
+        ) from failure
+    if not isinstance(payload, Mapping):
+        raise SnapshotError("retained snapshot timing manifest is not an object")
+
+    def _same_path(left: Any, right: Any) -> bool:
+        try:
+            return os.path.normcase(os.path.realpath(str(left))) == os.path.normcase(
+                os.path.realpath(str(right))
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+
+    if not _same_path(payload.get("data_snapshot_path"), path):
+        raise SnapshotError("retained snapshot timing manifest names a different snapshot path")
+    if str(payload.get("data_snapshot_sha256") or "") != str(data_snapshot_sha256):
+        raise SnapshotError("retained snapshot timing manifest names a different snapshot digest")
+    if int(payload.get("data_snapshot_size_bytes") or -1) != int(data_snapshot_size_bytes):
+        raise SnapshotError("retained snapshot timing manifest names a different snapshot size")
+    if str(payload.get("execution_run_uuid") or "") != str(execution_run_uuid):
+        raise SnapshotError("retained snapshot timing manifest names a different execution UUID")
+    if dict(payload.get("data_snapshot_source_db_identity") or {}) != dict(source_db_identity):
+        raise SnapshotError("retained snapshot timing manifest names a different source database identity")
+    declared_cutoff = payload.get("planning_cutoff")
+    if declared_cutoff is not None and str(declared_cutoff) != str(origin_cutoff):
+        raise SnapshotError("retained snapshot timing manifest names a different planning cutoff")
+
+    required_times = (
+        "snapshot_lock_acquired_at",
+        "snapshot_capture_started_at",
+        "snapshot_consistency_at",
+        "snapshot_capture_completed_at",
+    )
+    missing = [name for name in required_times if not payload.get(name)]
+    if missing:
+        raise SnapshotError(f"retained snapshot timing evidence omits {missing}")
+    lock_at = str(payload["snapshot_lock_acquired_at"])
+    capture_started_at = str(payload["snapshot_capture_started_at"])
+    consistency_at = str(payload["snapshot_consistency_at"])
+    capture_completed_at = str(payload["snapshot_capture_completed_at"])
+    # These equalities are properties of capture_execution_snapshot: the SQLite
+    # writer lock is acquired before VACUUM INTO, and the source is held stable
+    # until capture completes.  Recheck them instead of trusting the sidecar label.
+    if not (_aware(lock_at, label="snapshot lock acquired") ==
+            _aware(capture_started_at, label="snapshot capture started") ==
+            _aware(consistency_at, label="snapshot consistency")):
+        raise SnapshotError("snapshot lock, capture-start and consistency instants do not agree")
+    if _aware(capture_completed_at, label="snapshot capture completed") < _aware(
+        consistency_at, label="snapshot consistency"
+    ):
+        raise SnapshotError("snapshot capture completed before its consistency instant")
+
+    # Reuse the exact live cutoff contract and the canonical causal-order check.
+    require_live_cutoff_matches_snapshot(consistency_at, str(origin_cutoff))
+    snapshot_for_cutoff(consistency_at, str(origin_cutoff))
+    assert_causal_cutoff(
+        consistency_at, str(execution_started_at), label="generation execution start"
+    )
+    # A snapshot whose bytes were not completely materialized by execution start
+    # cannot be the causal input that execution consumed, even when its consistency
+    # point and planning cutoff agree.
+    assert_causal_cutoff(
+        capture_completed_at,
+        str(execution_started_at),
+        label="snapshot capture completion",
+        tolerance_seconds=0.0,
+    )
+    assert_causal_cutoff(
+        str(origin_cutoff), str(execution_started_at), label="generation planning"
+    )
+
+    # The file digest is checked again at the point the causal evidence is derived.
+    installed = load_snapshot_manifest(path.parent, manifest_path=manifest_path)
+    opened = open_snapshot(installed)
+    opened.close()
+    if installed.data_snapshot_sha256 != str(data_snapshot_sha256):
+        raise SnapshotError("loaded snapshot validator returned a different snapshot digest")
+
+    timing_evidence = {
+        "data_snapshot_sha256": str(data_snapshot_sha256),
+        "data_snapshot_size_bytes": int(data_snapshot_size_bytes),
+        "source_db_identity": dict(source_db_identity),
+        "execution_run_uuid": str(execution_run_uuid),
+        "planning_cutoff": str(origin_cutoff),
+        "snapshot_lock_acquired_at": lock_at,
+        "snapshot_capture_started_at": capture_started_at,
+        "snapshot_consistency_at": consistency_at,
+        "snapshot_capture_completed_at": capture_completed_at,
+    }
+    timing_bytes = json.dumps(
+        timing_evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return {
+        "schema": GENERATION_CAUSALITY_SCHEMA,
+        "origin_planning_event": int(origin_planning_event),
+        "origin_cutoff": str(origin_cutoff),
+        "execution_run_uuid": str(execution_run_uuid),
+        "execution_started_at": str(execution_started_at),
+        "snapshot_sha256": str(data_snapshot_sha256),
+        "snapshot_size_bytes": int(data_snapshot_size_bytes),
+        # Bind the validated timing facts, not the sidecar's filesystem location.
+        # Two retained copies of identical snapshot bytes and timing evidence must
+        # keep the generation's content identity stable.
+        "snapshot_timing_evidence_sha256": hashlib.sha256(timing_bytes).hexdigest(),
+        "snapshot_lock_acquired_at": lock_at,
+        "snapshot_capture_started_at": capture_started_at,
+        "snapshot_consistency_at": consistency_at,
+        "snapshot_capture_completed_at": capture_completed_at,
+        "temporal_status": "CAUSAL",
+        "reasons": [],
+    }
 
 
 def assert_snapshot_unchanged(snapshot: ExecutionSnapshot) -> None:
@@ -446,12 +600,14 @@ __all__ = [
     "DIAG_SNAPSHOT_MISSING",
     "DIAG_SNAPSHOT_MUTATED",
     "ExecutionSnapshot",
+    "GENERATION_CAUSALITY_SCHEMA",
     "SNAPSHOT_FILENAME",
     "SNAPSHOT_MANIFEST",
     "SnapshotError",
     "assert_snapshot_unchanged",
     "assert_connection_matches_snapshot",
     "capture_execution_snapshot",
+    "derive_generation_causality",
     "file_sha256",
     "live_source_drift",
     "load_snapshot_manifest",

@@ -1,0 +1,2128 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from fpl_brain import chip_evidence_ops as ops
+from fpl_brain import database, outcome_ledger as ol, raw_archive, route_optimizer as ro
+
+
+def _prospective_state_fixture(*, event_flags=(0, 0), fixture_flags=(0, 0, 0),
+                               kickoff_offset_days=30, fixture_updated_at=None):
+    from datetime import timedelta
+
+    from fpl_brain import repositories as repo
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    database.initialize_database(conn)
+    now = ops._utc_now()
+    checked = ops._parse_utc(now, name="test source time")
+    kickoff = None if kickoff_offset_days is None else (
+        checked + timedelta(days=kickoff_offset_days)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    conn.execute(
+        "INSERT INTO events(id,name,finished,data_checked,raw_json,updated_at) VALUES(5,'GW5',?,?, '{}',?)",
+        (event_flags[0], event_flags[1], now),
+    )
+    conn.execute(
+        "INSERT INTO fixtures(id,event,kickoff_time,team_h,team_a,started,finished,finished_provisional,"
+        "raw_json,updated_at) VALUES(50,5,?,1,2,?,?,?,'{}',?)",
+        (kickoff, *fixture_flags, fixture_updated_at or now),
+    )
+    conn.commit()
+    return conn
+
+
+def _retain_official_prospective_state(
+    conn, *, event, cutoff, kickoff_time, raw_root, reversed_fetch_interval=False,
+    fetch_status="success",
+):
+    """Seed an exact successful archived observation before the pinned cutoff."""
+
+    from datetime import timedelta
+
+    cutoff_at = ops._parse_utc(cutoff, name="test pinned cutoff")
+    observed_at = (cutoff_at - timedelta(minutes=15)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    finished_at = (cutoff_at - timedelta(minutes=14)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    started_at = (
+        cutoff_at - timedelta(minutes=13) if reversed_fetch_interval
+        else cutoff_at - timedelta(minutes=14, seconds=30)
+    ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    if reversed_fetch_interval:
+        finished_at = (cutoff_at - timedelta(minutes=14)).isoformat(
+            timespec="microseconds",
+        ).replace("+00:00", "Z")
+    raw_path = Path(raw_root).resolve()
+    raw_path.mkdir(parents=True, exist_ok=True)
+    cursor = conn.execute(
+        "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+        "endpoints_failed,raw_dir) VALUES(?,?,?,'fetch_fpl',?,?,?,?)",
+        (started_at, finished_at, str(fetch_status), int(event),
+         json.dumps(["bootstrap-static", "fixtures"]),
+         json.dumps([] if fetch_status == "success" else [{"endpoint": "event/4/live", "error": "test partial"}]),
+         str(raw_path)),
+    )
+    run_id = int(cursor.lastrowid)
+    conn.execute(
+        "UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=?",
+        (observed_at, int(event)),
+    )
+    fixture_rows = [dict(row) for row in conn.execute(
+        "SELECT id,event,team_h,team_a,kickoff_time FROM fixtures WHERE event=? ORDER BY id",
+        (int(event),),
+    ).fetchall()]
+    assert fixture_rows
+    conn.execute(
+        "UPDATE fixtures SET started=0,finished=0,finished_provisional=0,kickoff_time=?,updated_at=? "
+        "WHERE event=?",
+        (kickoff_time, observed_at, int(event)),
+    )
+    conn.commit()
+    fixture_payload = [{
+        "id": int(row["id"]),
+        "event": int(event),
+        "kickoff_time": kickoff_time,
+        "team_h": int(row["team_h"]),
+        "team_a": int(row["team_a"]),
+        "started": False,
+        "finished": False,
+        "finished_provisional": False,
+    } for row in fixture_rows]
+    bootstrap_payload = {
+        "events": [{"id": int(event), "name": f"GW{event}", "finished": False, "data_checked": False}],
+        "teams": [{"id": 1, "name": "One"}, {"id": 2, "name": "Two"}],
+        "elements": [],
+    }
+    for source, payload, source_event in (
+        ("bootstrap_static", bootstrap_payload, None),
+        ("fixtures", fixture_payload, None),
+    ):
+        raw_archive.archive_raw_capture(
+            raw_path,
+            source=source,
+            observed_at=observed_at,
+            body=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            event=source_event,
+            run_id=run_id,
+        )
+    return observed_at, fixture_payload, started_at
+
+
+def test_prospective_gate_rejects_reversed_successful_fetch_interval(tmp_path):
+    from datetime import timedelta
+
+    conn = _prospective_state_fixture()
+    try:
+        kickoff = (
+            ops._parse_utc(ops._utc_now(), name="current test time") + timedelta(days=30)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        _retain_official_prospective_state(
+            conn,
+            event=5,
+            cutoff="2026-09-19T11:00:00Z",
+            kickoff_time=kickoff,
+            raw_root=tmp_path / "reversed-state-raw",
+            reversed_fetch_interval=True,
+        )
+        with pytest.raises(ops.ChipEvidenceError, match="fetch interval is reversed"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_requires_matching_intact_official_state_archives():
+    conn = _prospective_state_fixture()
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="bootstrap_static source provenance is missing"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_accepts_verified_endpoint_captures_from_completed_partial_fetch(tmp_path):
+    from datetime import timedelta
+
+    conn = _prospective_state_fixture()
+    try:
+        kickoff = (
+            ops._parse_utc(ops._utc_now(), name="current test time") + timedelta(days=30)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        _retain_official_prospective_state(
+            conn,
+            event=5,
+            cutoff="2026-09-19T11:00:00Z",
+            kickoff_time=kickoff,
+            raw_root=tmp_path / "partial-state-raw",
+            fetch_status="partial",
+        )
+        check = ops._prospective_event_state_check(
+            conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+        )
+        assert check["source_provenance"]["event"]["fetch_status"] == "partial"
+        assert check["source_provenance"]["fixtures"]["fetch_status"] == "partial"
+        assert ops._parse_utc(
+            check["source_provenance"]["event"]["observed_at"], name="raw observation",
+        ) < ops._parse_utc(
+            check["source_provenance"]["event"]["fetch_started_at"], name="fetch start",
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("event_flags", "fixture_flags", "state"),
+    [
+        ((0, 0), (1, 0, 0), "IN_PROGRESS"),
+        ((0, 0), (0, 1, 1), "PROVISIONAL"),
+        ((1, 1), (0, 0, 0), "FINAL"),
+    ],
+)
+def test_prospective_gate_rejects_non_scheduled_event_states(event_flags, fixture_flags, state):
+    from fpl_brain import planning
+
+    conn = _prospective_state_fixture(event_flags=event_flags, fixture_flags=fixture_flags)
+    try:
+        assert planning.event_data_state(conn, 5)[0] == state
+        with pytest.raises(ops.ChipEvidenceError, match="only a verified scheduled event"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_rejects_inconsistent_event_or_provisional_fixture_flags():
+    conn = _prospective_state_fixture(event_flags=(0, 1), fixture_flags=(0, 0, 0))
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="event flags are not explicitly"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+    conn = _prospective_state_fixture(event_flags=(0, 0), fixture_flags=(0, 0, 1))
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="marked provisional"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("case", ["unknown_event", "unknown_kickoff", "kickoff_passed", "future_fixture_state"])
+def test_prospective_gate_refuses_unverifiable_fixture_timing(case):
+    if case == "unknown_event":
+        conn = _prospective_state_fixture()
+        conn.execute("DELETE FROM events WHERE id=5")
+    elif case == "unknown_kickoff":
+        conn = _prospective_state_fixture(kickoff_offset_days=None)
+    elif case == "kickoff_passed":
+        conn = _prospective_state_fixture(kickoff_offset_days=-1)
+    else:
+        conn = _prospective_state_fixture(fixture_updated_at="2099-09-18T11:00:00Z")
+    try:
+        if case == "unknown_event":
+            match = "no official event row"
+        elif case == "unknown_kickoff":
+            match = "unknown kickoff"
+        elif case == "kickoff_passed":
+            match = "kickoff has passed"
+        else:
+            match = "source timestamp is later than the state check"
+        with pytest.raises(ops.ChipEvidenceError, match=match):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def test_prospective_gate_rejects_existing_event_grain_outcome_capture():
+    conn = _prospective_state_fixture()
+    try:
+        payload = {"event": 5, "player_id": 99, "points": 0}
+        conn.execute(
+            "INSERT INTO outcome_observation_captures(capture_digest,grain,event,player_id,captured_at,created_at,"
+            "observation_state,source_name,payload_json) VALUES(?,? ,5,99,?,?, 'PROVISIONAL',?,?)",
+            (ops._sha256(payload), ol.GRAIN_PLAYER_EVENT, ops._utc_now(), ops._utc_now(),
+             "player_gameweeks_final", json.dumps(payload)),
+        )
+        conn.commit()
+        with pytest.raises(ops.ChipEvidenceError, match="event-grain outcome capture"):
+            ops._prospective_event_state_check(
+                conn, event=5, cutoff="2026-09-19T11:00:00Z", stage="preflight",
+            )
+    finally:
+        conn.close()
+
+
+def _identity(tmp_path: Path, db_path: Path) -> dict:
+    db_path.touch(exist_ok=True)
+    return {
+        "db_path": db_path,
+        "entry_id": 77,
+        "generation_id": "generation-fixture",
+        "decision_id": "decision-fixture",
+        "route_id": "route-fixture",
+        "planning_event": 1,
+        "cutoff": "2026-10-01T10:00:00Z",
+        "evidence_root": tmp_path / "evidence",
+    }
+
+
+def _raw_capture_set(tmp_path: Path, *, finished=True, data_checked=True,
+                     fixture_finished=True, players=(1,), run_id=None,
+                     observed_base="2026-10-01T10:10:00Z", run_started_at=None,
+                     run_finished_at=None, conflicting_archive_time=False,
+                     extra_fixture_rows=()):
+    db_path = tmp_path / "fpl.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    database.initialize_database(conn)
+    conn.execute(
+        "INSERT INTO events(id,name,finished,data_checked,raw_json,updated_at) VALUES(2,'GW2',?,?,?,?)",
+        (int(finished), int(data_checked), "{}", observed_base),
+    )
+    conn.execute(
+        "INSERT INTO fixtures(id,event,started,finished,finished_provisional,raw_json,updated_at) "
+        "VALUES(200,2,?,?,1,'{}',?)",
+        (int(fixture_finished), int(fixture_finished), observed_base),
+    )
+    raw_root = tmp_path / "raw"
+    import datetime as dt
+
+    base_time = ops._parse_utc(observed_base, name="fixture observation time")
+    started_at = run_started_at or (base_time + dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    finished_at = run_finished_at or (base_time + dt.timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
+    if run_id is None:
+        cursor = conn.execute(
+            "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?, 'success','test',2,?,?,?)",
+            (started_at, finished_at, json.dumps([
+                "bootstrap-static", "fixtures", "event/2/live",
+            ]), "[]", str(raw_root.resolve())),
+        )
+        run_id = int(cursor.lastrowid)
+    else:
+        conn.execute(
+            "INSERT INTO fetch_runs(id,started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?,?,'success','test',2,?,'[]',?)",
+            (int(run_id), started_at, finished_at, json.dumps([
+                "bootstrap-static", "fixtures", "event/2/live",
+            ]), str(raw_root.resolve())),
+        )
+    conn.commit()
+    event = {
+        "id": 2, "name": "GW2", "finished": bool(finished),
+        "data_checked": bool(data_checked),
+    }
+    bootstrap = {
+        "events": [event],
+        "teams": [{"id": 1, "name": "Team"}],
+        "elements": [
+            {"id": player, "web_name": f"P{player}", "team": 1, "element_type": 3}
+            for player in sorted(set(players) | {2})
+        ],
+    }
+    fixture_payload = [{
+        "id": 200, "event": 2, "started": bool(fixture_finished),
+        "finished": bool(fixture_finished), "finished_provisional": True,
+        "team_h": 1, "team_a": 2,
+    }]
+    fixture_payload.extend(dict(row) for row in extra_fixture_rows)
+    live = {"elements": [
+        {"id": player, "stats": {"minutes": 0, "total_points": 0}}
+        for player in players
+    ]}
+    conflicting_time = (base_time + dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    observed_times = (
+        observed_base,
+        conflicting_time if conflicting_archive_time else observed_base,
+        observed_base,
+    )
+    for source, observed_at, value, event_id in (
+        ("bootstrap_static", observed_times[0], bootstrap, None),
+        ("fixtures", observed_times[1], fixture_payload, 2),
+        ("event_live_2", observed_times[2], live, 2),
+    ):
+        raw_archive.archive_raw_capture(
+            raw_root,
+            source=source,
+            observed_at=observed_at,
+            body=json.dumps(value, separators=(",", ":")).encode("utf-8"),
+            event=event_id,
+            run_id=run_id,
+        )
+    return conn, db_path, raw_root, int(run_id)
+
+
+def _forecast_parent(event=2, required=(1, 2)):
+    schedule = [{"event": event, "proposed_squad_ids": list(required)}]
+    causal = {
+        "forecast": {"selected_event": event},
+        "counterfactual_pair": {
+            role: {"valuation_schedule": {"events": schedule}}
+            for role in ("play", "save")
+        },
+    }
+    return {
+        "origin_id": "origin-fixture",
+        "receipt": {"selected_event": event},
+        "causal": causal,
+    }
+
+
+def test_origin_manifest_and_receipt_bind_exact_explicit_source_identity(tmp_path):
+    identity = {
+        "entry_id": 77, "generation_id": "g", "decision_id": "d", "route_id": "r",
+        "planning_event": 6, "cutoff": "2026-10-01T10:00:00Z",
+        "database_path": str(tmp_path / "fpl.db"), "evidence_root": str(tmp_path / "evidence"),
+    }
+    origin_id = ops._sha256(ops._origin_key(identity))
+    origin = {
+        "schema": ops.ORIGIN_SCHEMA,
+        "origin_id": origin_id,
+        "registered_at": "2026-10-01T10:01:00Z",
+        "identity": identity,
+    }
+    receipt = ops._origin_receipt(origin_id, "chip-origin-fixture.json", origin)
+    ops._verify_origin_binding(receipt, origin, origin_id=origin_id, expected_identity=identity)
+
+    substituted = {**identity, "route_id": "another-route"}
+    forged_origin = {**origin, "identity": substituted}
+    forged_receipt = ops._origin_receipt(origin_id, "chip-origin-fixture.json", forged_origin)
+    with pytest.raises(ops.ChipEvidenceError, match="origin id does not reproduce"):
+        ops._verify_origin_binding(
+            forged_receipt, forged_origin, origin_id=origin_id, expected_identity=identity,
+        )
+
+
+def test_register_origin_recovers_manifest_published_before_receipt(tmp_path, monkeypatch):
+    db_path = tmp_path / "fpl.db"
+    db_path.touch()
+    evidence_root = tmp_path / "evidence"
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g",
+        "decision_id": "d", "route_id": "r", "planning_event": 6,
+        "cutoff": "2026-10-01T10:00:00Z", "evidence_root": evidence_root,
+    }
+    identity = ops._required_identity(**kwargs)
+    origin_id = ops._sha256(ops._origin_key(identity))
+    receipt_path = ops._metadata_root(evidence_root) / f"origin-{origin_id}.json"
+    monkeypatch.setattr(ops, "_origin_verification", lambda *_a, **_k: (object(), {}, object(), {}, {}))
+    monkeypatch.setattr(
+        ops,
+        "_origin_manifest",
+        lambda *, identity, origin_id, registered_at, **_kwargs: {
+            "schema": ops.ORIGIN_SCHEMA,
+            "origin_id": origin_id,
+            "registered_at": registered_at,
+            "identity": dict(identity),
+        },
+    )
+    monkeypatch.setattr(ops, "_verify_origin_manifest_authority", lambda *_a, **_k: None)
+    original_write = ops._write_new_json
+    failed = False
+
+    def fail_receipt_once(path, value):
+        nonlocal failed
+        if Path(path) == receipt_path and not failed:
+            failed = True
+            raise OSError("injected origin-receipt publication failure")
+        return original_write(path, value)
+
+    monkeypatch.setattr(ops, "_write_new_json", fail_receipt_once)
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(OSError, match="injected origin-receipt"):
+            ops.register_origin(conn, **kwargs)
+        manifests = list(evidence_root.glob("chip-origin-*.json"))
+        assert len(manifests) == 1
+        retained_registered_at = ops._read_json(manifests[0])["registered_at"]
+
+        monkeypatch.setattr(ops, "_write_new_json", original_write)
+        recovered = ops.register_origin(conn, **kwargs)
+        assert recovered["origin"]["registered_at"] == retained_registered_at
+        assert recovered["receipt"]["origin_id"] == origin_id
+        assert len(list(evidence_root.glob("chip-origin-*.json"))) == 1
+        assert receipt_path.is_file()
+    finally:
+        conn.close()
+
+
+def test_forecast_intent_without_completion_is_not_replayed_with_old_time(tmp_path, monkeypatch):
+    db_path = tmp_path / "fpl.db"
+    db_path.touch()
+    evidence_root = tmp_path / "evidence"
+    identity = {
+        "database_path": str(db_path.resolve()), "entry_id": 77,
+        "generation_id": "g", "decision_id": "d", "route_id": "r",
+        "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "evidence_root": str(evidence_root.resolve()),
+    }
+    origin_id = ops._sha256(ops._origin_key(identity))
+    operation_id = ops._forecast_operation_id(origin_id, "BB", "bb-obs-1")
+    intent_path = ops._metadata_root(evidence_root) / f"forecast-intent-{operation_id}.json"
+    intent = ops._sealed(ops.FORECAST_INTENT_SCHEMA, {
+        "operation_id": operation_id,
+        "identity_sha256": ops._sha256(identity),
+        "origin_id": origin_id,
+        "observation_id": "bb-obs-1",
+        "action": "BB",
+        "expiry_event": 4,
+        "continuation_generation_id": None,
+        "cache_dir": str((ops._metadata_root(evidence_root) / "world-cache" / origin_id).resolve()),
+        "materialize_worlds": False,
+        "calculation_started_at": "2026-10-01T10:01:00Z",
+    })
+    ops._write_new_json(intent_path, intent)
+
+    class FakeRoute:
+        events = (1, 2, 3, 4)
+        planning_event = 1
+
+    retained = {"origin": {"chip_eligibility": {"BB": {"eligible": True, "expiry_event": 4}}}}
+    monkeypatch.setattr(ops, "_required_identity", lambda **_kwargs: identity)
+    monkeypatch.setattr(
+        ops, "_revalidate_registered_origin",
+        lambda *_args, **_kwargs: (retained, object(), {}, FakeRoute(), {}, {}),
+    )
+    monkeypatch.setattr(ops, "_source_identity", lambda *_args: {})
+    from fpl_brain import planning
+    from fpl_brain import chip_route_assembly as cra
+    monkeypatch.setattr(planning, "event_data_state", lambda *_args: (planning.EVENT_STATE_SCHEDULED, []))
+    monkeypatch.setattr(ops, "_world_cache_requirements", lambda *_args, **_kwargs: pytest.fail("must not re-score"))
+    monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_args, **_kwargs: pytest.fail("must not re-score"))
+
+    conn = sqlite3.connect(":memory:")
+    with pytest.raises(ops.ChipEvidenceError, match="only an intent"):
+        ops.forecast_origin(
+            conn,
+            db_path=db_path,
+            entry_id=77,
+            generation_id="g",
+            decision_id="d",
+            route_id="r",
+            planning_event=1,
+            cutoff="2026-10-01T10:00:00Z",
+            action="BB",
+            expiry_event=4,
+            observation_id="bb-obs-1",
+            continuation_generation_id=None,
+            evidence_root=evidence_root,
+            cache_dir=Path(identity["evidence_root"]) / ".chip-evidence" / "world-cache" / origin_id,
+        )
+    conn.close()
+
+
+def _completed_forecast_retry_fixture(tmp_path, monkeypatch):
+    db_path = tmp_path / "fpl.db"
+    db_path.touch()
+    evidence_root = tmp_path / "evidence"
+    identity = {
+        "database_path": str(db_path.resolve()), "entry_id": 77,
+        "generation_id": "g", "decision_id": "d", "route_id": "r",
+        "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "evidence_root": str(evidence_root.resolve()),
+    }
+    origin_id = ops._sha256(ops._origin_key(identity))
+    operation_id = ops._forecast_operation_id(origin_id, "BB", "bb-retry")
+    metadata_root = ops._metadata_root(evidence_root)
+    metadata_root.mkdir(parents=True)
+    cache_dir = metadata_root / "world-cache" / origin_id
+    intent_body = {
+        "operation_id": operation_id,
+        "identity_sha256": ops._sha256(identity),
+        "origin_id": origin_id,
+        "observation_id": "bb-retry",
+        "action": "BB",
+        "expiry_event": 4,
+        "continuation_generation_id": "coverage-original",
+        "cache_dir": str(cache_dir.resolve()),
+        "materialize_worlds": False,
+    }
+    intent = ops._sealed(ops.FORECAST_INTENT_SCHEMA, {
+        **intent_body, "calculation_started_at": "2026-10-01T10:01:00Z",
+    })
+    publication = ops._sealed(ops.FORECAST_PUBLICATION_SCHEMA, {
+        **intent_body,
+        "intent_sha256": ops._sha256(intent),
+        "issued_at": "2026-10-01T10:02:00Z",
+    })
+    (metadata_root / f"forecast-intent-{operation_id}.json").write_text(
+        json.dumps(intent), encoding="utf-8",
+    )
+    (metadata_root / f"forecast-publication-{operation_id}.json").write_text(
+        json.dumps(publication), encoding="utf-8",
+    )
+    receipt = ops._sealed(ops.FORECAST_RECEIPT_SCHEMA, {
+        "operation_id": operation_id,
+        "origin_id": origin_id,
+        "observation_id": "bb-retry",
+        "identity_sha256": ops._sha256(identity),
+        "action": "BB",
+        "expiry_event": 4,
+        "issued_at": "2026-10-01T10:02:00Z",
+    })
+    (metadata_root / f"forecast-{operation_id}.json").write_text(
+        json.dumps(receipt), encoding="utf-8",
+    )
+
+    class FakeRoute:
+        events = (1, 2, 3, 4)
+        planning_event = 1
+
+    retained = {"origin": {"chip_eligibility": {"BB": {"eligible": True, "expiry_event": 4}}}}
+    parent = {"receipt": receipt, "origin_id": origin_id}
+    monkeypatch.setattr(ops, "_required_identity", lambda **_kwargs: identity)
+    monkeypatch.setattr(
+        ops, "_revalidate_registered_origin",
+        lambda *_args, **_kwargs: (retained, object(), {}, FakeRoute(), {}, {}),
+    )
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: (retained, object(), {}, FakeRoute(), {}, parent),
+    )
+    for name in ("_world_cache_requirements", "_collect_prospective_state_checks", "_write_new_json"):
+        monkeypatch.setattr(ops, name, lambda *_args, _name=name, **_kwargs: pytest.fail(
+            f"completed retry must not call {_name}"
+        ))
+    from fpl_brain import chip_route_assembly as cra
+    monkeypatch.setattr(
+        cra, "build_bb_tc_reservation_forecast",
+        lambda *_args, **_kwargs: pytest.fail("completed retry must not re-score"),
+    )
+    conn = sqlite3.connect(":memory:")
+    return conn, db_path, evidence_root, identity, cache_dir, receipt, retained
+
+
+@pytest.mark.parametrize(
+    ("overrides", "revalidated_expiry"),
+    [
+        ({"expiry_event": 5}, 4),
+        ({"expiry_event": 5}, 5),
+        ({"continuation_generation_id": "coverage-different"}, 4),
+        ({"cache_dir": Path("different-cache")}, 4),
+        ({"materialize_worlds": True}, 4),
+    ],
+    ids=["expiry-not-pinned", "expiry-conflicts-with-publication", "continuation-generation",
+         "resolved-cache-path", "materialization-policy"],
+)
+def test_completed_forecast_retry_refuses_changed_explicit_request(
+    tmp_path, monkeypatch, overrides, revalidated_expiry,
+):
+    conn, db_path, evidence_root, identity, cache_dir, _receipt, retained = _completed_forecast_retry_fixture(
+        tmp_path, monkeypatch,
+    )
+    retained["origin"]["chip_eligibility"]["BB"]["expiry_event"] = revalidated_expiry
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "expiry_event": 4, "observation_id": "bb-retry",
+        "continuation_generation_id": "coverage-original", "evidence_root": evidence_root,
+        "cache_dir": cache_dir, "materialize_worlds": False,
+    }
+    if overrides.get("materialize_worlds"):
+        overrides = {**overrides, "cache_dir": cache_dir}
+    kwargs.update(overrides)
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="expiry|immutable operation intent"):
+            ops.forecast_origin(conn, **kwargs)
+    finally:
+        conn.close()
+
+
+def test_completed_forecast_retry_reuses_same_receipt_without_current_state_or_work(
+    tmp_path, monkeypatch,
+):
+    conn, db_path, evidence_root, _identity, cache_dir, receipt, _retained = _completed_forecast_retry_fixture(
+        tmp_path, monkeypatch,
+    )
+    from fpl_brain import planning
+    monkeypatch.setattr(
+        planning, "event_data_state",
+        lambda *_args: pytest.fail("published retry must not recheck today's official finality"),
+    )
+    try:
+        recovered = ops.forecast_origin(
+            conn,
+            db_path=db_path, entry_id=77, generation_id="g", decision_id="d", route_id="r",
+            planning_event=1, cutoff="2026-10-01T10:00:00Z", action="BB", expiry_event=4,
+            observation_id="bb-retry", continuation_generation_id="coverage-original",
+            evidence_root=evidence_root, cache_dir=cache_dir, materialize_worlds=False,
+        )
+        assert recovered == receipt
+        assert recovered["issued_at"] == "2026-10-01T10:02:00Z"
+    finally:
+        conn.close()
+
+
+def test_forecast_requires_same_origin_coverage_before_cache_or_scoring(tmp_path, monkeypatch):
+    db_path = tmp_path / "fpl.db"
+    db_path.touch()
+    evidence_root = tmp_path / "evidence"
+    identity = {
+        "database_path": str(db_path.resolve()), "entry_id": 77,
+        "generation_id": "g", "decision_id": "d", "route_id": "r",
+        "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "evidence_root": str(evidence_root.resolve()),
+    }
+
+    class FakeRoute:
+        events = (1, 2, 3, 4)
+        planning_event = 1
+
+    retained = {"origin": {"chip_eligibility": {"BB": {"eligible": True, "expiry_event": 4}}}}
+    monkeypatch.setattr(ops, "_required_identity", lambda **_kwargs: identity)
+    monkeypatch.setattr(
+        ops, "_revalidate_registered_origin",
+        lambda *_args, **_kwargs: (retained, object(), {}, FakeRoute(), {}, {}),
+    )
+    monkeypatch.setattr(ops, "_source_identity", lambda *_args: {})
+    from fpl_brain import planning
+    from fpl_brain import chip_route_assembly as cra
+
+    monkeypatch.setattr(planning, "event_data_state", lambda *_args: (planning.EVENT_STATE_SCHEDULED, []))
+    monkeypatch.setattr(ops, "_world_cache_requirements", lambda *_a, **_k: pytest.fail("must refuse before cache work"))
+    monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_a, **_k: pytest.fail("must not score"))
+    cache_dir = evidence_root / ".chip-evidence" / "world-cache" / "origin-fixture"
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="complete future-chip coverage requires"):
+            ops.forecast_origin(
+                conn,
+                db_path=db_path, entry_id=77, generation_id="g", decision_id="d", route_id="r",
+                planning_event=1, cutoff="2026-10-01T10:00:00Z", action="BB", expiry_event=4,
+                observation_id="bb-no-coverage", continuation_generation_id=None,
+                evidence_root=evidence_root, cache_dir=cache_dir,
+            )
+        assert not list(evidence_root.glob("chip-reservation-forecast-*.json"))
+        assert not list((evidence_root / ".chip-evidence").glob("forecast-intent-*.json"))
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("finished", "data_checked", "fixture_finished", "accepted"),
+    [(True, True, True, True), (False, False, False, False), (True, False, True, False),
+     (True, True, False, False)],
+)
+def test_official_outcome_archive_requires_event_and_fixture_finality(
+    tmp_path, finished, data_checked, fixture_finished, accepted,
+):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path, finished=finished, data_checked=data_checked,
+        fixture_finished=fixture_finished,
+    )
+    try:
+        if accepted:
+            archive = ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+            assert archive["event"] == 2
+            assert archive["parsed"]["fixtures"][0].finished == 1
+            # A finalized, data-checked event may retain finished_provisional=true.
+            assert archive["payloads"]["fixtures"][0]["finished_provisional"] is True
+        else:
+            with pytest.raises(ops.ChipEvidenceError, match="finished|final|unfinished"):
+                ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_official_outcome_archive_rejects_unparseable_target_fixture_instead_of_dropping_it(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path,
+        extra_fixture_rows=({"event": 2, "started": False, "finished": False},),
+    )
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="fixture.*id|id.*fixture|malformed"):
+            ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_official_outcome_archive_rejects_duplicate_raw_target_fixture_identity(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path,
+        extra_fixture_rows=({
+            "id": 200, "event": 2, "started": False, "finished": False,
+            "finished_provisional": False, "team_h": 1, "team_a": 2,
+        },),
+    )
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="duplicate|repeat"):
+            ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_official_outcome_archive_preserves_explicit_null_event_schedule_rows(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path,
+        extra_fixture_rows=({
+            "id": 201, "event": None, "started": False, "finished": False,
+            "finished_provisional": False, "team_h": 1, "team_a": 2,
+        },),
+    )
+    try:
+        archive = ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+        assert [row.id for row in archive["parsed"]["fixtures"]] == [200]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"run_started_at": "2026-10-01T10:13:00Z", "run_finished_at": "2026-10-01T10:12:00Z"}, "reversed"),
+        ({"run_started_at": "2026-10-01T10:08:00Z", "run_finished_at": "2026-10-01T10:09:00Z"}, "after successful fetch completion"),
+        ({"conflicting_archive_time": True}, "share the fetch run's observation identity"),
+    ],
+)
+def test_official_archive_requires_valid_completed_fetch_interval_and_shared_observation(
+    tmp_path, options, message,
+):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(tmp_path, **options)
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match=message):
+            ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_official_archive_requires_successful_fetch_completion_timestamp(tmp_path):
+    conn, _db_path, raw_root, run_id = _raw_capture_set(tmp_path)
+    try:
+        conn.execute("UPDATE fetch_runs SET finished_at=NULL WHERE id=?", (run_id,))
+        conn.commit()
+        with pytest.raises(ops.ChipEvidenceError, match="finished_at is required"):
+            ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    finally:
+        conn.close()
+
+
+def test_capture_retry_recovers_receipt_without_duplicate_rows_and_later_capture_is_distinct(
+    tmp_path, monkeypatch,
+):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1,))
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, _forecast_parent()),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "bb-obs", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        first = ops.capture_outcome(conn, **kwargs)
+        count_after_first = conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0]
+        assert count_after_first == 1
+        assert first["missing_player_ids"] == [2]
+        assert first["captures"][0]["player_id"] == 1
+
+        receipt_path = ops._metadata_root(evidence_root) / f"capture-{first['operation_id']}.json"
+        receipt_path.unlink()
+        recovered = ops.capture_outcome(conn, **kwargs)
+        assert recovered == first
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 1
+
+        later_root = raw_root
+        later_bootstrap = {
+            "events": [{"id": 2, "name": "GW2", "finished": True, "data_checked": True}],
+            "teams": [{"id": 1, "name": "Team"}],
+            "elements": [{"id": 1, "web_name": "P1", "team": 1, "element_type": 3}],
+        }
+        later_fixtures = [{
+            "id": 200, "event": 2, "started": True, "finished": True,
+            "finished_provisional": True, "team_h": 1, "team_a": 2,
+        }]
+        later_live = {"elements": [{"id": 1, "stats": {"minutes": 0, "total_points": 0}}]}
+        later_at = ("2026-10-01T11:00:00Z", "2026-10-01T11:01:00Z", "2026-10-01T11:02:00Z")
+        new_run = conn.execute(
+            "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?, 'success','test',2,?,?,?)",
+            (later_at[0], later_at[2], json.dumps([
+                "bootstrap-static", "fixtures", "event/2/live",
+            ]), "[]", str(later_root.resolve())),
+        ).lastrowid
+        for source, observed_at, payload, event in (
+            ("bootstrap_static", later_at[0], later_bootstrap, None),
+            ("fixtures", later_at[0], later_fixtures, 2),
+            ("event_live_2", later_at[0], later_live, 2),
+        ):
+            raw_archive.archive_raw_capture(
+                later_root,
+                source=source,
+                observed_at=observed_at,
+                body=json.dumps(payload, separators=(",", ":")).encode(),
+                event=event,
+                run_id=new_run,
+            )
+        conn.commit()
+        later = ops.capture_outcome(conn, **{**kwargs, "fetch_run_id": int(new_run)})
+        assert later["operation_id"] != first["operation_id"]
+        assert later["captured_at"] > first["captured_at"]
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_retry_rejects_receipt_with_resealed_partial_required_player_set(tmp_path, monkeypatch):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "bb-partial-receipt", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt = ops.capture_outcome(conn, **kwargs)
+        path = ops._metadata_root(evidence_root) / f"capture-{receipt['operation_id']}.json"
+        source = json.loads(path.read_text(encoding="utf-8"))
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["required_player_ids"] = [1]
+        body["captures"] = [row for row in body["captures"] if int(row["player_id"]) == 1]
+        body["missing_player_ids"] = []
+        path.write_text(json.dumps(ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)), encoding="utf-8")
+
+        with pytest.raises(ops.ChipEvidenceError, match="player set|policy|required.*player"):
+            ops.capture_outcome(conn, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_operation_identity_separates_bb_and_tc_for_same_observation_source():
+    common = ("origin", "same-observation", 2, 7, "payload", "2026-10-01T10:00:00Z")
+    assert ops._capture_operation_id(*common, action="BB") != ops._capture_operation_id(*common, action="TC")
+
+
+def test_capture_retry_rejects_receipt_for_wrong_action(tmp_path, monkeypatch):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "TC", "observation_id": "same-bb-tc-observation", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt = ops.capture_outcome(conn, **kwargs)
+        assert receipt["action"] == "TC"
+        tc_path = ops._metadata_root(evidence_root) / f"capture-{receipt['operation_id']}.json"
+        source = json.loads(tc_path.read_text(encoding="utf-8"))
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["action"] = "BB"
+        tc_path.write_text(json.dumps(ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)), encoding="utf-8")
+        with pytest.raises(ops.ChipEvidenceError, match="action|operation|receipt"):
+            ops.capture_outcome(conn, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_retry_rejects_valid_receipt_copied_under_different_fetch_operation_key(
+    tmp_path, monkeypatch,
+):
+    from datetime import timedelta
+
+    conn, db_path, raw_root, run_a = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    base_kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "same-fetch-binding-observation", "realization_event": 2,
+        "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt_a = ops.capture_outcome(conn, **{**base_kwargs, "fetch_run_id": run_a})
+        observed_at = "2026-10-01T11:10:00Z"
+        observed = ops._parse_utc(observed_at, name="second fetch observation")
+        started_at = (observed + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        finished_at = (observed + timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
+        run_b = int(conn.execute(
+            "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?, 'success','test',2,?,?,?)",
+            (started_at, finished_at, json.dumps([
+                "bootstrap-static", "fixtures", "event/2/live",
+            ]), "[]", str(raw_root.resolve())),
+        ).lastrowid)
+        bootstrap = {
+            "events": [{"id": 2, "name": "GW2", "finished": True, "data_checked": True}],
+            "teams": [{"id": 1, "name": "Team"}],
+            "elements": [
+                {"id": player, "web_name": f"P{player}", "team": 1, "element_type": 3}
+                for player in (1, 2)
+            ],
+        }
+        fixtures = [{
+            "id": 200, "event": 2, "started": True, "finished": True,
+            "finished_provisional": True, "team_h": 1, "team_a": 2,
+        }]
+        live = {"elements": [
+            {"id": player, "stats": {"minutes": 0, "total_points": 0}}
+            for player in (1, 2)
+        ]}
+        for source, payload, source_event in (
+            ("bootstrap_static", bootstrap, None),
+            ("fixtures", fixtures, 2),
+            ("event_live_2", live, 2),
+        ):
+            raw_archive.archive_raw_capture(
+                raw_root, source=source, observed_at=observed_at,
+                body=json.dumps(payload, separators=(",", ":")).encode(),
+                event=source_event, run_id=run_b,
+            )
+        conn.commit()
+        archive_b = ops._official_event_archive(
+            conn, raw_root=raw_root, fetch_run_id=run_b, event=2,
+        )
+        operation_b = ops._capture_operation_id(
+            str(parent["origin_id"]), base_kwargs["observation_id"], 2, run_b,
+            str(archive_b["records"]["event_live"]["payload_sha256"]),
+            str(archive_b["available_at"]), action="BB",
+        )
+        requested_path = ops._metadata_root(evidence_root) / f"capture-{operation_b}.json"
+        retained_a_path = ops._metadata_root(evidence_root) / f"capture-{receipt_a['operation_id']}.json"
+        requested_path.write_bytes(retained_a_path.read_bytes())
+
+        with pytest.raises(ops.ChipEvidenceError, match="requested source operation"):
+            ops.capture_outcome(conn, **{**base_kwargs, "fetch_run_id": run_b})
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_capture_retry_refuses_legacy_action_unbound_receipt_key_without_rewriting_it(
+    tmp_path, monkeypatch,
+):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "legacy-capture-observation", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    try:
+        receipt = ops.capture_outcome(conn, **kwargs)
+        source_path = ops._metadata_root(evidence_root) / f"capture-{receipt['operation_id']}.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        legacy_id = ops._sha256([
+            str(receipt["origin_id"]), str(receipt["observation_id"]), 2, run_id,
+            str(receipt["raw_sources"]["event_live"]["payload_sha256"]),
+            str(receipt["available_at"]),
+        ])
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["operation_id"] = legacy_id
+        legacy_receipt = ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)
+        legacy_path = ops._metadata_root(evidence_root) / f"capture-{legacy_id}.json"
+        legacy_bytes = json.dumps(legacy_receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        legacy_path.write_bytes(legacy_bytes)
+
+        with pytest.raises(ops.ChipEvidenceError, match="legacy action-unbound.*unsupported"):
+            ops.capture_outcome(conn, **kwargs)
+        assert legacy_path.read_bytes() == legacy_bytes
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_partial_unreceipted_capture_refuses_instead_of_completing_from_a_subset(tmp_path, monkeypatch):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, None, {}, _forecast_parent()),
+    )
+    archive = ops._official_event_archive(conn, raw_root=raw_root, fetch_run_id=run_id, event=2)
+    live_row = archive["payloads"]["event_live"]["elements"][0]
+    fields = __import__("fpl_brain.parsers", fromlist=["parse_live_event_totals"]).parse_live_event_totals(live_row)
+    conn.commit()
+    ol.capture_observation(
+        conn,
+        grain=ol.GRAIN_PLAYER_EVENT,
+        event=2,
+        player_id=1,
+        fields=fields,
+        source_name="player_gameweeks_final",
+        official_final_at=archive["official_final_at"],
+        observation_state=ol.OBSERVATION_FINAL,
+        source_identity="player_gameweeks:2",
+        source_payload_sha256=archive["records"]["event_live"]["payload_sha256"],
+        fetch_run_id=run_id,
+        archive_capture_id=archive["records"]["event_live"]["capture_id"],
+        captured_at=archive["available_at"],
+    )
+    conn.commit()
+    with pytest.raises(ops.ChipEvidenceError, match="partial committed event capture"):
+        ops.capture_outcome(
+            conn,
+            db_path=db_path, entry_id=77, generation_id="g", decision_id="d", route_id="r",
+            planning_event=1, cutoff="2026-10-01T10:00:00Z", action="BB",
+            observation_id="bb-partial", realization_event=2, fetch_run_id=run_id,
+            raw_root=raw_root, evidence_root=evidence_root,
+        )
+    conn.close()
+
+
+def _overlapping_capture_case(tmp_path, monkeypatch):
+    conn, db_path, raw_root, run_id = _raw_capture_set(
+        tmp_path, players=tuple(range(1, 17)),
+    )
+    evidence_root = tmp_path / "overlap-evidence"
+    parents = {}
+    identities = {}
+
+    def load_forecast(_conn, *, identity, action, observation_id):
+        if dict(identity) != identities[observation_id] or action not in {"BB", "TC"}:
+            raise ops.ChipEvidenceError("test forecast origin does not match its own retained identity")
+        return ({}, None, None, {}, {}, parents[observation_id])
+
+    monkeypatch.setattr(ops, "_load_forecast_origin", load_forecast)
+
+    def kwargs_for(*, suffix, observation_id, selected_run=run_id):
+        result = {
+            "db_path": db_path, "entry_id": 77, "generation_id": f"g-{suffix}",
+            "decision_id": f"d-{suffix}", "route_id": f"r-{suffix}",
+            "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z", "action": "BB",
+            "observation_id": observation_id, "realization_event": 2,
+            "fetch_run_id": selected_run, "raw_root": raw_root, "evidence_root": evidence_root,
+        }
+        identity = ops._required_identity(
+            db_path=db_path, entry_id=77, generation_id=result["generation_id"],
+            decision_id=result["decision_id"], route_id=result["route_id"],
+            planning_event=1, cutoff=result["cutoff"], evidence_root=evidence_root,
+        )
+        identities[observation_id] = identity
+        required = tuple(range(1, 16)) if suffix == "a" else tuple(range(2, 17))
+        parent = _forecast_parent(event=2, required=required)
+        origin_id = ops._sha256(ops._origin_key(identity))
+        parent["origin_id"] = origin_id
+        parents[observation_id] = parent
+        origin_artifact = {
+            "schema": ops.ORIGIN_SCHEMA,
+            "origin_id": origin_id,
+            "registered_at": "2026-10-01T10:01:00Z",
+            "identity": identity,
+        }
+        origin_ref = f"chip-origin-{ops._sha256(origin_artifact)}.json"
+        ops._write_new_json(ops._root(evidence_root) / origin_ref, origin_artifact)
+        ops._write_new_json(
+            ops._metadata_root(evidence_root) / f"origin-{origin_id}.json",
+            ops._origin_receipt(origin_id, origin_ref, origin_artifact),
+        )
+        return result
+
+    return conn, db_path, raw_root, run_id, evidence_root, kwargs_for
+
+
+def test_capture_outcome_reuses_verified_rows_from_overlapping_origin_same_final_fetch(
+    tmp_path, monkeypatch,
+):
+    conn, _db_path, _raw_root, _run_id, evidence_root, kwargs_for = _overlapping_capture_case(
+        tmp_path, monkeypatch,
+    )
+    kwargs_a = kwargs_for(suffix="a", observation_id="obs-a")
+    kwargs_b = kwargs_for(suffix="b", observation_id="obs-b")
+    original_verify = ops._verified_shared_capture_digests
+
+    def verify_under_writer_lock(conn_arg, *args, **kwargs):
+        assert conn_arg.in_transaction
+        return original_verify(conn_arg, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "_verified_shared_capture_digests", verify_under_writer_lock)
+    try:
+        receipt_a = ops.capture_outcome(conn, **kwargs_a)
+        path_a = ops._metadata_root(evidence_root) / f"capture-{receipt_a['operation_id']}.json"
+        raw_a = path_a.read_bytes()
+        assert len(receipt_a["captures"]) == 15
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
+
+        receipt_b = ops.capture_outcome(conn, **kwargs_b)
+        path_b = ops._metadata_root(evidence_root) / f"capture-{receipt_b['operation_id']}.json"
+        assert receipt_b["operation_id"] != receipt_a["operation_id"]
+        assert len(receipt_b["captures"]) == 15
+        assert receipt_b["missing_player_ids"] == []
+        assert path_a.read_bytes() == raw_a
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 16
+        assert conn.execute(
+            "SELECT COUNT(DISTINCT player_id) FROM outcome_observation_captures WHERE event=2",
+        ).fetchone()[0] == 16
+
+        retried_b = ops.capture_outcome(conn, **kwargs_b)
+        assert retried_b == receipt_b
+        assert path_b.read_bytes() == json.dumps(receipt_b, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":")).encode("utf-8")
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 16
+    finally:
+        conn.close()
+
+
+def test_bb_and_tc_captures_with_same_observation_have_distinct_receipts_and_share_final_rows(
+    tmp_path, monkeypatch,
+):
+    conn, _db_path, _raw_root, _run_id, evidence_root, kwargs_for = _overlapping_capture_case(
+        tmp_path, monkeypatch,
+    )
+    kwargs_bb = kwargs_for(suffix="a", observation_id="shared-bb-tc-observation")
+    kwargs_tc = {**kwargs_bb, "action": "TC"}
+    try:
+        receipt_bb = ops.capture_outcome(conn, **kwargs_bb)
+        path_bb = ops._metadata_root(evidence_root) / f"capture-{receipt_bb['operation_id']}.json"
+        bytes_bb = path_bb.read_bytes()
+
+        receipt_tc = ops.capture_outcome(conn, **kwargs_tc)
+        path_tc = ops._metadata_root(evidence_root) / f"capture-{receipt_tc['operation_id']}.json"
+        assert receipt_bb["action"] == "BB"
+        assert receipt_tc["action"] == "TC"
+        assert receipt_bb["operation_id"] != receipt_tc["operation_id"]
+        assert path_bb.read_bytes() == bytes_bb
+        assert len(receipt_bb["captures"]) == len(receipt_tc["captures"]) == 15
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
+        assert ops.capture_outcome(conn, **kwargs_tc) == receipt_tc
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
+    finally:
+        conn.close()
+
+
+def test_capture_outcome_rejects_overlap_when_prior_receipt_is_tampered(tmp_path, monkeypatch):
+    conn, _db_path, _raw_root, _run_id, evidence_root, kwargs_for = _overlapping_capture_case(
+        tmp_path, monkeypatch,
+    )
+    try:
+        receipt_a = ops.capture_outcome(conn, **kwargs_for(suffix="a", observation_id="obs-a"))
+        path_a = ops._metadata_root(evidence_root) / f"capture-{receipt_a['operation_id']}.json"
+        tampered = json.loads(path_a.read_text(encoding="utf-8"))
+        tampered_body = {
+            key: value for key, value in tampered.items()
+            if key not in {"schema", "receipt_sha256"}
+        }
+        tampered_sources = dict(tampered_body["raw_sources"])
+        tampered_live_source = dict(tampered_sources["event_live"])
+        tampered_live_source["capture_id"] = "false-capture-id"
+        tampered_sources["event_live"] = tampered_live_source
+        tampered_body["raw_sources"] = tampered_sources
+        tampered = ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, tampered_body)
+        path_a.write_text(json.dumps(tampered), encoding="utf-8")
+
+        with pytest.raises(ops.ChipEvidenceError, match="archive binding differs"):
+            ops.capture_outcome(conn, **kwargs_for(suffix="b", observation_id="obs-b"))
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
+    finally:
+        conn.close()
+
+
+def test_capture_outcome_rejects_resealed_receipt_with_partial_policy_player_list(tmp_path, monkeypatch):
+    conn, _db_path, _raw_root, _run_id, evidence_root, kwargs_for = _overlapping_capture_case(
+        tmp_path, monkeypatch,
+    )
+    try:
+        receipt_a = ops.capture_outcome(conn, **kwargs_for(suffix="a", observation_id="obs-a"))
+        path_a = ops._metadata_root(evidence_root) / f"capture-{receipt_a['operation_id']}.json"
+        source = json.loads(path_a.read_text(encoding="utf-8"))
+        body = {key: value for key, value in source.items() if key not in {"schema", "receipt_sha256"}}
+        body["required_player_ids"] = [2]
+        body["captures"] = [row for row in body["captures"] if int(row["player_id"]) == 2]
+        body["missing_player_ids"] = []
+        partial = ops._sealed(ops.CAPTURE_RECEIPT_SCHEMA, body)
+        path_a.write_text(json.dumps(partial), encoding="utf-8")
+
+        with pytest.raises(ops.ChipEvidenceError, match="player set differs from its verified forecast policy"):
+            ops.capture_outcome(conn, **kwargs_for(suffix="b", observation_id="obs-b"))
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 15
+    finally:
+        conn.close()
+
+
+def test_capture_outcome_does_not_use_receipt_for_different_fetch_or_availability(
+    tmp_path, monkeypatch,
+):
+    from datetime import timedelta
+    from fpl_brain import parsers
+
+    conn, _db_path, raw_root, run_a, evidence_root, kwargs_for = _overlapping_capture_case(
+        tmp_path, monkeypatch,
+    )
+    try:
+        receipt_a = ops.capture_outcome(conn, **kwargs_for(suffix="a", observation_id="obs-a"))
+        assert receipt_a["fetch_run_id"] == run_a
+
+        observed_at = "2026-10-01T12:10:00Z"
+        observed = ops._parse_utc(observed_at, name="second fetch observation")
+        started_at = (observed + timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+        finished_at = (observed + timedelta(seconds=3)).isoformat().replace("+00:00", "Z")
+        cursor = conn.execute(
+            "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?, 'success','test',2,?,?,?)",
+            (started_at, finished_at, json.dumps([
+                "bootstrap-static", "fixtures", "event/2/live",
+            ]), "[]", str(raw_root.resolve())),
+        )
+        run_b = int(cursor.lastrowid)
+        bootstrap = {
+            "events": [{"id": 2, "name": "GW2", "finished": True, "data_checked": True}],
+            "teams": [{"id": 1, "name": "Team"}],
+            "elements": [
+                {"id": player, "web_name": f"P{player}", "team": 1, "element_type": 3}
+                for player in range(1, 17)
+            ],
+        }
+        fixtures = [{
+            "id": 200, "event": 2, "started": True, "finished": True,
+            "finished_provisional": True, "team_h": 1, "team_a": 2,
+        }]
+        live = {"elements": [
+            {"id": player, "stats": {"minutes": 0, "total_points": 0}}
+            for player in range(1, 17)
+        ]}
+        for source, payload, event in (
+            ("bootstrap_static", bootstrap, None),
+            ("fixtures", fixtures, 2),
+            ("event_live_2", live, 2),
+        ):
+            raw_archive.archive_raw_capture(
+                raw_root, source=source, observed_at=observed_at,
+                body=json.dumps(payload, separators=(",", ":")).encode(),
+                event=event, run_id=run_b,
+            )
+        conn.commit()
+        archive_b = ops._official_event_archive(
+            conn, raw_root=raw_root, fetch_run_id=run_b, event=2,
+        )
+        live_player = next(
+            item for item in archive_b["payloads"]["event_live"]["elements"] if item["id"] == 2
+        )
+        ol.capture_observation(
+            conn, grain=ol.GRAIN_PLAYER_EVENT, event=2, player_id=2,
+            fields=parsers.parse_live_event_totals(live_player),
+            source_name="player_gameweeks_final",
+            official_final_at=archive_b["official_final_at"],
+            observation_state=ol.OBSERVATION_FINAL,
+            source_identity="player_gameweeks:2",
+            source_payload_sha256=archive_b["records"]["event_live"]["payload_sha256"],
+            fetch_run_id=run_b,
+            archive_capture_id=archive_b["records"]["event_live"]["capture_id"],
+            captured_at=archive_b["available_at"],
+        )
+        conn.commit()
+        with pytest.raises(ops.ChipEvidenceError, match="partial committed event capture"):
+            ops.capture_outcome(
+                conn, **kwargs_for(suffix="b", observation_id="obs-b", selected_run=run_b),
+            )
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 16
+    finally:
+        conn.close()
+
+
+def test_capture_outcome_transaction_failure_rolls_back_and_exact_retry_recovers(
+    tmp_path, monkeypatch,
+):
+    conn, db_path, raw_root, run_id = _raw_capture_set(tmp_path, players=(1, 2))
+    evidence_root = tmp_path / "transaction-recovery-evidence"
+    parent = _forecast_parent(event=2, required=(1, 2))
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_args, **_kwargs: ({}, None, None, {}, {}, parent),
+    )
+    kwargs = {
+        "db_path": db_path, "entry_id": 77, "generation_id": "g", "decision_id": "d",
+        "route_id": "r", "planning_event": 1, "cutoff": "2026-10-01T10:00:00Z",
+        "action": "BB", "observation_id": "transaction-recovery", "realization_event": 2,
+        "fetch_run_id": run_id, "raw_root": raw_root, "evidence_root": evidence_root,
+    }
+    original_capture = ol.capture_observation
+
+    def fail_second_capture(conn_arg, **capture_kwargs):
+        if int(capture_kwargs["player_id"]) == 2:
+            raise RuntimeError("injected second-row transaction failure")
+        return original_capture(conn_arg, **capture_kwargs)
+
+    monkeypatch.setattr(ol, "capture_observation", fail_second_capture)
+    try:
+        with pytest.raises(RuntimeError, match="second-row transaction failure"):
+            ops.capture_outcome(conn, **kwargs)
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 0
+
+        monkeypatch.setattr(ol, "capture_observation", original_capture)
+        receipt = ops.capture_outcome(conn, **kwargs)
+        assert len(receipt["captures"]) == 2
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+        assert ops.capture_outcome(conn, **kwargs) == receipt
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_maturation_receipt_key_is_stable_for_observation_and_event():
+    left = ops._maturation_key("tc-origin-7", 13)
+    assert left == ops._maturation_key("tc-origin-7", 13)
+    assert left != ops._maturation_key("tc-origin-8", 13)
+    assert left != ops._maturation_key("tc-origin-7", 14)
+
+
+@pytest.mark.parametrize(
+    "orphan_artifacts",
+    [
+        [("chip-outcome-orphan.json", {"observation_id": "orphan-observation", "realization_event": 5})],
+        [
+            ("chip-outcome-orphan-a.json", {"observation_id": "orphan-observation", "realization_event": 5}),
+            ("chip-outcome-orphan-b.json", {"observation_id": "orphan-observation", "realization_event": 5}),
+        ],
+    ],
+    ids=["partial-pair", "ambiguous-pairs"],
+)
+def test_maturation_partial_or_ambiguous_artifacts_refuse_to_finalize_again(
+    tmp_path, monkeypatch, orphan_artifacts,
+):
+    from types import SimpleNamespace
+
+    from fpl_brain import candidate_universe as cu
+    from fpl_brain import chip_reservation_calibration as cal
+    from fpl_brain import generation_store as gs
+
+    db_path = tmp_path / "fpl.db"
+    db_path.touch()
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    identity = {"entry_id": 77, "generation_id": "g", "decision_id": "d", "route_id": "r"}
+    generation = SimpleNamespace()
+    retained_parent = {
+        "origin_id": "origin-fixture",
+        "receipt": {"selected_event": 5, "expiry_event": 5},
+        "causal": _forecast_parent(event=5, required=(1,))["causal"],
+    }
+    monkeypatch.setattr(ops, "_required_identity", lambda **_kwargs: identity)
+    monkeypatch.setattr(
+        ops, "_load_forecast_origin",
+        lambda *_a, **_k: ({}, generation, {}, object(), {}, retained_parent),
+    )
+    monkeypatch.setattr(ops, "_verified_capture_receipts_for_observation", lambda *_a, **_k: [{"captures": []}])
+
+    class Snapshot:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(gs, "_open_generation_snapshot", lambda _generation: Snapshot())
+    monkeypatch.setattr(cu, "load_pool", lambda _snapshot: {1: {"position": "MID"}})
+    monkeypatch.setattr(
+        ops, "_load_causal_origin",
+        lambda *_a, **_k: (evidence_root / "causal.json", {}, evidence_root / "forecast.json", {}),
+    )
+    monkeypatch.setattr(
+        cal, "finalize_causal_observation",
+        lambda *_a, **_k: pytest.fail("must not finalize when unreceipted artifacts already exist"),
+    )
+    for name, artifact in orphan_artifacts:
+        (evidence_root / name).write_text(json.dumps(artifact), encoding="utf-8")
+    conn = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(ops.ChipEvidenceError, match="partial or ambiguous"):
+            ops.mature_observation(
+                conn,
+                db_path=db_path, entry_id=77, generation_id="g", decision_id="d", route_id="r",
+                planning_event=1, cutoff="2026-10-01T10:00:00Z", action="BB",
+                observation_id="orphan-observation", realization_event=5, evidence_root=evidence_root,
+            )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("action", ["BB", "TC"])
+def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
+    tmp_path, monkeypatch, action,
+):
+    """Exercise BB and TC through the complete retained workflow on temp fixtures."""
+    import test_four_gw_decision as four_gw
+    import test_pe9_production_decision as pe9
+    from fpl_brain import (
+        candidate_universe as cu,
+        chip_route_assembly as cra,
+        chip_reservation_calibration as cal,
+        chip_reservation_forecast as crf,
+        execution,
+        generation_store as gs,
+        manager_lineup as ml,
+        models,
+        repositories as repo,
+        route_comparator as rc,
+        transfer_state as ts,
+    )
+
+    original_seed = four_gw._seed_regression_manager
+
+    def seed_with_chips(conn, entry_id=241392, event=4):
+        result = original_seed(conn, entry_id=entry_id, event=event)
+        repo.upsert_chips(conn, [
+            models.ChipRecord(
+                id=2, name="bboost", number=1, chip_type="boost", start_event=4, stop_event=5,
+            ),
+            models.ChipRecord(
+                id=3, name="3xc", number=1, chip_type="captain", start_event=4, stop_event=5,
+            ),
+        ])
+        from fpl_brain.ingest_provenance import element_id_sha256
+
+        ids = repo.active_player_ids(conn)
+        repo.record_bootstrap_generation(
+            conn,
+            captured_at="2026-09-11T20:00:00Z",
+            accepted=True,
+            official_element_count=len(ids),
+            parsed_count=len(ids),
+            persisted_count=len(ids),
+            element_ids=ids,
+            element_ids_sha256=element_id_sha256(ids),
+            acceptance_rule="fixture-only exact player pool",
+            acceptance_rule_version="test-v1",
+        )
+        return result
+
+    monkeypatch.setattr(four_gw, "_seed_regression_manager", seed_with_chips)
+    db_path = tmp_path / "fpl.db"
+    conn, generation = pe9._four_gw_certified_manager_world(db_path)
+    try:
+        def canonical_route_runner(**kwargs):
+            canonical = kwargs["canonical_manager_state"]
+            source_conn = kwargs["source_conn"]
+            gen = kwargs["generation"]
+            initial = cra._state_from_payload(canonical["route_state"])
+            player_ids = sorted(initial.by_id())
+            price_snapshot = cu.price_snapshot_as_of(
+                source_conn, gen.planning_event, gen.cutoff, required_player_ids=player_ids,
+            )
+            scenario = rc.flat_current_price_scenario(price_snapshot, gen.events)
+            meta = rc.load_player_meta(source_conn, player_ids)
+            positions = {pid: str(meta[pid].position) for pid in player_ids}
+            policy = ml.ManagerPolicy(
+                starter_ids=(1, 13, 14, 15, 21, 22, 23, 24, 31, 32, 33),
+                bench_gk_id=2,
+                bench_outfield_order=(41, 42, 25),
+                captain_id=21,
+                vice_captain_id=22,
+            )
+            actions = []
+            state = initial
+            for event in gen.events:
+                transition = ts.apply_transfer_batch(
+                    state, ts.TransferBatch.roll(), scenario.snapshot_for(event), meta,
+                )
+                assert transition.ok, transition.errors
+                state = transition.next_event_state
+                actions.append({
+                    "event": int(event), "kind": "ROLL", "transfers": [],
+                    "squad_ids": sorted(state.by_id()), "bank_after": state.bank_tenths,
+                    "ft_after": state.free_transfers, "hit_points": transition.hit_points,
+                })
+            route_row = {
+                "actions": actions,
+                "terminal_bank_tenths": state.bank_tenths,
+                "terminal_ft": state.free_transfers,
+                "per_event": [
+                    {"event": int(event), "policy": policy.as_dict()}
+                    for event in gen.events
+                ],
+            }
+            return {
+                "decision": {"status": "FIXTURE_ROUTE_REPLAY"},
+                "consumed_manager_state": canonical,
+                "provenance": {"planning_context_hash": gs.four_gw_manager_context_identity(canonical)},
+                "runner_identity": "chip-evidence-lifecycle-fixture",
+                "artifact_blocks": {"search": {"config": {"search_draws": 2, "seed": 62026}}},
+                "finalist_refinement": {"route_table": {"routes": {"route_fixture": route_row}}},
+            }
+
+        monkeypatch.setattr(gs, "_decision_executor", lambda _profile: canonical_route_runner)
+        decision = gs.make_decision(
+            conn,
+            {"entry_id": 241392, "planning_event": 4, "cutoff": generation.cutoff, "season": "2026/27"},
+            4,
+            horizon_kind=gs.HORIZON_KIND_FOUR_GW,
+            generation_id=generation.generation_id,
+            profile=gs.DecisionProfile(kind=gs.HORIZON_KIND_FOUR_GW),
+        )
+        decision_id = str(decision["decision_record_id"])
+        # The accepted forecast contract requires a verified same-origin
+        # CHIP_RESERVATION product for any future expiry, including one inside
+        # the normal decision's four-event window.
+        from datetime import datetime, timedelta, timezone
+
+        continuation_controller = execution.ExecutionController(conn)
+        continuation_controller.create_run(
+            planning_event=4,
+            planning_cutoff=generation.cutoff,
+            hard_stop_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            label="chip_evidence_lifecycle_fixture_continuation",
+        )
+        continuation_controller.start()
+        continuation_controller.acquire_writer_lease()
+        try:
+            continuation = gs.certify_chip_reservation_generation(
+                conn,
+                chip_generation_id=generation.generation_id,
+                planning_event=4,
+                cutoff=generation.cutoff,
+                events=generation.events,
+                runs_by_event={event: generation.runs_for(event) for event in generation.events},
+                snapshot=generation.snapshot,
+                controller=continuation_controller,
+            )
+        except BaseException as failure:
+            continuation_controller.finish(execution.RUN_FAILED, str(failure))
+            raise
+        continuation_controller.finish(execution.RUN_COMPLETE)
+        identity = {
+            "db_path": db_path,
+            "entry_id": 241392,
+            "generation_id": generation.generation_id,
+            "decision_id": decision_id,
+            "route_id": "route_fixture",
+            "planning_event": 4,
+            "cutoff": generation.cutoff,
+            "evidence_root": tmp_path / "evidence",
+        }
+        origin = ops.register_origin(conn, **identity)
+        origin_id = origin["receipt"]["origin_id"]
+        route = cra.load_verified_normal_route(conn, decision_id, route_id="route_fixture")
+        loaded_generation = gs.load_generation(conn, generation.generation_id)
+        coverage_product = crf.build_reservation_coverage_product(
+            conn,
+            action=action,
+            source_identity=ops._source_identity(route, loaded_generation),
+            expiry_event=5,
+            product_generation_id=continuation.generation_id,
+        )
+        other_action = "TC" if action == "BB" else "BB"
+        other_coverage_product = crf.build_reservation_coverage_product(
+            conn,
+            action=other_action,
+            source_identity=ops._source_identity(route, loaded_generation),
+            expiry_event=5,
+            product_generation_id=continuation.generation_id,
+        )
+        from datetime import timedelta
+
+        current_state_at = ops._utc_now()
+        future_kickoff = (
+            ops._parse_utc(current_state_at, name="fixture source refresh") + timedelta(days=30)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        source_observed_at, _fixture_payload, source_started_at = _retain_official_prospective_state(
+            conn,
+            event=5,
+            cutoff=generation.cutoff,
+            kickoff_time=future_kickoff,
+            raw_root=tmp_path / "state-raw",
+        )
+        assert ops._parse_utc(source_observed_at, name="test source observation") < ops._parse_utc(
+            generation.cutoff, name="test origin cutoff",
+        )
+        assert ops._parse_utc(source_observed_at, name="test source observation") < ops._parse_utc(
+            source_started_at, name="test fetch start",
+        )
+        target_fixture_rows = [dict(row) for row in conn.execute(
+            "SELECT id,event,kickoff_time,team_h,team_a FROM fixtures WHERE event=5 ORDER BY id"
+        ).fetchall()]
+        assert target_fixture_rows
+        requirements = ops._world_cache_requirements(
+            conn, route=route, generation=loaded_generation,
+            coverage_product=coverage_product, expiry_event=5,
+        )
+        other_requirements = ops._world_cache_requirements(
+            conn, route=route, generation=loaded_generation,
+            coverage_product=other_coverage_product, expiry_event=5,
+        )
+        assert [row["event"] for row in requirements] == [5]
+        assert [row["cache_key"] for row in other_requirements] == [row["cache_key"] for row in requirements]
+        requirement = requirements[0]
+        player_ids = requirement["player_ids"]
+        matrix = {
+            "worlds": 2,
+            "player_ids": player_ids,
+            "core": {pid: [5.0, 6.0] for pid in player_ids},
+            "minutes": {pid: [90.0, 90.0] for pid in player_ids},
+            "expected_bonus": {pid: 0.0 for pid in player_ids},
+            "role_actionability": {pid: False for pid in player_ids},
+        }
+        cache_entry = {
+            "worlds": matrix["worlds"],
+            "player_ids": matrix["player_ids"],
+            "core": {str(pid): values for pid, values in matrix["core"].items()},
+            "minutes": {str(pid): values for pid, values in matrix["minutes"].items()},
+            "expected_bonus": {str(pid): value for pid, value in matrix["expected_bonus"].items()},
+            "role_actionability": {str(pid): value for pid, value in matrix["role_actionability"].items()},
+            ro.CACHE_CONTENT_DIGEST_KEY: ro.world_matrix_content_identity(matrix),
+        }
+        # Short separate path avoids Windows MAX_PATH in pytest's long temp root.
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        assert cache_dir.is_dir()
+        (cache_dir / f"{requirement['cache_key']}.json").write_text(
+            json.dumps(cache_entry), encoding="utf-8",
+        )
+
+        # A completed member fixture can leave event_data_state=SCHEDULED while
+        # other fixtures have not started. The stricter prospective gate must
+        # refuse before cache inspection/scoring or operation artifacts.
+        partial_fixture_id = max(int(row["id"]) for row in target_fixture_rows) + 1000
+        fresh_partial_at = ops._utc_now()
+        conn.execute(
+            "INSERT INTO fixtures(id,event,kickoff_time,team_h,team_a,started,finished,finished_provisional,"
+            "raw_json,updated_at) VALUES(?,5,?,?,?,0,0,0,'{}',?)",
+            (partial_fixture_id, future_kickoff, target_fixture_rows[0]["team_h"],
+             target_fixture_rows[0]["team_a"], fresh_partial_at),
+        )
+        conn.execute(
+            "UPDATE fixtures SET started=0,finished=1,finished_provisional=1,updated_at=? WHERE event=5 AND id=?",
+            (fresh_partial_at, int(target_fixture_rows[0]["id"])),
+        )
+        conn.execute("UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=5", (fresh_partial_at,))
+        conn.commit()
+        from fpl_brain import planning
+
+        assert planning.event_data_state(conn, 5)[0] == planning.EVENT_STATE_SCHEDULED
+        partial_observation = f"{action.lower()}-partial-start-state"
+        partial_operation = ops._forecast_operation_id(origin_id, action, partial_observation)
+        with monkeypatch.context() as guard:
+            guard.setattr(ops, "_world_cache_requirements", lambda *_a, **_k: pytest.fail(
+                "cache requirement work must not begin for an already-played fixture"
+            ))
+            guard.setattr(ops, "_preflight_world_cache", lambda *_a, **_k: pytest.fail(
+                "cache probing must not begin for an already-played fixture"
+            ))
+            guard.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_a, **_k: pytest.fail(
+                "forecast evaluator must not run for an already-played fixture"
+            ))
+            with pytest.raises(ops.ChipEvidenceError, match="started or finished"):
+                ops.forecast_origin(
+                    conn, **identity, action=action, expiry_event=5,
+                    observation_id=partial_observation,
+                    continuation_generation_id=continuation.generation_id,
+                    cache_dir=cache_dir,
+                )
+        assert not (ops._metadata_root(identity["evidence_root"]) /
+                    f"forecast-intent-{partial_operation}.json").exists()
+        assert not (ops._metadata_root(identity["evidence_root"]) /
+                    f"forecast-publication-{partial_operation}.json").exists()
+        conn.execute("DELETE FROM fixtures WHERE id=?", (partial_fixture_id,))
+        conn.execute(
+            "UPDATE fixtures SET started=0,finished=0,finished_provisional=0,kickoff_time=?,updated_at=? "
+            "WHERE event=5",
+            (future_kickoff, source_observed_at),
+        )
+        conn.execute(
+            "UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=5",
+            (source_observed_at,),
+        )
+        conn.commit()
+
+        # A fixture starting while the evaluator runs invalidates the new
+        # issuance. The immutable intent/calculation may remain, but no
+        # prospective publication or causal observation may be retained.
+        start_during_observation = f"{action.lower()}-started-during-calculation"
+        start_during_operation = ops._forecast_operation_id(origin_id, action, start_during_observation)
+        original_builder = cra.build_bb_tc_reservation_forecast
+        started_during_build = False
+
+        def start_fixture_during_build(*args, **kwargs):
+            nonlocal started_during_build
+            generated = original_builder(*args, **kwargs)
+            started_during_build = True
+            started_at = ops._utc_now()
+            conn.execute(
+                "UPDATE fixtures SET started=1,updated_at=? WHERE event=5 AND id=?",
+                (started_at, int(target_fixture_rows[0]["id"])),
+            )
+            conn.commit()
+            return generated
+
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", start_fixture_during_build)
+        with pytest.raises(ops.ChipEvidenceError, match="IN_PROGRESS|started or finished"):
+            ops.forecast_origin(
+                conn, **identity, action=action, expiry_event=5,
+                observation_id=start_during_observation,
+                continuation_generation_id=continuation.generation_id,
+                cache_dir=cache_dir,
+            )
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", original_builder)
+        assert started_during_build
+        start_during_publication = ops._metadata_root(identity["evidence_root"]) / \
+            f"forecast-publication-{start_during_operation}.json"
+        assert not start_during_publication.exists()
+        assert not any(
+            str(ops._read_json(path).get("observation_id") or "") == start_during_observation
+            for path in Path(identity["evidence_root"]).glob("chip-causal-evidence-*.json")
+        )
+        conn.execute(
+            "UPDATE fixtures SET started=0,finished=0,finished_provisional=0,kickoff_time=?,updated_at=? "
+            "WHERE event=5",
+            (future_kickoff, source_observed_at),
+        )
+        conn.execute(
+            "UPDATE events SET finished=0,data_checked=0,updated_at=? WHERE id=5",
+            (source_observed_at,),
+        )
+        conn.commit()
+
+        # Simulate a lost acknowledgement after the immutable publication was
+        # committed. Later finality must not invalidate that earlier valid issue
+        # or cause a rescore during recovery.
+        observation_id = f"{action.lower()}-fixture-observation-1"
+        forecast_operation = ops._forecast_operation_id(origin_id, action, observation_id)
+        publication_path = ops._metadata_root(identity["evidence_root"]) / \
+            f"forecast-publication-{forecast_operation}.json"
+        original_write = ops._write_new_json
+        publication_written_then_failed = False
+
+        def lose_publication_ack(path, value):
+            nonlocal publication_written_then_failed
+            digest = original_write(path, value)
+            if Path(path) == publication_path and not publication_written_then_failed:
+                publication_written_then_failed = True
+                raise OSError("injected lost forecast-publication acknowledgement")
+            return digest
+
+        monkeypatch.setattr(ops, "_write_new_json", lose_publication_ack)
+        with pytest.raises(OSError, match="lost forecast-publication"):
+            ops.forecast_origin(
+                conn, **identity, action=action, expiry_event=5,
+                observation_id=observation_id,
+                continuation_generation_id=continuation.generation_id,
+                cache_dir=cache_dir,
+            )
+        monkeypatch.setattr(ops, "_write_new_json", original_write)
+        assert publication_written_then_failed and publication_path.is_file()
+        assert not (ops._metadata_root(identity["evidence_root"]) /
+                    f"forecast-{forecast_operation}.json").exists()
+        retained_publication = ops._read_json(publication_path)
+        pre_final_issued_at = retained_publication["issued_at"]
+
+        # The same verified origin may retain separate BB and TC forecasts at
+        # one observation key, plus a second TC observation for substitution
+        # regression coverage. All are issued while GW5 is still prospective.
+        alternate_same_observation = ops.forecast_origin(
+            conn, **identity, action=other_action, expiry_event=5,
+            observation_id=observation_id,
+            continuation_generation_id=continuation.generation_id,
+            cache_dir=cache_dir,
+        )
+        second_observation_id = f"{other_action.lower()}-fixture-observation-2"
+        alternate_second_observation = ops.forecast_origin(
+            conn, **identity, action=other_action, expiry_event=5,
+            observation_id=second_observation_id,
+            continuation_generation_id=continuation.generation_id,
+            cache_dir=cache_dir,
+        )
+        assert alternate_same_observation["action"] == other_action
+        assert alternate_second_observation["selected_event"] == 5
+
+        # Official finality now exists. Recovery is allowed only from the
+        # verified publication witness and must not call the forecast producer.
+        final_at = ops._utc_now()
+        conn.execute("UPDATE events SET finished=1,data_checked=1,updated_at=? WHERE id=5", (final_at,))
+        conn.execute(
+            "UPDATE fixtures SET started=1,finished=1,finished_provisional=1,updated_at=? WHERE event=5",
+            (final_at,),
+        )
+        conn.commit()
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_a, **_k: pytest.fail(
+            "publication recovery must not rescore"
+        ))
+        forecast_receipt = ops.forecast_origin(
+            conn, **identity, action=action, expiry_event=5,
+            observation_id=observation_id,
+            continuation_generation_id=continuation.generation_id,
+            cache_dir=cache_dir,
+        )
+        monkeypatch.setattr(cra, "build_bb_tc_reservation_forecast", original_builder)
+        assert forecast_receipt["selected_event"] == 5
+        assert forecast_receipt["materialized_worlds"] is False
+        assert forecast_receipt["issued_at"] == pre_final_issued_at
+        with monkeypatch.context() as guard:
+            guard.setattr(cra, "build_bb_tc_reservation_forecast", lambda *_a, **_k: pytest.fail(
+                "identical completed retry after finality must not rescore"
+            ))
+            guard.setattr(ops, "_world_cache_requirements", lambda *_a, **_k: pytest.fail(
+                "identical completed retry after finality must not inspect or build worlds"
+            ))
+            guard.setattr(ops, "_preflight_world_cache", lambda *_a, **_k: pytest.fail(
+                "identical completed retry after finality must not probe world cache"
+            ))
+            guard.setattr(ops, "_write_new_json", lambda *_a, **_k: pytest.fail(
+                "identical completed retry after finality must not write new artifacts"
+            ))
+            same_retry = ops.forecast_origin(
+                conn, **identity, action=action, expiry_event=5,
+                observation_id=observation_id,
+                continuation_generation_id=continuation.generation_id,
+                cache_dir=cache_dir,
+            )
+            assert same_retry == forecast_receipt
+            with pytest.raises(ops.ChipEvidenceError, match="immutable operation intent"):
+                ops.forecast_origin(
+                    conn, **identity, action=action, expiry_event=5,
+                    observation_id=observation_id,
+                    continuation_generation_id="different-certified-continuation",
+                    cache_dir=cache_dir,
+                )
+        assert forecast_receipt["issued_at"] >= forecast_receipt["calculation_started_at"]
+
+        # Retain final raw official source evidence in the temporary test DB.
+        import datetime as dt
+
+        raw_root = tmp_path / "raw"
+        base = ops._parse_utc(final_at, name="fixture final timestamp")
+        raw_observed_at = base.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        run_started_at = (base + dt.timedelta(seconds=1)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        run_finished_at = (base + dt.timedelta(seconds=3)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        run_id = int(conn.execute(
+            "INSERT INTO fetch_runs(started_at,finished_at,status,trigger,current_event,endpoints_ok,"
+            "endpoints_failed,raw_dir) VALUES(?,?,'success','chip-evidence-test',5,?,?,?)",
+            (run_started_at, run_finished_at, json.dumps([
+                "bootstrap-static", "fixtures", "event/5/live",
+            ]), "[]", str(raw_root.resolve())),
+        ).lastrowid)
+        conn.commit()
+        bootstrap = {
+            "events": [{"id": 5, "name": "GW5", "finished": True, "data_checked": True}],
+            "teams": [{"id": 1, "name": "One"}, {"id": 2, "name": "Two"}],
+            "elements": [{
+                "id": pid, "web_name": f"P{pid}", "team": 1,
+                "element_type": {"GKP": 1, "DEF": 2, "MID": 3, "FWD": 4}[route.positions[pid]],
+            } for pid in route.proposed_owned_ids],
+        }
+        fixtures = [{
+            **row, "event": 5, "started": True, "finished": True,
+            "finished_provisional": True,
+        } for row in target_fixture_rows]
+        live = {"elements": [{"id": pid, "stats": {"minutes": 0, "total_points": 0}}
+                              for pid in route.proposed_owned_ids]}
+        for source, observed_at, payload, event_id in (
+            ("bootstrap_static", raw_observed_at, bootstrap, None),
+            ("fixtures", raw_observed_at, fixtures, 5),
+            ("event_live_5", raw_observed_at, live, 5),
+        ):
+            raw_archive.archive_raw_capture(
+                raw_root,
+                source=source,
+                observed_at=observed_at,
+                body=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                event=event_id,
+                run_id=run_id,
+            )
+
+        capture = ops.capture_outcome(
+            conn,
+            **identity,
+            action=action,
+            observation_id=f"{action.lower()}-fixture-observation-1",
+            realization_event=5,
+            fetch_run_id=run_id,
+            raw_root=raw_root,
+        )
+        assert capture["source_name"] == "player_gameweeks_final"
+        assert capture["source_identity"] == "player_gameweeks:5"
+        assert capture["missing_player_ids"] == []
+        assert capture["raw_observed_at"] == raw_observed_at
+        assert capture["available_at"] == run_finished_at
+        assert capture["captured_at"] == run_finished_at
+        alternate_capture = ops.capture_outcome(
+            conn,
+            **identity,
+            action=other_action,
+            observation_id=observation_id,
+            realization_event=5,
+            fetch_run_id=run_id,
+            raw_root=raw_root,
+        )
+        second_capture = ops.capture_outcome(
+            conn,
+            **identity,
+            action=other_action,
+            observation_id=second_observation_id,
+            realization_event=5,
+            fetch_run_id=run_id,
+            raw_root=raw_root,
+        )
+        assert alternate_capture["action"] == second_capture["action"] == other_action
+        assert alternate_capture["captures"] == capture["captures"]
+
+        finalize_calls = []
+        original_finalize = cal.finalize_causal_observation
+
+        def count_finalization(*args, **kwargs):
+            finalize_calls.append(1)
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(cal, "finalize_causal_observation", count_finalization)
+        key = ops._maturation_key(f"{action.lower()}-fixture-observation-1", 5)
+        receipt_path = ops._metadata_root(identity["evidence_root"]) / f"maturation-{key}.json"
+        original_write = ops._write_new_json
+        failed_receipt = False
+
+        def fail_maturation_receipt_once(path, value):
+            nonlocal failed_receipt
+            if Path(path) == receipt_path and not failed_receipt:
+                failed_receipt = True
+                raise OSError("injected maturation-receipt publication failure")
+            return original_write(path, value)
+
+        monkeypatch.setattr(ops, "_write_new_json", fail_maturation_receipt_once)
+        with pytest.raises(OSError, match="injected maturation-receipt"):
+            ops.mature_observation(
+                conn,
+                **identity,
+                action=action,
+                observation_id=f"{action.lower()}-fixture-observation-1",
+                realization_event=5,
+            )
+        assert failed_receipt is True
+        assert len(finalize_calls) == 1
+        assert not receipt_path.exists()
+        monkeypatch.setattr(ops, "_write_new_json", original_write)
+
+        recovery_started_at = ops._parse_utc(ops._utc_now(), name="test maturation/recovery start")
+        matured = ops.mature_observation(
+            conn,
+            **identity,
+            action=action,
+            observation_id=f"{action.lower()}-fixture-observation-1",
+            realization_event=5,
+        )
+        assert len(finalize_calls) == 1
+        assert receipt_path.is_file()
+        assert len(list(Path(identity["evidence_root"]).glob("chip-outcome-*.json"))) == 1
+        assert matured["receipt"]["receipt_key"] == key
+        assert matured["calibration_row"]["label_available_at"] == run_finished_at
+        assert ops._parse_utc(matured["receipt"]["matured_at"], name="matured_at") >= recovery_started_at
+        assert matured["calibration_row"]["realized_value"] == 0.0
+        alternate_matured = ops.mature_observation(
+            conn,
+            **identity,
+            action=other_action,
+            observation_id=second_observation_id,
+            realization_event=5,
+        )
+        alternate_receipt_path = ops._metadata_root(identity["evidence_root"]) / (
+            f"maturation-{ops._maturation_key(second_observation_id, 5)}.json"
+        )
+        assert alternate_matured["receipt"]["observation_id"] == second_observation_id
+        assert alternate_matured["receipt"]["action"] == other_action
+        assert len(finalize_calls) == 2
+
+        def evidence_snapshot():
+            import hashlib
+
+            return {
+                str(path.relative_to(identity["evidence_root"])): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in Path(identity["evidence_root"]).rglob("*") if path.is_file()
+            }
+
+        artifacts_before_wrong_action = evidence_snapshot()
+        rows_before_wrong_action = conn.execute(
+            "SELECT COUNT(*) FROM outcome_observation_captures"
+        ).fetchone()[0]
+        # The deterministic receipt key omits action, so the existing receipt
+        # must be bound to the action explicitly requested by this caller.
+        with pytest.raises(ops.ChipEvidenceError, match="requested observation/action/event/origin/key"):
+            ops.mature_observation(
+                conn,
+                **identity,
+                action=other_action,
+                observation_id=observation_id,
+                realization_event=5,
+            )
+        assert len(finalize_calls) == 2
+        assert conn.execute("SELECT COUNT(*) FROM outcome_observation_captures").fetchone()[0] == rows_before_wrong_action
+        assert evidence_snapshot() == artifacts_before_wrong_action
+
+        primary_receipt_bytes = receipt_path.read_bytes()
+        receipt_path.write_bytes(alternate_receipt_path.read_bytes())
+        artifacts_before_wrong_observation = evidence_snapshot()
+        rows_before_wrong_observation = conn.execute(
+            "SELECT COUNT(*) FROM outcome_observation_captures"
+        ).fetchone()[0]
+        try:
+            # A valid receipt for another observation cannot be substituted
+            # under this caller's canonical deterministic receipt path.
+            with pytest.raises(ops.ChipEvidenceError, match="requested observation/action/event/origin/key"):
+                ops.mature_observation(
+                    conn,
+                    **identity,
+                    action=action,
+                    observation_id=observation_id,
+                    realization_event=5,
+                )
+            assert evidence_snapshot() == artifacts_before_wrong_observation
+            assert len(finalize_calls) == 2
+            assert conn.execute(
+                "SELECT COUNT(*) FROM outcome_observation_captures"
+            ).fetchone()[0] == rows_before_wrong_observation
+        finally:
+            receipt_path.write_bytes(primary_receipt_bytes)
+
+        retried = ops.mature_observation(
+            conn,
+            **identity,
+            action=action,
+            observation_id=f"{action.lower()}-fixture-observation-1",
+            realization_event=5,
+        )
+        assert retried["receipt"] == matured["receipt"]
+        handoff = ops.load_verified_calibration_handoff(conn, **identity)
+        assert len(handoff) == 2
+        assert {row["observation_id"] for row in handoff} == {
+            f"{action.lower()}-fixture-observation-1", second_observation_id,
+        }
+        misplaced_path = ops._metadata_root(identity["evidence_root"]) / "maturation-wrong-name.json"
+        valid_alt_receipt_bytes = alternate_receipt_path.read_bytes()
+        misplaced_path.write_bytes(valid_alt_receipt_bytes)
+        artifacts_before_misnamed_handoff = evidence_snapshot()
+        rows_before_misnamed_handoff = conn.execute(
+            "SELECT COUNT(*) FROM outcome_observation_captures"
+        ).fetchone()[0]
+        try:
+            with pytest.raises(ops.ChipEvidenceError, match="filename does not match"):
+                ops.load_verified_calibration_handoff(conn, **identity)
+            assert evidence_snapshot() == artifacts_before_misnamed_handoff
+            assert conn.execute(
+                "SELECT COUNT(*) FROM outcome_observation_captures"
+            ).fetchone()[0] == rows_before_misnamed_handoff
+            assert len(finalize_calls) == 2
+        finally:
+            misplaced_path.unlink()
+        assert alternate_receipt_path.read_bytes() == valid_alt_receipt_bytes
+    finally:
+        conn.close()

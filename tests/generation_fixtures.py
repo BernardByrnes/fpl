@@ -18,6 +18,7 @@ import sqlite3
 import tempfile
 import json
 import shutil
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -55,7 +56,9 @@ def prepare_fixture_snapshot(
     from fpl_brain.planning import get_planning_context
 
     source_dir = Path(tempfile.mkdtemp(prefix="fpl-pe9-source-"))
-    snapshot = write_snapshot(source_dir / "source.db", database=conn)
+    snapshot = write_snapshot(
+        source_dir / "source.db", database=conn, planning_cutoff=str(cutoff)
+    )
     inputs = {
         "entry_id": 1,
         "season": None,
@@ -109,6 +112,70 @@ def fixture_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
     if record is None:
         raise ValueError("the fixture source snapshot was not prepared before projection rows")
     return dict(record["snapshot"])
+
+
+def fixture_search_permission_evaluation(
+    source_identity: Mapping[str, Any],
+    *,
+    events: Sequence[int] | None = None,
+    horizon_kind: str = gs.HORIZON_KIND_FOUR_GW,
+) -> dict[str, Any]:
+    """Build explicit fixture-only permission evidence for tests outside the gate.
+
+    Production code never imports this helper. The actual permission decision is
+    exercised by ``test_production_search_permission``; legacy builder/lifecycle
+    tests may use this fixture evidence to keep their intended test target isolated.
+    """
+
+    from fpl_brain import history_completeness as hc, search_permission as sp
+
+    generation_id = str(source_identity["generation_id"])
+    planning_event = int(source_identity.get("planning_event") or -1)
+    cutoff = str(source_identity.get("origin_cutoff") or "")
+    snapshot_sha256 = str(source_identity.get("data_snapshot_sha256") or "")
+    selected_events = list(
+        events if events is not None else range(planning_event, planning_event + 4)
+    )
+    history = {
+        "schema": hc.HISTORY_COMPLETENESS_SCHEMA,
+        "planning_event": planning_event,
+        "cutoff": cutoff,
+        "required_completed_events": [],
+        "latest_required_completed_event": planning_event - 1,
+        "complete": True,
+        "blocker": None,
+        "reasons": [],
+        "detail": "explicit fixture-only complete history evidence",
+    }
+    body = {
+        "schema": sp.SEARCH_PERMISSION_EVALUATION_SCHEMA,
+        "permitted": True,
+        "reasons": [],
+        "origin": {
+            "generation_id": generation_id,
+            "generation_manifest_sha256": generation_id,
+            "planning_event": planning_event,
+            "cutoff": cutoff,
+            "horizon_kind": horizon_kind,
+            "events": selected_events,
+            "data_snapshot_sha256": snapshot_sha256,
+            "execution_run_uuid": "fixture-execution-run",
+            "predictive_code_snapshot_sha256": source_identity.get(
+                "predictive_code_snapshot_sha256"
+            ),
+        },
+        "conditions": {
+            "temporal_status": "CAUSAL",
+            "causal_evidence_sha256": "sha256:" + "f" * 64,
+            "dependency_validation": "COHERENT",
+            "horizon_status": "DECISION_HORIZON_COMPLETE",
+            "data_snapshot_sha256": snapshot_sha256,
+            "snapshot_identity": "VERIFIED",
+            "snapshot_error": None,
+            "history_completeness": history,
+        },
+    }
+    return {**body, "evaluation_sha256": sp.evaluation_digest(body)}
 
 
 def _fixture_record_for_runs(
@@ -360,8 +427,74 @@ def world_with_run_ids(
 _DEFAULT_SNAPSHOT = Path(tempfile.mkdtemp(prefix="fpl-pe9-fixture-")) / "snapshot.db"
 
 
+def _write_fixture_snapshot_manifest(
+    snapshot: Mapping[str, Any], *, planning_cutoff: str = CUTOFF
+) -> dict[str, Any]:
+    """Write canonical timing evidence for explicitly synthetic PE-9 fixtures."""
+
+    path = Path(str(snapshot["path"]))
+    manifest_path = path.with_name(path.name + ".execution_source_snapshot.json")
+    cutoff = str(planning_cutoff)
+    captured = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    completed_at = (captured + timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    execution_run_uuid = str(snapshot.get("execution_run_uuid") or "")
+    payload = {
+        "data_snapshot_path": str(path),
+        "data_snapshot_sha256": str(snapshot["sha256"]),
+        "data_snapshot_created_at": cutoff,
+        "snapshot_lock_acquired_at": cutoff,
+        "snapshot_capture_started_at": cutoff,
+        "snapshot_consistency_at": cutoff,
+        "snapshot_capture_completed_at": completed_at,
+        "snapshot_capture_seconds": 1.0,
+        "data_snapshot_source_db_identity": dict(snapshot["source_db_identity"]),
+        "execution_run_uuid": execution_run_uuid,
+        "planning_cutoff": cutoff,
+        "data_snapshot_size_bytes": int(snapshot["size_bytes"]),
+        "data_snapshot_manifest": str(manifest_path),
+    }
+    manifest_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return {**dict(snapshot), "manifest_path": str(manifest_path)}
+
+
+def ensure_fixture_execution_run(
+    conn: sqlite3.Connection, *, planning_event: int, cutoff: str, snapshot: Mapping[str, Any]
+) -> None:
+    """Bind a synthetic snapshot to a run row after its recorded consistency time."""
+
+    manifest_path = snapshot.get("manifest_path") or snapshot.get("data_snapshot_manifest")
+    if not manifest_path or not Path(str(manifest_path)).is_file():
+        return
+    payload = json.loads(Path(str(manifest_path)).read_text(encoding="utf-8"))
+    if (
+        str(payload.get("planning_cutoff") or "") != str(cutoff)
+        or str(payload.get("data_snapshot_path") or "") != str(snapshot.get("path") or "")
+        or str(payload.get("execution_run_uuid") or "") != str(snapshot.get("execution_run_uuid") or "")
+    ):
+        return
+    completed = datetime.fromisoformat(
+        str(payload["snapshot_capture_completed_at"]).replace("Z", "+00:00")
+    )
+    started_at = (completed + timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    hard_stop_at = (completed + timedelta(hours=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    with conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO execution_runs(
+                   run_uuid, planning_event, planning_cutoff, semantic_run_key, status,
+                   started_at, hard_stop_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                str(snapshot["execution_run_uuid"]), int(planning_event), str(cutoff),
+                f"fixture-causal:{snapshot['execution_run_uuid']}", "COMPLETE", started_at,
+                hard_stop_at, str(payload["snapshot_consistency_at"]), started_at,
+            ),
+        )
+
+
 def write_snapshot(
-    path: Path, *, database: str | Path | sqlite3.Connection
+    path: Path, *, database: str | Path | sqlite3.Connection, planning_cutoff: str = CUTOFF
 ) -> dict[str, Any]:
     """A real file the generation can pin, so retention checks have something to see.
 
@@ -409,13 +542,14 @@ def write_snapshot(
         }
     else:
         identity = es.source_db_identity(database)
-    return {
+    snapshot = {
         "path": str(path),
         "sha256": es.file_sha256(path),
         "size_bytes": int(path.stat().st_size),
         "source_db_identity": identity,
-        "execution_run_uuid": "00000000-0000-0000-0000-000000000001",
+        "execution_run_uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, f"fpl-test-snapshot:{es.file_sha256(path)}")),
     }
+    return _write_fixture_snapshot_manifest(snapshot, planning_cutoff=planning_cutoff)
 
 
 def _write_default_snapshot(
@@ -443,11 +577,16 @@ def _write_default_snapshot(
         _DEFAULT_SNAPSHOT.unlink()
     else:
         _DEFAULT_SNAPSHOT.replace(retained_path)
-    return {
+    old_manifest = Path(str(staged["manifest_path"]))
+    snapshot = {
         **staged,
         "path": str(retained_path),
         "source_db_identity": es.source_db_identity(retained_path),
+        "manifest_path": str(retained_path.with_name(retained_path.name + ".execution_source_snapshot.json")),
     }
+    if old_manifest.exists() and old_manifest != Path(snapshot["manifest_path"]):
+        old_manifest.unlink()
+    return _write_fixture_snapshot_manifest(snapshot)
 
 
 def _copy_database(source: str | Path | sqlite3.Connection, target: Path) -> None:
@@ -526,12 +665,14 @@ def certify_world(
     lifecycle production does not have.
     """
 
+    from fpl_brain import execution_snapshot as es
+
     resolved_events = [int(event) for event in (events if events is not None else runs_by_event)]
     fixture_record = _fixture_record_for_runs(conn, runs_by_event)
     if snapshot_database is not None:
         source_database = snapshot_database
         target = snapshot_path or _DEFAULT_SNAPSHOT
-        snapshot = write_snapshot(target, database=source_database)
+        snapshot = write_snapshot(target, database=source_database, planning_cutoff=str(cutoff))
     elif fixture_record is not None:
         snapshot = dict(fixture_record["snapshot"])
         if snapshot_path is not None:
@@ -539,7 +680,13 @@ def certify_world(
             target.parent.mkdir(parents=True, exist_ok=True)
             if Path(snapshot["path"]).resolve() != target.resolve():
                 shutil.copyfile(snapshot["path"], target)
-            snapshot = {**snapshot, "path": str(target)}
+            snapshot = _write_fixture_snapshot_manifest({
+                **snapshot,
+                "path": str(target),
+                "size_bytes": int(target.stat().st_size),
+                "sha256": es.file_sha256(target),
+                "manifest_path": None,
+            }, planning_cutoff=str(cutoff))
     else:
         source_database = conn
         snapshot = (
@@ -573,6 +720,14 @@ def certify_under_writer_lease(conn: sqlite3.Connection, **kwargs) -> gs.Certifi
 
     from fpl_brain import execution
 
+    snapshot = kwargs.get("snapshot")
+    if isinstance(snapshot, Mapping):
+        ensure_fixture_execution_run(
+            conn,
+            planning_event=int(kwargs.get("planning_event") or 0),
+            cutoff=str(kwargs.get("cutoff") or CUTOFF),
+            snapshot=snapshot,
+        )
     controller = execution.ExecutionController(conn)
     controller.create_run(
         planning_event=int(kwargs.get("planning_event") or 0),

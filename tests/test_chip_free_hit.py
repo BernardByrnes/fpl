@@ -1027,7 +1027,7 @@ def test_the_reservation_is_subtracted_exactly_once():
     evaluation = fh.evaluate_free_hit(_improving_request())
     decision = _decision(evaluation, reservation=_SpyReservation(3.0))
     assert decision.candidate_metrics["net_of_reservation"] == pytest.approx(
-        evaluation.mean_uplift - 3.0
+        evaluation.mean_uplift / cd.CHIP_HORIZON_LENGTH - 3.0
     )
 
 
@@ -1039,7 +1039,7 @@ def test_review_only_blocks_autoplay_even_with_a_calibrated_reservation():
         materiality=0.0,
     )
     assert decision.status != cd.STATUS_PLAY_CHIP
-    assert decision.status == cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
+    assert decision.status == cd.STATUS_CHIP_REVIEW_REQUIRED
     assert cd.DIAG_CHIP_EVALUATOR_UNCALIBRATED in decision.reason_codes
 
 

@@ -370,9 +370,12 @@ def test_L_no_xi_player_appears_so_the_chip_is_worthless():
     assert evaluation.candidate_metrics["mean_paired_uplift"] == pytest.approx(0.0)
     assert tc.DIAG_TC_NO_ARMBAND_POSSIBLE in evaluation.reason_codes
 
-    decision = _evaluated_decision(evaluations={cd.CHIP_ACTION_TC: evaluation})
+    decision = _evaluated_decision(
+        evaluations={cd.CHIP_ACTION_TC: evaluation},
+        chip_availability=_availability(available=("3xc",)),
+    )
     assert decision.status == cd.STATUS_NO_CHIP
-    assert cd.DIAG_CHIP_UPLIFT_NON_POSITIVE in decision.reason_codes
+    assert cd.DIAG_CHIP_UPLIFT_NOT_MATERIAL in decision.reason_codes
 
 
 def test_L2_a_pair_that_appears_is_preferred_over_an_absent_armband():
@@ -445,7 +448,10 @@ def test_P_a_positive_mean_uplift_cannot_emit_play_chip():
     )
     assert evaluation.mean_uplift is not None and evaluation.mean_uplift > 0
 
-    decision = _evaluated_decision(evaluations={cd.CHIP_ACTION_TC: evaluation})
+    decision = _evaluated_decision(
+        evaluations={cd.CHIP_ACTION_TC: evaluation},
+        chip_availability=_availability(available=("3xc",)),
+    )
     assert decision.recommended_action == cd.CHIP_ACTION_TC
     assert decision.status == cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
     assert decision.status != cd.STATUS_PLAY_CHIP
@@ -461,7 +467,11 @@ def test_P_a_positive_mean_uplift_cannot_emit_play_chip():
                 weeks_to_expiry=17, reason_codes=(), conditional_on=("weeks_remaining",),
             )
 
-    played = _evaluated_decision(evaluations={cd.CHIP_ACTION_TC: evaluation}, reservation=Calibrated())
+    played = _evaluated_decision(
+        evaluations={cd.CHIP_ACTION_TC: evaluation},
+        chip_availability=_availability(available=("3xc",)),
+        reservation=Calibrated(),
+    )
     assert played.status == cd.STATUS_PLAY_CHIP
     assert played.recommended_action == cd.CHIP_ACTION_TC
 
@@ -1244,3 +1254,80 @@ def test_P2_4_F_a_single_definition_row_is_unchanged():
     )
     assert spy.calls[0]["expiry_event"] is None
     assert decision.candidate_metrics["reservation_weeks_to_expiry"] is None
+
+
+def _rankable_fixture_evaluation(action: str, uplift: float) -> cd.ChipEvaluation:
+    binding = _binding()
+    return cd.ChipEvaluation(
+        action=action,
+        evaluator_version=f"fixture-{action.lower()}-v1",
+        candidate_metrics={"mean_paired_uplift": uplift},
+        uncertainty={"paired_interval_low": uplift, "paired_interval_high": uplift},
+        evidence={
+            "certification_identity": binding.certification_identity,
+            "data_snapshot_sha256": binding.data_snapshot_sha256,
+            "horizon_events": list(binding.horizon_events),
+            "planning_event": binding.planning_event,
+        },
+        calibration_status=cd.CALIBRATION_CALIBRATED,
+        execution_permitted=True,
+        data_snapshot_bound=True,
+    )
+
+
+class _ActionReservation:
+    def __init__(self, values):
+        self.values = dict(values)
+
+    def estimate(self, *, action, planning_event, expiry_event, state):
+        value = self.values.get(action)
+        return cd.ReservationEstimate(
+            value=value,
+            calibration_status=(
+                cd.CALIBRATION_CALIBRATED if value is not None else cd.CALIBRATION_UNCALIBRATED
+            ),
+            terminal_value=0.0,
+            weeks_to_expiry=None if expiry_event is None else int(expiry_event) - int(planning_event),
+            reason_codes=() if value is not None else (cd.DIAG_CHIP_RESERVATION_UNCALIBRATED,),
+        )
+
+
+def test_arbiter_ranks_candidates_after_reservation_in_shared_value_units():
+    binding = _binding()
+    decision = cd.decide_chip_action(
+        horizon_binding=binding,
+        chip_availability=_availability(available=("bboost", "3xc")),
+        evaluations={
+            cd.CHIP_ACTION_BB: _rankable_fixture_evaluation(cd.CHIP_ACTION_BB, 10.0),
+            cd.CHIP_ACTION_TC: _rankable_fixture_evaluation(cd.CHIP_ACTION_TC, 8.0),
+        },
+        reservation=_ActionReservation({cd.CHIP_ACTION_BB: 9.0, cd.CHIP_ACTION_TC: 2.0}),
+        certification_valid=True,
+        manager_state={"squad_ids": list(SQUAD)},
+    )
+    comparisons = decision.candidate_metrics["candidate_comparisons"]
+    assert comparisons[cd.CHIP_ACTION_BB]["net_value"] == pytest.approx(1.0)
+    assert comparisons[cd.CHIP_ACTION_TC]["net_value"] == pytest.approx(6.0)
+    assert decision.recommended_action == cd.CHIP_ACTION_TC
+    assert decision.status == cd.STATUS_PLAY_CHIP
+
+
+def test_unknown_candidate_reservation_stays_unrankable_instead_of_zero():
+    binding = _binding()
+    decision = cd.decide_chip_action(
+        horizon_binding=binding,
+        chip_availability=_availability(available=("bboost", "3xc")),
+        evaluations={
+            cd.CHIP_ACTION_BB: _rankable_fixture_evaluation(cd.CHIP_ACTION_BB, 10.0),
+            cd.CHIP_ACTION_TC: _rankable_fixture_evaluation(cd.CHIP_ACTION_TC, 8.0),
+        },
+        reservation=_ActionReservation({cd.CHIP_ACTION_BB: 2.0, cd.CHIP_ACTION_TC: None}),
+        certification_valid=True,
+        manager_state={"squad_ids": list(SQUAD)},
+    )
+    comparison = decision.candidate_metrics["candidate_comparisons"][cd.CHIP_ACTION_TC]
+    assert comparison["status"] == "UNRANKABLE"
+    assert comparison["reservation_value"] is None
+    assert comparison["net_value"] is None
+    assert decision.status == cd.STATUS_CHIP_CANDIDATE_RECHECK_REQUIRED
+    assert cd.DIAG_CHIP_RESERVATION_UNCALIBRATED in decision.reason_codes

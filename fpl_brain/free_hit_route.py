@@ -43,7 +43,7 @@ an 8-point swing is the one authority this contract exists to protect.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from . import season_rules as sr
@@ -122,6 +122,7 @@ class FreeHitRouteEvent:
     mean_net_core: float
     mean_gross_core: float
     hit_points: int = 0
+    policy: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +133,7 @@ class FreeHitRouteEvent:
             "mean_net_core": round(float(self.mean_net_core), 6),
             "mean_gross_core": round(float(self.mean_gross_core), 6),
             "hit_points": int(self.hit_points),
+            "policy": dict(self.policy),
         }
 
 
@@ -406,6 +408,7 @@ def free_hit_route_from_canonical_route(
             mean_net_core=float(per_event[int(entry["event"])]["mean_net_core"]),
             mean_gross_core=float(per_event[int(entry["event"])]["mean_gross_core"]),
             hit_points=int(per_event[int(entry["event"])].get("hit_points") or 0),
+            policy=dict(per_event[int(entry["event"])].get("policy") or {}),
         )
         for entry in entries
     )

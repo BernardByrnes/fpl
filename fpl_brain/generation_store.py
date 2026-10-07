@@ -38,19 +38,30 @@ from typing import Any, Callable, Mapping, Sequence
 from . import certified_bundle as cb
 
 MANIFEST_SCHEMA = "fpl_brain.pe9_generation_manifest.v1"
-DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v1"
+LEGACY_DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v1"
+DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v2"
+DECISION_RECORD_SCHEMAS = frozenset({LEGACY_DECISION_RECORD_SCHEMA, DECISION_RECORD_SCHEMA})
 
 #: The declared horizon kinds.  A generation is global predictive evidence for one
 #: (planning_event, horizon_kind); manager-specific state never enters its identity.
 HORIZON_KIND_FOUR_GW = "FOUR_GW"
 HORIZON_KIND_MANAGER_WORLD = "MANAGER_WORLD"
-HORIZON_KINDS: tuple[str, ...] = (HORIZON_KIND_FOUR_GW, HORIZON_KIND_MANAGER_WORLD)
+HORIZON_KIND_WILDCARD_VALUE = "WILDCARD_VALUE"
+HORIZON_KIND_CHIP_RESERVATION = "CHIP_RESERVATION"
+HORIZON_KINDS: tuple[str, ...] = (
+    HORIZON_KIND_FOUR_GW,
+    HORIZON_KIND_MANAGER_WORLD,
+    HORIZON_KIND_WILDCARD_VALUE,
+    HORIZON_KIND_CHIP_RESERVATION,
+)
 
 #: The horizon LENGTH each kind is certified over.  The four-Gameweek normal-transfer
 #: horizon is the frozen product rule; a manager-world generation covers exactly the
 #: events it declares.  The length is part of the manifest, so the gate a generation
 #: passed is reproducible rather than inferred from the caller's context.
 HORIZON_LENGTHS: dict[str, int] = {HORIZON_KIND_FOUR_GW: 4}
+WILDCARD_VALUE_MIN_EVENTS = 6
+WILDCARD_VALUE_MAX_EVENTS = 10
 
 # --- refusal tokens ---------------------------------------------------------
 DIAG_GENERATION_UNKNOWN = "UNKNOWN_GENERATION_ID"
@@ -69,6 +80,7 @@ DIAG_PRODUCTION_DESCRIPTOR_ONLY = "PRODUCTION_DESCRIPTOR_ONLY"
 DIAG_PRODUCTION_PROFILE_UNKNOWN = "PRODUCTION_DECISION_PROFILE_UNKNOWN"
 DIAG_DECISION_REPLAY_ONLY = "DECISION_REPLAY_ONLY"
 DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED = "GENERATION_PLANNING_CONTEXT_REQUIRED"
+DIAG_PRODUCTION_SEARCH_PERMISSION_DENIED = "PRODUCTION_SEARCH_PERMISSION_DENIED"
 
 #: How far the PE-8 evidence reference was actually REPRODUCED by the verifier.
 #: ``NOT_CONSULTED`` is not a failure: no calibration claim was made.  There is no
@@ -205,6 +217,75 @@ class ProductionDescriptorOnly(GenerationRefused):
         super().__init__(DIAG_PRODUCTION_DESCRIPTOR_ONLY, reasons)
 
 
+def _wildcard_value_horizon_problems(
+    *, planning_event: int, events: Sequence[int], horizon_length: int, last_event: int
+) -> list[str]:
+    """Validate Wildcard's separate 6–10 event certification contract.
+
+    This product is intentionally distinct from ``FOUR_GW``. Its events must
+    be one complete, contiguous sequence beginning at the planning event, and
+    every declared event must exist in the pinned season snapshot.
+    """
+
+    resolved = tuple(int(event) for event in events)
+    problems: list[str] = []
+    if not (WILDCARD_VALUE_MIN_EVENTS <= len(resolved) <= WILDCARD_VALUE_MAX_EVENTS):
+        problems.append(
+            f"Wildcard value horizon needs {WILDCARD_VALUE_MIN_EVENTS}-{WILDCARD_VALUE_MAX_EVENTS} "
+            f"events, got {len(resolved)}"
+        )
+    if int(horizon_length) != len(resolved):
+        problems.append(
+            f"Wildcard value horizon length {int(horizon_length)} does not match its "
+            f"{len(resolved)} declared events"
+        )
+    if not resolved or resolved[0] != int(planning_event):
+        problems.append("Wildcard value events must begin at the planning event")
+    if len(set(resolved)) != len(resolved):
+        problems.append("Wildcard value events contain duplicates")
+    expected = tuple(range(int(planning_event), int(planning_event) + len(resolved)))
+    if resolved != expected:
+        problems.append(f"Wildcard value events {list(resolved)} are not contiguous from GW{planning_event}")
+    if resolved and resolved[-1] > int(last_event):
+        problems.append(
+            f"Wildcard value horizon ends at GW{resolved[-1]}, beyond pinned season end GW{last_event}"
+        )
+    return problems
+
+
+def _chip_reservation_horizon_problems(
+    *, planning_event: int, events: Sequence[int], horizon_length: int, last_event: int,
+) -> list[str]:
+    """Validate the separate origin-pinned product used for chip forecasts.
+
+    This product can extend beyond the normal four-event decision horizon. It
+    is an input product only: it never widens a normal chip decision or creates
+    a production decision profile. Wildcard consumers still bind a separate
+    6-10 event value window within this product.
+    """
+
+    resolved = tuple(int(event) for event in events)
+    problems: list[str] = []
+    if len(resolved) < 4:
+        problems.append("chip-reservation product must retain the exact four-event normal prefix")
+    if int(horizon_length) != len(resolved):
+        problems.append(
+            f"chip-reservation horizon length {int(horizon_length)} does not match its {len(resolved)} events"
+        )
+    if not resolved or resolved[0] != int(planning_event):
+        problems.append("chip-reservation events must begin at the origin planning event")
+    if len(set(resolved)) != len(resolved):
+        problems.append("chip-reservation events contain duplicates")
+    expected = tuple(range(int(planning_event), int(planning_event) + len(resolved)))
+    if resolved != expected:
+        problems.append("chip-reservation events must be contiguous from the origin planning event")
+    if resolved and resolved[-1] > int(last_event):
+        problems.append(
+            f"chip-reservation product ends at GW{resolved[-1]}, beyond pinned season end GW{last_event}"
+        )
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # Canonical semantic manifest
 # ---------------------------------------------------------------------------
@@ -290,7 +371,7 @@ def manifest_semantic_projection(manifest: Mapping[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             return None
 
-    return {
+    projection = {
         "schema": manifest.get("schema"),
         "planning_event": _int_or_none(manifest.get("planning_event")),
         "horizon_kind": (
@@ -320,6 +401,12 @@ def manifest_semantic_projection(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "pe8_evidence": manifest.get("pe8_evidence"),
         "disclosure": manifest.get("disclosure"),
     }
+    # Legacy generation rows predate retained temporal evidence. Keep their
+    # identity projection byte-for-byte compatible; new rows include the evidence
+    # block (including an explicit UNRESOLVED result when it cannot be derived).
+    if "search_permission_causality" in manifest:
+        projection["search_permission_causality"] = manifest.get("search_permission_causality")
+    return projection
 
 
 @dataclass(frozen=True)
@@ -393,6 +480,7 @@ def build_generation_manifest(
     last_event: int,
     pe8_evidence: Mapping[str, Any],
     disclosure: Mapping[str, Any],
+    search_permission_causality: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the canonical semantic manifest of ONE generation.
 
@@ -418,6 +506,8 @@ def build_generation_manifest(
             "size_bytes": snapshot.get("size_bytes"),
             "source_db_identity": snapshot.get("source_db_identity"),
             "execution_run_uuid": snapshot.get("execution_run_uuid"),
+            **({"manifest_path": snapshot.get("manifest_path")}
+               if snapshot.get("manifest_path") else {}),
         },
         "per_event": {
             str(int(event)): {
@@ -451,6 +541,15 @@ def build_generation_manifest(
         "last_event": int(last_event),
         "pe8_evidence": canonical_identity_value(dict(pe8_evidence)),
         "disclosure": canonical_identity_value(dict(disclosure)),
+        "search_permission_causality": (
+            canonical_identity_value(dict(search_permission_causality))
+            if isinstance(search_permission_causality, Mapping)
+            else {
+                "schema": "fpl_brain.generation_causality.v1",
+                "temporal_status": "UNRESOLVED",
+                "reasons": ["UNRESOLVED: causal timestamp evidence was not available at certification"],
+            }
+        ),
     }
     # Fails closed on any float the projection above let through.
     canonical_manifest_bytes(manifest)
@@ -710,6 +809,12 @@ def certify_generation(
     required_versions = cb.declared_required_versions()
     code_identity = authoritative_code_identity()
     snapshot_block = _snapshot_identity_block(snapshot)
+    search_permission_causality = _generation_causality_for_manifest(
+        conn,
+        snapshot=snapshot_block,
+        generation_planning_event=int(planning_event),
+        generation_cutoff=str(cutoff),
+    )
     calibration_digest, calibration_file_sha256 = _calibration_file_identity(
         calibration, calibration_artifact_ref, required=bool(require_calibration)
     )
@@ -739,6 +844,29 @@ def certify_generation(
             ],
         )
     resolved_last_event = snapshot_last_event
+    resolved_length = int(
+        horizon_length
+        if horizon_length is not None
+        else HORIZON_LENGTHS.get(str(horizon_kind), len(resolved_events))
+    )
+    if horizon_kind == HORIZON_KIND_WILDCARD_VALUE:
+        problems = _wildcard_value_horizon_problems(
+            planning_event=int(planning_event),
+            events=resolved_events,
+            horizon_length=resolved_length,
+            last_event=resolved_last_event,
+        )
+        if problems:
+            raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED, problems)
+    elif horizon_kind == HORIZON_KIND_CHIP_RESERVATION:
+        problems = _chip_reservation_horizon_problems(
+            planning_event=int(planning_event),
+            events=resolved_events,
+            horizon_length=resolved_length,
+            last_event=resolved_last_event,
+        )
+        if problems:
+            raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED, problems)
 
     from .database import write_transaction
 
@@ -862,11 +990,6 @@ def certify_generation(
         if contextless:
             raise GenerationRefused(DIAG_GENERATION_PLANNING_CONTEXT_REQUIRED, contextless)
 
-        resolved_length = int(
-            horizon_length
-            if horizon_length is not None
-            else HORIZON_LENGTHS.get(str(horizon_kind), len(resolved_events))
-        )
         horizon = fg.evaluate_horizon(
             planning_event=int(resolved_events[0]) if resolved_events else int(planning_event),
             support_by_event=support,
@@ -935,6 +1058,7 @@ def certify_generation(
             last_event=resolved_last_event,
             pe8_evidence=pe8_evidence,
             disclosure=disclosure,
+            search_permission_causality=search_permission_causality,
         )
         generation_id = generation_id_of(manifest)
         created_at = (clock or _utc_now)()
@@ -970,6 +1094,425 @@ def certify_generation(
             (int(planning_event), str(horizon_kind), generation_id, str(created_at)),
         )
     return load_generation(conn, generation_id)
+
+
+def certify_wildcard_value_generation(
+    conn: sqlite3.Connection,
+    *,
+    chip_generation_id: str,
+    planning_event: int,
+    cutoff: str,
+    events: Sequence[int],
+    runs_by_event: Mapping[int, Mapping[str, int]],
+    snapshot: Mapping[str, Any] | None,
+    calibration: Mapping[str, Any] | None = None,
+    calibration_artifact_ref: str | Path | None = None,
+    require_calibration: bool = False,
+    controller: Any = None,
+    clock: Callable[[], str] | None = None,
+) -> CertifiedGeneration:
+    """Certify Wildcard's 6–10 event value product against a normal generation.
+
+    The four-event normal-transfer generation remains a separate, unchanged
+    product. This entry point requires a verified ``FOUR_GW`` generation for
+    the same planning event and exact first four events, and binds the Wildcard
+    value generation to that generation's cutoff, pinned snapshot and
+    predictive code identity. Later planning runs cannot be stitched together
+    by supplying a different cutoff, snapshot or code identity.
+    """
+
+    value_events = tuple(int(event) for event in events)
+    base = load_generation(conn, str(chip_generation_id))
+    base_report = verify_generation(conn, base.generation_id)
+    if not base_report.get("verified"):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the normal four-event generation did not verify"],
+        )
+    if base.horizon_kind != HORIZON_KIND_FOUR_GW:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"the Wildcard value product requires a FOUR_GW base, got {base.horizon_kind!r}"],
+        )
+    if int(base.planning_event) != int(planning_event):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard and normal products have different planning events"],
+        )
+    if tuple(base.events) != value_events[:4]:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the normal four-event product is not the exact first four Wildcard value events"],
+        )
+    normalized_runs = {
+        int(event): {str(family): int(run_id) for family, run_id in families.items()}
+        for event, families in runs_by_event.items()
+    }
+    prefix_run_disagreements = [
+        f"GW{event}: Wildcard runs {normalized_runs.get(event)!r} do not exactly reuse "
+        f"the normal certified runs {base.runs_for(event)!r}"
+        for event in base.events
+        if normalized_runs.get(int(event)) != base.runs_for(int(event))
+    ]
+    if prefix_run_disagreements:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                "the first four Wildcard value events must reuse the exact normal-generation "
+                "run ids and dependency closure; separately generated later planning runs "
+                "cannot be stitched into this assessment",
+                *prefix_run_disagreements,
+            ],
+        )
+    if str(base.cutoff) != str(cutoff):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard and normal products have different cutoffs"],
+        )
+    snapshot_block = _snapshot_identity_block(snapshot)
+    base_snapshot = base.manifest.get("data_snapshot") or {}
+    if str(snapshot_block.get("sha256")) != str(base_snapshot.get("sha256")):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard value product does not use the normal product's pinned data snapshot"],
+        )
+    base_code = str(base.manifest.get("code_snapshot_sha256") or "")
+    if not base_code or base_code != authoritative_code_identity():
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the normal product's predictive code identity differs from the current declared identity"],
+        )
+
+    result = certify_generation(
+        conn,
+        planning_event=int(planning_event),
+        cutoff=str(cutoff),
+        runs_by_event=runs_by_event,
+        snapshot=snapshot_block,
+        horizon_kind=HORIZON_KIND_WILDCARD_VALUE,
+        events=value_events,
+        horizon_length=len(value_events),
+        calibration=calibration,
+        calibration_artifact_ref=calibration_artifact_ref,
+        require_calibration=require_calibration,
+        controller=controller,
+        clock=clock,
+    )
+    report = verify_generation(conn, result.generation_id)
+    if not report.get("verified"):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the newly certified Wildcard value generation failed its independent verification"],
+        )
+    if (
+        str(result.cutoff) != str(base.cutoff)
+        or str(result.manifest.get("code_snapshot_sha256")) != base_code
+        or str((result.manifest.get("data_snapshot") or {}).get("sha256"))
+        != str(base_snapshot.get("sha256"))
+    ):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the Wildcard and normal products do not reproduce one predictive identity"],
+        )
+    base_events = base.manifest.get("per_event") or {}
+    result_events = result.manifest.get("per_event") or {}
+    dependency_disagreements = [
+        int(event)
+        for event in base.events
+        if (base_events.get(str(int(event))) or {}).get("dependency_closure")
+        != (result_events.get(str(int(event))) or {}).get("dependency_closure")
+    ]
+    if dependency_disagreements:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                "the first four Wildcard events do not reproduce the normal generation's "
+                f"dependency closure for {dependency_disagreements}"
+            ],
+        )
+    return result
+
+
+def certify_future_wildcard_value_generation(
+    conn: sqlite3.Connection,
+    *,
+    coverage_product: Mapping[str, Any],
+    planning_event: int,
+    controller: Any = None,
+    clock: Callable[[], str] | None = None,
+) -> CertifiedGeneration:
+    """Certify a future 6–10 event WC window from one origin-pinned product.
+
+    This is the future-opportunity counterpart to
+    :func:`certify_wildcard_value_generation`. The existing normal FOUR_GW
+    generation is still the origin product's prefix. A future value window is
+    derived only from the verified CHIP_RESERVATION product named by the
+    retained coverage record; no later planning runs, free-standing run ids,
+    snapshot or cutoff are caller supplied.
+    """
+
+    from . import chip_decision as cd, chip_reservation_forecast as crf
+
+    source_identity = coverage_product.get("source_identity")
+    if not isinstance(source_identity, Mapping):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the future WC coverage product omits its origin source identity"],
+        )
+    origin_event = int(source_identity.get("planning_event") or -1)
+    expiry_event = coverage_product.get("expiry_event")
+    try:
+        verified_coverage = crf.verify_reservation_coverage_product(
+            conn,
+            coverage_product,
+            expected={
+                "action": cd.CHIP_ACTION_WC,
+                "planning_event": origin_event,
+                "expiry_event": expiry_event,
+                "source_identity": dict(source_identity),
+            },
+        )
+    except Exception as failure:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"the future WC coverage product did not verify: {failure}"],
+        ) from failure
+    if not verified_coverage.get("verified") or coverage_product.get("coverage_complete") is not True:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["future WC certification requires complete, verified expiry coverage"],
+        )
+
+    event = int(planning_event)
+    horizon_length = int(coverage_product.get("wildcard_value_horizon_length") or 0)
+    value_events = tuple(range(event, event + horizon_length))
+    forecast_events = {int(value) for value in coverage_product.get("forecast_events") or ()}
+    if (
+        expiry_event is None
+        or event <= origin_event
+        or event not in forecast_events
+        or not WILDCARD_VALUE_MIN_EVENTS <= horizon_length <= WILDCARD_VALUE_MAX_EVENTS
+    ):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["future WC needs a known unexpired event and a declared 6–10 event value horizon"],
+        )
+
+    try:
+        origin = load_generation(conn, str(coverage_product.get("root_generation_id") or ""))
+        continuation = load_generation(conn, str(coverage_product.get("product_generation_id") or ""))
+        origin_report = verify_generation(conn, origin.generation_id)
+        continuation_report = verify_generation(conn, continuation.generation_id)
+    except Exception as failure:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"future WC origin or continuation generation refused: {failure}"],
+        ) from failure
+    if (
+        not origin_report.get("verified")
+        or origin.horizon_kind != HORIZON_KIND_FOUR_GW
+        or not continuation_report.get("verified")
+        or continuation.horizon_kind != HORIZON_KIND_CHIP_RESERVATION
+        or int(origin.planning_event) != origin_event
+        or int(continuation.planning_event) != origin_event
+        or tuple(continuation.events[:4]) != tuple(origin.events)
+        or str(origin.cutoff) != str(continuation.cutoff)
+        or str(origin.cutoff) != str(source_identity.get("origin_cutoff"))
+        or str((origin.manifest.get("data_snapshot") or {}).get("sha256"))
+        != str((continuation.manifest.get("data_snapshot") or {}).get("sha256"))
+        or str(continuation.manifest.get("code_snapshot_sha256"))
+        != str(origin.manifest.get("code_snapshot_sha256"))
+        or str(continuation.manifest.get("code_snapshot_sha256"))
+        != str(source_identity.get("predictive_code_snapshot_sha256"))
+        or continuation.generation_id != str(coverage_product.get("product_generation_id"))
+    ):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["future WC source is not one origin-pinned normal/continuation identity"],
+        )
+    if not set(value_events).issubset({int(value) for value in continuation.events}):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the origin-pinned continuation product does not cover the complete future WC value window"],
+        )
+    source_runs = coverage_product.get("product_runs_by_event")
+    if not isinstance(source_runs, Mapping) or any(
+        {str(key): int(value) for key, value in (source_runs.get(str(value_event)) or {}).items()}
+        != continuation.runs_for(value_event)
+        for value_event in value_events
+    ):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["future WC runs differ from the verified CHIP_RESERVATION product"],
+        )
+
+    base_code = str(continuation.manifest.get("code_snapshot_sha256") or "")
+    if not base_code or base_code != authoritative_code_identity():
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["origin-pinned predictive code identity differs from the current declared identity"],
+        )
+    runs_by_event = {value_event: continuation.runs_for(value_event) for value_event in value_events}
+    snapshot = continuation.manifest.get("data_snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["origin-pinned continuation has no retained data snapshot"],
+        )
+
+    result = certify_generation(
+        conn,
+        planning_event=event,
+        cutoff=str(continuation.cutoff),
+        runs_by_event=runs_by_event,
+        snapshot=snapshot,
+        horizon_kind=HORIZON_KIND_WILDCARD_VALUE,
+        events=value_events,
+        horizon_length=horizon_length,
+        controller=controller,
+        clock=clock,
+    )
+    report = verify_generation(conn, result.generation_id)
+    if not report.get("verified"):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the future Wildcard value generation failed independent verification"],
+        )
+    if (
+        str(result.cutoff) != str(continuation.cutoff)
+        or str(result.manifest.get("code_snapshot_sha256")) != base_code
+        or str((result.manifest.get("data_snapshot") or {}).get("sha256"))
+        != str((continuation.manifest.get("data_snapshot") or {}).get("sha256"))
+    ):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["future Wildcard generation differs from its origin predictive identity"],
+        )
+    source_events = continuation.manifest.get("per_event") or {}
+    value_records = result.manifest.get("per_event") or {}
+    closure_disagreements = [
+        value_event for value_event in value_events
+        if (source_events.get(str(value_event)) or {}).get("dependency_closure")
+        != (value_records.get(str(value_event)) or {}).get("dependency_closure")
+    ]
+    if closure_disagreements:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"future Wildcard dependency closure differs from origin runs for {closure_disagreements}"],
+        )
+    return result
+
+
+def certify_chip_reservation_generation(
+    conn: sqlite3.Connection,
+    *,
+    chip_generation_id: str,
+    planning_event: int,
+    cutoff: str,
+    events: Sequence[int],
+    runs_by_event: Mapping[int, Mapping[str, int]],
+    snapshot: Mapping[str, Any] | None,
+    calibration: Mapping[str, Any] | None = None,
+    calibration_artifact_ref: str | Path | None = None,
+    require_calibration: bool = False,
+    controller: Any = None,
+    clock: Callable[[], str] | None = None,
+) -> CertifiedGeneration:
+    """Certify the origin-pinned event product used to cover chip expiry.
+
+    This product is separate from normal decisions and does not relax their
+    four-event contract. Its prefix must reuse the exact normal generation runs;
+    its remaining events are certified from the same cutoff, snapshot and
+    predictive code identity. Wildcard evaluators bind their own 6-10 event
+    windows within this product.
+    """
+
+    product_events = tuple(int(event) for event in events)
+    base = load_generation(conn, str(chip_generation_id))
+    base_report = verify_generation(conn, base.generation_id)
+    if not base_report.get("verified"):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["the normal four-event generation did not verify"])
+    if base.horizon_kind != HORIZON_KIND_FOUR_GW:
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                [f"chip-reservation product requires a FOUR_GW base, got {base.horizon_kind!r}"])
+    if int(base.planning_event) != int(planning_event):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["chip-reservation and normal products have different planning events"])
+    if product_events[:4] != tuple(int(event) for event in base.events):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["the normal four-event product is not the exact chip-reservation prefix"])
+    if product_events != tuple(range(int(planning_event), int(planning_event) + len(product_events))):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["chip-reservation events are not contiguous from the origin event"])
+    normalized_runs = {
+        int(event): {str(family): int(run_id) for family, run_id in families.items()}
+        for event, families in runs_by_event.items()
+    }
+    disagreements = [
+        f"GW{event}: reservation runs {normalized_runs.get(int(event))!r} do not reuse "
+        f"normal runs {base.runs_for(int(event))!r}"
+        for event in base.events
+        if normalized_runs.get(int(event)) != base.runs_for(int(event))
+    ]
+    if disagreements:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the first four reservation events must reuse the exact normal-generation run ids", *disagreements],
+        )
+    if str(cutoff) != str(base.cutoff):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["chip-reservation and normal products have different cutoffs"])
+    snapshot_block = _snapshot_identity_block(snapshot)
+    base_snapshot = base.manifest.get("data_snapshot") or {}
+    base_code = str(base.manifest.get("code_snapshot_sha256") or "")
+    if str(snapshot_block.get("sha256")) != str(base_snapshot.get("sha256")):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["chip-reservation product does not use the normal pinned snapshot"])
+    if not base_code or base_code != authoritative_code_identity():
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["normal predictive code identity differs from the current declared identity"])
+
+    result = certify_generation(
+        conn,
+        planning_event=int(planning_event),
+        cutoff=str(cutoff),
+        runs_by_event=runs_by_event,
+        snapshot=snapshot_block,
+        horizon_kind=HORIZON_KIND_CHIP_RESERVATION,
+        events=product_events,
+        horizon_length=len(product_events),
+        calibration=calibration,
+        calibration_artifact_ref=calibration_artifact_ref,
+        require_calibration=require_calibration,
+        controller=controller,
+        clock=clock,
+    )
+    report = verify_generation(conn, result.generation_id)
+    if not report.get("verified"):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["the new chip-reservation product failed independent verification"])
+    result_snapshot = result.manifest.get("data_snapshot") or {}
+    if (
+        str(result.cutoff) != str(base.cutoff)
+        or str(result.manifest.get("code_snapshot_sha256")) != base_code
+        or str(result_snapshot.get("sha256")) != str(base_snapshot.get("sha256"))
+    ):
+        raise GenerationRefused(DIAG_GENERATION_NOT_CERTIFIED,
+                                ["chip-reservation and normal products do not share one predictive identity"])
+    base_records = base.manifest.get("per_event") or {}
+    product_records = result.manifest.get("per_event") or {}
+    mismatched_prefix = [
+        int(event) for event in base.events
+        if (base_records.get(str(int(event))) or {}).get("dependency_closure")
+        != (product_records.get(str(int(event))) or {}).get("dependency_closure")
+    ]
+    if mismatched_prefix:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"chip-reservation prefix dependency closure differs for {mismatched_prefix}"],
+        )
+    return result
 
 
 def assert_writer_lease_held(conn: sqlite3.Connection, controller: Any) -> str:
@@ -1145,7 +1688,128 @@ def _snapshot_identity_block(snapshot: Mapping[str, Any] | None) -> dict[str, An
         "size_bytes": int(snapshot_file.stat().st_size),
         "source_db_identity": identity,
         "execution_run_uuid": execution_run_uuid,
+        **({
+            "manifest_path": str(
+                snapshot.get("manifest_path") or snapshot.get("data_snapshot_manifest")
+            )
+        } if (snapshot.get("manifest_path") or snapshot.get("data_snapshot_manifest")) else {}),
     }
+
+
+def _derive_generation_causality(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: Mapping[str, Any],
+    generation_planning_event: int,
+    generation_cutoff: str,
+) -> dict[str, Any]:
+    """Reproduce temporal evidence from the snapshot manifest and execution row."""
+
+    from . import execution_snapshot as es
+
+    execution_run_uuid = str(snapshot.get("execution_run_uuid") or "")
+    if not execution_run_uuid:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the origin snapshot has no execution UUID for causal timestamp derivation"],
+        )
+    try:
+        run = conn.execute(
+            "SELECT planning_event, planning_cutoff, started_at FROM execution_runs WHERE run_uuid=?",
+            (execution_run_uuid,),
+        ).fetchone()
+    except sqlite3.Error as failure:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"the origin execution timestamp cannot be read: {failure}"],
+        ) from failure
+    if run is None:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [f"no retained execution run binds the origin snapshot UUID {execution_run_uuid}"],
+        )
+    if run["planning_event"] is None or not run["planning_cutoff"] or not run["started_at"]:
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            ["the retained origin execution omits planning event, cutoff, or started_at"],
+        )
+    if int(run["planning_event"]) != int(generation_planning_event):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                f"the origin execution planning event {int(run['planning_event'])} differs from "
+                f"generation planning event {int(generation_planning_event)}"
+            ],
+        )
+    origin_cutoff = str(run["planning_cutoff"])
+    if origin_cutoff != str(generation_cutoff):
+        raise GenerationRefused(
+            DIAG_GENERATION_NOT_CERTIFIED,
+            [
+                f"the origin execution cutoff {origin_cutoff} differs from generation cutoff "
+                f"{generation_cutoff}"
+            ],
+        )
+    return es.derive_generation_causality(
+        snapshot_path=str(snapshot.get("path") or ""),
+        data_snapshot_sha256=str(snapshot.get("sha256") or ""),
+        data_snapshot_size_bytes=int(snapshot.get("size_bytes") or 0),
+        source_db_identity=dict(snapshot.get("source_db_identity") or {}),
+        snapshot_manifest_path=(
+            str(snapshot.get("manifest_path")) if snapshot.get("manifest_path") else None
+        ),
+        execution_run_uuid=execution_run_uuid,
+        origin_planning_event=int(run["planning_event"]),
+        origin_cutoff=origin_cutoff,
+        execution_started_at=str(run["started_at"]),
+    )
+
+
+def _generation_causality_for_manifest(
+    conn: sqlite3.Connection,
+    *,
+    snapshot: Mapping[str, Any],
+    generation_planning_event: int,
+    generation_cutoff: str,
+) -> dict[str, Any]:
+    """Persist a fail-closed temporal result even when required evidence is absent."""
+
+    from . import execution_snapshot as es
+
+    try:
+        return _derive_generation_causality(
+            conn,
+            snapshot=snapshot,
+            generation_planning_event=int(generation_planning_event),
+            generation_cutoff=str(generation_cutoff),
+        )
+    except Exception as failure:  # evidence absence is a retained UNRESOLVED result
+        detail = str(failure)
+        unresolved_paths = {
+            str(value)
+            for value in (
+                snapshot.get("path"),
+                snapshot.get("manifest_path"),
+                snapshot.get("data_snapshot_manifest"),
+                (
+                    Path(str(snapshot.get("path"))).parent / es.SNAPSHOT_MANIFEST
+                    if snapshot.get("path")
+                    else None
+                ),
+            )
+            if value
+        }
+        for path in sorted(unresolved_paths, key=len, reverse=True):
+            detail = detail.replace(path, "<retained-snapshot>")
+        return {
+            "schema": es.GENERATION_CAUSALITY_SCHEMA,
+            "origin_planning_event": None,
+            "origin_cutoff": str(generation_cutoff),
+            "execution_run_uuid": str(snapshot.get("execution_run_uuid") or ""),
+            "snapshot_sha256": str(snapshot.get("sha256") or ""),
+            "temporal_status": "UNRESOLVED",
+            "reasons": [f"UNRESOLVED: {type(failure).__name__}: {detail}"],
+        }
 
 
 def _run_identity_failures(
@@ -1465,6 +2129,32 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     generation = load_generation(conn, generation_id)
     manifest = dict(generation.manifest)
     failures: list[str] = []
+    if generation.horizon_kind not in HORIZON_KINDS:
+        failures.append(f"the generation declares unknown horizon kind {generation.horizon_kind!r}")
+    elif generation.horizon_kind == HORIZON_KIND_WILDCARD_VALUE:
+        try:
+            failures.extend(
+                _wildcard_value_horizon_problems(
+                    planning_event=int(generation.planning_event),
+                    events=generation.events,
+                    horizon_length=int(manifest.get("horizon_length") or 0),
+                    last_event=int(manifest.get("last_event") or 0),
+                )
+            )
+        except (TypeError, ValueError) as failure:
+            failures.append(f"the Wildcard value horizon declaration is malformed: {failure}")
+    elif generation.horizon_kind == HORIZON_KIND_CHIP_RESERVATION:
+        try:
+            failures.extend(
+                _chip_reservation_horizon_problems(
+                    planning_event=int(generation.planning_event),
+                    events=generation.events,
+                    horizon_length=int(manifest.get("horizon_length") or 0),
+                    last_event=int(manifest.get("last_event") or 0),
+                )
+            )
+        except (TypeError, ValueError) as failure:
+            failures.append(f"the chip-reservation horizon declaration is malformed: {failure}")
     authoritative_versions = {
         str(family): str(version) for family, version in cb.declared_required_versions().items()
     }
@@ -1488,6 +2178,39 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
         snapshot_status = "VERIFIED"
     except GenerationRefused as failure:
         raise failure
+
+    causal_evidence_reproduced: bool | None = None
+    if "search_permission_causality" in manifest:
+        causal_block = manifest.get("search_permission_causality")
+        if not isinstance(causal_block, Mapping):
+            failures.append("the retained search-permission causality block is not an object")
+        elif causal_block.get("schema") != "fpl_brain.generation_causality.v1":
+            failures.append("the retained search-permission causality block has an unknown schema")
+        elif causal_block.get("temporal_status") == "CAUSAL":
+            try:
+                reproduced_causality = _derive_generation_causality(
+                    conn,
+                    snapshot=snapshot,
+                    generation_planning_event=int(generation.planning_event),
+                    generation_cutoff=generation.cutoff,
+                )
+            except Exception as failure:
+                failures.append(
+                    "the generation's causal timestamp evidence cannot be reproduced: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+                causal_evidence_reproduced = False
+            else:
+                causal_evidence_reproduced = dict(causal_block) == reproduced_causality
+                if not causal_evidence_reproduced:
+                    failures.append(
+                        "the retained search-permission causality block differs from the "
+                        "canonical snapshot/execution timestamp derivation"
+                    )
+        elif causal_block.get("temporal_status") == "UNRESOLVED":
+            causal_evidence_reproduced = False
+        else:
+            failures.append("the retained search-permission causality status is malformed")
 
     base_bundles: dict[int, cb.CertifiedBundle] = {}
     dependency_ok = True
@@ -1761,6 +2484,7 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
         "dependency_closure_reproduced": dependency_ok,
         "snapshot_identity": snapshot_status,
         "snapshot_source_identity_reproduced": True,
+        "causal_evidence_reproduced": causal_evidence_reproduced,
         "pe8_evidence_consulted": pe8_consulted,
         "pe8_evidence_artifact_digest_verified": pe8_artifact_verified,
         "pe8_evidence_refs_reproduce": pe8_reproduced,
@@ -1963,8 +2687,11 @@ def decision_identity_of(record: Mapping[str, Any]) -> str:
     """Recompute a decision record's id from its own persisted fields."""
 
     evidence = json.loads(str(record.get("evidence_json") or "{}"))
+    record_schema = str(evidence.get("schema") or "") if isinstance(evidence, Mapping) else ""
+    if record_schema not in DECISION_RECORD_SCHEMAS:
+        raise ValueError(f"decision record declares unsupported evidence schema {record_schema!r}")
     identity = {
-        "schema": DECISION_RECORD_SCHEMA,
+        "schema": record_schema,
         "generation_id": str(record.get("generation_id")),
         "planning_event": int(record.get("planning_event")),
         "horizon_kind": str(record.get("horizon_kind")),
@@ -2058,6 +2785,38 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
             DIAG_DECISION_RECORD_INVALID,
             [f"the decision artifact {artifact_ref} does not hold a decision payload"],
         )
+
+    permission_evidence_verified: bool | None = None
+    evidence_schema = str(evidence_record.get("schema") or "")
+    if evidence_schema == DECISION_RECORD_SCHEMA:
+        provenance = payload.get("provenance") or {}
+        permission = provenance.get("search_permission_evaluation") if isinstance(provenance, Mapping) else None
+        binding = evidence_record.get("search_permission")
+        if not isinstance(permission, Mapping) or not isinstance(binding, Mapping):
+            failures.append(
+                "the new-format decision record or artifact omits required search-permission evidence"
+            )
+            permission_evidence_verified = False
+        else:
+            from . import search_permission as sp
+
+            permission_evidence_verified = sp.verify_recorded_evaluation(
+                conn,
+                generation_id=str(record["generation_id"]),
+                evaluation=permission,
+                record_binding=binding,
+            )
+            if not permission_evidence_verified:
+                failures.append(
+                    "the retained search-permission block, digest, record binding, or origin identities "
+                    "do not reproduce from the verified generation and its pinned snapshot"
+                )
+    elif evidence_schema == LEGACY_DECISION_RECORD_SCHEMA:
+        # Explicit v1 evidence keeps its historical verifier contract. Missing
+        # permission evidence in a v2 record never falls back to this path.
+        permission_evidence_verified = None
+    else:
+        failures.append(f"the decision record evidence schema {evidence_schema!r} is unsupported")
 
     result_digest = result_identity_of(payload)
     if result_digest != str(record["result_sha256"]):
@@ -2183,7 +2942,7 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
     if failures:
         raise GenerationRefused(DIAG_DECISION_RECORD_INVALID, failures)
     return {
-        "schema": DECISION_RECORD_SCHEMA,
+        "schema": evidence_schema,
         "decision_id": str(decision_id),
         "generation_id": str(record["generation_id"]),
         "planning_event": int(record["planning_event"]),
@@ -2193,6 +2952,7 @@ def verify_decision(conn: sqlite3.Connection, decision_id: str) -> dict[str, Any
         "manager_context_digest_verified": bool(manager_context_verified),
         "request_digest_verified": bool(request_verified),
         "result_digest_verified": True,
+        "search_permission_evidence_verified": permission_evidence_verified,
         "runner_identity_verified": True,
         "runner_code_identity_bound": True,
         "runner_code_identity_replay_boundary": (
@@ -3123,6 +3883,17 @@ def make_decision(
         )
     require_snapshot_retained(generation)
 
+    from . import search_permission as sp
+
+    try:
+        search_permission_evaluation = sp.require_search_permission(
+            conn, generation.generation_id
+        )
+    except sp.SearchPermissionRefused as failure:
+        raise GenerationRefused(
+            DIAG_PRODUCTION_SEARCH_PERMISSION_DENIED, failure.reasons
+        ) from failure
+
     runner_code_identity = _decision_runner_code_identity(resolved_profile)
     executor = _decision_executor(resolved_profile)
     source_conn = _open_generation_snapshot(generation)
@@ -3240,6 +4011,7 @@ def make_decision(
             "generation_manifest": dict(generation.manifest),
             "pe8_evidence": generation.manifest.get("pe8_evidence"),
             "disclosure": generation.manifest.get("disclosure"),
+            "search_permission_evaluation": search_permission_evaluation,
         },
         "decision": decision_result.get("decision"),
         "screened_actions": decision_result.get("screened_actions"),
@@ -3290,6 +4062,7 @@ def make_decision(
             "calibration_consulted": bool(
                 (generation.manifest.get("pe8_evidence") or {}).get("consulted")
             ),
+            "search_permission": sp.decision_record_binding(search_permission_evaluation),
         },
         decision_artifact_ref=artifact_ref,
     )

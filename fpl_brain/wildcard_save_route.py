@@ -293,7 +293,7 @@ def wildcard_save_route_from_canonical_route(
         world_identity=world_identity,
     )
     per_event = {
-        int(row["event"]): float(row["mean_net_core"])
+        int(row["event"]): dict(row)
         for row in (evaluation.get("per_event") or ())
     }
     for event in expected_events:
@@ -302,7 +302,7 @@ def wildcard_save_route_from_canonical_route(
                 f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} has no canonical exact-evaluation value",
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
             )
-        if not math.isfinite(per_event[int(event)]):
+        if not math.isfinite(float(per_event[int(event)].get("mean_net_core"))):
             raise WildcardSaveRouteError(
                 f"{wc.WC_SAVE_ROUTE_INVALID}: event {event} canonical mean_net_core is not finite",
                 reasons=(wc.WC_SAVE_ROUTE_INVALID,),
@@ -319,9 +319,10 @@ def wildcard_save_route_from_canonical_route(
             purchase_price_tenths=basis,
             free_transfers=ft,
             # mean_net_core ALREADY includes this event's hit; nothing is subtracted
-            mean_net_core=per_event[int(event)],
+            mean_net_core=float(per_event[int(event)]["mean_net_core"]),
             hit_points=hits,
             actions=(kind,),
+            policy=dict(per_event[int(event)].get("policy") or {}),
         )
         for event, squad, bank, basis, ft, hits, kind in validated
     ]
