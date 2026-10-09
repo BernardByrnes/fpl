@@ -1065,6 +1065,16 @@ def test_causal_finalizer_derives_and_retains_matured_outcome_from_official_ledg
         row = result["calibration_row"]
         assert row["realized_value"] == 4.0
         assert row["forecast_value"] == 10.0
+        # Preserve the gross arm observations separately from the paired net
+        # outcome label and the origin-time net forecast.
+        assert result["outcome_record"]["paired_results"]["play"]["observed_points"] == 16.0
+        assert result["outcome_record"]["paired_results"]["save"]["observed_points"] == 12.0
+        assert (
+            result["outcome_record"]["paired_results"]["play"]["observed_points"]
+            - result["outcome_record"]["paired_results"]["save"]["observed_points"]
+            == row["realized_value"]
+        )
+        assert row["realized_value"] != row["forecast_value"]
         assert result["outcome_record"]["available_at"] == "2025-01-03T00:05:00Z"
         assert result["outcome_record"]["paired_results"]["play"]["scoring_weights"] != {}
         assert result["outcome_record"]["paired_results"]["save"]["scoring_weights"] != {}
@@ -1320,6 +1330,35 @@ def test_assessment_store_retains_each_run_and_detects_tampering(tmp_path):
     target.write_text(json.dumps(changed), encoding="utf-8")
     with pytest.raises(store.ChipAssessmentStoreError, match="digest differs"):
         store.verify_assessment(target)
+
+
+def test_public_retain_refuses_malformed_run_id_before_filesystem_or_store_change(tmp_path):
+    record = store.build_assessment_record(
+        context=_context(),
+        manager_state={
+            "squad_ids": list(range(1, 16)), "bank_tenths": 70,
+            "free_transfers": 3, "event_start_free_transfers": None,
+        },
+        chip_results=_blocked_results(),
+        decision={
+            "recommended_action": cd.CHIP_ACTION_NO_CHIP,
+            "status": cd.STATUS_INSUFFICIENT_EVIDENCE,
+            "calibration_status": cd.CALIBRATION_UNCALIBRATED,
+        },
+        run_id="safe-run",
+    )
+    record["run_id"] = "../outside"
+    record.pop("record_sha256")
+    record["record_sha256"] = store._digest(record)
+    root = tmp_path / "must-not-be-created"
+    changes_before = _SYNTHETIC_STORE_CONN.total_changes
+
+    with pytest.raises(store.ChipAssessmentStoreError, match="run_id"):
+        store.retain_assessment(record, root, store_conn=_SYNTHETIC_STORE_CONN)
+
+    assert not root.exists()
+    assert list(tmp_path.iterdir()) == []
+    assert _SYNTHETIC_STORE_CONN.total_changes == changes_before
 
 
 @pytest.mark.parametrize(

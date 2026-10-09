@@ -21,6 +21,7 @@ from fpl_brain import chip_assessment, chip_assessment_store, chip_decision
 from fpl_brain import chip_reservation_calibration
 from fpl_brain import chip_evaluator_readiness
 from fpl_brain import generation_store, repositories
+from fpl_brain.sqlite_uri import readonly_sqlite_uri
 
 
 def _pinned_generation_position_resolver(conn: sqlite3.Connection):
@@ -214,7 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not args.db.is_file():
         parser.error(f"database does not exist: {args.db}")
-    uri = f"file:{args.db.resolve().as_posix()}?mode=ro"
+    uri = readonly_sqlite_uri(args.db)
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")

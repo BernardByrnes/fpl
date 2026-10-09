@@ -13,6 +13,7 @@ import json
 import sqlite3
 import tempfile
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -447,6 +448,50 @@ def test_building_without_canonical_authority_refuses_by_default(conn):
         ad.build_free_hit_request(state, _certified(), certification_path=CERT_PATH,
                                   world_cache_dir=WORLD_CACHE)
     assert caught.value.reasons[0] == ad.FH_CANONICAL_AUTHORITY_REQUIRED
+
+
+def test_public_continuation_branch_checks_permission_before_authority_construction(
+    conn, monkeypatch,
+):
+    """Mocked seam wiring: exact selected identity is checked before authority use."""
+    from fpl_brain import generation_store as gs
+    from fpl_brain import search_permission as sp
+
+    _seed(conn)
+    state = _state(conn)
+    generation = SimpleNamespace(
+        generation_id="origin-pinned-chip-reservation",
+        planning_event=EVENT,
+        cutoff=CUTOFF,
+        snapshot={"sha256": DATA},
+        horizon_kind=gs.HORIZON_KIND_CHIP_RESERVATION,
+        events=(EVENT - 1, EVENT, EVENT + 1, EVENT + 2, EVENT + 3),
+    )
+    calls = []
+    authority_calls = []
+
+    def deny(_conn, generation_id, **expected):
+        calls.append((generation_id, expected))
+        raise sp.SearchPermissionRefused(["fixture unresolved permission"])
+
+    monkeypatch.setattr(sp, "require_search_permission", deny)
+    monkeypatch.setattr(
+        ad.fh.FreeHitDecisionAuthority,
+        "from_verified_continuation_generation",
+        lambda *_args, **_kwargs: authority_calls.append("constructed"),
+    )
+    with pytest.raises(ad.FreeHitAdapterError, match="lacks canonical search permission"):
+        ad.build_free_hit_request(
+            state, _certified(), conn=conn, generation=generation,
+            certification_path=None, world_cache_dir=WORLD_CACHE,
+        )
+
+    assert calls == [(generation.generation_id, {
+        "expected_origin_planning_event": EVENT,
+        "expected_origin_cutoff": CUTOFF,
+        "expected_snapshot_sha256": DATA,
+    })]
+    assert authority_calls == []
 
 
 # ---------------------------------------------------------------------------

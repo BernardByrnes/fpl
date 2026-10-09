@@ -141,6 +141,44 @@ def test_predictive_source_identity_covers_shared_permission_implementation_byte
     assert legacy_before == legacy_after
 
 
+def test_predictive_source_identity_covers_sqlite_uri_dependency_bytes(tmp_path):
+    """The newly delegated path-selection code is part of certified identity."""
+    uri_path = "fpl_brain/sqlite_uri.py"
+    assert "fpl_brain/database.py" in analytics.SOURCE_SNAPSHOT_FILES
+    assert uri_path in analytics.SOURCE_SNAPSHOT_FILES
+    source_root = Path(__file__).resolve().parents[1]
+    for relative in analytics.SOURCE_SNAPSHOT_FILES:
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((source_root / relative).read_bytes())
+
+    before = analytics.source_snapshot_sha256(root=tmp_path)
+    uri_file = tmp_path / uri_path
+    uri_file.write_bytes(uri_file.read_bytes() + b"\n# source identity sensitivity\n")
+    after = analytics.source_snapshot_sha256(root=tmp_path)
+
+    assert after != before
+
+
+def test_verified_generation_with_incomplete_origin_history_has_no_search_permission(tmp_path):
+    """Canonical integration: structural validity alone is not search authority."""
+    conn, generation = _generation(tmp_path, completed_history_placeholder=True)
+    try:
+        report = gs.verify_generation(conn, generation.generation_id)
+        assert report["verified"] is True
+        assert report["causal_evidence_reproduced"] is True
+        with pytest.raises(sp.SearchPermissionRefused):
+            sp.require_search_permission(
+                conn,
+                generation.generation_id,
+                expected_origin_planning_event=generation.planning_event,
+                expected_origin_cutoff=generation.cutoff,
+                expected_snapshot_sha256=str(generation.snapshot["sha256"]),
+            )
+    finally:
+        conn.close()
+
+
 def test_complete_causal_history_admits_canonical_decision_and_binds_evaluation(
     tmp_path, monkeypatch
 ):

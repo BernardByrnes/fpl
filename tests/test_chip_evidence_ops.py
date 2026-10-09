@@ -1470,6 +1470,9 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
     import test_pe9_production_decision as pe9
     from fpl_brain import (
         candidate_universe as cu,
+        chip_bench_boost as bb,
+        chip_decision as cd,
+        chip_evaluator_readiness as readiness,
         chip_route_assembly as cra,
         chip_reservation_calibration as cal,
         chip_reservation_forecast as crf,
@@ -2028,6 +2031,43 @@ def test_canonical_bb_tc_origin_forecast_final_capture_and_maturation_lifecycle(
         assert matured["calibration_row"]["label_available_at"] == run_finished_at
         assert ops._parse_utc(matured["receipt"]["matured_at"], name="matured_at") >= recovery_started_at
         assert matured["calibration_row"]["realized_value"] == 0.0
+        if action == "BB":
+            # This is one real retained/matured row from the permission-bound
+            # lifecycle above. Validate it with the unpatched causal validator;
+            # one row must remain insufficient and never grant execution.
+            calibration_row = matured["calibration_row"]
+            evidence_verifier = lambda reference: ops._flat_artifact(
+                identity["evidence_root"], reference,
+            )[1]
+            verified_opportunity = cal.validate_observation(
+                calibration_row,
+                evidence_verifier=evidence_verifier,
+                store_conn=conn,
+            )
+            assert verified_opportunity.evaluator_version == bb.BENCH_BOOST_EVALUATOR_VERSION
+            readiness_artifact = readiness.build_evaluator_readiness(
+                [calibration_row],
+                action=cd.CHIP_ACTION_BB,
+                evaluator_version=bb.BENCH_BOOST_EVALUATOR_VERSION,
+                evidence_verifier=evidence_verifier,
+                store_conn=conn,
+                evaluation_cutoff=ops._utc_now(),
+            )
+            assert readiness_artifact["status"] == readiness.READINESS_INSUFFICIENT
+            assert readiness_artifact["metrics"]["matured_origins"] == 1
+            assert readiness_artifact["metrics"]["distinct_source_decisions"] == 1
+            assert readiness_artifact["rejected_observations"] == []
+            assert readiness_artifact["execution_permitted"] is False
+            readiness_verification = readiness.verify_evaluator_readiness(
+                readiness_artifact,
+                [calibration_row],
+                action=cd.CHIP_ACTION_BB,
+                evaluator_version=bb.BENCH_BOOST_EVALUATOR_VERSION,
+                evidence_verifier=evidence_verifier,
+                store_conn=conn,
+            )
+            assert readiness_verification["verified"] is True
+            assert readiness_verification["execution_permitted"] is False
         alternate_matured = ops.mature_observation(
             conn,
             **identity,

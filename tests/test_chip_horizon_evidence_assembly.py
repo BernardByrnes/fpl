@@ -110,6 +110,7 @@ def _make_verified_origin(
     chip_expiry_event=5, free_hit_expiry_event=None, free_transfers=2,
     later_paid_hit_event=None, paid_fh_play_event=None,
     historical_paid_hit_event=None, suppress_fh_play_standouts=False,
+    optimizer_union_fixture=False, fixture_metadata=None,
 ):
     """Build a real, tiny PE-9 generation/decision/route with an event-5 transfer."""
     import generation_fixtures as gf
@@ -129,9 +130,13 @@ def _make_verified_origin(
     original_prepare = gf.prepare_fixture_snapshot
     raw_root = tmp_path / "origin-raw"
     standout_mid_ids: list[int] = []
+    fixture_metadata = {} if fixture_metadata is None else fixture_metadata
+    fixture_metadata.setdefault("optimizer_union_probe_ids", ())
     expanded_fixture_inputs = any(value is not None for value in (
         later_paid_hit_event, paid_fh_play_event, historical_paid_hit_event,
     ))
+    if optimizer_union_fixture:
+        assert not expanded_fixture_inputs
     if paid_fh_play_event is not None:
         assert int(paid_fh_play_event) == 6
     if historical_paid_hit_event is not None:
@@ -195,8 +200,9 @@ def _make_verified_origin(
             repo.upsert_players(conn, synthetic_players)
             repo.insert_snapshots(conn, synthetic_snapshots, run_id)
             # Complete every supplemental match side before the accepted
-            # bootstrap pool and fixture snapshot are bound. Each side is a
-            # coherent 1-GKP / 10-outfielder simulation population.
+            # bootstrap pool and fixture snapshot are bound. Each baseline
+            # side has a coherent 1-GKP / 10-outfielder core. This separate
+            # paid-hit expansion is not used by the NO_FIXTURE union probe.
             supplemental_rosters = (
                 (11, ((1, 1), (3, 4), (4, 3))),
                 (12, ((1, 1), (2, 1), (3, 3), (4, 3))),
@@ -224,6 +230,32 @@ def _make_verified_origin(
                             standout_mid_ids.append(player_id)
             repo.upsert_players(conn, supplemental_players)
             repo.insert_snapshots(conn, supplemental_snapshots, run_id)
+        if optimizer_union_fixture:
+            # These candidates are intentionally NO_FIXTURE in every supported
+            # event. Their official identities and prices are still part of the
+            # certified pool; no fabricated player projections are inserted.
+            from fpl_brain.models import PlayerRecord, PlayerSnapshotRecord
+
+            first_probe_id = max(repo.active_player_ids(conn)) + 1
+            optimizer_union_probe_ids = tuple(range(first_probe_id, first_probe_id + 16))
+            assert len(optimizer_union_probe_ids) == 16
+            assert conn.execute("SELECT 1 FROM teams WHERE id=40").fetchone() is not None
+            repo.upsert_players(conn, [
+                PlayerRecord(
+                    id=player_id, web_name=f"U{player_id}",
+                    full_name=f"Union Probe Player {player_id}",
+                    team_id=40, element_type=3,
+                )
+                for player_id in optimizer_union_probe_ids
+            ])
+            repo.insert_snapshots(conn, [
+                PlayerSnapshotRecord(
+                    player_id=player_id, captured_at=raw_observed_at,
+                    now_cost=150, raw_json={},
+                )
+                for player_id in optimizer_union_probe_ids
+            ], run_id)
+            fixture_metadata["optimizer_union_probe_ids"] = optimizer_union_probe_ids
         element_ids = repo.active_player_ids(conn)
         repo.record_bootstrap_generation(
             conn,
@@ -602,7 +634,7 @@ def _make_verified_origin(
     db_path = tmp_path / "origin.db"
     conn, generation = pe9._four_gw_certified_manager_world(
         db_path,
-        bank=7,
+        bank=9 if optimizer_union_fixture else 7,
         free_transfers=int(free_transfers),
         event_start_free_transfers=event_start_ft,
     )
@@ -912,6 +944,7 @@ def _assert_wc_value_greedy_seed_before_world_build(
 def _archive_future_official_state(
     conn, raw_root, events, *, final_events=(), live_players_by_event=None, observed_after=None,
     observed_at_override=None, finished_at_override=None, wall_clock_base_override=None,
+    preserve_kickoff=False,
 ):
     """Create a completed, intact bootstrap/fixture source witness in the temp DB."""
     from datetime import datetime, timedelta, timezone
@@ -958,17 +991,31 @@ def _archive_future_official_state(
     future_kickoff_text = (now + timedelta(days=30)).isoformat().replace("+00:00", "Z")
     final_kickoff_text = (observed - timedelta(days=1)).isoformat().replace("+00:00", "Z")
     for event in targets:
-        final = event in final_set
+        existing_event = conn.execute(
+            "SELECT finished,data_checked FROM events WHERE id=?", (event,),
+        ).fetchone()
+        preserve_final = bool(
+            preserve_kickoff and existing_event is not None
+            and int(existing_event["finished"] or 0) == 1
+            and int(existing_event["data_checked"] or 0) == 1
+        )
+        final = event in final_set or preserve_final
         conn.execute(
             "UPDATE events SET finished=?,data_checked=?,updated_at=? WHERE id=?",
             (int(final), int(final), observed_text, event),
         )
-        conn.execute(
-            "UPDATE fixtures SET kickoff_time=?,started=?,finished=?,finished_provisional=?,updated_at=? "
-            "WHERE event=?",
-            (final_kickoff_text if final else future_kickoff_text,
-             int(final), int(final), int(final), observed_text, event),
-        )
+        if preserve_kickoff:
+            conn.execute(
+                "UPDATE fixtures SET started=?,finished=?,finished_provisional=?,updated_at=? WHERE event=?",
+                (int(final), int(final), int(final), observed_text, event),
+            )
+        else:
+            conn.execute(
+                "UPDATE fixtures SET kickoff_time=?,started=?,finished=?,finished_provisional=?,updated_at=? "
+                "WHERE event=?",
+                (final_kickoff_text if final else future_kickoff_text,
+                 int(final), int(final), int(final), observed_text, event),
+            )
     event_payload = {
         "elements": [dict(row) for row in conn.execute(
             "SELECT id,web_name FROM players ORDER BY id",
@@ -3837,6 +3884,80 @@ def test_rapid_changed_archives_get_monotonic_observations_from_normalized_manif
         conn.close()
 
 
+def _search_view_rankings_from_actual_rows(ro, rows, n):
+    """Expose and cross-check all five unchanged rankings from copied optimizer rows."""
+    from fpl_brain import candidate_universe as cu
+
+    source_criteria = {
+        "first_event_core": "TOP_FIRST_EVENT_CORE",
+        "supported_3gw_expected_core": "TOP_WINDOW_CORE",
+        "supported_3gw_expected_minutes": "TOP_MINUTES",
+        "cheapest": "TOP_CHEAP",
+        "descriptive_value": "TOP_VALUE",
+    }
+    rankings_by_position = {}
+    for position in ro.POSITIONS:
+        group = [row for row in rows.values() if row["position"] == position]
+        if not group:
+            rankings_by_position[position] = {
+                criterion: () for criterion in (
+                    "first_event_core", "supported_3gw_expected_core",
+                    "supported_3gw_expected_minutes", "cheapest", "descriptive_value",
+                )
+            }
+            continue
+        rankings = {
+            "first_event_core": sorted(
+                group,
+                key=lambda row: (
+                    -ro.first_event_core(row), int(row["current_market_price_tenths"]),
+                    int(row["player_id"]),
+                ),
+            ),
+            "supported_3gw_expected_core": sorted(
+                group,
+                key=lambda row: (
+                    -float(row["supported_3gw_expected_core"]),
+                    int(row["current_market_price_tenths"]), int(row["player_id"]),
+                ),
+            ),
+            "supported_3gw_expected_minutes": sorted(
+                group,
+                key=lambda row: (
+                    -float(row["supported_3gw_expected_minutes"]),
+                    int(row["current_market_price_tenths"]), int(row["player_id"]),
+                ),
+            ),
+            "cheapest": sorted(
+                group,
+                key=lambda row: (
+                    int(row["current_market_price_tenths"]), int(row["player_id"]),
+                ),
+            ),
+            "descriptive_value": sorted(
+                group,
+                key=lambda row: (
+                    -(
+                        row["descriptive_value"]
+                        if row["descriptive_value"] is not None else float("-inf")
+                    ),
+                    int(row["player_id"]),
+                ),
+            ),
+        }
+        rankings_by_position[position] = {
+            criterion: tuple(int(row["player_id"]) for row in ordered[:int(n)])
+            for criterion, ordered in rankings.items()
+        }
+        production_rankings = cu._search_view_rankings(group, int(n))
+        assert all(
+            rankings_by_position[position][criterion]
+            == tuple(int(row["player_id"]) for row in production_rankings[source_name])
+            for criterion, source_name in source_criteria.items()
+        )
+    return rankings_by_position
+
+
 def _optimizer_capture_union_from_actual_inputs(ro, call):
     """Mirror optimize's exact initial capture-union derivation on copied inputs."""
     import copy
@@ -3849,6 +3970,22 @@ def _optimizer_capture_union_from_actual_inputs(ro, call):
         config = ro._with_n(config, int(override))
 
     owned_ids = [int(player.player_id) for player in initial_state.players]
+    rows = {int(row["player_id"]): row for row in universe["universe"]}
+    rankings_by_position = _search_view_rankings_from_actual_rows(
+        ro, rows, int(config.search_n_per_criterion),
+    )
+    ranked_union = {
+        player_id
+        for position_rankings in rankings_by_position.values()
+        for ranking_ids in position_rankings.values()
+        for player_id in ranking_ids
+    }
+    search_view_ids = tuple(sorted(
+        int(pid) for pid in ro.search_view_ids(
+            rows, int(config.search_n_per_criterion),
+        )
+    ))
+    assert ranked_union == set(search_view_ids)
     search_pool = ro.build_search_pool(universe, owned_ids, config)
     required_routes = tuple(call.get("required_routes") or ())
     inherited_routes = tuple((call.get("nested_prior") or {}).get("promoted") or ())
@@ -3875,6 +4012,18 @@ def _optimizer_capture_union_from_actual_inputs(ro, call):
         "tail_universe_ids": tuple(sorted({
             int(row["player_id"]) for row in universe["universe"]
         })),
+        "position_counts": {
+            position: sum(row["position"] == position for row in rows.values())
+            for position in ro.POSITIONS
+        },
+        "position_player_ids": {
+            position: tuple(sorted(
+                pid for pid, row in rows.items() if row["position"] == position
+            ))
+            for position in ro.POSITIONS
+        },
+        "search_view_ids": search_view_ids,
+        "rankings_by_position": rankings_by_position,
         "search_pool_ids": tuple(int(pid) for pid in search_pool["pool_ids"]),
         "required_route_player_ids": tuple(required_player_ids),
         "inherited_route_player_ids": tuple(inherited_player_ids),
@@ -3884,52 +4033,143 @@ def _optimizer_capture_union_from_actual_inputs(ro, call):
 
 def _prepare_public_fh_optimizer_capture_caches(
     conn, *, generation, decision_id, route_id, continuation, coverage, cache_dir,
-    prewarmed_caches, monkeypatch,
+    prewarmed_caches, monkeypatch, target_events=(5,), expiry_event=5,
+    optimizer_union_probe_ids=(),
 ):
-    """Probe exact PLAY optimizer inputs, then build only their certified caches."""
+    """Probe exact PLAY inputs and materialize each unique certified cache once."""
     from pathlib import Path
     from fpl_brain import chip_horizon_evidence_assembly as assembly
     from fpl_brain import route_optimizer as ro
+    from fpl_brain import monte_carlo
 
-    events = (6, 7, 8)
-    full_pool_matrix = prewarmed_caches[((5, 6, 7, 8), 6)][0]
-    full_pool_ids = tuple(sorted(int(pid) for pid in full_pool_matrix["player_ids"]))
+    targets = tuple(int(event) for event in target_events)
+    optimizer_union_probe_ids = tuple(sorted({int(pid) for pid in optimizer_union_probe_ids}))
+    assert targets and targets == tuple(range(targets[0], int(expiry_event) + 1))
+    events_by_target = {target: tuple(range(target + 1, target + 4)) for target in targets}
+    windows_by_target = {target: tuple(range(target, target + 4)) for target in targets}
+    # Preserve the original default lookup: the full-pool event matrix is the
+    # first PLAY-tail event, target + 1, not the opportunity event itself.
+    full_pool_ids_by_target = {
+        target: tuple(sorted(int(pid) for pid in prewarmed_caches[(windows_by_target[target], target + 1)][0]["player_ids"]))
+        for target in targets
+    }
     captured = {}
     probe_cache_calls = []
+    capture_phase_by_target = {target: "BEFORE_COMPOSER_CALL" for target in targets}
+    capture_failure_by_target = {}
     original_optimize = ro.optimize
     original_builder = ro.build_event_worlds
     db_changes_before = conn.total_changes
 
     def observe_optimizer(**kwargs):
-        assert not captured, "the canonical PLAY setup probe invoked optimize more than once"
-        assert kwargs.get("allow_world_materialization") is False
-        assert type(kwargs.get("allow_world_materialization")) is bool
-        derived = _optimizer_capture_union_from_actual_inputs(ro, kwargs)
-        config = derived["config"]
-        generation_arg = kwargs["generation"]
-        assert str(generation_arg.generation_id) == str(continuation.generation_id)
-        assert tuple(int(event) for event in config.events) == events
-        assert int(config.search_draws) == 2
-        assert int(config.seed) == 62026
-        assert kwargs.get("search_n_override") is None
-        assert derived["union_ids"] != full_pool_ids, (
-            "fixture must distinguish the optimizer's canonical capture union from its "
-            "prewarmed full eligible-pool context cache"
-        )
-        captured.update({
-            **derived,
-            "generation_id": str(generation_arg.generation_id),
-            "runs_by_event": {
-                event: dict(generation_arg.runs_for(event)) for event in events
-            },
-            "allow_world_materialization": kwargs["allow_world_materialization"],
-        })
+        events = tuple(int(event) for event in kwargs["config"].events)
+        target = next(target for target in targets if events == events_by_target[target])
+        capture_phase_by_target[target] = "BEFORE_INPUT_CAPTURE"
+        try:
+            assert kwargs.get("allow_world_materialization") is False
+            assert type(kwargs.get("allow_world_materialization")) is bool
+            derived = _optimizer_capture_union_from_actual_inputs(ro, kwargs)
+            config = derived["config"]
+            generation_arg = kwargs["generation"]
+            assert str(generation_arg.generation_id) == str(continuation.generation_id)
+            assert int(config.search_draws) == 2
+            assert int(config.seed) == 62026
+            assert kwargs.get("search_n_override") is None
+            full_pool_ids = set(full_pool_ids_by_target[target])
+            assert set(derived["union_ids"]) != full_pool_ids, (
+                "fixture must distinguish the optimizer's canonical capture union from its "
+                "prewarmed full eligible-pool context cache"
+            )
+            if optimizer_union_probe_ids:
+                rows = {int(row["player_id"]): row for row in kwargs["universe"]["universe"]}
+                probe_ids = set(optimizer_union_probe_ids)
+                eligible_ids = set(rows)
+                assert len(probe_ids) == 16
+                assert full_pool_ids == eligible_ids
+                assert len(eligible_ids) == 34
+                assert derived["position_counts"] == {
+                    "GKP": 2, "DEF": 8, "MID": 21, "FWD": 3,
+                }
+                assert set(derived["initial_state_ids"]).issubset(eligible_ids)
+                assert not (set(derived["initial_state_ids"]) & probe_ids)
+                assert not any(
+                    probe_ids & set(player_ids)
+                    for player_ids in (
+                        *derived["required_route_player_ids"],
+                        *derived["inherited_route_player_ids"],
+                    )
+                )
+                assert probe_ids.issubset(eligible_ids)
+                assert all(
+                    rows[pid]["position"] == "MID"
+                    and int(rows[pid]["club_id"]) == 40
+                    and int(rows[pid]["current_market_price_tenths"]) == 150
+                    and float(rows[pid]["supported_3gw_expected_core"]) == 0.0
+                    and float(rows[pid]["supported_3gw_expected_minutes"]) == 0.0
+                    and float(rows[pid]["descriptive_value"]) == 0.0
+                    and all(
+                        feature.status == "NO_FIXTURE"
+                        and float(feature.expected_core) == 0.0
+                        and float(feature.expected_minutes) == 0.0
+                        for feature in rows[pid]["events"]
+                    )
+                    for pid in probe_ids
+                )
+                assert not any(
+                    edge["currently_legal_single_transfer"]
+                    and int(edge["in_player_id"]) in probe_ids
+                    for edge in (kwargs["universe"].get("replacement_edges") or [])
+                )
+                all_mid_ids = {
+                    pid for pid, row in rows.items() if row["position"] == "MID"
+                }
+                omitted_by_criterion = {}
+                for criterion, ranked_ids in derived["rankings_by_position"]["MID"].items():
+                    assert len(ranked_ids) == 20
+                    omitted_by_criterion[criterion] = all_mid_ids - set(ranked_ids)
+                assert len(omitted_by_criterion) == 5
+                omitted_sets = tuple(omitted_by_criterion.values())
+                assert all(len(omitted) == 1 for omitted in omitted_sets)
+                assert all(omitted == omitted_sets[0] for omitted in omitted_sets)
+                omitted_probe_ids = omitted_sets[0]
+                assert omitted_probe_ids.issubset(probe_ids)
+                assert set(derived["search_view_ids"]) == eligible_ids - omitted_probe_ids
+                assert set(derived["search_pool_ids"]) == eligible_ids - omitted_probe_ids
+                assert set(derived["union_ids"]) == eligible_ids - omitted_probe_ids
+            assert target not in captured
+            captured[target] = {
+                **derived,
+                "target_event": target,
+                "config_events": events,
+                "generation_id": str(generation_arg.generation_id),
+                "runs_by_event": {
+                    event: dict(generation_arg.runs_for(event)) for event in events
+                },
+                "allow_world_materialization": kwargs["allow_world_materialization"],
+            }
+            capture_phase_by_target[target] = "AFTER_INPUT_CAPTURE_BEFORE_CACHE_ONLY_OPTIMIZER"
+        except BaseException as failure:
+            capture_phase_by_target[target] = "INPUT_CAPTURE_FAILED_BEFORE_ASSIGNMENT"
+            capture_failure_by_target[target] = {
+                "type": f"{type(failure).__module__}.{type(failure).__qualname__}",
+                "text": str(failure),
+            }
+            raise
         # Pass every original input through unchanged. This cache-only probe is
         # expected to refuse at its first absent exact optimizer cache.
-        return original_optimize(**kwargs)
+        try:
+            return original_optimize(**kwargs)
+        except BaseException as failure:
+            capture_phase_by_target[target] = "CACHE_ONLY_OPTIMIZER_RAISED_AFTER_INPUT_CAPTURE"
+            capture_failure_by_target[target] = {
+                "type": f"{type(failure).__module__}.{type(failure).__qualname__}",
+                "text": str(failure),
+            }
+            raise
 
     def observe_builder(conn_arg, generation_arg, event_arg, union_arg, config_arg, **kwargs):
-        if tuple(int(event) for event in config_arg.events) == events:
+        config_events = tuple(int(event) for event in config_arg.events)
+        if config_events in tuple(events_by_target.values()):
             event = int(event_arg)
             key = ro.world_cache_key(
                 event=event,
@@ -3951,91 +4191,244 @@ def _prepare_public_fh_optimizer_capture_caches(
 
     monkeypatch.setattr(ro, "optimize", observe_optimizer)
     monkeypatch.setattr(ro, "build_event_worlds", observe_builder)
-    probe_failure = None
+    probe_failures = {}
     try:
-        assembly.build_future_free_hit_request(
-            conn,
-            decision_id=decision_id,
-            generation_id=generation.generation_id,
-            route_id=route_id,
-            entry_id=241392,
-            origin_cutoff=generation.cutoff,
-            data_snapshot_sha256=str(generation.snapshot["sha256"]),
-            target_event=5,
-            season="2026/27",
-            continuation_generation_id=continuation.generation_id,
-            cache_dir=cache_dir,
-            expiry_event=5,
-            coverage_product=coverage,
-        )
-    except assembly.FutureStateAssemblyError as failure:
-        probe_failure = str(failure)
+        for target in targets:
+            capture_phase_by_target[target] = "BEFORE_COMPOSER_CALL"
+            try:
+                assembly.build_future_free_hit_request(
+                    conn, decision_id=decision_id,
+                    generation_id=generation.generation_id, route_id=route_id,
+                    entry_id=241392, origin_cutoff=generation.cutoff,
+                    data_snapshot_sha256=str(generation.snapshot["sha256"]),
+                    target_event=target, season="2026/27",
+                    continuation_generation_id=continuation.generation_id,
+                    cache_dir=cache_dir, expiry_event=expiry_event,
+                    coverage_product=coverage,
+                )
+            except assembly.FutureStateAssemblyError as failure:
+                probe_failures[target] = str(failure)
+                detail = {
+                    "target_event": target,
+                    "phase": capture_phase_by_target[target],
+                    "type": f"{type(failure).__module__}.{type(failure).__qualname__}",
+                    "text": str(failure),
+                }
+                capture_failure_by_target.setdefault(target, detail)
+                if hasattr(failure, "add_note"):
+                    failure.add_note("optimizer capture diagnostic: " + json.dumps(detail, sort_keys=True))
+            except BaseException as failure:
+                detail = {
+                    "target_event": target,
+                    "phase": capture_phase_by_target[target],
+                    "type": f"{type(failure).__module__}.{type(failure).__qualname__}",
+                    "text": str(failure),
+                }
+                if hasattr(failure, "add_note"):
+                    failure.add_note("optimizer capture diagnostic: " + json.dumps(detail, sort_keys=True))
+                raise
     finally:
         # The following certified cache construction is outside every
         # composer/optimizer invocation and outside the observation wrappers.
         monkeypatch.setattr(ro, "optimize", original_optimize)
         monkeypatch.setattr(ro, "build_event_worlds", original_builder)
 
-    assert probe_failure is not None, "expected the cache-only setup probe to refuse"
-    assert len(captured) > 0
-    assert len(probe_cache_calls) == 1
-    assert probe_cache_calls[0]["event"] == events[0]
-    assert probe_cache_calls[0]["allow_materialization"] is False
-    assert probe_cache_calls[0]["generation_id"] == str(continuation.generation_id)
-    assert probe_cache_calls[0]["union_ids"] == captured["union_ids"]
-    assert probe_cache_calls[0]["config_events"] == events
-    assert probe_cache_calls[0]["cache_dir"] == str(Path(cache_dir).resolve())
+    if set(probe_failures) != set(targets) or set(captured) != set(targets):
+        diagnostics = {
+            target: {
+                "input_captured": target in captured,
+                "phase": capture_phase_by_target.get(target),
+                "failure": capture_failure_by_target.get(target),
+            }
+            for target in targets
+        }
+        raise AssertionError(
+            "optimizer input capture did not reach the expected cache-only boundary: "
+            + json.dumps(diagnostics, sort_keys=True)
+        )
+    assert set(probe_failures) == set(targets)
+    assert set(captured) == set(targets)
+    assert len(probe_cache_calls) == len(targets)
+    assert [row["config_events"] for row in probe_cache_calls] == [events_by_target[target] for target in targets]
+    assert all(
+        row["union_ids"] == captured[target]["union_ids"]
+        for row, target in zip(probe_cache_calls, targets)
+    )
+    assert all(row["allow_materialization"] is False for row in probe_cache_calls)
+    assert all(row["generation_id"] == str(continuation.generation_id) for row in probe_cache_calls)
+    assert all(row["cache_dir"] == str(Path(cache_dir).resolve()) for row in probe_cache_calls)
+    assert [row["event"] for row in probe_cache_calls] == [events_by_target[target][0] for target in targets]
+    assert all(
+        row["union_ids"] == captured[target]["union_ids"]
+        for row, target in zip(probe_cache_calls, targets)
+    )
     assert conn.total_changes == db_changes_before
 
-    config = captured["config"]
-    union_ids = captured["union_ids"]
     cache_root = Path(cache_dir).expanduser().resolve()
-    cache_keys = {}
-    for event in events:
-        assert dict(continuation.runs_for(event)) == captured["runs_by_event"][event]
-        cache_keys[event] = ro.world_cache_key(
-            event=event,
-            generation_id=continuation.generation_id,
-            runs=continuation.runs_for(event),
-            config=config,
-            union_ids=union_ids,
-        )
-    assert "CERTIFIED_WORLD_CACHE_REQUIRED" in probe_failure
-    assert "MISS_ABSENT" in probe_failure
-    assert cache_keys[events[0]] in probe_failure
-    assert not (cache_root / f"{cache_keys[events[0]]}.json").exists()
+    cache_keys_by_target = {}
+    cache_semantic_bindings_by_target = {}
+    cache_references_by_key = {}
 
-    # Build only the exact optimizer capture union, directly from the certified
-    # generation. No composer/optimizer call or altered production flag is used.
-    for event in events:
-        cache_path = cache_root / f"{cache_keys[event]}.json"
+    def optimizer_cache_semantic_binding(event, generation_id, runs, config, union_ids):
+        return {
+            "event": int(event),
+            "generation_id": str(generation_id),
+            "runs_by_event": tuple(sorted(
+                (str(name), int(run_id)) for name, run_id in dict(runs).items()
+            )),
+            "union_ids": tuple(sorted(int(pid) for pid in union_ids)),
+            "search_draws": int(config.search_draws),
+            "seed": int(config.seed),
+            "monte_carlo_model": str(monte_carlo.MONTE_CARLO_MODEL_VERSION),
+            "cache_schema": str(ro.CACHE_SCHEMA_VERSION),
+            "expected_bonus": True,
+            "role_actionability": True,
+        }
+
+    for target in targets:
+        events = events_by_target[target]
+        target_capture = captured[target]
+        config = target_capture["config"]
+        union_ids = target_capture["union_ids"]
+        cache_keys = {}
+        semantic_bindings = {}
+        for event in events:
+            assert dict(continuation.runs_for(event)) == target_capture["runs_by_event"][event]
+            key = ro.world_cache_key(
+                event=event, generation_id=continuation.generation_id,
+                runs=continuation.runs_for(event), config=config, union_ids=union_ids,
+            )
+            binding = optimizer_cache_semantic_binding(
+                event, continuation.generation_id, continuation.runs_for(event),
+                config, union_ids,
+            )
+            assert all(reference["semantic_binding"] == binding
+                       for reference in cache_references_by_key.get(key, ())), (
+                "one certified cache key mapped to different event/generation/run/union/draw/seed/model semantics"
+            )
+            cache_keys[event] = key
+            semantic_bindings[event] = binding
+            cache_references_by_key.setdefault(key, []).append({
+                "target_event": target, "event": event, "semantic_binding": binding,
+            })
+        cache_keys_by_target[target] = cache_keys
+        cache_semantic_bindings_by_target[target] = semantic_bindings
+
+        failure = probe_failures[target]
+        assert "CERTIFIED_WORLD_CACHE_REQUIRED" in failure and "MISS_ABSENT" in failure
+        assert cache_keys[events[0]] in failure
+        assert not (cache_root / f"{cache_keys[events[0]]}.json").exists()
+
+    # Prove every unique optimizer entry absent before any materialization.
+    for key in cache_references_by_key:
+        assert not (cache_root / f"{key}.json").exists()
+
+    # Build each certified identity once; shared references must read the same
+    # content-verified hit and match the complete production-key semantics.
+    cache_build_counts_by_key = {key: 0 for key in cache_references_by_key}
+    cache_materialization_by_key = {}
+    cache_reuse_observations_by_target = {target: [] for target in targets}
+    for key, references in cache_references_by_key.items():
+        owner = references[0]
+        owner_target = owner["target_event"]
+        event = owner["event"]
+        owner_capture = captured[owner_target]
+        config = owner_capture["config"]
+        union_ids = owner_capture["union_ids"]
+        binding = owner["semantic_binding"]
+        assert dict(continuation.runs_for(event)) == owner_capture["runs_by_event"][event]
+        cache_path = cache_root / f"{key}.json"
         assert not cache_path.exists()
         matrix, build_info = ro.build_event_worlds(
             conn, continuation, event, union_ids, config,
             cache_dir=cache_root, allow_materialization=True,
         )
-        assert str(build_info["key"]) == cache_keys[event]
+        cache_build_counts_by_key[key] += 1
+        assert cache_build_counts_by_key[key] == 1
+        assert str(build_info["key"]) == key
         assert str(build_info["generation_id"]) == str(continuation.generation_id)
-        assert str(matrix.get(ro.MANAGER_MATRIX_IDENTITY_KEY) or "") == cache_keys[event]
+        assert str(matrix.get(ro.MANAGER_MATRIX_IDENTITY_KEY) or "") == key
         assert tuple(sorted(int(pid) for pid in matrix["player_ids"])) == union_ids
-        loaded, read_info = ro.read_world_cache_entry(cache_path)
-        assert loaded is not None
-        assert read_info["cache"]["status"] == ro.CACHE_HIT
-        assert tuple(sorted(int(pid) for pid in loaded["player_ids"])) == union_ids
+        built_content_digest = ro.world_matrix_content_identity(matrix)
+        assert built_content_digest
 
+        for reference_index, reference in enumerate(references):
+            target = reference["target_event"]
+            reference_event = reference["event"]
+            target_capture = captured[target]
+            reference_config = target_capture["config"]
+            reference_union = target_capture["union_ids"]
+            reference_binding = cache_semantic_bindings_by_target[target][reference_event]
+            assert reference_binding == reference["semantic_binding"] == binding
+            assert dict(continuation.runs_for(reference_event)) == target_capture["runs_by_event"][reference_event]
+            actual_binding = optimizer_cache_semantic_binding(
+                reference_event, continuation.generation_id,
+                continuation.runs_for(reference_event), reference_config, reference_union,
+            )
+            assert actual_binding == binding
+            reference_key = ro.world_cache_key(
+                event=reference_event, generation_id=continuation.generation_id,
+                runs=continuation.runs_for(reference_event),
+                config=reference_config, union_ids=reference_union,
+            )
+            assert reference_key == key
+            assert cache_keys_by_target[target][reference_event] == key
+            assert cache_path.name == f"{key}.json"
+
+            loaded, read_info = ro.read_world_cache_entry(cache_path)
+            assert loaded is not None and read_info["cache"]["status"] == ro.CACHE_HIT
+            assert tuple(sorted(int(pid) for pid in loaded["player_ids"])) == tuple(binding["union_ids"])
+            loaded_content_digest = ro.world_matrix_content_identity(loaded)
+            assert str(loaded_content_digest) == str(built_content_digest)
+            assert str(read_info["cache"]["content_digest"]) == str(built_content_digest)
+            ro._stamp_matrix_identity(loaded, key)
+            assert str(loaded.get(ro.MANAGER_MATRIX_IDENTITY_KEY) or "") == key
+            if reference_index:
+                cache_reuse_observations_by_target[target].append({
+                    "event": reference_event, "key": key,
+                    "generation_id": binding["generation_id"],
+                    "runs_by_event": binding["runs_by_event"],
+                    "union_ids": binding["union_ids"],
+                    "search_draws": binding["search_draws"], "seed": binding["seed"],
+                    "monte_carlo_model": binding["monte_carlo_model"],
+                    "cache_status": str(read_info["cache"]["status"]),
+                    "matrix_identity": str(loaded.get(ro.MANAGER_MATRIX_IDENTITY_KEY)),
+                    "content_digest": str(loaded_content_digest),
+                })
+
+        cache_materialization_by_key[key] = {
+            "key": key, "build_count": cache_build_counts_by_key[key],
+            "reference_count": len(references), "build_owner_target": owner_target,
+            "build_owner_event": event, "semantic_binding": binding,
+            "content_digest": str(built_content_digest),
+            "references": [{"target_event": item["target_event"], "event": item["event"]}
+                           for item in references],
+        }
+
+    assert all(count == 1 for count in cache_build_counts_by_key.values())
+    cache_build_count = sum(cache_build_counts_by_key.values())
+    cache_reference_count = sum(len(references) for references in cache_references_by_key.values())
+    cache_reuse_count = sum(len(references) - 1 for references in cache_references_by_key.values())
+    assert cache_build_count == len(cache_references_by_key)
+    assert cache_reference_count == sum(len(events_by_target[target]) for target in targets)
     later_cache_calls = []
     later_matrix_observations = []
 
     def verify_later_cache_identity(conn_arg, generation_arg, event_arg, union_arg, config_arg, **kwargs):
-        if tuple(int(event) for event in config_arg.events) == events:
+        config_events = tuple(int(event) for event in config_arg.events)
+        if config_events in tuple(events_by_target.values()):
+            target = next(target for target in targets if config_events == events_by_target[target])
+            target_capture = captured[target]
+            events = events_by_target[target]
             event = int(event_arg)
             assert event in events
             assert type(kwargs.get("allow_materialization")) is bool
             assert kwargs["allow_materialization"] is False
             assert str(generation_arg.generation_id) == str(continuation.generation_id)
             actual_union = tuple(sorted(int(pid) for pid in union_arg))
+            union_ids = target_capture["union_ids"]
             assert actual_union == union_ids
-            assert dict(generation_arg.runs_for(event)) == captured["runs_by_event"][event]
+            assert dict(generation_arg.runs_for(event)) == target_capture["runs_by_event"][event]
             assert Path(kwargs["cache_dir"]).expanduser().resolve() == cache_root
             actual_key = ro.world_cache_key(
                 event=event,
@@ -4044,12 +4437,16 @@ def _prepare_public_fh_optimizer_capture_caches(
                 config=config_arg,
                 union_ids=actual_union,
             )
-            assert actual_key == cache_keys[event]
+            assert actual_key == cache_keys_by_target[target][event]
             later_cache_calls.append({
                 "event": event, "union_ids": actual_union, "key": actual_key,
+                "allow_materialization": kwargs["allow_materialization"],
+                "target_event": target,
             })
         loaded = original_builder(conn_arg, generation_arg, event_arg, union_arg, config_arg, **kwargs)
-        if tuple(int(value) for value in config_arg.events) == events:
+        config_events = tuple(int(value) for value in config_arg.events)
+        if config_events in tuple(events_by_target.values()):
+            target = next(target for target in targets if config_events == events_by_target[target])
             later_matrix_observations.append({
                 "event": int(event_arg),
                 "generation_id": str(generation_arg.generation_id),
@@ -4057,36 +4454,91 @@ def _prepare_public_fh_optimizer_capture_caches(
                 "config_events": tuple(int(value) for value in config_arg.events),
                 "allow_materialization": kwargs.get("allow_materialization"),
                 "cache_dir": str(Path(kwargs["cache_dir"]).expanduser().resolve()),
-                "key": later_cache_calls[-1]["key"],
+                "key": later_cache_calls[-1]["key"], "target_event": target,
                 "matrix": loaded[0],
                 "evidence": loaded[1],
             })
         return loaded
 
     monkeypatch.setattr(ro, "build_event_worlds", verify_later_cache_identity)
+    legacy_first_capture = {
+        key: value for key, value in captured[targets[0]].items()
+        if key not in {"target_event", "config_events"}
+    }
     return {
-        "play_optimizer_union_ids": union_ids,
-        "play_optimizer_config_events": tuple(int(event) for event in config.events),
-        "play_optimizer_cache_keys": cache_keys,
-        "play_optimizer_runs_by_event": captured["runs_by_event"],
+        "play_optimizer_union_ids": captured[targets[0]]["union_ids"],
+        "play_optimizer_unions_by_target": {target: captured[target]["union_ids"] for target in targets},
+        "play_optimizer_config_events": events_by_target[targets[0]],
+        "play_optimizer_configs_by_target": events_by_target,
+        "play_optimizer_full_pool_ids_by_target": full_pool_ids_by_target,
+        "play_optimizer_pool_counts_by_target": {
+            target: captured[target]["position_counts"] for target in targets
+        },
+        "play_optimizer_position_ids_by_target": {
+            target: captured[target]["position_player_ids"] for target in targets
+        },
+        "play_optimizer_owned_ids_by_target": {
+            target: captured[target]["initial_state_ids"] for target in targets
+        },
+        "play_optimizer_required_route_ids_by_target": {
+            target: captured[target]["required_route_player_ids"] for target in targets
+        },
+        "play_optimizer_inherited_route_ids_by_target": {
+            target: captured[target]["inherited_route_player_ids"] for target in targets
+        },
+        "play_optimizer_search_view_ids_by_target": {
+            target: captured[target]["search_view_ids"] for target in targets
+        },
+        "play_optimizer_search_pool_ids_by_target": {
+            target: captured[target]["search_pool_ids"] for target in targets
+        },
+        "play_optimizer_rankings_by_target": {
+            target: captured[target]["rankings_by_position"] for target in targets
+        },
+        "play_optimizer_eligible_pool_ids_by_target": {
+            target: captured[target]["tail_universe_ids"] for target in targets
+        },
+        "play_optimizer_omitted_ids_by_target": {
+            target: tuple(sorted(set(full_pool_ids_by_target[target]) - set(captured[target]["union_ids"])))
+            for target in targets
+        },
+        "optimizer_union_probe_ids": tuple(sorted(optimizer_union_probe_ids)),
+        "play_optimizer_cache_keys": cache_keys_by_target[targets[0]],
+        "play_optimizer_cache_keys_by_target": cache_keys_by_target,
+        "play_optimizer_cache_semantic_bindings_by_target": cache_semantic_bindings_by_target,
+        "play_optimizer_cache_build_count": cache_build_count,
+        "play_optimizer_cache_reference_count": cache_reference_count,
+        "play_optimizer_cache_reuse_count": cache_reuse_count,
+        "play_optimizer_cache_build_counts_by_key": cache_build_counts_by_key,
+        "play_optimizer_cache_materialization_by_key": cache_materialization_by_key,
+        "play_optimizer_cache_reuse_observations_by_target": cache_reuse_observations_by_target,
+        "play_optimizer_runs_by_event": captured[targets[0]]["runs_by_event"],
         "play_optimizer_setup_probe": {
-            "captured_inputs": captured,
-            "wrapped_failure": probe_failure,
+            # Keep exact legacy single-target fields and add explicit maps for
+            # multi-opportunity callers.
+            "captured_inputs": legacy_first_capture,
+            "wrapped_failure": probe_failures[targets[0]],
+            "captured_inputs_by_target": captured,
+            "wrapped_failures_by_target": probe_failures,
             "cache_calls": probe_cache_calls,
             "cache_materialization_basis": "the existing helper restores both wrappers before its direct certified prewarm loop",
+            "capture_phase_by_target": dict(capture_phase_by_target),
+            "capture_failure_by_target": dict(capture_failure_by_target),
         },
         "play_cache_loader_calls": later_cache_calls,
         "play_cache_matrix_observations": later_matrix_observations,
-        "play_optimizer_tail_universe_ids": captured["tail_universe_ids"],
-        "play_optimizer_search_pool_ids": captured["search_pool_ids"],
-        "play_optimizer_initial_state_ids": captured["initial_state_ids"],
-        "play_optimizer_required_route_player_ids": captured["required_route_player_ids"],
-        "play_optimizer_inherited_route_player_ids": captured["inherited_route_player_ids"],
+        "play_optimizer_tail_universe_ids": captured[targets[0]]["tail_universe_ids"],
+        "play_optimizer_search_pool_ids": captured[targets[0]]["search_pool_ids"],
+        "play_optimizer_initial_state_ids": captured[targets[0]]["initial_state_ids"],
+        "play_optimizer_required_route_player_ids": captured[targets[0]]["required_route_player_ids"],
+        "play_optimizer_inherited_route_player_ids": captured[targets[0]]["inherited_route_player_ids"],
     }
 
 def _prepare_public_fh_hit_gate_case(
     tmp_path, monkeypatch, *, later_paid_hit_event=None, paid_fh_play_event=None,
     historical_paid_hit_event=None, suppress_fh_play_standouts=False,
+    expiry_event=5, event_start_ft=0, free_transfers=0,
+    optimizer_union_fixture=False,
 ):
     import generation_fixtures as gf
     from datetime import datetime, timedelta, timezone
@@ -4096,13 +4548,22 @@ def _prepare_public_fh_hit_gate_case(
     from fpl_brain import chip_reservation_forecast as crf, chip_route_assembly as cra
     from fpl_brain import execution, generation_store as gs
 
+    fixture_metadata = {}
     conn, generation, decision_id, route_id = _make_verified_origin(
-        tmp_path, monkeypatch, event_start_ft=0, free_transfers=0,
-        extended_events=(8, 9, 10, 11), chip_expiry_event=5, free_hit_expiry_event=5,
+        tmp_path, monkeypatch, event_start_ft=event_start_ft, free_transfers=free_transfers,
+        extended_events=(8, 9, 10, 11), chip_expiry_event=expiry_event,
+        free_hit_expiry_event=expiry_event,
         later_paid_hit_event=later_paid_hit_event, paid_fh_play_event=paid_fh_play_event,
         historical_paid_hit_event=historical_paid_hit_event,
         suppress_fh_play_standouts=suppress_fh_play_standouts,
+        optimizer_union_fixture=optimizer_union_fixture,
+        fixture_metadata=fixture_metadata,
     )
+    optimizer_union_probe_ids = tuple(
+        int(pid) for pid in fixture_metadata.get("optimizer_union_probe_ids", ())
+    )
+    if not optimizer_union_fixture:
+        assert optimizer_union_probe_ids == ()
     try:
         route = cra.load_verified_normal_route(
             conn, decision_id, route_id=route_id, require_recommended=False,
@@ -4138,12 +4599,15 @@ def _prepare_public_fh_hit_gate_case(
         coverage = crf.build_reservation_coverage_product(
             conn, action=cd.CHIP_ACTION_FH,
             source_identity=assembly._source_identity(route, generation),
-            expiry_event=5, product_generation_id=continuation.generation_id,
+            expiry_event=expiry_event, product_generation_id=continuation.generation_id,
         )
+        target_events = tuple(range(5, int(expiry_event) + 1))
+        scoring_windows = tuple(tuple(range(target, target + 4)) for target in target_events)
+        context_events = tuple(sorted({event for window in scoring_windows for event in window}))
         cache_dir = tmp_path / "fh-world-cache"
         prewarmed_caches = _materialize_synthetic_fixture_caches(
             conn, continuation, decision_id, cache_dir,
-            events=(5, 6, 7, 8), windows=((5, 6, 7, 8),),
+            events=context_events, windows=scoring_windows,
         )
         optimizer_cache = _prepare_public_fh_optimizer_capture_caches(
             conn,
@@ -4155,9 +4619,11 @@ def _prepare_public_fh_hit_gate_case(
             cache_dir=cache_dir,
             prewarmed_caches=prewarmed_caches,
             monkeypatch=monkeypatch,
+            target_events=target_events, expiry_event=expiry_event,
+            optimizer_union_probe_ids=tuple(sorted(optimizer_union_probe_ids)),
         )
         raw_root = tmp_path / "origin-raw"
-        _archive_future_official_state(conn, raw_root, (5, 6, 7, 8))
+        _archive_future_official_state(conn, raw_root, context_events)
         evidence_root = tmp_path / "fh-evidence"
         identity = evidence_ops._required_identity(
             db_path=tmp_path / "origin.db", entry_id=241392,
@@ -4177,11 +4643,271 @@ def _prepare_public_fh_hit_gate_case(
             "coverage": coverage, "cache_dir": cache_dir,
             "raw_root": raw_root, "evidence_root": evidence_root,
             "identity": identity,
+            "expiry_event": int(expiry_event),
+            "target_events": target_events,
+            "scoring_windows": scoring_windows,
+            "context_events": context_events,
+            "optimizer_union_probe_ids": tuple(sorted(optimizer_union_probe_ids)),
             **optimizer_cache,
         }
     except BaseException:
         conn.close()
         raise
+
+
+def test_public_fh_two_opportunity_forecast_replays_both_zero_hit_windows_before_retention(
+    tmp_path, monkeypatch,
+):
+    from fpl_brain import chip_horizon_evidence_assembly as assembly
+    from fpl_brain import chip_evidence_ops as evidence_ops
+    from fpl_brain import chip_horizon_evidence_ops as horizon_ops
+    from fpl_brain import chip_reservation_calibration as calibration
+    from fpl_brain import monte_carlo
+
+    context = _prepare_public_fh_hit_gate_case(
+        tmp_path, monkeypatch, expiry_event=6, event_start_ft=2, free_transfers=2,
+        optimizer_union_fixture=True,
+    )
+    conn = context["conn"]
+    try:
+        assert context["target_events"] == (5, 6)
+        assert context["scoring_windows"] == ((5, 6, 7, 8), (6, 7, 8, 9))
+        assert context["context_events"] == (5, 6, 7, 8, 9)
+        built = {}
+        original_composer = assembly.build_future_free_hit_request
+
+        def observe_real_composer(conn_arg, **kwargs):
+            request, report = original_composer(conn_arg, **kwargs)
+            target = int(kwargs["target_event"])
+            assert target not in built
+            built[target] = (request, report)
+            return request, report
+
+        monkeypatch.setattr(assembly, "build_future_free_hit_request", observe_real_composer)
+        verifier_calls = []
+        original_verifier = assembly.verify_future_action_hit_cost_witnesses
+
+        def audit_real_verifier(conn_arg, **kwargs):
+            assert kwargs["action"] == "FH"
+            assert tuple(kwargs["expected_events"]) == (5, 6)
+            reports = {int(row["event"]): row for row in kwargs["assembly_reports"]}
+            records = {int(row["event"]): row for row in kwargs["opportunity_records"]}
+            assert tuple(sorted(reports)) == tuple(sorted(records)) == (5, 6)
+            for target in (5, 6):
+                report = reports[target]
+                witness = report["hit_cost_witness"]
+                assert records[target]["action"] == "FH"
+                assert int(records[target]["event"]) == target
+                assert witness["action"] == "FH"
+                assert int(witness["event"]) == target
+                assert witness["source_identity"] == records[target]["source_identity"]
+                assert witness["continuation_generation_id"] == context["continuation"].generation_id
+                assert set(report["world_cache_keys"]) == {
+                    str(event) for event in range(target, target + 4)
+                }
+                play_actions = witness["play_route_record"]["actions"]
+                save_actions = witness["save_route_actions"]
+                assert [int(row["event"]) for row in play_actions] == list(range(target + 1, target + 4))
+                assert [int(row["event"]) for row in save_actions] == list(range(target, target + 4))
+                assert all(type(row["hit_points"]) is int and row["hit_points"] == 0
+                           for row in play_actions + save_actions)
+                assert set(report["play_optimizer_world_info"]) == {
+                    str(event) for event in range(target + 1, target + 4)
+                }
+                assert all(
+                    row["status"] == "HIT"
+                    for row in report["world_cache_report"]
+                )
+            proof = original_verifier(conn_arg, **kwargs)
+            verifier_calls.append({"events": (5, 6), "proof_sha256": proof})
+            return proof
+
+        monkeypatch.setattr(assembly, "verify_future_action_hit_cost_witnesses", audit_real_verifier)
+        monkeypatch.setattr(
+            monte_carlo, "simulate",
+            lambda *_args, **_kwargs: pytest.fail("public FH forecast attempted uncached world construction"),
+        )
+
+        forecast = horizon_ops.build_future_action_forecast(
+            conn, identity=context["identity"], action="FH",
+            observation_id="fh-two-opportunity-zero-hit", entry_id=241392,
+            continuation_generation_id=context["continuation"].generation_id,
+            value_generation_ids={}, expiry_event=6, coverage_product=context["coverage"],
+            evidence_root=context["evidence_root"], cache_dir=context["cache_dir"],
+        )
+        assert tuple(sorted(built)) == (5, 6)
+        assert {
+            event: request.permanent.event_start_free_transfers
+            for event, (request, _report) in built.items()
+        } == {5: 3, 6: 3}
+        assert [call["events"] for call in verifier_calls] == [(5, 6), (5, 6)]
+        assert forecast["forecast"]["covered_events"] == [5, 6]
+        assert [int(row["event"]) for row in forecast["assembly_reports"]] == [5, 6]
+        retained_opportunities = forecast["forecast"]["opportunities"]
+        assert [int(row["artifact_payload"]["event"]) for row in retained_opportunities] == [5, 6]
+        assert forecast["receipt"]["hit_cost_proof_sha256"] == verifier_calls[-1]["proof_sha256"]
+        assert forecast["receipt"].get("reused") is not True
+        assert all(
+            report["hit_cost_witness"]["continuation_generation_id"]
+            == context["continuation"].generation_id
+            for report in forecast["assembly_reports"]
+        )
+        assert context["play_optimizer_configs_by_target"] == {5: (6, 7, 8), 6: (7, 8, 9)}
+        probe_ids = set(context["optimizer_union_probe_ids"])
+        assert len(probe_ids) == 16
+        assert set(context["play_optimizer_omitted_ids_by_target"]) == {5, 6}
+        omitted_by_target = context["play_optimizer_omitted_ids_by_target"]
+        assert all(len(omitted_by_target[target]) == 1 for target in (5, 6))
+        assert omitted_by_target[5] == omitted_by_target[6]
+        assert set(omitted_by_target[5]).issubset(probe_ids)
+        for target in (5, 6):
+            eligible_ids = set(context["play_optimizer_eligible_pool_ids_by_target"][target])
+            assert len(eligible_ids) == 34
+            assert set(context["play_optimizer_full_pool_ids_by_target"][target]) == eligible_ids
+            assert context["play_optimizer_pool_counts_by_target"][target] == {
+                "GKP": 2, "DEF": 8, "MID": 21, "FWD": 3,
+            }
+            rankings = context["play_optimizer_rankings_by_target"][target]["MID"]
+            assert set(rankings) == {
+                "first_event_core", "supported_3gw_expected_core",
+                "supported_3gw_expected_minutes", "cheapest", "descriptive_value",
+            }
+            all_mids = set(context["play_optimizer_position_ids_by_target"][target]["MID"])
+            assert len(all_mids) == 21
+            owned_ids = set(context["play_optimizer_owned_ids_by_target"][target])
+            required_route_ids = {
+                pid for route_ids in context["play_optimizer_required_route_ids_by_target"][target]
+                for pid in route_ids
+            }
+            inherited_route_ids = {
+                pid for route_ids in context["play_optimizer_inherited_route_ids_by_target"][target]
+                for pid in route_ids
+            }
+            assert owned_ids.issubset(eligible_ids)
+            assert not (probe_ids & (owned_ids | required_route_ids | inherited_route_ids))
+            for ranked_ids in rankings.values():
+                assert len(ranked_ids) == 20
+                assert all_mids - set(ranked_ids) == set(omitted_by_target[target])
+            assert set(context["play_optimizer_search_view_ids_by_target"][target]) == (
+                eligible_ids - set(omitted_by_target[target])
+            )
+            assert set(context["play_optimizer_search_pool_ids_by_target"][target]) == (
+                eligible_ids - set(omitted_by_target[target])
+            )
+            assert len(context["play_optimizer_unions_by_target"][target]) == 33
+            assert set(context["play_optimizer_unions_by_target"][target]) == (
+                eligible_ids - set(omitted_by_target[target])
+            )
+        capture_diagnostics = context["play_optimizer_setup_probe"]["capture_phase_by_target"]
+        assert all(
+            capture_diagnostics[target] == "CACHE_ONLY_OPTIMIZER_RAISED_AFTER_INPUT_CAPTURE"
+            for target in (5, 6)
+        )
+        assert set(context["play_optimizer_cache_keys_by_target"]) == {5, 6}
+        assert all(call["allow_materialization"] is False for call in context["play_cache_loader_calls"])
+        assert {call["target_event"] for call in context["play_cache_loader_calls"]} == {5, 6}
+
+        # Continue through the retained public capture/maturation path using
+        # isolated fixture archives, then contrast official gross arm scores
+        # with the already-issued paired net forecast/realized reservation value.
+        causal_ref = forecast["receipt"]["causal_evidence_ref"]
+        _causal_path, causal = evidence_ops._flat_artifact(context["evidence_root"], causal_ref)
+        selected_event = int(forecast["receipt"]["selected_event"])
+        realization_events = evidence_ops._scheduled_event_ids(
+            causal, "FH", selected_event=selected_event,
+        )
+        assert tuple(realization_events) == tuple(range(selected_event, selected_event + 4))
+        operation_id = evidence_ops._forecast_operation_id(
+            evidence_ops._sha256(evidence_ops._origin_key(context["identity"])),
+            "FH", "fh-two-opportunity-zero-hit",
+        )
+        retained_receipt = evidence_ops._read_forecast_receipt(
+            context["evidence_root"], operation_id,
+        )
+        assert retained_receipt == forecast["receipt"]
+        forecast_available_at = retained_receipt["forecast_available_at"]
+        all_player_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM players ORDER BY id")]
+        captures = []
+        previous_capture_available_at = forecast_available_at
+        for realization_event in realization_events:
+            kickoff_values = [
+                str(row["kickoff_time"])
+                for row in conn.execute(
+                    "SELECT kickoff_time FROM fixtures WHERE event=? ORDER BY id",
+                    (realization_event,),
+                )
+                if row["kickoff_time"]
+            ]
+            assert kickoff_values
+            chronology_floor = max(
+                [
+                    evidence_ops._parse_utc(forecast_available_at, name="retained forecast availability"),
+                    evidence_ops._parse_utc(previous_capture_available_at, name="prior completed capture"),
+                    *[
+                        evidence_ops._parse_utc(value, name="retained fixture kickoff")
+                        for value in kickoff_values
+                    ],
+                ]
+            ).isoformat().replace("+00:00", "Z")
+            final_run = _archive_future_official_state(
+                conn, context["raw_root"], context["context_events"],
+                final_events=(realization_event,),
+                live_players_by_event={realization_event: all_player_ids},
+                observed_after=chronology_floor,
+                preserve_kickoff=True,
+            )
+            assert evidence_ops._parse_utc(
+                final_run["observed_at"], name="fixture official finality",
+            ) > evidence_ops._parse_utc(chronology_floor, name="fixture chronology floor")
+            assert evidence_ops._parse_utc(
+                final_run["finished_at"], name="fixture fetch completion",
+            ) > evidence_ops._parse_utc(forecast_available_at, name="retained forecast availability")
+            assert [
+                str(row["kickoff_time"])
+                for row in conn.execute(
+                    "SELECT kickoff_time FROM fixtures WHERE event=? ORDER BY id",
+                    (realization_event,),
+                )
+            ] == kickoff_values
+            capture_receipt = evidence_ops.capture_outcome(
+                conn, db_path=tmp_path / "origin.db", entry_id=241392,
+                generation_id=context["generation"].generation_id,
+                decision_id=context["decision_id"], route_id=context["route_id"],
+                planning_event=4, cutoff=context["generation"].cutoff,
+                action="FH", observation_id="fh-two-opportunity-zero-hit",
+                realization_event=realization_event, fetch_run_id=final_run["run_id"],
+                raw_root=context["raw_root"], evidence_root=context["evidence_root"],
+            )
+            assert capture_receipt["available_at"] == final_run["finished_at"]
+            captures.append(capture_receipt)
+            previous_capture_available_at = capture_receipt["available_at"]
+        assert [row["source_identity"] for row in captures] == [
+            f"player_gameweeks:{event}" for event in realization_events
+        ]
+        matured = evidence_ops.mature_observation(
+            conn, db_path=tmp_path / "origin.db", entry_id=241392,
+            generation_id=context["generation"].generation_id,
+            decision_id=context["decision_id"], route_id=context["route_id"],
+            planning_event=4, cutoff=context["generation"].cutoff,
+            action="FH", observation_id="fh-two-opportunity-zero-hit",
+            realization_event=selected_event, evidence_root=context["evidence_root"],
+        )
+        outcome_ref = matured["receipt"]["outcome_ref"]
+        _outcome_path, outcome = evidence_ops._flat_artifact(context["evidence_root"], outcome_ref)
+        gross_play = float(outcome["paired_results"]["play"]["observed_points"])
+        gross_save = float(outcome["paired_results"]["save"]["observed_points"])
+        calibration_row = matured["calibration_row"]
+        assert gross_play > 0 and gross_save > 0
+        assert calibration_row["realized_value"] == pytest.approx(gross_play - gross_save)
+        assert calibration_row["forecast_value"] == forecast["forecast"]["raw_value"]
+        verifier = lambda reference: evidence_ops._flat_artifact(context["evidence_root"], reference)[1]
+        verified = calibration.validate_observation(
+            calibration_row, evidence_verifier=verifier, store_conn=conn,
+        )
+        assert verified.action == "FH"
+        assert len(outcome["source"]["captures"]) > 0
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
@@ -4367,6 +5093,10 @@ def test_public_fh_full_source_replay_refuses_paid_play_and_save_schedules(
                 assert not rows
             phrase = f"FH {role} GW6 has source-replayed transfer hit cost 4"
             assert (phrase in message) is (expected == 4)
+            if expected == 4:
+                assert (
+                    f"{phrase}; gross-only realized scoring is unsupported" in message
+                )
         # Reseal a false-zero route claim, then ask the real full verifier to
         # replay it again. Transfer costs are recomputed from the accepted
         # source state; changing the claim and its digests cannot erase them.

@@ -165,9 +165,15 @@ def test_horizon_forecast_cli_binds_explicit_products_and_uses_readonly_store(
     route = object()
     coverage = {"product_sha256": "coverage-digest"}
     calls = {}
+    identity_arguments = {}
 
     monkeypatch.setattr(cli.database, "connect_readonly_database", lambda _path: connection)
-    monkeypatch.setattr(evidence_ops, "_required_identity", lambda **_kwargs: identity)
+
+    def required_identity(**kwargs):
+        identity_arguments.update(kwargs)
+        return identity
+
+    monkeypatch.setattr(evidence_ops, "_required_identity", required_identity)
     monkeypatch.setattr(gs, "load_generation", lambda _conn, _generation_id: generation)
     monkeypatch.setattr(cra, "load_verified_normal_route", lambda *_args, **_kwargs: route)
     monkeypatch.setattr(evidence_ops, "_source_identity", lambda _route, _generation: {"source": "bound"})
@@ -201,6 +207,16 @@ def test_horizon_forecast_cli_binds_explicit_products_and_uses_readonly_store(
         "wildcard_value_horizon_length": 6,
     }
     assert calls["forecast"]["identity"] == identity
+    assert identity_arguments == {
+        "db_path": str(db_path),
+        "entry_id": 77,
+        "generation_id": "g-1",
+        "decision_id": "d-1",
+        "route_id": "route-1",
+        "planning_event": 4,
+        "cutoff": "2026-10-01T10:00:00Z",
+        "evidence_root": "evidence",
+    }
     assert calls["forecast"]["value_generation_ids"] == {5: "wc5", 6: "wc6"}
     assert calls["forecast"]["coverage_product"] is coverage
     assert connection.closed is True

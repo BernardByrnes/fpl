@@ -86,9 +86,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     raw = json.loads(args.runs_json.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping):
         parser.error("runs-json must be an object mapping events to run-id maps")
-    runs = {int(event): dict(rows) for event, rows in raw.items() if isinstance(rows, Mapping)}
+    if any(not isinstance(rows, Mapping) for rows in raw.values()):
+        parser.error("every runs-json event value must be an object mapping families to run ids")
+    try:
+        runs = {int(event): {str(key): int(value) for key, value in rows.items()}
+                for event, rows in raw.items()}
+    except (TypeError, ValueError) as failure:
+        parser.error(f"runs-json event ids, family names and run ids must be valid: {failure}")
     conn = connect_database(args.db)
     controller = execution.ExecutionController(conn)
+    run_created = False
+    run_terminal = False
     try:
         base = gs.load_generation(conn, args.four_gw_generation)
         controller.create_run(
@@ -97,20 +105,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             hard_stop_at=datetime.now(timezone.utc) + timedelta(hours=1),
             label="wildcard_value_horizon_certification",
         )
+        run_created = True
         controller.start()
         controller.acquire_writer_lease()
-        try:
-            result = certify_wildcard_horizon(
-                conn,
-                four_gw_generation_id=base.generation_id,
-                events=args.events,
-                runs_by_event=runs,
-                controller=controller,
-            )
-        except BaseException as failure:
-            controller.finish(execution.RUN_FAILED, str(failure))
-            raise
+        result = certify_wildcard_horizon(
+            conn,
+            four_gw_generation_id=base.generation_id,
+            events=args.events,
+            runs_by_event=runs,
+            controller=controller,
+        )
         controller.finish(execution.RUN_COMPLETE)
+        run_terminal = True
         print(json.dumps({
             "generation_id": result.generation_id,
             "horizon_kind": result.horizon_kind,
@@ -120,6 +126,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "verified": bool(gs.verify_generation(conn, result.generation_id).get("verified")),
         }, sort_keys=True))
         return 0
+    except BaseException as failure:
+        if run_created and not run_terminal:
+            try:
+                controller.finish(execution.RUN_FAILED, str(failure))
+            except BaseException as bookkeeping_failure:
+                if hasattr(failure, "add_note"):
+                    failure.add_note(
+                        "RUN_FAILED finalization also failed: "
+                        f"{type(bookkeeping_failure).__name__}: {bookkeeping_failure}"
+                    )
+        raise
     finally:
         conn.close()
 

@@ -170,6 +170,17 @@ def test_future_wildcard_value_window_is_certified_from_origin_continuation_only
             reservation_controller.finish(execution.RUN_FAILED, str(failure))
             raise
         reservation_controller.finish(execution.RUN_COMPLETE)
+        # Canonical integration: the correctly origin-pinned continuation must
+        # satisfy the same permission gate before it is used for future FH.
+        continuation_permission = sp.require_search_permission(
+            conn,
+            continuation.generation_id,
+            expected_origin_planning_event=origin_event,
+            expected_origin_cutoff=pe9.CUTOFF,
+            expected_snapshot_sha256=str(snapshot["sha256"]),
+        )
+        assert continuation_permission["permitted"] is True
+        assert continuation_permission["origin"]["generation_id"] == continuation.generation_id
         future_fh_events = tuple(range(future_event, future_event + fh.cd.CHIP_HORIZON_LENGTH))
         future_fh_authority = fhauthority.FreeHitDecisionAuthority.from_verified_continuation_generation(
             conn,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .utils import utc_now
+from .sqlite_uri import readonly_sqlite_uri
 
 SCHEMA_VERSION = 19
 
@@ -1590,7 +1591,13 @@ def connect_readonly_database(
     database_path = str(path)
     if database_path != ":memory:" and not _Path(database_path).exists():
         raise FileNotFoundError(f"database not found: {database_path}")
-    uri = f"file:{database_path}?mode=ro"
+    if database_path == ":memory:":
+        conn = sqlite3.connect(database_path, timeout=max(0.0, float(busy_timeout_ms) / 1000.0))
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+    uri = readonly_sqlite_uri(database_path)
     conn = sqlite3.connect(uri, uri=True, timeout=max(0.0, float(busy_timeout_ms) / 1000.0))
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")

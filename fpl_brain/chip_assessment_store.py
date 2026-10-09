@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import uuid
@@ -22,10 +23,18 @@ ASSESSMENT_ACTIONS = (cd.CHIP_ACTION_BB, cd.CHIP_ACTION_TC, cd.CHIP_ACTION_FH, c
 
 ASSESSMENT_INVALID = "CHIP_ASSESSMENT_RECORD_INVALID"
 ASSESSMENT_PUBLICATION_UNAVAILABLE = "CHIP_ASSESSMENT_ATOMIC_PUBLICATION_UNAVAILABLE"
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class ChipAssessmentStoreError(ValueError):
     pass
+
+
+def _validate_run_id(value: Any) -> str:
+    run_id = str(value or "")
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise ChipAssessmentStoreError("assessment run_id must contain only letters, digits, '_' or '-'")
+    return run_id
 
 
 def _canonical_bytes(payload: Any) -> bytes:
@@ -453,6 +462,7 @@ def retain_assessment(
     value = _plain(record)
     if not isinstance(value, dict) or value.get("schema") != ASSESSMENT_SCHEMA:
         raise ChipAssessmentStoreError("refusing to retain an unknown assessment record")
+    _validate_run_id(value.get("run_id"))
     _validate_context(value, store_conn=store_conn)
     expected = str(value.pop("record_sha256", ""))
     if expected != _digest(value):

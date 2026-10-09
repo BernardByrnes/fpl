@@ -91,6 +91,9 @@ SOURCE_SNAPSHOT_FILES = (
     "fpl_brain/analytics.py",
     "fpl_brain/calibration.py",
     "fpl_brain/database.py",
+    # Read-only connection identity depends on escaped SQLite URI construction;
+    # changes to that delegated path-selection logic affect certified execution.
+    "fpl_brain/sqlite_uri.py",
     # The DEFCON probability calibration is part of the certified source set:
     # its versioned spec determines the DEFCON term in every xPts row, so a
     # change to it must change the certified code identity.

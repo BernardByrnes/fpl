@@ -406,6 +406,32 @@ def test_forecast_verification_detects_tampering_and_assessment_substitution():
         )
 
 
+def test_public_forecast_verifier_rejects_duplicate_opportunity_events():
+    _, _, records = _inputs()
+    artifact = _build(records, expiry_event=8)
+    forged = json.loads(json.dumps(artifact))
+    forged["opportunities"][1] = dict(forged["opportunities"][0])
+    forged["covered_events"] = [7, 7]
+    forged["artifact_sha256"] = _sha({key: value for key, value in forged.items()
+                                      if key != "artifact_sha256"})
+
+    with pytest.raises(forecast.ReservationForecastError, match="event manifest is not strictly increasing"):
+        forecast.inspect_reservation_forecast_structure(forged, expected={})
+
+
+def test_public_forecast_verifier_rejects_unresealed_nested_opportunity_digest():
+    _, _, records = _inputs()
+    artifact = _build(records, expiry_event=8)
+    forged = json.loads(json.dumps(artifact))
+    nested = forged["opportunities"][0]["artifact_payload"]
+    nested["expected_incremental_points"] += 1.0
+    forged["artifact_sha256"] = _sha({key: value for key, value in forged.items()
+                                      if key != "artifact_sha256"})
+
+    with pytest.raises(forecast.ReservationForecastError, match="event opportunity content digest does not verify"):
+        forecast.inspect_reservation_forecast_structure(forged, expected={})
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -464,6 +490,63 @@ def test_assessment_cli_refuses_ambiguous_content_addressed_forecasts(tmp_path):
     try:
         with pytest.raises(ValueError, match="multiple retained reservation forecasts found for TC"):
             run_chip_assessment._load_reservation_forecast_inputs(tmp_path, conn)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("retainer_name", ["retain_reservation_forecast", "retain_event_opportunity_record"])
+def test_atomic_retention_reuses_identical_existing_bytes_and_refuses_conflicts(
+    tmp_path, monkeypatch, retainer_name,
+):
+    value = {"artifact_sha256": "same-digest", "payload": "canonical"}
+    payload = forecast._canonical_bytes(value)
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(forecast, "verify_reservation_forecast", lambda *_a, **_k: None)
+    monkeypatch.setattr(forecast, "_verify_event_opportunity", lambda *_a, **_k: None)
+    retainer = getattr(forecast, retainer_name)
+    prefix = "chip-reservation-forecast" if retainer_name == "retain_reservation_forecast" else "chip-event-opportunity"
+    target = tmp_path / f"{prefix}-same-digest.json"
+    target.write_bytes(payload)
+    monkeypatch.setattr(forecast.os, "link", lambda *_a: (_ for _ in ()).throw(FileExistsError()))
+    try:
+        result = retainer(value, tmp_path, store_conn=conn)
+        assert Path(result["path"]).read_bytes() == payload
+        assert list(tmp_path.glob("*.tmp-*")) == []
+
+        target.write_bytes(b"conflicting-existing-content")
+        with pytest.raises(forecast.ReservationForecastError, match="different bytes"):
+            retainer(value, tmp_path, store_conn=conn)
+        assert target.read_bytes() == b"conflicting-existing-content"
+        assert list(tmp_path.glob("*.tmp-*")) == []
+        assert conn.total_changes == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("retainer_name", ["retain_reservation_forecast", "retain_event_opportunity_record"])
+def test_atomic_retention_link_or_staging_failure_leaves_no_final_or_temp_file(
+    tmp_path, monkeypatch, retainer_name,
+):
+    value = {"artifact_sha256": "failure-digest", "payload": "canonical"}
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(forecast, "verify_reservation_forecast", lambda *_a, **_k: None)
+    monkeypatch.setattr(forecast, "_verify_event_opportunity", lambda *_a, **_k: None)
+    retainer = getattr(forecast, retainer_name)
+    prefix = "chip-reservation-forecast" if retainer_name == "retain_reservation_forecast" else "chip-event-opportunity"
+    target = tmp_path / f"{prefix}-failure-digest.json"
+    try:
+        monkeypatch.setattr(forecast.os, "link", lambda *_a: (_ for _ in ()).throw(OSError("link denied")))
+        with pytest.raises(forecast.ReservationForecastError, match="atomic no-replace"):
+            retainer(value, tmp_path, store_conn=conn)
+        assert not target.exists()
+        assert list(tmp_path.glob("*.tmp-*")) == []
+
+        monkeypatch.setattr(forecast.tempfile, "mkstemp", lambda **_kw: (_ for _ in ()).throw(OSError("stage denied")))
+        with pytest.raises(OSError, match="stage denied"):
+            retainer(value, tmp_path, store_conn=conn)
+        assert not target.exists()
+        assert list(tmp_path.glob("*.tmp-*")) == []
+        assert conn.total_changes == 0
     finally:
         conn.close()
 

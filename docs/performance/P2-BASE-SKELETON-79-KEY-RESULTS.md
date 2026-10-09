@@ -13,9 +13,9 @@ Date: 2026-10-03 UTC. This report extends the earlier eight-key profile at `C:\U
 
 This is offline exact scoring of retained certified route inputs. It did not rerun route search or the optimizer and does not establish unchanged ranking for a complete production search.
 
-## One isolated change
+## One isolated change in the historical benchmark variant
 
-The candidate changes only `fpl_brain/manager_worlds.py` in the production implementation: each skeleton computes a watched-bit mask once and uses `appearance_mask & watch_mask` as its local autosub-choice dictionary key. The key contains exactly the same watched appearance bits as the prior boolean tuple. The dictionary remains local to one skeleton. XI, ordered bench, player positions, goalkeeper flags, entrant selection, appearance-group order, policy enumeration, and floating-point accumulation order remain unchanged. No unrelated optimization was added.
+This section describes the integer-key variant measured in this historical benchmark, not the later combined candidate. That combined candidate also contains starter-sum reuse; see the dated [2026-10-08 addendum](P2-BASE-SKELETON-79-KEY-RESULTS-ADDENDUM-2026-10-08.md). The measured variant changes only `fpl_brain/manager_worlds.py`: each skeleton computes a watched-bit mask once and uses `appearance_mask & watch_mask` as its local autosub-choice dictionary key. The key contains exactly the same watched appearance bits as the prior boolean tuple. The dictionary remains local to one skeleton. XI, ordered bench, player positions, goalkeeper flags, entrant selection, appearance-group order, policy enumeration, and floating-point accumulation order remain unchanged in that measured variant.
 
 The focused oracle tests cover high player indices, irrelevant bits, skeleton-local cache separation, bench ordering, goalkeeper availability/swap boundaries, and entrant scoring. The reference implementation is the equivalence oracle.
 

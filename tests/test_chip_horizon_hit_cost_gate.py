@@ -91,3 +91,40 @@ def test_zero_hit_gate_requires_both_arms_every_scored_event_and_exact_integers(
         assembly._require_zero_hit_arms("WC", expected_events=(5, 6), arms=bool_is_not_an_integer)
     with pytest.raises(assembly.FutureStateAssemblyError, match="both PLAY and SAVE"):
         assembly._require_zero_hit_arms("FH", expected_events=(5,), arms={"PLAY": [{"event": 5, "hit_points": 0}]})
+
+
+def test_public_hit_cost_verifier_rejects_duplicate_assembly_reports_before_source_reads():
+    with pytest.raises(assembly.FutureStateAssemblyError) as failure:
+        assembly.verify_future_action_hit_cost_witnesses(
+            object(), identity={}, action="FH", continuation_generation_id="continuation",
+            value_generation_ids={}, expected_events=(5,),
+            assembly_reports=[{"event": 5}, {"event": 5}], opportunity_records=[],
+        )
+    assert str(failure.value) == "duplicate FH/WC assembly report for GW5"
+
+
+def test_public_hit_cost_verifier_rejects_duplicate_opportunity_records_before_source_reads():
+    with pytest.raises(assembly.FutureStateAssemblyError) as failure:
+        assembly.verify_future_action_hit_cost_witnesses(
+            object(), identity={}, action="FH", continuation_generation_id="continuation",
+            value_generation_ids={}, expected_events=(5,), assembly_reports=[],
+            opportunity_records=[{"event": 5}, {"event": 5}],
+        )
+    assert str(failure.value) == "duplicate FH/WC opportunity record for GW5"
+
+
+def test_public_hit_cost_verifier_rejects_unsealed_witness_digest_before_source_reads():
+    report = {
+        "event": 5,
+        "hit_cost_witness": {
+            "schema": assembly.HIT_COST_WITNESS_SCHEMA,
+            "witness_sha256": "0" * 64,
+        },
+    }
+    with pytest.raises(assembly.FutureStateAssemblyError) as failure:
+        assembly.verify_future_action_hit_cost_witnesses(
+            object(), identity={}, action="FH", continuation_generation_id="continuation",
+            value_generation_ids={}, expected_events=(5,), assembly_reports=[report],
+            opportunity_records=[{"event": 5}],
+        )
+    assert str(failure.value) == "GW5 FH/WC hit-cost witness digest does not verify"

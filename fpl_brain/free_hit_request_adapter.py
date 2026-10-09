@@ -56,6 +56,7 @@ from . import manager_lineup as ml
 from . import planning as planning_module
 from . import repositories as repo
 from . import season_rules as sr
+from . import search_permission as sp
 from .chip_wildcard import (
     WildcardWorldInputs,
     WildcardPoolBinding,
@@ -74,13 +75,31 @@ FH_CUTOFF_MISMATCH = "FREE_HIT_PRICE_PREDICTION_CUTOFF_MISMATCH"
 FH_KEYSET_MISMATCH = "FREE_HIT_CALLER_KEYSET_IS_NOT_THE_CANONICAL_UNIVERSE"
 FH_POOL_MISMATCH = "FREE_HIT_POOL_IS_NOT_THE_ACCEPTED_GENERATION"
 FH_UNIVERSE_INCOMPLETE = "FREE_HIT_CANONICAL_UNIVERSE_INCOMPLETE"
-#: Production Free Hit must LOAD the canonical certification.  There is no
-#: caller-supplied authority, and no fallback to request-owned values.
+#: Production Free Hit must use a canonical certified authority. A continuation
+#: generation must also pass the canonical search-permission gate.
 FH_CERTIFICATION_REQUIRED = "FREE_HIT_PRODUCTION_CERTIFICATION_REQUIRED"
 
 
 class FreeHitAdapterError(fh.FreeHitInputError):
     """The production adapter could not assemble an authoritative request."""
+
+
+def _require_continuation_search_permission(conn: sqlite3.Connection, generation: Any) -> None:
+    """Recheck canonical production permission at the continuation seam."""
+
+    try:
+        sp.require_search_permission(
+            conn,
+            str(generation.generation_id),
+            expected_origin_planning_event=int(generation.planning_event),
+            expected_origin_cutoff=str(generation.cutoff),
+            expected_snapshot_sha256=str((generation.snapshot or {}).get("sha256") or ""),
+        )
+    except sp.SearchPermissionRefused as failure:
+        raise FreeHitAdapterError(
+            f"{FH_CERTIFICATION_REQUIRED}: continuation generation lacks canonical search permission: {failure}",
+            reasons=(FH_CERTIFICATION_REQUIRED,),
+        ) from failure
 
 
 # ---------------------------------------------------------------------------
@@ -379,12 +398,11 @@ def build_free_hit_request(
         )
 
     # ── the canonical decision context is LOADED, never supplied ──────────────
-    # `certification_path` is the ONE production source of authority: the accepted
-    # loader validates the real v2 artifact and `FreeHitDecisionAuthority`
-    # recomputes the certification identity from it.  A caller cannot pass an
-    # authority object at all, so "B agrees with B, therefore B is trusted" has no
-    # production path.  Price retrieval below uses the CERTIFIED cutoff, so a later
-    # caller cutoff can never pull post-cutoff prices into this decision.
+    # The production authority is either the accepted v2 certification artifact
+    # or a verified CHIP_RESERVATION continuation with canonical search
+    # permission. Callers cannot provide an authority object. Price retrieval
+    # below uses the certified cutoff, so a later caller cutoff cannot pull
+    # post-cutoff prices into this decision.
     if conn is not None and generation is None:
         try:
             generation = gs.resolve_generation(conn, planning_event=int(manager.planning_event))
@@ -408,6 +426,7 @@ def build_free_hit_request(
         )
     try:
         if use_continuation_authority:
+            _require_continuation_search_permission(conn, generation)
             authority = fh.FreeHitDecisionAuthority.from_verified_continuation_generation(
                 conn, generation.generation_id, events=requested_events,
             )

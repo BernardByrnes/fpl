@@ -856,6 +856,17 @@ def test_optimize_cache_only_rejects_injected_provider_before_calling_it(tmp_pat
     assert calls == []
 
 
+def test_world_loader_cache_only_refuses_injected_provider_before_calling_it():
+    calls = []
+    provider = lambda *_a, **_k: calls.append("called")
+    with pytest.raises(cb.CertificationRefused, match="cache-only world loading"):
+        ro._load_event_worlds(
+            None, None, 4, [1], _config(events=(4,), search_draws=2),
+            allow_materialization=False, non_production_worlds=_np(provider),
+        )
+    assert calls == []
+
+
 def test_optimize_cache_policy_requires_an_actual_bool():
     universe, state, meta = _universe(events=(4,))
     with pytest.raises(TypeError, match="actual bool"):

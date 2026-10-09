@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from . import certified_bundle as cb
+from .sqlite_uri import readonly_sqlite_uri
 
 MANIFEST_SCHEMA = "fpl_brain.pe9_generation_manifest.v1"
 LEGACY_DECISION_RECORD_SCHEMA = "fpl_brain.pe9_engine_decision_record.v1"
@@ -1827,7 +1828,7 @@ def _run_identity_failures(
     from . import execution_snapshot as es
 
     try:
-        snapshot_conn = sqlite3.connect(f"file:{Path(str(snapshot['path']))}?mode=ro", uri=True)
+        snapshot_conn = sqlite3.connect(readonly_sqlite_uri(str(snapshot["path"])), uri=True)
         snapshot_conn.row_factory = sqlite3.Row
         snapshot_conn.execute("PRAGMA query_only=ON")
     except (OSError, sqlite3.Error, KeyError) as failure:
@@ -2424,7 +2425,7 @@ def verify_generation(conn: sqlite3.Connection, generation_id: str) -> dict[str,
     reproduced_horizon: dict[str, Any] = {"status": "UNVERIFIABLE"}
     last_event = manifest.get("last_event")
     if snapshot_status == "VERIFIED":
-        snapshot_conn = sqlite3.connect(f"file:{Path(str(snapshot.get('path')))}?mode=ro", uri=True)
+        snapshot_conn = sqlite3.connect(readonly_sqlite_uri(str(snapshot.get("path"))), uri=True)
         try:
             snapshot_conn.row_factory = sqlite3.Row
             actual_last_event = int(fg.season_last_event_from_db(snapshot_conn))
@@ -4163,7 +4164,7 @@ def _open_generation_snapshot(generation: CertifiedGeneration) -> sqlite3.Connec
         installed = None
     if installed is not None:
         return es.open_snapshot(installed)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(readonly_sqlite_uri(path), uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     return conn

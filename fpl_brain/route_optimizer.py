@@ -920,6 +920,11 @@ def _load_event_worlds(conn, generation, event, union_ids, config, *,
     from . import certified_bundle as cb
     from . import generation_store as gs
 
+    if not allow_materialization and non_production_worlds is not None:
+        raise cb.CertificationRefused(
+            DIAG_CERTIFIED_WORLD_CACHE_REQUIRED,
+            ["cache-only world loading refuses injected/non-production matrices or providers"],
+        )
     if non_production_worlds is not None:
         if generation is not None:
             raise cb.CertificationRefused(
